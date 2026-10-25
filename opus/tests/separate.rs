@@ -113,7 +113,7 @@ fn separate_store_pipeline_copies_blobs_before_trees() {
     let log = pipeline(&root, &store, &up, "15m", &["--blobs", "separate"]);
     assert!(log.contains("blobs separate"), "{log}");
     let m = manifest(&store_dir);
-    assert!(m.separate_blobs() && m.blobs_partial());
+    assert!(m.separate_blobs());
     assert_eq!(
         slab_kinds(&store_dir, &m.baseline),
         vec![OBJ_COMMIT, OBJ_TREE]
@@ -121,7 +121,7 @@ fn separate_store_pipeline_copies_blobs_before_trees() {
     assert_eq!(all_sizes(&store_dir, &m), git_blobs(&up.bare, &["--all"]));
     let s = Store::open(&store, "").unwrap();
     let (bm, _) = blobcopy::load(&s).unwrap();
-    assert!(bm.segments.is_empty() && bm.tip_complete.is_none());
+    assert!(bm.segments.is_empty() && !bm.complete());
     assert!(m.blobs_generation >= 1 && bm.generation >= m.blobs_generation);
     // The mode is the store's: an inline run on it is refused.
     let refused = pipeline_at(
@@ -275,8 +275,10 @@ fn mirror(root: &Path, store: &str, up: &Upstream, extra: &[&str]) -> Result<Str
     }
 }
 
+/// The mirror copies every blob of the history (the tip's tree first), in slices, never
+/// twice, and is then complete; with the pipeline's windows, every blob of every commit.
 #[test]
-fn mirror_completes_every_commit_since_genesis_and_resumes() {
+fn mirror_copies_the_whole_history_and_resumes() {
     let root = tempdir("sep-mirror");
     let up = Upstream::new(&root);
     let store_dir = root.join("store");
@@ -319,7 +321,7 @@ fn mirror_completes_every_commit_since_genesis_and_resumes() {
     let s = Store::open(&store, "").unwrap();
     assert!(!blobcopy::load(&s).unwrap().0.complete());
 
-    // In slices: two packs, then the rest.
+    // In slices: two packs (the tip's blobs come first), then the rest.
     let log = mirror(
         &root,
         &store,
@@ -330,55 +332,46 @@ fn mirror_completes_every_commit_since_genesis_and_resumes() {
     assert!(log.contains("stopped after 2"), "{log}");
     let (bm, _) = blobcopy::load(&s).unwrap();
     assert!(!bm.complete() && !bm.segments.is_empty());
+    let tip = commit_blobs(&up.bare, &["-1", &t]);
+    let first = store_blobs(&root, &store_dir);
+    assert!(!first.is_empty());
+    for id in first.keys() {
+        assert!(
+            tip.contains_key(id),
+            "{id}: not a tip blob in the first slice"
+        );
+    }
     let log = mirror(&root, &store, &up, &["--blob-pack-mib", "1"]).unwrap();
     let (bm, _) = blobcopy::load(&s).unwrap();
     assert!(bm.complete(), "{log}");
     assert_eq!(bm.genesis.to_string(), g);
 
-    // Every blob of every commit since genesis, byte for byte: the genesis tree's (even
-    // the file deleted since) and the window's.
+    // Every blob of the history, byte for byte: old versions (c1's), the genesis tree's
+    // (even the file deleted since) and the window's.
     let stored = store_blobs(&root, &store_dir);
-    let since_genesis = commit_blobs(&up.bare, &["--ancestry-path", &format!("{g}..{t}")]);
-    let at_genesis = commit_blobs(&up.bare, &["-1", &g]);
-    for (id, at) in since_genesis.iter().chain(&at_genesis) {
+    let history = git_blobs(&up.bare, &["--all"]);
+    assert!(
+        commit_blobs(&up.bare, &["-1", &c1])
+            .keys()
+            .any(|id| !tip.contains_key(id))
+    );
+    for id in history.keys() {
         let content = stored
             .get(id)
-            .unwrap_or_else(|| panic!("{at} ({id}) missing\n{log}"));
-        assert!(*content == cat_blob(&up.bare, id), "{at} differs");
+            .unwrap_or_else(|| panic!("{id} missing\n{log}"));
+        assert!(*content == cat_blob(&up.bare, id), "{id} differs");
     }
+    assert_eq!(stored.len(), history.len());
     // Nothing was copied twice: one record per blob across all segments.
     let records: usize = bm.segments.iter().map(|m| m.blobs as usize).sum();
     assert_eq!(records, stored.len(), "a blob listed twice");
-    // Versions only commits before genesis reference were not copied.
-    let old_only: Vec<String> = commit_blobs(&up.bare, &["-1", &c1])
-        .into_keys()
-        .filter(|id| !at_genesis.contains_key(id))
-        .collect();
-    assert!(!old_only.is_empty() && old_only.iter().all(|id| !stored.contains_key(id)));
 
     // Again: nothing to copy.
     let log = mirror(&root, &store, &up, &[]).unwrap();
     assert!(log.contains("to copy in 0 items"), "{log}");
-
-    // The whole history: every blob ever referenced.
-    let log = mirror(
-        &root,
-        &store,
-        &up,
-        &["--scope", "history", "--blob-pack-mib", "1"],
-    )
-    .unwrap();
-    let stored = store_blobs(&root, &store_dir);
-    for id in git_blobs(&up.bare, &["--all"]).keys() {
-        assert!(
-            stored.contains_key(id),
-            "{id} missing after --scope history\n{log}"
-        );
-    }
-    let (bm, _) = blobcopy::load(&s).unwrap();
-    assert!(bm.complete() && bm.since_ts == 1);
-    let records: usize = bm.segments.iter().map(|m| m.blobs as usize).sum();
-    assert_eq!(records, stored.len(), "a blob listed twice");
+    // There is no partial mirror any more.
+    let refused = mirror(&root, &store, &up, &["--scope", "tip"]).unwrap_err();
+    assert!(refused.contains("scope"), "{refused}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -419,8 +412,12 @@ fn parse_sizes_json(body: &[u8]) -> BTreeMap<String, u64> {
         .collect()
 }
 
+/// An edge of a separate-blob store: unready until the mirror is done (blobs it is asked
+/// for meanwhile come through the proxy), then every blob of the history from the store
+/// as loose objects, packs, sizes and ranges; a push's blobs through the proxy until the
+/// pipeline seals them.
 #[test]
-fn edge_serves_blobs_from_the_store_and_through_the_proxy() {
+fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
     let root = tempdir("sep-edge");
     let up = Upstream::new(&root);
     let store_dir = root.join("store");
@@ -458,17 +455,17 @@ fn edge_serves_blobs_from_the_store_and_through_the_proxy() {
     assert_eq!(status, 503);
     assert!(String::from_utf8_lossy(&body).contains("blobs incomplete"));
 
-    // Before the mirror the tip's blobs come through the proxy.
+    // Before the mirror, blobs come through the proxy (not a fault: not complete yet).
     let text2 = rev(&up.bare, &format!("{g}:a/text.txt"));
     let (status, ct, _) = server.get(&format!("/gvfs/objects/{text2}"));
     assert_eq!((status, ct.as_str()), (200, CT_LOOSE));
     assert_eq!(server.metric("gvfs_blobs_proxied_total"), 1);
+    assert_eq!(server.metric("gvfs_blobs_missing_total"), 0);
 
     mirror(&root, &store, &up, &[]).unwrap();
-    server.wait_for("tip complete", |s| s.get("/healthz").0 == 200);
+    server.wait_for("complete", |s| s.get("/healthz").0 == 200);
 
-    // Every blob of history as a loose object: the tip's from the store, old versions
-    // through the proxy. git re-hashes each one.
+    // Every blob of history as a loose object, from the store. git re-hashes each one.
     let history = git_blobs(&up.bare, &["--all"]);
     let all_blobs: Vec<String> = history.keys().cloned().collect();
     let tip_blobs = commit_blobs(&up.bare, &["-1", &g]);
@@ -485,19 +482,16 @@ fn edge_serves_blobs_from_the_store_and_through_the_proxy() {
         cat_batch(&loose, &all_blobs),
         cat_batch(&up.bare, &all_blobs)
     );
-    assert!(server.metric("gvfs_blobs_from_store_total") >= tip_blobs.len() as u64);
-    let old_only = all_blobs
-        .iter()
-        .filter(|b| !tip_blobs.contains_key(*b))
-        .count() as u64;
-    assert_eq!(server.metric("gvfs_blobs_proxied_total"), 1 + old_only);
+    assert!(server.metric("gvfs_blobs_from_store_total") >= all_blobs.len() as u64);
+    assert_eq!(server.metric("gvfs_blobs_proxied_total"), 1);
+    assert!(all_blobs.len() > tip_blobs.len(), "old versions too");
     // Ids no tree of the store names are not proxied.
     assert_eq!(
         server.get(&format!("/gvfs/objects/{}", "0".repeat(40))).0,
         404
     );
 
-    // A POST of trees and blobs (stored and old versions): one pack git accepts.
+    // A POST of trees and blobs (the tip's and old versions): one pack git accepts.
     let kinds = types(&up.bare, &up.objects(&g));
     let mut batch: Vec<String> = kinds
         .iter()
@@ -657,6 +651,7 @@ fn edge_serves_blobs_from_the_store_and_through_the_proxy() {
     assert_eq!(server.get(&format!("/gvfs/objects/{text4}")).0, 200);
     assert_eq!(server.metric("gvfs_blobs_from_store_total"), stored + 1);
     assert_eq!(server.metric("gvfs_blobs_proxied_total"), proxied);
+    assert_eq!(server.metric("gvfs_blobs_missing_total"), 0);
     server.assert_clean();
     drop(server);
     let _ = std::fs::remove_dir_all(&root);
@@ -664,7 +659,7 @@ fn edge_serves_blobs_from_the_store_and_through_the_proxy() {
 
 /// Stock microsoft/git against an edge of a separate-blob store: gvfs-helper prefetches
 /// commits and trees, and a checkout faults the blobs in (GET singles, POST batches),
-/// byte for byte git's; old versions come through the proxy; a sparse cone fetches only
+/// byte for byte git's, old versions too, all from the store; a sparse cone fetches only
 /// its own blobs.
 #[test]
 fn stock_gvfs_helper_checks_out_a_separate_store() {
@@ -800,7 +795,7 @@ fn stock_gvfs_helper_checks_out_a_separate_store() {
         tip_blobs.keys().all(|b| !gone.contains(b)),
         "the tip's blobs were faulted in"
     );
-    // An old version, never mirrored: through the proxy.
+    // An old version: mirrored with the history.
     let shown = msg(
         &full,
         &[
@@ -833,6 +828,8 @@ fn stock_gvfs_helper_checks_out_a_separate_store() {
         missing(&sparse, &g).contains(&large_id),
         "outside the cone: not fetched"
     );
+    assert_eq!(server.metric("gvfs_blobs_proxied_total"), 0);
+    assert_eq!(server.metric("gvfs_blobs_missing_total"), 0);
     server.assert_clean();
     drop(server);
     let _ = std::fs::remove_dir_all(&root);
@@ -1174,18 +1171,26 @@ fn work_git(up: &Upstream, args: &[&str]) -> String {
     git(&up.work, &all)
 }
 
-/// Commits after genesis that reuse versions which exist only before genesis: an old side
-/// branch merged (git leaves its base's subtrees out of the window's pack) and a revert
-/// against an upstream with reachability bitmaps (which leaves out every subtree the haves
-/// reach). Windows copy what is new; those old versions are not copied, and an edge serves
-/// them through the proxy like any pre-genesis version. Every blob of every commit since
-/// genesis reaches a client, byte for byte.
+/// Commits after genesis that reuse versions from before genesis: an old side branch
+/// merged (git leaves its base's subtrees out of the window's pack) and a revert against an
+/// upstream with reachability bitmaps (which leaves out every subtree the haves reach).
+/// The mirror copies the whole history, so the versions a window's pack leaves out are in
+/// the store already: whether the mirror runs before the windows (store A) or after them
+/// (store B), every blob of every commit is in the store once, and an edge serves them all
+/// from it, none through the proxy.
 #[test]
-fn reused_pre_genesis_versions_come_through_the_proxy() {
+fn reused_old_versions_are_in_the_store() {
     let root = tempdir("sep-reused");
     let up = Upstream::new(&root);
-    let store_dir = root.join("store");
-    let store = format!("fs:{}", store_dir.display());
+    let stores: Vec<(std::path::PathBuf, String)> = ["store-a", "store-b"]
+        .iter()
+        .map(|n| {
+            let d = root.join(n);
+            let spec = format!("fs:{}", d.display());
+            (d, spec)
+        })
+        .collect();
+    let (store_a, store_b) = (&stores[0].1, &stores[1].1);
     commit_files(
         &up,
         "c1",
@@ -1197,9 +1202,11 @@ fn reused_pre_genesis_versions_come_through_the_proxy() {
     );
     let x = commit_files(&up, "X", &[("lib/foo/a.c", Some(b"a v2\n".to_vec()))]);
     work_git(&up, &["branch", "topic", &x]);
-    let g = commit_files(&up, "Y", &[("lib/bar/c.c", Some(b"c v2\n".to_vec()))]);
-    pipeline(&root, &store, &up, "15m", &["--blobs", "separate"]);
-    mirror(&root, &store, &up, &[]).unwrap();
+    commit_files(&up, "Y", &[("lib/bar/c.c", Some(b"c v2\n".to_vec()))]);
+    for (_, spec) in &stores {
+        pipeline(&root, spec, &up, "15m", &["--blobs", "separate"]);
+    }
+    mirror(&root, store_a, &up, &[]).unwrap();
 
     // The side branch's commit keeps lib/bar from before genesis (c v1).
     work_git(&up, &["checkout", "-q", "topic"]);
@@ -1212,44 +1219,119 @@ fn reused_pre_genesis_versions_come_through_the_proxy() {
         &["merge", "-q", "--no-ff", "-m", "merge topic", "topic"],
     );
     work_git(&up, &["push", "-q", "origin", "HEAD:main"]);
-    pipeline(&root, &store, &up, "15m", &[]);
+    for (_, spec) in &stores {
+        pipeline(&root, spec, &up, "15m", &[]);
+    }
     // A revert of X restores lib/foo from before genesis (a v1).
     work_git(&up, &["revert", "--no-edit", &x]);
     work_git(&up, &["push", "-q", "origin", "HEAD:main"]);
     git(&up.bare, &["repack", "-adbq"]);
-    pipeline(&root, &store, &up, "15m", &[]);
-
-    // In the store: every blob no commit up to genesis has, and the genesis tip's blobs.
-    // (`rev-list --objects main ^G` is not that set: like upload-pack, it lists old
-    // objects deep in G's history.)
-    let stored = store_blobs(&root, &store_dir);
-    let since = format!("^{g}");
-    let referenced = commit_blobs(&up.bare, &["main", &since]);
-    let before = commit_blobs(&up.bare, &[&g]);
-    let at_genesis = commit_blobs(&up.bare, &["-1", &g]);
-    let new: Vec<&String> = referenced
-        .keys()
-        .filter(|id| !before.contains_key(*id))
-        .collect();
-    assert!(!new.is_empty());
-    for id in new.into_iter().chain(at_genesis.keys()) {
-        assert!(stored.contains_key(id), "{id} not in the store");
+    for (_, spec) in &stores {
+        pipeline(&root, spec, &up, "15m", &[]);
     }
-    // Not in the store: exactly the two reused pre-genesis versions.
-    let mut old: Vec<String> = referenced
-        .keys()
-        .filter(|id| !stored.contains_key(*id))
-        .cloned()
-        .collect();
-    old.sort();
-    let mut expect: Vec<String> = [format!("{x}^:lib/foo/a.c"), format!("{x}:lib/bar/c.c")]
+    let log = mirror(&root, store_b, &up, &[]).unwrap();
+
+    let history = git_blobs(&up.bare, &["--all"]);
+    let reused: Vec<String> = [format!("{x}^:lib/foo/a.c"), format!("{x}:lib/bar/c.c")]
         .iter()
         .map(|spec| rev(&up.bare, spec))
         .collect();
-    expect.sort();
-    assert_eq!(old, expect, "a v1 and c v1 are the only blobs not copied");
+    for (dir, spec) in &stores {
+        let s = Store::open(spec, "").unwrap();
+        let (bm, _) = blobcopy::load(&s).unwrap();
+        assert!(bm.complete(), "{spec}\n{log}");
+        let stored = store_blobs(&root, dir);
+        for id in history.keys().chain(&reused) {
+            assert!(
+                stored.contains_key(id),
+                "{spec}: {id} not in the store\n{log}"
+            );
+        }
+        let records: usize = bm.segments.iter().map(|m| m.blobs as usize).sum();
+        assert_eq!(records, stored.len(), "{spec}: a blob listed twice");
+    }
 
-    // Every blob of every commit since genesis, through an edge: git re-hashes each one.
+    // Every blob of every commit, through an edge of each store, from the store: git
+    // re-hashes each one.
+    let ids: Vec<String> = history.keys().cloned().collect();
+    for (i, (_, spec)) in stores.iter().enumerate() {
+        let cache = root.join(format!("cache-{i}"));
+        let server = Server::start(&[
+            "--store",
+            spec,
+            "--upstream",
+            up.bare.to_str().unwrap(),
+            "--poll-ms",
+            "100",
+            "--cache-dir",
+            cache.to_str().unwrap(),
+        ]);
+        let loose = fresh_repo(&root, &format!("loose-{i}"));
+        for id in &ids {
+            let (status, ct, body) = server.get(&format!("/gvfs/objects/{id}"));
+            assert_eq!((status, ct.as_str()), (200, CT_LOOSE), "{id}");
+            let dir = loose.join("objects").join(&id[..2]);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(&id[2..]), body).unwrap();
+        }
+        git(&loose, &["fsck", "--strict", "--no-dangling"]);
+        assert_eq!(cat_batch(&loose, &ids), cat_batch(&up.bare, &ids));
+        assert_eq!(
+            server.metric("gvfs_blobs_from_store_total"),
+            ids.len() as u64
+        );
+        assert_eq!(server.metric("gvfs_blobs_proxied_total"), 0);
+        assert_eq!(server.metric("gvfs_blobs_missing_total"), 0);
+        server.assert_clean();
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A blob a sealed tree names that a complete store has lost track of (here: its segment
+/// dropped from `blobs.bin`) is a fault, not a 404: an edge stays ready, serves it through
+/// the proxy, and counts it in `gvfs_blobs_missing_total` once per upstream fetch.
+#[test]
+fn a_blob_missing_from_a_complete_store_is_served_and_counted() {
+    let root = tempdir("sep-missing");
+    let up = Upstream::new(&root);
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    let files: Vec<(String, Option<Vec<u8>>)> = (0..6u32)
+        .map(|i| (format!("d/f{i}.txt"), Some(text(100 + i))))
+        .collect();
+    let refs: Vec<(&str, Option<Vec<u8>>)> =
+        files.iter().map(|(p, c)| (p.as_str(), c.clone())).collect();
+    let g = commit_files(&up, "c1", &refs);
+    pipeline(&root, &store, &up, "15m", &["--blobs", "separate"]);
+    mirror(&root, &store, &up, &[]).unwrap();
+    let t = commit_files(&up, "c2", &[("n/new.txt", Some(b"new\n".to_vec()))]);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let lost: Vec<String> = (0..6)
+        .map(|i| rev(&up.bare, &format!("{g}:d/f{i}.txt")))
+        .collect();
+
+    // blobs.bin forgets the segment that lists c1's blobs.
+    let s = Store::open(&store, "").unwrap();
+    let (bm, _) = blobcopy::load(&s).unwrap();
+    assert!(bm.complete());
+    let first = Oid::from_hex(lost[0].as_bytes()).unwrap();
+    let dropped = bm
+        .segments
+        .iter()
+        .find(|m| {
+            blobcopy::open_segment(&s, &root, m)
+                .unwrap()
+                .find(&first)
+                .is_some()
+        })
+        .unwrap()
+        .clone();
+    blobcopy::update(&s, |bm| {
+        bm.segments.retain(|x| x.id != dropped.id);
+        Ok(())
+    })
+    .unwrap();
+
     let cache = root.join("cache");
     let server = Server::start(&[
         "--store",
@@ -1261,18 +1343,33 @@ fn reused_pre_genesis_versions_come_through_the_proxy() {
         "--cache-dir",
         cache.to_str().unwrap(),
     ]);
-    let ids: Vec<String> = referenced.keys().cloned().collect();
+    let (status, ct, body) = server.get(&format!("/gvfs/objects/{}", lost[0]));
+    assert_eq!((status, ct.as_str()), (200, CT_LOOSE));
     let loose = fresh_repo(&root, "loose");
-    for id in &ids {
-        let (status, ct, body) = server.get(&format!("/gvfs/objects/{id}"));
-        assert_eq!((status, ct.as_str()), (200, CT_LOOSE), "{}", referenced[id]);
-        let dir = loose.join("objects").join(&id[..2]);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(&id[2..]), body).unwrap();
-    }
+    let dir = loose.join("objects").join(&lost[0][..2]);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(&lost[0][2..]), body).unwrap();
     git(&loose, &["fsck", "--strict", "--no-dangling"]);
-    assert_eq!(cat_batch(&loose, &ids), cat_batch(&up.bare, &ids));
-    assert_eq!(server.metric("gvfs_blobs_proxied_total"), 2);
+    assert_eq!(server.metric("gvfs_blobs_missing_total"), 1);
+    // A POST of that one (now in the proxy's cache) and two more: two more fetched.
+    let batch: Vec<String> = lost[..3].to_vec();
+    let (status, _, pack) =
+        server.post("/gvfs/objects", json_ids(&batch, None).as_bytes(), CT_PACK);
+    assert_eq!(status, 200);
+    let posted = fresh_repo(&root, "post");
+    git_stdin(
+        &posted,
+        &["index-pack", "--stdin", "--strict", "--keep=t"],
+        &pack,
+    );
+    assert_eq!(cat_batch(&posted, &batch), cat_batch(&up.bare, &batch));
+    assert_eq!(server.metric("gvfs_blobs_missing_total"), 3);
+    // The window's blob is in the store, and the edge stays ready.
+    let new_id = rev(&up.bare, &format!("{t}:n/new.txt"));
+    let before = server.metric("gvfs_blobs_from_store_total");
+    assert_eq!(server.get(&format!("/gvfs/objects/{new_id}")).0, 200);
+    assert_eq!(server.metric("gvfs_blobs_from_store_total"), before + 1);
+    assert_eq!(server.get("/healthz").0, 200);
     server.assert_clean();
     drop(server);
     let _ = std::fs::remove_dir_all(&root);

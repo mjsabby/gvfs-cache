@@ -16,12 +16,12 @@ USAGE:
         TIER by repacking slabs from the store. With no manifest yet: the one-time seed.
         TIER: 15m | 1h | 6h | 12h | 24h | 168h  (168h = weekly delta + new baseline)
 
-    gvfs-daemon mirror --store <SPEC> --upstream <URL|PATH> [--scope <SCOPE>] [OPTIONS]
-        Copies blobs into a --blobs separate store, resumably: planned from the store's
-        own trees and sizes tables, skipping blobs already copied, verified by id as they
-        stream in, published to blobs.bin as it goes. SCOPE (comma-separated):
-        tip (default; the genesis tip, then `tip complete` is recorded and edges serve),
-        since:<30d|YYYY-MM-DD|SECONDS> (every tree of commits since then), history.
+    gvfs-daemon mirror --store <SPEC> --upstream <URL|PATH> [OPTIONS]
+        Copies every blob of the history into a --blobs separate store, resumably:
+        planned from the store's own trees and sizes tables (the tip's tree first),
+        skipping blobs already copied, verified by id and size as they stream in,
+        published to blobs.bin as it goes. When the last blob is in, blobs.bin is
+        complete and edges serve. Run again at any time: it copies only what is missing.
 
     gvfs-daemon serve --store <SPEC> [--upstream <URL|PATH>] [--bind <ADDR>] [OPTIONS]
         GVFS server. Remote edge: --bind 0.0.0.0:8080. Localhost proxy: --bind

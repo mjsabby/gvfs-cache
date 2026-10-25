@@ -2,7 +2,7 @@
 
 Builds a synthetic repository of real content shaped like SearchGold (many small text files,
 some medium binaries, a few large incompressible ones), then runs genesis with
-`--blobs separate` and `mirror --scope tip`, and checks a sample of blobs through an edge
+`--blobs separate` and `mirror`, and checks a sample of blobs through an edge
 against git. Prints and saves a JSON summary (bench/results/separate-seed.json).
 
     python3 bench/separate_seed.py [--small 20000] [--medium 200] [--large 16] [--jobs 8]

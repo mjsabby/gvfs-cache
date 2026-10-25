@@ -160,6 +160,16 @@ impl View {
         self.all.iter().find_map(|s| s.sizes()?.get(oid))
     }
 
+    /// Whether a sealed slab's tree names blob `oid` (its sizes table has it). Once
+    /// `blobs.bin` is complete, every such blob is in the store.
+    pub fn blob_sealed(&self, oid: &Oid) -> bool {
+        self.all
+            .get(self.l0_len..)
+            .unwrap_or(&[])
+            .iter()
+            .any(|s| s.sizes().is_some_and(|t| t.get(oid).is_some()))
+    }
+
     /// Finds `oid` in the newest slab that has it.
     #[inline]
     pub fn find(&self, oid: &Oid) -> Option<(u16, u32)> {

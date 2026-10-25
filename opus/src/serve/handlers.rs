@@ -11,9 +11,11 @@
 //! | `GET /healthz`, `GET /metrics` | readiness and counters |
 //!
 //! In a `--blobs separate` store, blobs come from the blob packs (spliced whole, like
-//! slab entries), or through the proxy for blobs the store lacks ([`super::blobs`]); a
-//! prefetch that sent `X-GVFS-Sizes: 1` gets a `GSZ1` section after its packs (the sizes
-//! of the blobs its trees introduce), and `X-GVFS-Sizes: 1` in the response says so.
+//! slab entries), or through the proxy for the L0 overlay's ([`super::blobs`]); a blob a
+//! sealed tree names that a complete store lacks is a fault, served through the proxy too
+//! but counted (`gvfs_blobs_missing_total`) and logged. A prefetch that sent
+//! `X-GVFS-Sizes: 1` gets a `GSZ1` section after its packs (the sizes of the blobs its
+//! trees introduce), and `X-GVFS-Sizes: 1` in the response says so.
 //!
 //! Any prefix before `/gvfs/` is accepted (`https://host/org/repo/gvfs/...`). Handlers use
 //! only the worker's buffers and a leased request arena: no heap allocation.
@@ -61,6 +63,9 @@ pub struct Metrics {
     /// Blobs served from the store's blob packs, and through the proxy.
     pub blobs_store: AtomicU64,
     pub blobs_proxied: AtomicU64,
+    /// Blobs a sealed tree names that a complete store lacked (a fault: the pipeline's
+    /// weekly run heals it).
+    pub blobs_missing: AtomicU64,
     pub unavailable: AtomicU64,
 }
 
@@ -148,11 +153,11 @@ pub fn handle(
         }
         Route::Health => {
             let started = ctx.ready.load(Ordering::Relaxed);
-            // A separate-blob store is ready once the genesis tip's blobs are in the store.
+            // A separate-blob store is ready once every blob of its history is in it.
             let blobs = ctx.view().blobs.as_ref().is_none_or(|b| b.complete);
             let (status, text) = match (started, blobs) {
                 (true, true) => (200, "ok\n"),
-                (true, false) => (503, "blobs incomplete (mirror --scope tip running)\n"),
+                (true, false) => (503, "blobs incomplete (gvfs-daemon mirror running)\n"),
                 _ => (503, "starting\n"),
             };
             respond_text(stream, status, text, keep)?;
@@ -244,6 +249,19 @@ enum Blob {
     Failed,
 }
 
+/// Counts and logs blobs that sealed trees name and a complete store lacks (cold path).
+fn missing(ctx: &Ctx, generation: u64, count: usize, first: &Oid) {
+    let _cold = gvfs_alloc_guard::cold_section();
+    ctx.metrics
+        .blobs_missing
+        .fetch_add(u64_of(count), Ordering::Relaxed);
+    crate::log!(
+        "serve: {count} blobs of sealed trees are not in blobs.bin generation {generation} \
+         (first: {first}); proxying them. The pipeline's weekly run (or gvfs-daemon mirror) \
+         copies them into the store"
+    );
+}
+
 /// A blob from the store's packs, else (if the store's trees name it) through the proxy.
 fn find_blob(ctx: &Ctx, view: &View, oid: &Oid) -> Blob {
     let Some(set) = view.blobs.as_ref() else {
@@ -253,16 +271,20 @@ fn find_blob(ctx: &Ctx, view: &View, oid: &Oid) -> Blob {
         inc(&ctx.metrics.blobs_store);
         return Blob::Found(Arc::clone(pack), rec);
     }
-    let Some(proxy) = ctx.proxy.as_ref() else {
-        return Blob::Unknown;
-    };
-    if let Some((pack, rec)) = proxy.cached(oid) {
+    if let Some((pack, rec)) = ctx.proxy.as_ref().and_then(|p| p.cached(oid)) {
         inc(&ctx.metrics.blobs_proxied);
         return Blob::Found(pack, rec);
     }
     if view.blob_size(oid).is_none() {
         return Blob::Unknown;
     }
+    if set.complete && view.blob_sealed(oid) {
+        missing(ctx, set.generation, 1, oid);
+    }
+    // Named by a tree but not in the store: only the upstream has it.
+    let Some(proxy) = ctx.proxy.as_ref() else {
+        return Blob::Failed;
+    };
     match proxy.fetch(std::slice::from_ref(oid)) {
         Ok(mut v) => match v.pop() {
             Some((pack, rec)) => {
@@ -954,7 +976,8 @@ fn plan_objects(view: &View, arena: &mut Arena, depth: u64) -> Result<(), Miss> 
 
 /// The requested ids that are not in the slabs, as blobs: from the store's blob packs,
 /// the proxy's cache, else from the upstream in one request (only for blobs the store's
-/// trees name; anything else is not found).
+/// trees name; anything else is not found). Sealed trees' blobs a complete store lacks are
+/// counted as missing.
 fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
     let Some(set) = view.blobs.as_ref() else {
         return Ok(());
@@ -1001,7 +1024,6 @@ fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
     if unresolved == 0 {
         return Ok(());
     }
-    let proxy = ctx.proxy.as_ref().ok_or(Miss::NotFound)?;
     let _cold = gvfs_alloc_guard::cold_section();
     let mut have: std::collections::HashSet<Oid> = blobs.iter().map(|b| b.1.oid).collect();
     let mut need = Vec::with_capacity(unresolved);
@@ -1013,6 +1035,14 @@ fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
             need.push(*oid);
         }
     }
+    if set.complete {
+        let mut sealed = need.iter().filter(|o| view.blob_sealed(o));
+        if let Some(first) = sealed.next() {
+            missing(ctx, set.generation, sealed.count().saturating_add(1), first);
+        }
+    }
+    // Named by trees but not in the store: only the upstream has them.
+    let proxy = ctx.proxy.as_ref().ok_or(Miss::Broken)?;
     let got = proxy.fetch(&need).map_err(|e| {
         crate::log!("serve: proxying {} blobs failed: {e}", need.len());
         Miss::Broken

@@ -23,12 +23,13 @@
 //!
 //! **Stores with `--blobs separate`** ([`crate::separate`]): the slabs hold commits and
 //! trees, each with its sizes table; blobs come from the blob packs `blobs.bin` lists
-//! ([`blobs::BlobSet`], polled like the manifest), or, for blobs the store lacks (L0's,
-//! versions only commits before genesis reference), from the upstream through
-//! [`blobs::Proxy`]. A manifest is applied only once the `blobs.bin` generation it
-//! requires is loaded, and `/healthz` reports ready only once `blobs.bin` records `tip
-//! complete`. L0 fetches are `blob:none`, with the sizes their trees introduce asked of
-//! the upstream.
+//! ([`blobs::BlobSet`], polled like the manifest), or, for the L0 overlay's (not copied
+//! until the pipeline seals them), from the upstream through [`blobs::Proxy`]. A manifest is
+//! applied only once the `blobs.bin` generation it requires is loaded, and `/healthz`
+//! reports ready only once `blobs.bin` is complete (every blob of the history mirrored).
+//! A sealed tree's blob missing from a complete store is a fault: still served through the
+//! proxy, but counted (`gvfs_blobs_missing_total`) and logged. L0 fetches are `blob:none`,
+//! with the sizes their trees introduce asked of the upstream.
 //!
 //! Requests are served by a fixed set of threads, each with its own buffers, all waiting on
 //! one epoll set that holds the listening socket and every idle keep-alive connection
@@ -818,9 +819,9 @@ impl Live {
             set.segments(),
             set.packs(),
             if set.complete {
-                ", tip complete"
+                ", complete"
             } else {
-                " (tip not complete: mirror running)"
+                " (not complete: gvfs-daemon mirror running)"
             }
         );
         self.blobs = Some(Arc::new(set));
@@ -1057,6 +1058,7 @@ pub fn metrics_text(ctx: &Ctx) -> String {
          gvfs_alloc_post_seal_total {}\n\
          gvfs_blobs_from_store_total {}\n\
          gvfs_blobs_proxied_total {}\n\
+         gvfs_blobs_missing_total {}\n\
          gvfs_blobs_unavailable_total {}\n\
          gvfs_blobs_generation {}\n\
          gvfs_blobs_complete {}\n\
@@ -1086,6 +1088,7 @@ pub fn metrics_text(ctx: &Ctx) -> String {
         a.post_seal,
         get(&m.blobs_store),
         get(&m.blobs_proxied),
+        get(&m.blobs_missing),
         get(&m.unavailable),
         v.blobs.as_ref().map_or(0, |b| b.generation),
         u8::from(v.blobs.as_ref().is_some_and(|b| b.complete)),

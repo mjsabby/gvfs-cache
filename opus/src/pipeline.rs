@@ -36,8 +36,8 @@
 //! `blobs.bin` ([`crate::separate`]). Fetches are `blob:none`, and every slab gets a sizes
 //! table (`slabs/<id>.sizes`) for the blobs its trees introduce:
 //!
-//! * Genesis takes every size from the upstream and publishes the history marked
-//!   `blobs: partial`; `gvfs-daemon mirror` then copies the tip's blobs.
+//! * Genesis takes every size from the upstream and publishes the history;
+//!   `gvfs-daemon mirror` then copies every blob of it (edges serve once it has).
 //! * A 15m run works **blobs first**: it lists the blobs its new trees reference, copies
 //!   the ones `blobs.bin` lacks (verified by id as they stream through), publishes them in
 //!   `blobs.bin`, and only then publishes its slab, recording the `blobs.bin` generation
@@ -49,7 +49,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::ingest::{Dest, Indexer, ingest_git_delta, ingest_git_delta_with};
-use crate::manifest::{FLAG_BLOBS_PARTIAL, FLAG_SEPARATE_BLOBS, MANIFEST_KEY, Manifest};
+use crate::manifest::{FLAG_SEPARATE_BLOBS, MANIFEST_KEY, Manifest};
 use crate::repack::{Input, Mode, Repacker};
 use crate::slab::{Slab, SlabMeta, Tier};
 use crate::splice::Resolver;
@@ -344,8 +344,8 @@ fn genesis(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<M
 }
 
 /// Genesis of a `--blobs separate` store: the history's commits and trees (`blob:none`),
-/// every size their trees need from the upstream, and an empty `blobs.bin`. Marked
-/// `blobs: partial`: `gvfs-daemon mirror` copies the tip's blobs.
+/// every size their trees need from the upstream, and `blobs.bin` naming the genesis
+/// commit, not mirrored: `gvfs-daemon mirror` copies the history's blobs.
 fn genesis_separate(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<Manifest> {
     crate::log!(
         "no manifest in {}: genesis (blobs separate) from {head}",
@@ -395,9 +395,9 @@ fn genesis_separate(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) ->
     crate::separate::put_sizes(&o.store, &s, &crate::sizes::build(&mut pairs))?;
     let bm = crate::blobcopy::update(&o.store, |bm| {
         if bm.genesis != head {
-            // A new genesis (the store was reset): no earlier mirror covers its tip.
+            // A new genesis (the store was reset): no earlier mirror covers its history.
             bm.genesis = head;
-            bm.tip_complete = None;
+            bm.mirrored = false;
         }
         Ok(())
     })?;
@@ -409,7 +409,7 @@ fn genesis_separate(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) ->
         weekly: Vec::new(),
         pyramid: Vec::new(),
         retained: Vec::new(),
-        flags: FLAG_SEPARATE_BLOBS | FLAG_BLOBS_PARTIAL,
+        flags: FLAG_SEPARATE_BLOBS,
         blobs_generation: bm.generation,
     };
     o.store.put(MANIFEST_KEY, &m.encode(), Cond::IfNoneMatch)?;
@@ -446,9 +446,8 @@ fn window_separate(
     let ts = crate::timeline::stamp(&raw.slab, &mut e.resolver, head, &mut known_ts, m.max_ts)?;
 
     // The trees in the window's pack: their blobs are copied (if the store lacks them) and
-    // their sizes go in the slab's table. Subtrees the pack leaves out (the haves reach
-    // them) hold blobs already in the store, or versions from before genesis, which edges
-    // proxy like every other pre-genesis version.
+    // their sizes go in the slab's table. Subtrees the pack leaves out are trees the haves
+    // reach, so they and their blobs are in the store already (`crate::separate`).
     let referenced = crate::blobcopy::referenced_blobs(&raw.slab, o.threads)?;
     let cache = o.cache_dir.clone();
     std::fs::create_dir_all(&cache).ctx(&format!("creating {}", cache.display()))?;

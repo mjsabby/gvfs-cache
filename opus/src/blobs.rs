@@ -583,32 +583,34 @@ pub struct PackMeta {
 /// `blobs.bin`: the blob packs and their segments, replaced by compare-and-swap.
 ///
 /// ```text
-/// "GVDBLOBM" | version u32 | generation u64 | flags u32 | tip [20] | since_ts u64
-/// | genesis [20]
+/// "GVDBLOBM" | version u32 (2) | generation u64 | flags u32 | genesis [20]
 /// | segments u32 | (id_len u16 | id | blobs u64 | index_len u64 | packs u32 | (len u16 | id)*)*
 /// | packs u32 | (id_len u16 | id | len u64 | trailer [20] | blobs u32)*
 /// | SHA-256 [32]
 /// ```
+///
+/// Flags: [`FLAG_MIRRORED`]. Version 1 (written before the whole history was mirrored: a
+/// `tip complete` commit and a mirrored-since stamp after the flags) still decodes, as not
+/// mirrored, so `mirror` copies the rest of the history.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BlobManifest {
     pub generation: u64,
     /// The commit the store's genesis was taken at (zero until genesis).
     pub genesis: Oid,
-    /// Every blob of this commit's tree is in a pack (`mirror --scope tip` finished). With
-    /// the pipeline copying every later window's new blobs first, `tip_complete == genesis`
-    /// means every blob of the genesis tip and every blob introduced since is in the store
-    /// (versions that exist only before genesis are read through).
-    pub tip_complete: Option<Oid>,
-    /// Old versions referenced since this commit stamp are mirrored too (0: none).
-    pub since_ts: u64,
-    /// Newest last.
+    /// `mirror` copied every blob of the history up to genesis. With the pipeline copying
+    /// each later window's new blobs before publishing its trees, every blob of every tree
+    /// in the store is then in a listed pack ([`BlobManifest::complete`]).
+    pub mirrored: bool,
+    /// Oldest first.
     pub segments: Vec<SegmentMeta>,
     pub packs: Vec<PackMeta>,
 }
 
 const BM_MAGIC: &[u8; 8] = b"GVDBLOBM";
-const BM_VERSION: u32 = 1;
-const FLAG_TIP_COMPLETE: u32 = 1;
+const BM_VERSION: u32 = 2;
+const BM_VERSION_TIP: u32 = 1;
+/// [`BlobManifest::mirrored`].
+const FLAG_MIRRORED: u32 = 1;
 
 fn put_str(out: &mut Vec<u8>, s: &str) {
     let b = s.as_bytes();
@@ -630,14 +632,8 @@ impl BlobManifest {
         out.extend_from_slice(BM_MAGIC);
         out.extend_from_slice(&BM_VERSION.to_le_bytes());
         out.extend_from_slice(&self.generation.to_le_bytes());
-        let flags = if self.tip_complete.is_some() {
-            FLAG_TIP_COMPLETE
-        } else {
-            0
-        };
+        let flags = if self.mirrored { FLAG_MIRRORED } else { 0 };
         out.extend_from_slice(&flags.to_le_bytes());
-        out.extend_from_slice(&self.tip_complete.unwrap_or(Oid::ZERO).0);
-        out.extend_from_slice(&self.since_ts.to_le_bytes());
         out.extend_from_slice(&self.genesis.0);
         out.extend_from_slice(&u32_of(self.segments.len()).to_le_bytes());
         for s in &self.segments {
@@ -667,17 +663,23 @@ impl BlobManifest {
         if ring::digest::digest(&ring::digest::SHA256, body).as_ref() != digest {
             crate::bail!("blobs.bin checksum mismatch");
         }
-        if body.get(..8) != Some(&BM_MAGIC[..]) || le_u32(body, 8) != Some(BM_VERSION) {
+        let version = le_u32(body, 8);
+        if body.get(..8) != Some(&BM_MAGIC[..])
+            || !matches!(version, Some(BM_VERSION | BM_VERSION_TIP))
+        {
             crate::bail!("not a blobs.bin (or an unsupported version)");
         }
         let generation = le_u64(body, 12).ctx("blobs.bin header")?;
         let flags = le_u32(body, 20).ctx("blobs.bin header")?;
-        let tip =
-            Oid::from_slice(sub(body, 24, 20).ctx("blobs.bin header")?).ctx("blobs.bin header")?;
-        let since_ts = le_u64(body, 44).ctx("blobs.bin header")?;
-        let genesis =
-            Oid::from_slice(sub(body, 52, 20).ctx("blobs.bin header")?).ctx("blobs.bin header")?;
-        let mut at = 72usize;
+        // Version 1 has a tip commit and a stamp before the genesis commit.
+        let (genesis_at, mirrored) = if version == Some(BM_VERSION_TIP) {
+            (52, false)
+        } else {
+            (24, flags & FLAG_MIRRORED != 0)
+        };
+        let genesis = Oid::from_slice(sub(body, genesis_at, 20).ctx("blobs.bin header")?)
+            .ctx("blobs.bin header")?;
+        let mut at = genesis_at.saturating_add(20);
         let nseg = le_u32(body, at).ctx("truncated blobs.bin")?;
         at = at.saturating_add(4);
         let mut segments = Vec::new();
@@ -722,16 +724,15 @@ impl BlobManifest {
         Ok(BlobManifest {
             generation,
             genesis,
-            tip_complete: (flags & FLAG_TIP_COMPLETE != 0).then_some(tip),
-            since_ts,
+            mirrored,
             segments,
             packs,
         })
     }
 
-    /// Every commit since genesis has all its blobs in the store (edges serve only then).
+    /// Every blob of every tree in the store is in a listed pack (edges serve only then).
     pub fn complete(&self) -> bool {
-        !self.genesis.is_zero() && self.tip_complete == Some(self.genesis)
+        !self.genesis.is_zero() && self.mirrored
     }
 
     /// Total blobs indexed (a blob in two segments counts twice).
@@ -889,8 +890,7 @@ mod tests {
         let m = BlobManifest {
             generation: 7,
             genesis: Oid([4u8; 20]),
-            tip_complete: Some(Oid([3u8; 20])),
-            since_ts: 123,
+            mirrored: true,
             segments: vec![SegmentMeta {
                 id: "seg-1".into(),
                 blobs: 10,
@@ -919,5 +919,23 @@ mod tests {
         let mut bad = bytes.clone();
         bad[30] ^= 1;
         assert!(BlobManifest::decode(&bad).is_err());
+
+        // Version 1 (tip complete, a stamp): the same lists, not mirrored.
+        let mut v1 = bytes[..24].to_vec();
+        v1[8..12].copy_from_slice(&1u32.to_le_bytes());
+        v1.extend_from_slice(&[3u8; 20]);
+        v1.extend_from_slice(&1u64.to_le_bytes());
+        v1.extend_from_slice(&bytes[24..bytes.len() - 32]);
+        let digest = ring::digest::digest(&ring::digest::SHA256, &v1);
+        v1.extend_from_slice(digest.as_ref());
+        let old = BlobManifest::decode(&v1).unwrap();
+        assert_eq!(
+            old,
+            BlobManifest {
+                mirrored: false,
+                ..m.clone()
+            }
+        );
+        assert!(m.complete() && !old.complete());
     }
 }

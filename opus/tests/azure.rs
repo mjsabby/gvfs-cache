@@ -508,8 +508,8 @@ fn azure_separate_store() {
         ],
         &env,
     );
-    // Every blob of history as a loose object: the store's read by range, old versions
-    // through the proxy.
+    // Every blob of history as a loose object, old versions too: read by range from the
+    // store, none through the proxy.
     let history = git_blobs(&up.bare, &["--all"]);
     let ids: Vec<String> = history.keys().cloned().collect();
     let loose = fresh_repo(&root, "loose");
@@ -522,8 +522,12 @@ fn azure_separate_store() {
     }
     git(&loose, &["fsck", "--strict", "--no-dangling"]);
     assert_eq!(cat_batch(&loose, &ids), cat_batch(&up.bare, &ids));
-    let tip = commit_blobs(&up.bare, &["-1", &t]);
-    assert!(server.metric("gvfs_blobs_from_store_total") >= tip.len() as u64);
+    assert_eq!(
+        server.metric("gvfs_blobs_from_store_total"),
+        ids.len() as u64
+    );
+    assert_eq!(server.metric("gvfs_blobs_proxied_total"), 0);
+    assert_eq!(server.metric("gvfs_blobs_missing_total"), 0);
     // Read again: from the edge's block cache, without asking Azure.
     let fetches = server.metric("gvfs_blob_cache_fetches_total");
     assert!(fetches > 0);

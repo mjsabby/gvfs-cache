@@ -5,11 +5,12 @@
 //!   per blob). Packs of a directory store are mapped in place and leave through
 //!   `sendfile(2)`; packs in object storage stay there and are read by range when a
 //!   request needs them (cold path), never downloaded whole.
-//! * [`Proxy`]: blobs the store does not have (the L0 overlay's, versions that only
-//!   commits before genesis reference) come from the upstream: once per blob per edge
-//!   (requests for a blob already being fetched wait for that fetch), verified by id as
-//!   they stream in, and kept in a local cache with a byte budget. Only blobs the store's
-//!   trees name are proxied ([`super::view::View::blob_size`]); anything else is a 404.
+//! * [`Proxy`]: blobs the store does not have come from the upstream: the L0 overlay's
+//!   (the pipeline copies them when it seals their trees), and, as a fault the edge counts,
+//!   any a sealed tree names that a complete store lacks. Once per blob per edge (requests
+//!   for a blob already being fetched wait for that fetch), verified by id as they stream
+//!   in, and kept in a local cache with a byte budget. Only blobs the store's trees name
+//!   are proxied ([`super::view::View::blob_size`]); anything else is a 404.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -107,7 +108,7 @@ impl Drop for BlobPack {
 /// The blob packs of one `blobs.bin` generation.
 pub struct BlobSet {
     pub generation: u64,
-    /// Every commit since genesis has its blobs in the store (`tip complete`).
+    /// Every blob of every sealed tree is in the store (`blobs.bin` complete).
     pub complete: bool,
     pub etag: String,
     /// Newest segment first, each with its packs (indexed by a record's `pack`).

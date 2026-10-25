@@ -19,7 +19,8 @@
 //! A store made with `--blobs separate` keeps blobs out of its slabs ([`crate::blobs`]):
 //! its manifests carry [`FLAG_SEPARATE_BLOBS`], and every slab has a sizes table beside it
 //! ([`crate::sizes`]). Such a manifest names the `blobs.bin` generation its trees' blobs are
-//! in (`blobs_generation`); [`FLAG_BLOBS_PARTIAL`] says genesis history is not mirrored yet.
+//! in (`blobs_generation`). Flag bit 2 ("history partial") was written by earlier versions
+//! and is ignored: `blobs.bin` says whether the history's blobs are all in the store.
 //! Other stores keep writing version 2, byte for byte as before.
 
 use crate::slab::{SlabMeta, Tier};
@@ -33,8 +34,6 @@ const VERSION: u32 = 3;
 const VERSION_PLAIN: u32 = 2;
 /// Blobs live in blob packs (`blobs.bin`), not in slabs; slabs have sizes tables.
 pub const FLAG_SEPARATE_BLOBS: u32 = 1;
-/// The trees' blobs are not all in the store yet (genesis before `mirror --scope tip`).
-pub const FLAG_BLOBS_PARTIAL: u32 = 2;
 
 const ROLE_BASELINE: u8 = 0;
 const ROLE_WEEKLY: u8 = 1;
@@ -53,7 +52,7 @@ pub struct Manifest {
     pub weekly: Vec<SlabMeta>,
     pub pyramid: Vec<SlabMeta>,
     pub retained: Vec<SlabMeta>,
-    /// [`FLAG_SEPARATE_BLOBS`], [`FLAG_BLOBS_PARTIAL`].
+    /// [`FLAG_SEPARATE_BLOBS`].
     pub flags: u32,
     /// The `blobs.bin` generation holding the blobs these slabs' trees reference.
     pub blobs_generation: u64,
@@ -62,10 +61,6 @@ pub struct Manifest {
 impl Manifest {
     pub fn separate_blobs(&self) -> bool {
         self.flags & FLAG_SEPARATE_BLOBS != 0
-    }
-
-    pub fn blobs_partial(&self) -> bool {
-        self.flags & FLAG_BLOBS_PARTIAL != 0
     }
 
     /// Every slab: baseline, weekly deltas, pyramid (each oldest first), then retained.
@@ -227,13 +222,8 @@ impl Manifest {
         );
         if self.separate_blobs() {
             s.push_str(&format!(
-                "  blobs in blob packs (blobs.bin generation {}{})\n",
-                self.blobs_generation,
-                if self.blobs_partial() {
-                    ", genesis history partial"
-                } else {
-                    ""
-                }
+                "  blobs in blob packs (blobs.bin generation {})\n",
+                self.blobs_generation
             ));
         }
         let mut row = |role: &str, m: &SlabMeta| {
@@ -330,7 +320,7 @@ mod tests {
         );
         assert_eq!(Manifest::decode(&b).unwrap(), m);
         let sep = Manifest {
-            flags: FLAG_SEPARATE_BLOBS | FLAG_BLOBS_PARTIAL,
+            flags: FLAG_SEPARATE_BLOBS,
             blobs_generation: 12,
             ..m.clone()
         };
@@ -338,7 +328,7 @@ mod tests {
         assert_eq!(le_u32(&b3, 8), Some(VERSION));
         let back = Manifest::decode(&b3).unwrap();
         assert_eq!(back, sep);
-        assert!(back.separate_blobs() && back.blobs_partial());
+        assert!(back.separate_blobs());
         assert!(sep.describe().contains("blobs.bin generation 12"));
         let mut bad = b.clone();
         bad[30] ^= 1;
