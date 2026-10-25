@@ -365,6 +365,16 @@ fn mirror_copies_the_whole_history_and_resumes() {
     // Nothing was copied twice: one record per blob across all segments.
     let records: usize = bm.segments.iter().map(|m| m.blobs as usize).sum();
     assert_eq!(records, stored.len(), "a blob listed twice");
+    // Published one pack at a time, folded as it went: a geometric progression of
+    // segments by blob count, every pack indexed by exactly one.
+    let counts: Vec<u64> = bm.segments.iter().map(|m| m.blobs).collect();
+    assert!(blobcopy::fold_set(&counts).is_empty(), "{counts:?}");
+    assert!(log.contains("blobs.bin: folded"), "{log}");
+    let mut indexed: Vec<&String> = bm.segments.iter().flat_map(|m| &m.packs).collect();
+    indexed.sort();
+    let mut listed: Vec<&String> = bm.packs.iter().map(|p| &p.id).collect();
+    listed.sort();
+    assert_eq!(indexed, listed);
 
     // Again: nothing to copy.
     let log = mirror(&root, &store, &up, &[]).unwrap();

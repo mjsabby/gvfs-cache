@@ -109,6 +109,8 @@ impl BlobIndex {
         for s in &bm.segments {
             segments.push(crate::blobcopy::open_segment(store, work, s)?);
         }
+        // Biggest first: most lookups end there.
+        segments.sort_by_key(|s| std::cmp::Reverse(s.count()));
         Ok(BlobIndex { segments })
     }
 

@@ -12,8 +12,10 @@
 //!   by its id as it streams through. Pack ids are fresh per copy, so a pack is never
 //!   overwritten once written (a crashed copy leaves an unlisted pack that GC removes).
 //! * [`publish`] indexes finished packs with a segment and appends both to `blobs.bin` by
-//!   compare-and-swap, where readers find them; [`fold`] merges the segments once there
-//!   are more than [`FOLD_AT`], so a lookup probes a few at most.
+//!   compare-and-swap, where readers find them; [`fold`] then merges the smallest
+//!   segments as needed to keep them a geometric progression by blob count ([`fold_set`],
+//!   git's `repack --geometric`): O(log n) segments to probe, and each record rewritten
+//!   (and downloaded again by every edge) O(log n) times, not once per fold.
 //! * [`referenced_blobs`] lists the blobs a slab's trees reference.
 
 use std::collections::{HashMap, HashSet};
@@ -40,8 +42,8 @@ use crate::util::{Context, Oid, Result, hex_string, le_u32, u32_of, u64_of};
 pub const LARGE_MIN: u64 = 16 << 20;
 /// Most blobs in one batch item.
 const ITEM_BLOBS_MAX: usize = 1 << 20;
-/// `blobs.bin` lists at most this many segments; [`fold`] merges them beyond.
-pub const FOLD_AT: usize = 16;
+/// Each segment holds at least this many times the blobs of the next smaller one.
+pub const FOLD_FACTOR: u64 = 2;
 const CAS_ATTEMPTS: u32 = 50;
 const COPY_ATTEMPTS: u32 = 3;
 
@@ -321,12 +323,64 @@ pub fn publish(
         }
         edit(m)
     })?;
-    if m.segments.len() > FOLD_AT {
-        if let Some(folded) = fold(store, work, threads)? {
+    if fold_set(&segment_counts(&m)).len() >= 2 {
+        let pick = |m: &BlobManifest| -> Vec<String> {
+            fold_set(&segment_counts(m))
+                .into_iter()
+                .filter_map(|i| m.segments.get(i).map(|s| s.id.clone()))
+                .collect()
+        };
+        if let Some(folded) = fold(store, work, threads, pick, &HashSet::new())? {
             return Ok(folded);
         }
     }
     Ok(m)
+}
+
+fn segment_counts(m: &BlobManifest) -> Vec<u64> {
+    m.segments.iter().map(|s| s.blobs).collect()
+}
+
+/// The segments (indexes into `counts`, their blob counts) to merge so that, by blob count,
+/// they form a geometric progression with factor [`FOLD_FACTOR`] again: the smallest ones
+/// up to the first pair out of progression, plus any bigger one their merge would not be
+/// [`FOLD_FACTOR`] times smaller than (git's `repack --geometric`). Empty: nothing to merge.
+pub fn fold_set(counts: &[u64]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..counts.len()).collect();
+    order.sort_by_key(|&i| counts.get(i).copied().unwrap_or(0));
+    let w: Vec<u64> = order
+        .iter()
+        .map(|&i| counts.get(i).copied().unwrap_or(0).max(1))
+        .collect();
+    let mut i = w.len().saturating_sub(1);
+    while i > 0 {
+        let below = i.saturating_sub(1);
+        let (Some(&ours), Some(&prev)) = (w.get(i), w.get(below)) else {
+            break;
+        };
+        if ours < FOLD_FACTOR.saturating_mul(prev) {
+            break;
+        }
+        i = below;
+    }
+    let mut split = if i > 0 { i.saturating_add(1) } else { 0 };
+    let mut total = w
+        .get(..split)
+        .unwrap_or(&[])
+        .iter()
+        .fold(0u64, |a, &b| a.saturating_add(b));
+    while let Some(&ours) = w.get(split) {
+        if split == 0 || ours >= FOLD_FACTOR.saturating_mul(total) {
+            break;
+        }
+        total = total.saturating_add(ours);
+        split = split.saturating_add(1);
+    }
+    if split < 2 {
+        return Vec::new();
+    }
+    order.truncate(split);
+    order
 }
 
 /// Opens a segment listed in `blobs.bin` (in place for directory stores, else downloaded
@@ -346,54 +400,101 @@ pub fn open_segment(store: &Store, work: &Path, meta: &SegmentMeta) -> Result<Se
     Segment::open(&path, &meta.id)
 }
 
-/// Merges every segment of `blobs.bin` into one. `None` if another writer changed the
+/// Merges the segments `pick` names (from the `blobs.bin` current when it runs) into one,
+/// leaving out the records of packs in `lost`; packs no segment indexes any more leave
+/// `blobs.bin`. `None` when there is nothing to do, or another writer changed those
 /// segments meanwhile (it folds, or the next publish does).
-pub fn fold(store: &Store, work: &Path, threads: usize) -> Result<Option<BlobManifest>> {
+pub fn fold(
+    store: &Store,
+    work: &Path,
+    threads: usize,
+    pick: impl Fn(&BlobManifest) -> Vec<String>,
+    lost: &HashSet<String>,
+) -> Result<Option<BlobManifest>> {
     let (m, _) = load(store)?;
-    if m.segments.len() < 2 {
+    let picked: HashSet<String> = pick(&m).into_iter().collect();
+    let metas: Vec<&SegmentMeta> = m
+        .segments
+        .iter()
+        .filter(|s| picked.contains(&s.id))
+        .collect();
+    if metas.is_empty() || (metas.len() < 2 && lost.is_empty()) {
         return Ok(None);
     }
     let mut refs: Vec<PackRef> = Vec::new();
     let mut index: HashMap<String, u32> = HashMap::new();
     let mut recs: Vec<BlobRec> = Vec::new();
-    for meta in &m.segments {
+    let mut dropped = 0usize;
+    for meta in &metas {
         let seg = open_segment(store, work, meta)?;
-        let mut remap = Vec::with_capacity(seg.packs().len());
+        let mut remap: Vec<Option<u32>> = Vec::with_capacity(seg.packs().len());
         for p in seg.packs() {
-            let at = *index.entry(p.id.clone()).or_insert_with(|| {
-                refs.push(p.clone());
-                u32_of(refs.len().saturating_sub(1))
+            remap.push(if lost.contains(&p.id) {
+                None
+            } else {
+                Some(*index.entry(p.id.clone()).or_insert_with(|| {
+                    refs.push(p.clone());
+                    u32_of(refs.len().saturating_sub(1))
+                }))
             });
-            remap.push(at);
         }
         for r in seg.records() {
-            let pack = *remap
+            match remap
                 .get(crate::util::us(u64::from(r.pack)))
-                .ctx("segment record names no pack")?;
-            recs.push(BlobRec { pack, ..r });
+                .ctx("segment record names no pack")?
+            {
+                Some(pack) => recs.push(BlobRec { pack: *pack, ..r }),
+                None => dropped = dropped.saturating_add(1),
+            }
         }
     }
-    let merged = write_segment(store, &refs, &recs, threads)?;
-    let folded: HashSet<String> = m.segments.iter().map(|s| s.id.clone()).collect();
+    let merged = if recs.is_empty() {
+        None
+    } else {
+        Some(write_segment(store, &refs, &recs, threads)?)
+    };
+    let folded: HashSet<String> = metas.iter().map(|s| s.id.clone()).collect();
     let mut stale = false;
     let out = update(store, |cur| {
         stale = !folded
             .iter()
             .all(|id| cur.segments.iter().any(|s| &s.id == id));
-        if !stale {
-            cur.segments.retain(|s| !folded.contains(&s.id));
-            cur.segments.insert(0, merged.clone());
+        if stale {
+            crate::bail!("blobs.bin: segments changed during a fold");
         }
+        let at = cur
+            .segments
+            .iter()
+            .position(|s| folded.contains(&s.id))
+            .unwrap_or(0);
+        cur.segments.retain(|s| !folded.contains(&s.id));
+        if let Some(mg) = &merged {
+            cur.segments.insert(at.min(cur.segments.len()), mg.clone());
+        }
+        let indexed: HashSet<String> = cur
+            .segments
+            .iter()
+            .flat_map(|s| s.packs.iter().cloned())
+            .collect();
+        cur.packs.retain(|p| indexed.contains(&p.id));
         Ok(())
-    })?;
-    if stale {
-        return Ok(None);
-    }
+    });
+    let out = match out {
+        Err(_) if stale => return Ok(None),
+        other => other?,
+    };
     crate::log!(
-        "blobs.bin: folded {} segments into {} ({} blobs)",
+        "blobs.bin: folded {} segments into {}{}",
         folded.len(),
-        merged.id,
-        merged.blobs
+        merged.as_ref().map_or_else(
+            || "none".to_string(),
+            |g| format!("{} ({} blobs)", g.id, g.blobs)
+        ),
+        if dropped > 0 {
+            format!(", dropping {dropped} records of lost packs")
+        } else {
+            String::new()
+        }
     );
     Ok(Some(out))
 }
@@ -533,6 +634,39 @@ mod tests {
             ]
         );
         assert!(plan(&[], 100).is_empty());
+        // Geometric folding (by blob count): nothing while each segment is at least twice
+        // the next smaller; else the smallest ones, and any bigger one they would not be
+        // twice smaller than.
+        let sorted = |mut v: Vec<usize>| {
+            v.sort_unstable();
+            v
+        };
+        assert!(fold_set(&[]).is_empty() && fold_set(&[5]).is_empty());
+        assert!(fold_set(&[8, 4, 2, 1]).is_empty());
+        assert!(fold_set(&[1000, 1]).is_empty());
+        assert_eq!(sorted(fold_set(&[1, 1])), vec![0, 1]);
+        assert_eq!(sorted(fold_set(&[10, 6])), vec![0, 1]);
+        assert_eq!(sorted(fold_set(&[100, 10, 3, 1, 1])), vec![2, 3, 4]);
+        assert_eq!(sorted(fold_set(&[1, 1, 100, 3, 10])), vec![0, 1, 3]);
+        // Publishing one blob at a time: few segments, each record rewritten few times.
+        let (mut segs, mut rewritten) = (Vec::<u64>::new(), 0u64);
+        for _ in 0..100_000 {
+            segs.push(1);
+            let f = fold_set(&segs);
+            if f.len() >= 2 {
+                let merged: u64 = f.iter().map(|&i| segs[i]).sum();
+                rewritten += merged;
+                let mut k = 0;
+                segs.retain(|_| {
+                    k += 1;
+                    !f.contains(&(k - 1))
+                });
+                segs.push(merged);
+            }
+            assert!(segs.len() <= 18, "{segs:?}");
+            assert!(fold_set(&segs).is_empty());
+        }
+        assert!(rewritten <= 100_000 * 18, "{rewritten}");
         use crate::pack::{OBJ_BLOB, OBJ_COMMIT};
         for (mode, kind) in [
             (&b"100644"[..], Some(OBJ_BLOB)),

@@ -111,7 +111,8 @@ pub struct BlobSet {
     /// Every blob of every sealed tree is in the store (`blobs.bin` complete).
     pub complete: bool,
     pub etag: String,
-    /// Newest segment first, each with its packs (indexed by a record's `pack`).
+    /// Biggest segment first (most lookups end there), each with its packs (indexed by a
+    /// record's `pack`).
     segments: Vec<(Arc<Segment>, Vec<Arc<BlobPack>>)>,
 }
 
@@ -161,6 +162,7 @@ impl BlobSet {
             }
             segments.push((seg, list));
         }
+        segments.sort_by_key(|(s, _)| std::cmp::Reverse(s.count()));
         Ok(BlobSet {
             generation: bm.generation,
             complete: bm.complete(),
