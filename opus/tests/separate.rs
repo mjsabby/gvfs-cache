@@ -1049,3 +1049,107 @@ fn blob_over_4gib_end_to_end() {
     drop(server);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// `mirror` killed (SIGKILL) at arbitrary points and run again: it resumes from what it
+/// published, the result is complete and correct with every blob listed once, and the
+/// packs a killed run uploaded but never published are invisible until GC removes them.
+#[test]
+fn mirror_survives_being_killed() {
+    let root = tempdir("sep-kill");
+    let up = Upstream::new(&root);
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    let mut files: Vec<(String, Option<Vec<u8>>)> = (0..60u32)
+        .map(|i| {
+            (
+                format!("d{}/f{i}.bin", i % 6),
+                Some(noise(60_000 + i as usize * 997, u64::from(i) + 1)),
+            )
+        })
+        .collect();
+    files.push(("big/one.bin".into(), Some(large((16 << 20) + 11))));
+    files.push(("big/two.bin".into(), Some(noise((16 << 20) + 13, 77))));
+    let refs: Vec<(&str, Option<Vec<u8>>)> =
+        files.iter().map(|(p, c)| (p.as_str(), c.clone())).collect();
+    let g = commit_files(&up, "c1", &refs);
+    pipeline(&root, &store, &up, "15m", &["--blobs", "separate"]);
+
+    let work = root.join("mirror-work");
+    std::fs::create_dir_all(&work).unwrap();
+    // Two runs that publish only at the end (killed: their finished packs are uploaded
+    // but never listed), then one that publishes as it goes.
+    for (delay_ms, publish) in [(300u64, "3600"), (500, "3600"), (400, "0")] {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-daemon"));
+        cmd.args(["mirror", "--store", &store, "--upstream"])
+            .arg(&up.bare)
+            .args(["--work-dir", work.to_str().unwrap(), "--jobs", "2"])
+            .args([
+                "--publish-secs",
+                publish,
+                "--blob-pack-mib",
+                "1",
+                "--rate-mbps",
+                "240",
+            ])
+            .stderr(std::process::Stdio::null());
+        gvfs_daemon::upstream::hermetic_git_env(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let s = Store::open(&store, "").unwrap();
+    let partial = blobcopy::load(&s).unwrap().0;
+    assert!(!partial.complete(), "killed before the end");
+    assert!(
+        partial.blobs() > 0,
+        "the last killed run published as it went"
+    );
+    let listed_then = partial.packs.len() + partial.segments.len();
+    let orphans = s.list("blobs/").unwrap().len() - listed_then;
+    assert!(orphans > 0, "killed runs left unpublished packs");
+    let log = mirror(&root, &store, &up, &["--blob-pack-mib", "1"]).unwrap();
+    let (bm, _) = blobcopy::load(&s).unwrap();
+    assert!(bm.complete(), "{log}");
+    let stored = store_blobs(&root, &store_dir);
+    for (id, at) in commit_blobs(&up.bare, &["-1", &g]) {
+        let content = stored.get(&id).unwrap_or_else(|| panic!("{at} missing"));
+        assert!(*content == cat_blob(&up.bare, &id), "{at} differs");
+    }
+    let records: usize = bm.segments.iter().map(|m| m.blobs as usize).sum();
+    assert_eq!(records, stored.len(), "a blob listed twice");
+
+    // Unpublished uploads are not listed; the pipeline's GC removes them.
+    let listed: std::collections::HashSet<String> = bm
+        .packs
+        .iter()
+        .map(|p| gvfs_daemon::blobs::pack_key(&p.id))
+        .chain(
+            bm.segments
+                .iter()
+                .map(|m| gvfs_daemon::blobs::segment_key(&m.id)),
+        )
+        .collect();
+    let on_disk = || -> Vec<String> {
+        s.list("blobs/")
+            .unwrap()
+            .into_iter()
+            .map(|o| o.key)
+            .collect()
+    };
+    let far = (gvfs_daemon::util::now_secs() + 86_400).to_string();
+    pipeline(
+        &root,
+        &store,
+        &up,
+        "15m",
+        &["--now", &far, "--gc-grace-secs", "60"],
+    );
+    let mut left = on_disk();
+    left.sort();
+    let mut want: Vec<String> = listed.into_iter().collect();
+    want.sort();
+    assert_eq!(left, want, "only what blobs.bin lists remains");
+    assert_eq!(store_blobs(&root, &store_dir).len(), stored.len());
+    let _ = std::fs::remove_dir_all(&root);
+}
