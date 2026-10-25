@@ -365,6 +365,7 @@ fn main() {
         threads,
         blobs: None,
         blob_pack_bytes: gvfs_daemon::separate::ITEM_BYTES,
+        cache_dir: work.join("pipeline-cache"),
     };
     let mut edge = Edge {
         store: Store::open(&store_spec, "").unwrap(),

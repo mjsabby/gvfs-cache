@@ -74,6 +74,10 @@ pub struct Options {
     pub blobs: Option<bool>,
     /// Bytes of small blobs per blob pack (`--blob-pack-mib`).
     pub blob_pack_bytes: u64,
+    /// Downloaded copies of immutable store objects (`--blobs separate`: the slabs, sizes
+    /// tables and segment indexes a window run reads), kept across runs and pruned to what
+    /// the store lists.
+    pub cache_dir: PathBuf,
 }
 
 /// How long a slab a rollup replaced stays listed for warm clients, by its tier.
@@ -105,8 +109,13 @@ pub fn main(args: &[String]) -> Result<()> {
             "threads",
             "blobs",
             "blob-pack-mib",
+            "cache-dir",
         ],
     )?;
+    let work_dir = f
+        .get("work-dir")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
     let tier = Tier::parse(f.require("tier")?)
         .filter(|t| (Tier::M15..=Tier::Week).contains(t))
         .ctx("--tier must be 15m, 1h, 6h, 12h, 24h or 168h")?;
@@ -122,10 +131,7 @@ pub fn main(args: &[String]) -> Result<()> {
             &crate::ingest::auth_from_flags(&f)?,
         )?,
         tier,
-        work_dir: f
-            .get("work-dir")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir),
+        work_dir: work_dir.clone(),
         now: f.num("now", crate::util::now_secs())?,
         keep_weeks: f.num("keep-weeks", 8usize)?,
         gc_grace: f.num("gc-grace-secs", 7200u64)?,
@@ -140,6 +146,10 @@ pub fn main(args: &[String]) -> Result<()> {
             .num("blob-pack-mib", crate::separate::ITEM_BYTES >> 20)?
             .max(1u64)
             .saturating_mul(1 << 20),
+        cache_dir: f
+            .get("cache-dir")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| work_dir.join("gvfs-daemon-store-cache")),
     };
     let m = run(&mut opts)?;
     crate::log!("published manifest:\n{}", m.describe());
@@ -274,6 +284,16 @@ fn step(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<Mani
     o.store
         .put(MANIFEST_KEY, &m.encode(), Cond::IfMatch(etag))?;
     gc(o, &m)?;
+    if m.separate_blobs() {
+        // The manifest is published: a failure here only costs downloads next run.
+        match crate::blobcopy::load(&o.store)
+            .and_then(|(bm, _)| crate::separate::prune_cache(&o.cache_dir, &m, &bm))
+        {
+            Ok(0) => {}
+            Ok(n) => crate::log!("cache: removed {n} files the store no longer lists"),
+            Err(e) => crate::log!("cache: pruning {} failed: {e}", o.cache_dir.display()),
+        }
+    }
     Ok(m)
 }
 
@@ -425,13 +445,25 @@ fn window_separate(
     let mut known_ts = crate::timeline::boundaries(m);
     let ts = crate::timeline::stamp(&raw.slab, &mut e.resolver, head, &mut known_ts, m.max_ts)?;
 
+    // The trees in the window's pack introduce the slab's sizes; the blobs to copy are
+    // those of every new commit's whole tree (the pack leaves out subtrees the haves
+    // reach, which may hold versions from before genesis).
     let referenced = crate::blobcopy::referenced_blobs(&raw.slab, o.threads)?;
-    let cache = work.join("store-cache");
-    std::fs::create_dir_all(&cache)?;
+    let cache = o.cache_dir.clone();
+    std::fs::create_dir_all(&cache).ctx(&format!("creating {}", cache.display()))?;
     let known = crate::separate::known_sizes(&o.store, &cache, m)?;
     let (bm, _) = crate::blobcopy::load(&o.store)?;
     let index = crate::separate::BlobIndex::load(&o.store, &cache, &bm)?;
-    let need: Vec<Oid> = referenced
+    let metas: Vec<SlabMeta> = std::iter::once(&m.baseline)
+        .chain(&m.pyramid)
+        .cloned()
+        .collect();
+    let stored = open_slabs(&o.store, &cache, &metas)?;
+    let walked = crate::separate::window_blobs(&raw.slab, &stored, m.tip)?;
+    let mut candidates: Vec<Oid> = referenced.iter().chain(&walked).copied().collect();
+    candidates.sort_unstable();
+    candidates.dedup();
+    let need: Vec<Oid> = candidates
         .iter()
         .filter(|b| index.find(b).is_none())
         .copied()
@@ -484,8 +516,11 @@ fn window_separate(
     m.pyramid.push(s);
     m.max_ts = ts;
     m.tip = head;
-    if let Some(bm) = published {
-        m.blobs_generation = m.blobs_generation.max(bm.generation);
+    // The trees need every blob of the generation `need` was computed against, whether or
+    // not this run copied any (a run that died after publishing `blobs.bin` left them).
+    m.blobs_generation = m.blobs_generation.max(bm.generation);
+    if let Some(p) = published {
+        m.blobs_generation = m.blobs_generation.max(p.generation);
     }
     Ok(())
 }

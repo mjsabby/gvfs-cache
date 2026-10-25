@@ -121,8 +121,10 @@ gvfs-daemon mirror --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT \
     --scope tip --jobs 16 [--rate-mbps 4000] [--max-items N]
 
 # Then schedule the pipeline as below: every run copies its window's new blobs before
-# publishing the trees that reference them. Edges serve blobs from the blob packs (read
-# in place, or by range from Azure) and proxy only what the store lacks.
+# publishing the trees that reference them (keep --work-dir, or --cache-dir, on a
+# persistent disk: a run reuses the store objects the previous one downloaded). Edges
+# serve blobs from the blob packs (read in place, or by range from Azure) and proxy only
+# what the store lacks.
 gvfs-daemon serve --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT ...
 ```
 
@@ -151,7 +153,7 @@ the optimal splice by hand.
 generation, and `gvfs_alloc_hot_path_total`, which must stay 0. Separate-blob stores add
 `gvfs_blobs_from_store_total`, `gvfs_blobs_proxied_total`, `gvfs_blobs_unavailable_total`,
 `gvfs_blobs_generation` and `gvfs_blobs_complete`, and for blob packs in object storage the
-edge's block cache (`gvfs_blob_cache_{hits,misses,fetches}_total`, `gvfs_blob_cache_bytes`;
+edge's block cache (`gvfs_blob_cache_{hits,misses,fetches,bypass}_total`, `gvfs_blob_cache_bytes`;
 size it with `--blob-cache-mib`, default 32 GiB).
 
 ## Performance

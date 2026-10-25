@@ -75,7 +75,9 @@ pub enum Route {
     ObjectGet(Oid),
     ObjectsPost,
     SizesPost,
-    BlobRange(Oid),
+    /// A blob's content from `offset`, `length` bytes (to its end without one). Parsed with
+    /// the route: once the head is consumed its buffer may hold the next request.
+    BlobRange(Oid, u64, Option<u64>),
     Health,
     Metrics,
     NotFound,
@@ -97,11 +99,16 @@ pub fn route(method: Method, path: &[u8], query: &[u8]) -> Route {
             .and_then(Oid::from_hex)
             .map(Route::ObjectGet)
             .unwrap_or(Route::NotFound),
-        (Method::Get, Some(rest)) if rest.starts_with(b"blobs/") => rest
-            .get(6..)
-            .and_then(Oid::from_hex)
-            .map(Route::BlobRange)
-            .unwrap_or(Route::NotFound),
+        (Method::Get, Some(rest)) if rest.starts_with(b"blobs/") => {
+            match rest.get(6..).and_then(Oid::from_hex) {
+                Some(oid) => Route::BlobRange(
+                    oid,
+                    query_number(query, b"offset").unwrap_or(0),
+                    query_number(query, b"length"),
+                ),
+                None => Route::NotFound,
+            }
+        }
         (Method::Post, Some(b"objects")) => Route::ObjectsPost,
         (Method::Post, Some(b"sizes")) => Route::SizesPost,
         (Method::Get, None) if path == b"/healthz" => Route::Health,
@@ -178,11 +185,8 @@ pub fn handle(
                 },
             }
         }
-        Route::BlobRange(oid) => {
+        Route::BlobRange(oid, offset, length) => {
             inc(&ctx.metrics.object_get);
-            let query = w.input.bytes(req.query);
-            let offset = query_number(query, b"offset").unwrap_or(0);
-            let length = query_number(query, b"length");
             let view = ctx.view();
             match find_blob(ctx, &view, &oid) {
                 Blob::Found(pack, rec) => {
@@ -1135,6 +1139,18 @@ mod tests {
             Route::ObjectsPost
         );
         assert_eq!(route(Method::Post, b"/gvfs/sizes", b""), Route::SizesPost);
+        assert_eq!(
+            route(
+                Method::Get,
+                format!("/gvfs/blobs/{oid}").as_bytes(),
+                b"length=7&offset=5"
+            ),
+            Route::BlobRange(Oid([0xaa; 20]), 5, Some(7))
+        );
+        assert_eq!(
+            route(Method::Get, format!("/gvfs/blobs/{oid}").as_bytes(), b""),
+            Route::BlobRange(Oid([0xaa; 20]), 0, None)
+        );
         assert_eq!(
             route(Method::Get, b"/gvfs/objects/zz", b""),
             Route::NotFound

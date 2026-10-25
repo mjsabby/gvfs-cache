@@ -290,18 +290,9 @@ pub fn run(o: Options) -> Result<()> {
         supersets,
     } = o;
     let store = Arc::new(store);
-    // Blob packs in object storage are read in blocks kept on local disk.
-    let blob_cache = match store.local_path(crate::blobs::BLOBS_KEY) {
-        None if blob_cache_bytes > 0 => Some(Arc::new(blobcache::BlockCache::new(
-            Arc::clone(&store),
-            cache_dir.join("blob-blocks"),
-            blob_cache_bytes,
-        )?)),
-        _ => None,
-    };
     let mut live = Live {
         store,
-        blob_cache: blob_cache.clone(),
+        blob_cache: None,
         upstream,
         tip: LiveTip::default(),
         cache_dir,
@@ -319,6 +310,14 @@ pub fn run(o: Options) -> Result<()> {
     let (manifest, etag) = live.wait_for_manifest()?;
     let separate = manifest.separate_blobs();
     if separate {
+        // Blob packs in object storage are read in blocks kept on local disk.
+        if live.store.local_path(crate::blobs::BLOBS_KEY).is_none() && blob_cache_bytes > 0 {
+            live.blob_cache = Some(Arc::new(blobcache::BlockCache::new(
+                Arc::clone(&live.store),
+                live.cache_dir.join("blob-blocks"),
+                blob_cache_bytes,
+            )?));
+        }
         live.tip.filter = Some("blob:none".to_string());
         // The manifest's trees need the blobs.bin generation it names.
         loop {
@@ -357,7 +356,7 @@ pub fn run(o: Options) -> Result<()> {
         idx_wanted: AtomicBool::new(prefetch_idx == IdxPolicy::Always),
         sizes_wanted: AtomicBool::new(false),
         proxy,
-        blob_cache,
+        blob_cache: live.blob_cache.clone(),
     });
     if let Err(e) = live.sync_upstream(&ctx) {
         crate::log!("serve: live tip not caught up at boot ({e}); serving sealed slabs");
@@ -1064,6 +1063,7 @@ pub fn metrics_text(ctx: &Ctx) -> String {
          gvfs_blob_cache_hits_total {}\n\
          gvfs_blob_cache_misses_total {}\n\
          gvfs_blob_cache_fetches_total {}\n\
+         gvfs_blob_cache_bypass_total {}\n\
          gvfs_blob_cache_bytes {}\n",
         get(&m.prefetch),
         get(&m.object_get),
@@ -1092,6 +1092,7 @@ pub fn metrics_text(ctx: &Ctx) -> String {
         ctx.blob_cache.as_ref().map_or(0, |c| get(&c.hits)),
         ctx.blob_cache.as_ref().map_or(0, |c| get(&c.misses)),
         ctx.blob_cache.as_ref().map_or(0, |c| get(&c.fetches)),
+        ctx.blob_cache.as_ref().map_or(0, |c| get(&c.bypassed)),
         ctx.blob_cache.as_ref().map_or(0, |c| c.bytes())
     )
 }

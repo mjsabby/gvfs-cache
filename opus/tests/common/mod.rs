@@ -835,3 +835,46 @@ pub fn commit_blobs(bare: &Path, revs: &[&str]) -> BTreeMap<String, String> {
 pub fn rev(bare: &Path, spec: &str) -> String {
     git(bare, &["rev-parse", spec]).trim().to_string()
 }
+
+/// Sends `paths` as GETs pipelined in one write on one connection; returns each body (every
+/// response must be a 200 with a Content-Length).
+pub fn pipelined(port: u16, paths: &[String]) -> Vec<Vec<u8>> {
+    use std::io::Read;
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    let req: String = paths
+        .iter()
+        .map(|p| format!("GET {p} HTTP/1.1\r\nHost: t\r\n\r\n"))
+        .collect();
+    s.write_all(req.as_bytes()).unwrap();
+    let (mut buf, mut bodies, mut at) = (Vec::new(), Vec::new(), 0usize);
+    while bodies.len() < paths.len() {
+        if let Some(h) = buf[at..].windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[at..at + h]).to_string();
+            assert!(
+                head.starts_with("HTTP/1.1 200"),
+                "response {}: {head}",
+                bodies.len()
+            );
+            let len: usize = head
+                .lines()
+                .find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse().unwrap())
+                })
+                .expect("a Content-Length");
+            let start = at + h + 4;
+            if buf.len() >= start + len {
+                bodies.push(buf[start..start + len].to_vec());
+                at = start + len;
+                continue;
+            }
+        }
+        let mut chunk = [0u8; 1 << 16];
+        let n = s.read(&mut chunk).unwrap();
+        assert!(n > 0, "connection closed after {} responses", bodies.len());
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    bodies
+}

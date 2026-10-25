@@ -381,6 +381,10 @@ fn azure_pipeline_and_serve() {
     install_pack(&cold, &packs[0].1);
     assert_complete(&cold, &up.tip());
     server.assert_clean();
+    assert!(
+        !cache.join("blob-blocks").exists(),
+        "an inline store's edge keeps no blob blocks"
+    );
 
     // GC removed the slabs the rollups and the weekly rebuild replaced.
     let s = backend.store("");
@@ -462,6 +466,31 @@ fn azure_separate_store() {
         ],
     );
     run(&[]);
+    // The runner's cache holds only what the store lists.
+    let s = backend.store("");
+    let (bytes, _) = s.get("manifest.bin").unwrap().unwrap();
+    let m = gvfs_daemon::manifest::Manifest::decode(&bytes).unwrap();
+    let (bm, _) = gvfs_daemon::blobcopy::load(&s).unwrap();
+    let listed: std::collections::HashSet<String> = m
+        .slabs()
+        .flat_map(|x| {
+            [
+                format!("{}.pack", x.id),
+                format!("{}.mphf", x.id),
+                x.sizes_key().replace('/', "_"),
+            ]
+        })
+        .chain(bm.segments.iter().map(|g| format!("{}.bidx", g.id)))
+        .collect();
+    let cached: Vec<String> = std::fs::read_dir(root.join("pipeline-work/gvfs-daemon-store-cache"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        cached.iter().any(|f| f.ends_with(".pack")),
+        "the window read the baseline: {cached:?}"
+    );
+    assert!(cached.iter().all(|f| listed.contains(f)), "{cached:?}");
 
     let cache = root.join("cache");
     let server = Server::start_with_env(

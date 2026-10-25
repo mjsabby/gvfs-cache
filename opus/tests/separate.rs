@@ -600,6 +600,20 @@ fn edge_serves_blobs_from_the_store_and_through_the_proxy() {
         );
     }
 
+    // Pipelined requests (two in one write): each is answered from its own query.
+    let bodies = pipelined(
+        server.port,
+        &[
+            format!("/gvfs/blobs/{noise_id}?offset=0&length=100"),
+            format!("/gvfs/blobs/{noise_id}?offset=4096&length=100"),
+        ],
+    );
+    assert!(bodies[0] == noise_bytes[..100], "first pipelined range");
+    assert!(
+        bodies[1] == noise_bytes[4096..4196],
+        "second pipelined range"
+    );
+
     // A push is served at once (L0): its blobs through the proxy, its sizes with the warm
     // prefetch.
     let t = commit_files(
@@ -1151,5 +1165,118 @@ fn mirror_survives_being_killed() {
     want.sort();
     assert_eq!(left, want, "only what blobs.bin lists remains");
     assert_eq!(store_blobs(&root, &store_dir).len(), stored.len());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+fn work_git(up: &Upstream, args: &[&str]) -> String {
+    let mut all = vec!["-c", "user.name=t", "-c", "user.email=t@t"];
+    all.extend_from_slice(args);
+    git(&up.work, &all)
+}
+
+/// Windows whose commits share subtrees with history before genesis: an old side branch
+/// merged (git leaves the branch point's subtrees out of the window's pack), and a revert
+/// against an upstream with reachability bitmaps (which leaves out every subtree the haves
+/// reach). Every blob of every commit since genesis is in the store once they are sealed.
+#[test]
+fn windows_copy_blobs_of_subtrees_shared_with_old_history() {
+    let root = tempdir("sep-restored");
+    let up = Upstream::new(&root);
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    commit_files(
+        &up,
+        "c1",
+        &[
+            ("lib/foo/a.c", Some(b"a v1\n".to_vec())),
+            ("lib/bar/c.c", Some(b"c v1\n".to_vec())),
+            ("other/x.txt", Some(b"x\n".to_vec())),
+        ],
+    );
+    let x = commit_files(&up, "X", &[("lib/foo/a.c", Some(b"a v2\n".to_vec()))]);
+    work_git(&up, &["branch", "topic", &x]);
+    let g = commit_files(&up, "Y", &[("lib/bar/c.c", Some(b"c v2\n".to_vec()))]);
+    pipeline(&root, &store, &up, "15m", &["--blobs", "separate"]);
+    mirror(&root, &store, &up, &[]).unwrap();
+
+    // The side branch's commit keeps lib/bar from before genesis (c v1).
+    work_git(&up, &["checkout", "-q", "topic"]);
+    std::fs::write(up.work.join("other/y.txt"), b"y\n").unwrap();
+    work_git(&up, &["add", "-A"]);
+    work_git(&up, &["commit", "-q", "-m", "s1"]);
+    work_git(&up, &["checkout", "-q", "main"]);
+    work_git(
+        &up,
+        &["merge", "-q", "--no-ff", "-m", "merge topic", "topic"],
+    );
+    work_git(&up, &["push", "-q", "origin", "HEAD:main"]);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let stored = store_blobs(&root, &store_dir);
+    for (id, at) in commit_blobs(&up.bare, &["main", &format!("^{g}")]) {
+        assert!(stored.contains_key(&id), "{at} ({id}) not in the store");
+    }
+
+    // A revert of X restores lib/foo from before genesis (a v1); with bitmaps the upstream
+    // does not send that subtree again.
+    work_git(&up, &["revert", "--no-edit", &x]);
+    work_git(&up, &["push", "-q", "origin", "HEAD:main"]);
+    git(&up.bare, &["repack", "-adbq"]);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let stored = store_blobs(&root, &store_dir);
+    for (id, at) in commit_blobs(&up.bare, &["main", &format!("^{g}")]) {
+        let content = stored
+            .get(&id)
+            .unwrap_or_else(|| panic!("{at} ({id}) not in the store"));
+        assert!(*content == cat_blob(&up.bare, &id), "{at} differs");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A run that copied a window's blobs and published `blobs.bin`, then died before the
+/// manifest: the next run copies nothing, and its manifest must still name the
+/// `blobs.bin` generation its trees need.
+#[test]
+fn a_manifest_names_the_blobs_generation_its_trees_need() {
+    let root = tempdir("sep-gen");
+    let up = Upstream::new(&root);
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    let g = commit_files(&up, "c1", &[("a.txt", Some(b"one\n".to_vec()))]);
+    pipeline(&root, &store, &up, "15m", &["--blobs", "separate"]);
+    mirror(&root, &store, &up, &[]).unwrap();
+    let t = commit_files(&up, "c2", &[("b.txt", Some(b"two\n".to_vec()))]);
+
+    // What the dead run left: the window's blobs, published.
+    let s = Store::open(&store, "").unwrap();
+    let mut u = gvfs_daemon::upstream::Upstream::open(
+        up.bare.to_str().unwrap(),
+        "main",
+        &gvfs_daemon::upstream::Auth::default(),
+    )
+    .unwrap();
+    let new: Vec<Oid> = git_blobs(&up.bare, &[&format!("{g}..{t}")])
+        .keys()
+        .map(|k| Oid::from_hex(k.as_bytes()).unwrap())
+        .collect();
+    let work = root.join("dead-run");
+    let (published, _) = gvfs_daemon::separate::copy_needed(
+        &mut u,
+        &s,
+        &work,
+        &new,
+        gvfs_daemon::separate::ITEM_BYTES,
+        2,
+    )
+    .unwrap();
+    let needed = published.unwrap().generation;
+
+    let log = pipeline(&root, &store, &up, "15m", &[]);
+    let m = manifest(&store_dir);
+    assert_eq!(m.tip.to_string(), t);
+    assert!(
+        m.blobs_generation >= needed,
+        "manifest names blobs.bin generation {}, its trees need {needed}\n{log}",
+        m.blobs_generation
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

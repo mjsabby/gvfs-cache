@@ -256,22 +256,31 @@ impl Proxy {
 
     /// The blobs `oids` (distinct): from the cache, else from the upstream in one request
     /// for all of those not being fetched already (others wait for those fetches). Cold
-    /// path.
+    /// path. What the call has in hand it keeps (an `Arc` keeps a pack open, cached or
+    /// not), so the cache evicting one pack for another never makes it start over.
     pub fn fetch(&self, oids: &[Oid]) -> Result<Vec<(Arc<BlobPack>, BlobRec)>> {
         let _cold = gvfs_alloc_guard::cold_section();
+        let mut found: HashMap<Oid, (Arc<BlobPack>, BlobRec)> = HashMap::with_capacity(oids.len());
         loop {
             let mine: Vec<Oid> = {
                 let mut st = lock(&self.state);
                 loop {
+                    for o in oids {
+                        if !found.contains_key(o) {
+                            if let Some(hit) = st.cache.get(o) {
+                                found.insert(*o, hit.clone());
+                            }
+                        }
+                    }
                     let missing: Vec<Oid> = oids
                         .iter()
-                        .filter(|o| !st.cache.contains_key(o))
+                        .filter(|o| !found.contains_key(o))
                         .copied()
                         .collect();
                     if missing.is_empty() {
                         return oids
                             .iter()
-                            .map(|o| st.cache.get(o).cloned().ctx("proxied blob evicted"))
+                            .map(|o| found.get(o).cloned().ctx("proxied blob"))
                             .collect();
                     }
                     let mine: Vec<Oid> = missing
@@ -296,6 +305,7 @@ impl Proxy {
             if let Ok((pack, recs)) = &got {
                 for r in recs {
                     st.cache.insert(r.oid, (Arc::clone(pack), *r));
+                    found.insert(r.oid, (Arc::clone(pack), *r));
                 }
                 st.bytes = st.bytes.saturating_add(pack.len);
                 st.order
@@ -368,5 +378,87 @@ impl Proxy {
         let r = up.object_sizes(oids)?;
         lock(&self.idle).push(up);
         Ok(r)
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let mut cmd = Command::new("git");
+        cmd.args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        crate::upstream::hermetic_git_env(&mut cmd);
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// A request needing a proxied blob that is cached and one that is not, with a cache
+    /// that can hold one pack: both come back (the first is not evicted from under it).
+    #[test]
+    fn a_request_spanning_proxied_packs_completes_whatever_the_budget() {
+        let dir = std::env::temp_dir().join(format!("gvd-proxy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let work = dir.join("w");
+        std::fs::create_dir_all(&work).unwrap();
+        git(&dir, &["init", "-q", "-b", "main", work.to_str().unwrap()]);
+        let blob = |n: usize, seed: u8| -> Vec<u8> {
+            (0..n).map(|i| (i as u8).wrapping_mul(seed)).collect()
+        };
+        std::fs::write(work.join("a.bin"), blob(70_000, 3)).unwrap();
+        std::fs::write(work.join("b.bin"), blob(90_000, 5)).unwrap();
+        git(&work, &["add", "."]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "c",
+            ],
+        );
+        let id = |p: &str| {
+            Oid::from_hex(
+                git(&work, &["rev-parse", &format!("HEAD:{p}")])
+                    .trim()
+                    .as_bytes(),
+            )
+            .unwrap()
+        };
+        let (a, b) = (id("a.bin"), id("b.bin"));
+        let up = work.join(".git");
+        let proxy = Proxy::new(
+            up.to_str().unwrap(),
+            "main",
+            &Auth::default(),
+            &dir.join("proxy"),
+            0,
+        )
+        .unwrap();
+        assert_eq!(proxy.fetch(&[a]).unwrap()[0].1.oid, a);
+        let both = proxy.fetch(&[a, b]).unwrap();
+        assert_eq!(both.iter().map(|x| x.1.oid).collect::<Vec<_>>(), vec![a, b]);
+        assert_eq!((both[0].1.size, both[1].1.size), (70_000, 90_000));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

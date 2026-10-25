@@ -72,6 +72,10 @@ PIPELINE OPTIONS:
                                the store
     --blob-pack-mib <N>        small blobs per blob pack (default: 2048); blobs of 16 MiB
                                or more always get a pack of their own, streamed
+    --cache-dir <DIR>          separate stores: store objects a run downloads (slabs,
+                               sizes tables, segment indexes), kept for the next run and
+                               pruned to what the store lists (default:
+                               <work-dir>/gvfs-daemon-store-cache)
 
 MIRROR OPTIONS:
     --jobs <N>                 parallel copies, one upstream connection each (default: 4)

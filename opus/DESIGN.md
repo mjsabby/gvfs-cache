@@ -436,12 +436,27 @@ sizes are complete for every tree, mirrored or not.
   `POST /gvfs/sizes`, 4,000 ids per request), writes the baseline's sizes table, records
   the genesis commit in `blobs.bin`, and flags the manifest `separate, history partial`.
 * **A 15m run works blobs first** (`pipeline::window_separate`): a `blob:none` fetch of
-  the window; the blobs its new trees reference that no segment lists (new content, and
-  old versions a revert or copy brings back); their sizes from the upstream (so a large
-  blob is fetched alone); the copy, each blob verified by id; `blobs.bin` published; only
-  then the slab, its sizes table (the sizes no earlier table has) and the manifest naming
-  the `blobs.bin` generation. A run that dies in between leaves blobs no tree references
-  yet, never a tree without its blobs.
+  the window; the blobs its new commits' trees reference that no segment lists (new
+  content, and old versions a revert, a copy or a merge brings back); their sizes from the
+  upstream (so a large blob is fetched alone); the copy, each blob verified by id;
+  `blobs.bin` published; only then the slab, its sizes table (the sizes no earlier table
+  has) and the manifest. A run that dies in between leaves blobs no tree references yet,
+  never a tree without its blobs.
+* **Which blobs a window references** is not read off the trees in its pack: an upstream
+  leaves out every subtree its haves reach, and such a subtree may hold versions from
+  before genesis. Plain git leaves out the subtrees of a side branch's base, so an old
+  branch merged after genesis brings them in unseen; with reachability bitmaps every
+  subtree reachable from the haves is left out, so a revert does too. Instead
+  (`separate::window_blobs`), each new commit's whole tree is walked against the
+  manifest tip's tree: blobs and subtrees equal at the same path are skipped (that tree's
+  blobs are in the store, or will be once `mirror --scope tip` ends), and everything else
+  is walked, from the window's slab or the store's (baseline and pyramid). A tree walked
+  once is not walked again. The cost follows the diff against the tip, not the tree's
+  size. Pipeline runners keep the store objects this needs (slabs, sizes tables, segment
+  indexes) in `--cache-dir` across runs, pruned to what the store lists.
+* **The manifest names the `blobs.bin` generation** the run computed its copies against,
+  or the one it published if newer, even when it copied nothing: a run that died after
+  publishing `blobs.bin` left the blobs the next run's trees rely on.
 * **Rollups and the weekly rebuild** union their parts' tables. **GC** keeps the sizes
   tables of listed slabs and the packs and segments `blobs.bin` lists; anything else in
   `blobs/` older than `--gc-grace-secs` (a crashed copy's upload) is deleted.
@@ -491,15 +506,19 @@ points).
   segments of the loaded `blobs.bin` (newest first). Packs of a directory store are
   mapped and leave through `sendfile(2)`. Packs in Azure stay there. The edge holds
   their segment indexes and reads the packs in 4 MiB blocks into a local cache
-  (`src/serve/blobcache.rs`): a read fetches the blocks it lacks, each run of
-  consecutive ones with a single ranged GET, and blocks are evicted least recently used
-  beyond `--blob-cache-mib` (default 32 GiB). Packs are in path order, so a checkout's
-  blobs share blocks; a block being fetched is fetched once. A miss goes to the proxy:
-  its cache, else the upstream, but only for ids a sizes table names (a 404 otherwise,
-  without touching the upstream). The proxy fetches each blob once per edge (requests for
-  a blob being fetched wait for that fetch), verifies it as it streams in, and keeps it
-  on local disk up to `--proxy-cache-mib`. An upstream failure is a 503, which clients
-  retry; gvfs-helper treats a 404 as fatal.
+  (`src/serve/blobcache.rs`), at most 8 blocks per read at a time: a read fetches the
+  blocks it lacks, each run of consecutive ones with a single ranged GET, and pins them
+  while it streams them. Unpinned blocks are evicted least recently used beyond
+  `--blob-cache-mib` (default 32 GiB), so every read finishes, whatever the budget. A read
+  of more than a quarter of the budget (one huge blob) streams straight from the store,
+  32 MiB at a time, instead of evicting everything else. Packs are in path order, so a
+  checkout's blobs share blocks; a block being fetched is fetched once. A miss goes to the
+  proxy: its cache, else the upstream, but only for ids a sizes table names (a 404
+  otherwise, without touching the upstream). The proxy fetches each blob once per edge
+  (requests for a blob being fetched wait for that fetch), verifies it as it streams in,
+  and keeps it on local disk up to `--proxy-cache-mib`. A request keeps the packs it
+  already holds, so eviction never makes it start over. An upstream failure is a 503,
+  which clients retry; gvfs-helper treats a 404 as fatal.
 * **Loose objects** are spliced from the entry's deflate blocks between a stored block
   and the combined Adler-32, so nothing is inflated, and for a remote entry only its
   first 2 and last 4 zlib bytes are read before streaming. **POST packs** append whole
@@ -529,8 +548,10 @@ and remote reads are cold sections.
   `/gvfs/sizes`); a metadata-only fetch through `/gvfs/prefetch` would replace the filter.
 * The edge's block cache lives in memory and on local disk and starts empty after a
   restart. Hot small-blob packs are not prefetched whole.
-* Pipeline runners download every segment index (48 B per blob) and the manifest's sizes
-  tables each run: about 220 MB at SearchGold's scale, cacheable across runs.
+* A window run reads the baseline and pyramid slabs, every segment index (48 B per blob)
+  and the manifest's sizes tables: about 2.7 GB at SearchGold's scale. A runner that keeps
+  `--cache-dir` downloads each once (the baseline once a week); an ephemeral runner, each
+  run.
 * Small blobs are stored whole (no deltas), trading storage on similar small files for
   entries that always splice alone. Chunk-level dedup (HFS) is gone: git stores whole
   files.
