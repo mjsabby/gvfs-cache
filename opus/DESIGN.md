@@ -489,8 +489,12 @@ points).
 
 * **Where a blob comes from.** A request id not in the slabs is looked up in the
   segments of the loaded `blobs.bin` (newest first). Packs of a directory store are
-  mapped and leave through `sendfile(2)`; packs in Azure stay there and are read by
-  range when needed (the edge holds only the segment indexes). A miss goes to the proxy:
+  mapped and leave through `sendfile(2)`. Packs in Azure stay there. The edge holds
+  their segment indexes and reads the packs in 4 MiB blocks into a local cache
+  (`src/serve/blobcache.rs`): a read fetches the blocks it lacks, each run of
+  consecutive ones with a single ranged GET, and blocks are evicted least recently used
+  beyond `--blob-cache-mib` (default 32 GiB). Packs are in path order, so a checkout's
+  blobs share blocks; a block being fetched is fetched once. A miss goes to the proxy:
   its cache, else the upstream, but only for ids a sizes table names (a 404 otherwise,
   without touching the upstream). The proxy fetches each blob once per edge (requests for
   a blob being fetched wait for that fetch), verifies it as it streams in, and keeps it
@@ -523,8 +527,8 @@ and remote reads are cold sections.
 * ADO support for protocol v2 `filter blob:none` and `object-info` is assumed, not
   verified. GVFS endpoints are used where the upstream offers them (`/gvfs/objects`,
   `/gvfs/sizes`); a metadata-only fetch through `/gvfs/prefetch` would replace the filter.
-* Remote blob reads are not cached at the edge: each is a ranged GET. The plan's NVMe
-  LRU, and coalescing ranges for POST batches, are the next step.
+* The edge's block cache lives in memory and on local disk and starts empty after a
+  restart. Hot small-blob packs are not prefetched whole.
 * Pipeline runners download every segment index (48 B per blob) and the manifest's sizes
   tables each run: about 220 MB at SearchGold's scale, cacheable across runs.
 * Small blobs are stored whole (no deltas), trading storage on similar small files for

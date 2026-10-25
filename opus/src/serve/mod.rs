@@ -35,6 +35,7 @@
 //! ([`conns`]): an idle client costs a table slot, not a thread. POSTs lease a request arena.
 //! Large slab ranges leave through `sendfile(2)`.
 
+pub mod blobcache;
 pub mod blobs;
 pub mod conns;
 pub mod handlers;
@@ -85,6 +86,8 @@ pub struct Ctx {
     pub sizes_wanted: AtomicBool,
     /// Read-through of blobs the store lacks (`--blobs separate` stores with an upstream).
     pub proxy: Option<blobs::Proxy>,
+    /// Local blocks of blob packs in object storage.
+    pub blob_cache: Option<Arc<blobcache::BlockCache>>,
 }
 
 impl Ctx {
@@ -117,6 +120,8 @@ pub struct Options {
     pub upstream_spec: Option<(String, String, crate::upstream::Auth)>,
     /// Bytes of proxied blobs kept on local disk (`--proxy-cache-mib`).
     pub proxy_cache_bytes: u64,
+    /// Bytes of remote blob-pack blocks kept on local disk (`--blob-cache-mib`).
+    pub blob_cache_bytes: u64,
     pub bind: String,
     pub cache_dir: PathBuf,
     pub poll: Duration,
@@ -170,6 +175,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "prefetch-idx",
             "superset-tier",
             "proxy-cache-mib",
+            "blob-cache-mib",
         ],
     )?;
     match f.get("alloc-guard").unwrap_or("count") {
@@ -217,6 +223,7 @@ pub fn main(args: &[String]) -> Result<()> {
         upstream,
         upstream_spec,
         proxy_cache_bytes: f.num("proxy-cache-mib", 10240u64)?.saturating_mul(1 << 20),
+        blob_cache_bytes: f.num("blob-cache-mib", 32768u64)?.saturating_mul(1 << 20),
         bind: f.get("bind").unwrap_or("127.0.0.1:8080").to_string(),
         cache_dir: f
             .get("cache-dir")
@@ -265,6 +272,7 @@ pub fn run(o: Options) -> Result<()> {
         upstream,
         upstream_spec,
         proxy_cache_bytes,
+        blob_cache_bytes,
         bind,
         cache_dir,
         poll,
@@ -281,8 +289,19 @@ pub fn run(o: Options) -> Result<()> {
         hold,
         supersets,
     } = o;
+    let store = Arc::new(store);
+    // Blob packs in object storage are read in blocks kept on local disk.
+    let blob_cache = match store.local_path(crate::blobs::BLOBS_KEY) {
+        None if blob_cache_bytes > 0 => Some(Arc::new(blobcache::BlockCache::new(
+            Arc::clone(&store),
+            cache_dir.join("blob-blocks"),
+            blob_cache_bytes,
+        )?)),
+        _ => None,
+    };
     let mut live = Live {
-        store: Arc::new(store),
+        store,
+        blob_cache: blob_cache.clone(),
         upstream,
         tip: LiveTip::default(),
         cache_dir,
@@ -338,6 +357,7 @@ pub fn run(o: Options) -> Result<()> {
         idx_wanted: AtomicBool::new(prefetch_idx == IdxPolicy::Always),
         sizes_wanted: AtomicBool::new(false),
         proxy,
+        blob_cache,
     });
     if let Err(e) = live.sync_upstream(&ctx) {
         crate::log!("serve: live tip not caught up at boot ({e}); serving sealed slabs");
@@ -751,6 +771,7 @@ fn keep_l0(end_ts: u64, max_ts: u64, newest: u64) -> bool {
 /// The live thread's state.
 struct Live {
     store: Arc<Store>,
+    blob_cache: Option<Arc<blobcache::BlockCache>>,
     upstream: Option<Upstream>,
     tip: LiveTip,
     cache_dir: PathBuf,
@@ -787,6 +808,7 @@ impl Live {
         let set = blobs::BlobSet::load(
             &self.store,
             &self.cache_dir.join("blobs"),
+            self.blob_cache.as_ref(),
             &bm,
             etag,
             self.blobs.as_deref(),
@@ -1038,7 +1060,11 @@ pub fn metrics_text(ctx: &Ctx) -> String {
          gvfs_blobs_proxied_total {}\n\
          gvfs_blobs_unavailable_total {}\n\
          gvfs_blobs_generation {}\n\
-         gvfs_blobs_complete {}\n",
+         gvfs_blobs_complete {}\n\
+         gvfs_blob_cache_hits_total {}\n\
+         gvfs_blob_cache_misses_total {}\n\
+         gvfs_blob_cache_fetches_total {}\n\
+         gvfs_blob_cache_bytes {}\n",
         get(&m.prefetch),
         get(&m.object_get),
         get(&m.object_post),
@@ -1062,7 +1088,11 @@ pub fn metrics_text(ctx: &Ctx) -> String {
         get(&m.blobs_proxied),
         get(&m.unavailable),
         v.blobs.as_ref().map_or(0, |b| b.generation),
-        u8::from(v.blobs.as_ref().is_some_and(|b| b.complete))
+        u8::from(v.blobs.as_ref().is_some_and(|b| b.complete)),
+        ctx.blob_cache.as_ref().map_or(0, |c| get(&c.hits)),
+        ctx.blob_cache.as_ref().map_or(0, |c| get(&c.misses)),
+        ctx.blob_cache.as_ref().map_or(0, |c| get(&c.fetches)),
+        ctx.blob_cache.as_ref().map_or(0, |c| c.bytes())
     )
 }
 

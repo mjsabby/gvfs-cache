@@ -150,7 +150,9 @@ the optimal splice by hand.
 `curl http://edge:8080/metrics` reports request, byte, and L0 counters, the manifest
 generation, and `gvfs_alloc_hot_path_total`, which must stay 0. Separate-blob stores add
 `gvfs_blobs_from_store_total`, `gvfs_blobs_proxied_total`, `gvfs_blobs_unavailable_total`,
-`gvfs_blobs_generation` and `gvfs_blobs_complete`.
+`gvfs_blobs_generation` and `gvfs_blobs_complete`, and for blob packs in object storage the
+edge's block cache (`gvfs_blob_cache_{hits,misses,fetches}_total`, `gvfs_blob_cache_bytes`;
+size it with `--blob-cache-mib`, default 32 GiB).
 
 ## Performance
 

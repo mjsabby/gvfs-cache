@@ -615,7 +615,7 @@ consumer needs the HFS side channel. The alternative adopted here:
 | blob packs + segments + `blobs.bin` | whole-blob git packs (upstream zlib kept, or stored blocks when incompressible: byte ranges in place); 48-byte records with 64-bit offsets and lengths; a CAS'd list |
 | pipeline, blobs first | `blob:none` window; copy the blobs its new trees reference that the store lacks; publish `blobs.bin`; only then the slab and the manifest naming that `blobs.bin` generation |
 | `gvfs-daemon mirror` | the seed of the blobs, planned from the store's own trees and sizes (path order), resumable, parallel, rate-capped; records `tip complete` for the genesis tree |
-| edge | blobs from the packs (mapped, or ranged reads from Azure without downloading them); a single-flight read-through proxy for blobs the store lacks (L0, old versions), only for ids the trees name; `GSZ1` sizes section on opt-in; `GET /gvfs/blobs/<oid>?offset&length`; ready only once `tip complete` |
+| edge | blobs from the packs (mapped, or from Azure through a local 4 MiB block cache, never downloaded whole); a single-flight read-through proxy for blobs the store lacks (L0, old versions), only for ids the trees name; `GSZ1` sizes section on opt-in; `GET /gvfs/blobs/<oid>?offset&length`; ready only once `tip complete` |
 
 **Gates** (stock git judges every byte):
 
@@ -652,8 +652,10 @@ SHA-1s), so ADO's serving rate, not the daemon, will set the seed time.
   for genesis, the 15-minute runs and L0. `/gvfs/objects` and `/gvfs/sizes` are used when
   the upstream is GVFS. A short run against the real repository settles it; if the filter
   is missing, a metadata-only fetch through `/gvfs/prefetch` is the substitute.
-* *Remote blob reads are not cached at the edge:* each blob request to an Azure-backed store is
-  a ranged GET. The planned NVMe LRU, and coalescing POST batches into fewer ranges, come next.
+* *Edges cache blob packs in object storage by 4 MiB blocks* (`--blob-cache-mib`): a read fetches
+  each run of missing blocks with one ranged GET, so a checkout's blobs, which sit together in path
+  order, cost a few requests. Repeat reads cost none (tested on Azurite). The cache starts cold
+  after a restart.
 * *Runner downloads:* pipeline runners re-download every segment index (48 B per blob) and the
   manifest's sizes tables each run: about 220 MB at SearchGold's scale. A persistent runner
   cache removes that.

@@ -92,6 +92,10 @@ SERVE OPTIONS:
     --alloc-guard <count|strict|trace>   hot-path allocation policy (default: count)
     --prefetch-idx <auto|always|never>   send each prefetch pack's .idx; auto (default):
                                to every client except git itself (gvfs-helper discards it)
+    --proxy-cache-mib <N>      --blobs separate: blobs proxied from the upstream kept on
+                               local disk (default: 10240)
+    --blob-cache-mib <N>       --blobs separate: 4 MiB blocks of blob packs in object
+                               storage kept on local disk (default: 32768)
     --superset-tier <24h|168h|never>     send each sealed day and week (24h, default) or
                                week (168h) to a warm client whole, once, so that client
                                maintenance can expire its smaller packs; never: exact covers

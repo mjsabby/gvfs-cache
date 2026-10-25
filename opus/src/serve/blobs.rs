@@ -27,9 +27,17 @@ pub struct BlobPack {
     pub id: String,
     pub len: u64,
     local: Option<(File, gvfs_mmap::Map)>,
-    remote: Option<(Arc<Store>, String)>,
+    remote: Option<Remote>,
     /// Removed when the last user drops it (a proxied pack evicted from the cache).
     unlink: Option<PathBuf>,
+}
+
+/// Where a remote pack's bytes come from.
+enum Remote {
+    /// Ranged reads straight from the store.
+    Direct(Arc<Store>, String),
+    /// Through the edge's block cache ([`super::blobcache`]).
+    Cached(Arc<super::blobcache::BlockCache>, Arc<str>, String),
 }
 
 impl BlobPack {
@@ -45,12 +53,22 @@ impl BlobPack {
         })
     }
 
-    pub fn remote(store: Arc<Store>, id: &str, len: u64) -> BlobPack {
+    /// A pack in object storage, read through `cache` when there is one.
+    pub fn remote(
+        store: Arc<Store>,
+        cache: Option<&Arc<super::blobcache::BlockCache>>,
+        id: &str,
+        len: u64,
+    ) -> BlobPack {
+        let key = pack_key(id);
         BlobPack {
             id: id.to_string(),
             len,
             local: None,
-            remote: Some((store, pack_key(id))),
+            remote: Some(match cache {
+                Some(c) => Remote::Cached(Arc::clone(c), Arc::from(id), key),
+                None => Remote::Direct(store, key),
+            }),
             unlink: None,
         }
     }
@@ -71,7 +89,8 @@ impl BlobPack {
             return sink(sub(b, us(at), us(len)).ctx("blob pack range")?);
         }
         match &self.remote {
-            Some((store, key)) => store.read_range(key, at, len, sink),
+            Some(Remote::Direct(store, key)) => store.read_range(key, at, len, sink),
+            Some(Remote::Cached(cache, id, key)) => cache.read(id, key, self.len, at, len, sink),
             None => crate::bail!("blob pack {} has no bytes", self.id),
         }
     }
@@ -100,6 +119,7 @@ impl BlobSet {
     pub fn load(
         store: &Arc<Store>,
         cache: &Path,
+        blocks: Option<&Arc<super::blobcache::BlockCache>>,
         bm: &BlobManifest,
         etag: String,
         prev: Option<&BlobSet>,
@@ -125,7 +145,7 @@ impl BlobSet {
                     Some(x) => Arc::clone(x),
                     None => Arc::new(match store.local_path(&pack_key(&p.id)) {
                         Some(path) => BlobPack::open(&path, &p.id)?,
-                        None => BlobPack::remote(Arc::clone(store), &p.id, p.len),
+                        None => BlobPack::remote(Arc::clone(store), blocks, &p.id, p.len),
                     }),
                 };
                 if pack.len != p.len {

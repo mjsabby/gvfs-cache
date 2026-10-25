@@ -495,6 +495,13 @@ fn azure_separate_store() {
     assert_eq!(cat_batch(&loose, &ids), cat_batch(&up.bare, &ids));
     let tip = commit_blobs(&up.bare, &["-1", &t]);
     assert!(server.metric("gvfs_blobs_from_store_total") >= tip.len() as u64);
+    // Read again: from the edge's block cache, without asking Azure.
+    let fetches = server.metric("gvfs_blob_cache_fetches_total");
+    assert!(fetches > 0);
+    for id in &ids {
+        assert_eq!(server.get(&format!("/gvfs/objects/{id}")).0, 200);
+    }
+    assert_eq!(server.metric("gvfs_blob_cache_fetches_total"), fetches);
     // One pack of every blob.
     let (status, _, pack) = server.post("/gvfs/objects", json_ids(&ids, None).as_bytes(), CT_PACK);
     assert_eq!(status, 200);
@@ -505,6 +512,7 @@ fn azure_separate_store() {
         &pack,
     );
     assert_eq!(cat_batch(&posted, &ids), cat_batch(&up.bare, &ids));
+    assert_eq!(server.metric("gvfs_blob_cache_fetches_total"), fetches);
     // Ranges of a stored and of a compressed blob.
     let noise_id = rev(&up.bare, &format!("{g}:b/noise.bin"));
     let text_id = rev(&up.bare, &format!("{t}:a/text.txt"));
