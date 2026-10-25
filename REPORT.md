@@ -4,7 +4,9 @@
 `cdda1ae`…`f7d9bef`). It is the only implementation that is correct on every check *and*
 fastest or near-fastest on every workload that moves real bytes. Section 1 explains the call
 and its trade-offs; sections 3–8 are the evidence; section 9 lists every defect found, per
-implementation, including the opus defects this comparison found and fixed.
+implementation, including the opus defects this comparison found and fixed. Section 11
+studies client-side pack lifecycles; section 12 adds a store mode for real blobs in their own
+packs (`--blobs separate`), with sizes travelling beside the trees.
 
 All numbers: AMD Ryzen 9 9950X (16C/32T), 89 GiB, Linux 7.3, rustc 1.97.1, git 2.53, loopback.
 Each implementation built as shipped (`cargo build --release`, its own profile). The harness is
@@ -446,6 +448,12 @@ python3 ws_report.py opus opus@ss fable fable@h24        # bytes, packs per regi
 PC_SIZES=0,100,1000,5000,20000 python3 packcount.py opus agent-1m   # what pack count costs git
 cargo run --release --example clients -- --repo ~/SearchGold --from 2026-10-10 --days 14 \
   --work <scratch> --superset-tier 24h|168h|never      # (in opus/) opus's own 14-day simulator
+# §12: --blobs separate
+(cd ../opus && cargo test --release --test separate && \
+  cargo test --release --test separate -- --ignored blob_over_4gib)  # ~13 GB under target/
+python3 separate_seed.py --jobs 8                        # real-content seed, ~/gvfs-bench/sep-seed
+gvfs-daemon pipeline --store fs:<dir> --upstream ~/SearchGold --branch main --tier 15m \
+  --blobs separate                                       # SearchGold metadata in separate mode
 ```
 Scratch data lives under `~/gvfs-bench` (SearchGold stores ~16 GB); `/tmp` is a tmpfs here.
 The shell's injected `GIT_CONFIG_*` is stripped by `gvfslib.clean_env`.
@@ -587,3 +595,74 @@ and the lifecycles above.
 | Weekly "aha" delta for warm workstations | ✅ (6 days off: 1 pack, 0.98×) | ✅ |
 | Cron jitter / overlapping runs | ✅ L0 bridges any gap; the next 15m slab gets wider; CAS | ✅ |
 | Cold clone = 1 pack | ✅ (84/84 exact) | ✅ |
+
+## 12. Real blobs in their own packs (`--blobs separate`)
+
+**The decision.** The pointer design leaves the real content outside git, so nothing
+in the GVFS protocol can see it: `/gvfs/sizes` reports pointer sizes, and every
+consumer needs the HFS side channel. The alternative adopted here:
+* every file is a real git blob in ADO;
+* commits and trees travel in one set of packs, blobs in another;
+* the blob sizes a client needs to project a tree travel with the trees, as a side table.
+
+**What it is** (opus `5870cd0`…`60e9164`; formats and algorithms in `opus/DESIGN.md`,
+"Stores with real blobs"). A store chooses its mode at genesis
+(`pipeline --blobs separate`); inline stores are unchanged, manifest byte for byte.
+
+| piece | what it does |
+|---|---|
+| sizes tables | `slabs/<id>.sizes`: sorted `(id, size)` of the blobs a slab's trees introduce; rollups union them |
+| blob packs + segments + `blobs.bin` | whole-blob git packs (upstream zlib kept, or stored blocks when incompressible: byte ranges in place); 48-byte records with 64-bit offsets and lengths; a CAS'd list |
+| pipeline, blobs first | `blob:none` window; copy the blobs its new trees reference that the store lacks; publish `blobs.bin`; only then the slab and the manifest naming that `blobs.bin` generation |
+| `gvfs-daemon mirror` | the seed of the blobs, planned from the store's own trees and sizes (path order), resumable, parallel, rate-capped; records `tip complete` for the genesis tree |
+| edge | blobs from the packs (mapped, or ranged reads from Azure without downloading them); a single-flight read-through proxy for blobs the store lacks (L0, old versions), only for ids the trees name; `GSZ1` sizes section on opt-in; `GET /gvfs/blobs/<oid>?offset&length`; ready only once `tip complete` |
+
+**Gates** (stock git judges every byte):
+
+| gate | result |
+|---|---|
+| Blob packs valid, sizes exact | every pack passes `index-pack --strict`; every table and every `/gvfs/sizes` answer equals `git cat-file -s` |
+| Streaming copy: chunking, OFS/REF/forward deltas, stored vs raw, wrong/missing/extra objects, bad trailers | unit tests (`blobstream.rs`) |
+| Pipeline blobs first | every blob of every window byte-exact in the store, including a revert to a never-copied version; the window's table holds exactly the new sizes; `blobs.bin` published before the manifest; rollups/weekly union; GC keeps exactly what is listed |
+| Mirror | sliced (`--max-items`) and resumed; `SIGKILL`ed at several points, two runs leaving unpublished uploads: completes, every blob once, GC removes exactly the orphans |
+| Edge | every history blob loose (`fsck --strict`), POST packs (`index-pack --strict`), ranges of stored and compressed blobs, `GSZ1` equal to git's history (cold) and to the window's new blobs (warm), L0 blobs through the proxy and then from the store once sealed; 0 hot-path allocations in strict mode |
+| Stock microsoft/git 2.56 | `gvfs-helper prefetch` (no blobs), a checkout faulting every blob byte for byte (16 MiB included), an old version through the proxy, a sparse cone that never fetches blobs outside it |
+| Azure (Azurite) | streaming block uploads; an edge serving every blob loose and in packs by ranged reads, holding only segment indexes locally |
+| Beyond 4 GiB | a 4,294,979,641-byte blob: copied by a pipeline window in 7.0 s at an **11 MiB** peak RSS; served loose (hashes to its id), in a pack (`index-pack --strict`), and by ranges past 4 GiB |
+
+**Scale: SearchGold's history in separate mode** (commits and trees real; its blobs are the
+3.34M pointer files, so this measures the metadata side):
+
+| | inline (§5) | separate |
+|---|---|---|
+| genesis | 79 s | 99 s: 56 s `blob:none` fetch (git), 7 s tree walk, 27 s `object-info` for 3,342,769 sizes, 6 s repack |
+| baseline | 2.60 GB pack + 374 MB index | 2.27 GB pack + 238 MB index + 93.6 MB sizes table |
+| cold clone | 2.60 GB | 2.27 GB; 2.36 GB with `X-GVFS-Sizes: 1` (sizes of every history blob), 0.7 s on loopback |
+| `POST /gvfs/sizes`, 4,000 blob ids | — | 1–1.5 ms per request, answered from the table |
+
+**Seeding real content** (`bench/separate_seed.py`): a synthetic corpus shaped like
+SearchGold (20,216 files, 5.99 GB of which 4.7 GB in 16 large incompressible files),
+`mirror --jobs 8` copied it in 35.5 s (169 MB/s), at an 84 MiB peak RSS. perf: 95% of the CPU
+was the local git upstream (`pack-objects`: SHA-1DC, zlib), 5% the daemon (mostly verifying
+SHA-1s), so ADO's serving rate, not the daemon, will set the seed time.
+
+**Trade-offs and open questions:**
+
+* *ADO capabilities are assumed, not verified:* protocol v2 `filter blob:none` and `object-info`
+  for genesis, the 15-minute runs and L0. `/gvfs/objects` and `/gvfs/sizes` are used when
+  the upstream is GVFS. A short run against the real repository settles it; if the filter
+  is missing, a metadata-only fetch through `/gvfs/prefetch` is the substitute.
+* *Remote blob reads are not cached at the edge:* each blob request to an Azure-backed store is
+  a ranged GET. The planned NVMe LRU, and coalescing POST batches into fewer ranges, come next.
+* *Runner downloads:* pipeline runners re-download every segment index (48 B per blob) and the
+  manifest's sizes tables each run: about 220 MB at SearchGold's scale. A persistent runner
+  cache removes that.
+* *Storage:* small blobs are stored whole (no deltas), so any blob leaves as its own bytes. Git
+  stores whole files, so the chunk-level dedup HFS had is gone: a small edit to a 10 GB file
+  costs 10 GB again, upstream and here.
+* *Not done from the plan:*
+  * the 100–200 GB P0 corpus (the seed benchmark is 6 GB);
+  * the 7-day replay in separate mode, with its oracle extended to blobs;
+  * client-side lifecycles with blob packs (each gvfs-helper POST is a pack);
+  * a reference client for `GSZ1` and ranges;
+  * reachability GC of blob packs.
