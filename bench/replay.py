@@ -26,7 +26,8 @@ import traceback
 import impls
 from gvfslib import clean_env, git, git_out, init_bare, request, GpreError, parse_gpre
 
-R = "/home/muks/gvfs-bench/replay"
+R = "/home/muks/gvfs-bench/replay"                 # history + ideal-bytes cache (shared)
+W = os.environ.get("REPLAY_WORK", R)              # per-implementation stores and results
 SGOBJ = "/home/muks/SearchGold/.git/objects"
 UA = {"User-Agent": "git/2.53.0.vfs.0.0"}   # what gvfs-helper sends
 SOL_CAP = ["--max-objects", "16777216", "--max-links", "2147483647", "--pack-mib", "65536",
@@ -43,6 +44,7 @@ def binary(name):
 H = json.load(open(os.path.join(R, "history-w7.json")))
 S, E, SEED = H["start"], H["end"], H["seed"]
 COMMITS = H["commits"]           # [oid, effective, original]
+POS = {c[0]: i for i, c in enumerate(COMMITS)}
 
 
 def utc(t):
@@ -100,11 +102,16 @@ class Oracle:
         print(f"oracle: |objects(SEED)| = {len(self.seed)} in {time.time() - t0:.0f}s", flush=True)
 
     def save(self):
+        """Persist the ideal-bytes cache (best effort; called from every replay thread)."""
         with self.lock:
             d = {"ideal": {f"{a}:{b}": v for (a, b), v in self.ideal.items()}}
-        with open(os.path.join(R, "oracle.json.tmp"), "w") as f:
-            json.dump(d, f)
-        os.replace(os.path.join(R, "oracle.json.tmp"), os.path.join(R, "oracle.json"))
+            tmp = os.path.join(R, f"oracle.json.{os.getpid()}.{threading.get_ident()}.tmp")
+            try:
+                with open(tmp, "w") as f:
+                    json.dump(d, f)
+                os.replace(tmp, os.path.join(R, "oracle.json"))
+            except OSError:
+                pass
 
     def _once(self, key, fn, store):
         ikey = (id(store), key)
@@ -138,8 +145,22 @@ class Oracle:
             return frozenset()
 
         def f():
-            out = git_out(self.up, "rev-list", "--objects", tip, f"^{SEED}")
-            return frozenset(o for o in (l[:40] for l in out.splitlines() if l) if o not in self.seed)
+            # Exact and cheap: objects(t) = objects(a) | R(t ^a) for any ancestor a, so extend the
+            # newest cached first-parent ancestor instead of walking back to SEED every time.
+            pos = POS.get(tip)
+            base, base_set = SEED, frozenset()
+            if pos is not None:
+                with self.lock:
+                    cands = [(POS[k], k) for k in self.new if k in POS and POS[k] < pos]
+                if cands:
+                    _, base = max(cands)
+                    with self.lock:
+                        base_set = self.new.get(base)
+                    if base_set is None:
+                        base, base_set = SEED, frozenset()
+            out = git_out(self.up, "rev-list", "--objects", tip, f"^{base}")
+            fresh = (o for o in (l[:40] for l in out.splitlines() if l) if o not in self.seed)
+            return base_set | frozenset(fresh)
         return self._once(tip, f, self.new)
 
     def new_objects(self, have, want):
@@ -198,7 +219,7 @@ class Client:
 class Replay:
     def __init__(self, name, oracle):
         self.name = name
-        self.work = os.path.join(R, name)
+        self.work = os.path.join(W, name)
         self.oracle = oracle
         self.fail = []
         self.log = open(os.path.join(self.work, "replay.log"), "a")
@@ -472,7 +493,7 @@ class Replay:
 
 
 def seed(name):
-    work = os.path.join(R, name)
+    work = os.path.join(W, name)
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
     up = init_bare(os.path.join(work, "up.git"))
@@ -494,7 +515,7 @@ def main():
             seed(n)
         return
     names = args or ["opus", "fable", "sol", "astra"]
-    oracle = Oracle(os.path.join(R, names[0], "up.git"))
+    oracle = Oracle(os.path.join(W, names[0], "up.git"))
     oracle.count(SEED)
     with cf.ThreadPoolExecutor(len(names)) as ex:
         def go(n):

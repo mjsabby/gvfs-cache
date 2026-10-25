@@ -1,0 +1,27 @@
+## failures / pipeline / freshness
+- opus: failures 0 [] | pipeline runs 672 total 25s max 6.3s {'15m': '504x avg 0.03s max 0.1s', '1h': '140x avg 0.03s max 0.1s', '6h': '14x avg 0.05s max 0.1s', '12h': '7x avg 0.08s max 0.1s', '24h': '6x avg 0.10s max 0.1s', '168h': '1x avg 6.32s max 6.3s'} | live wait p50 0.35s max 1.06s (n=1410) | metrics {'gvfs_errors_total': 0.0, 'gvfs_alloc_hot_path_total': 0.0, 'gvfs_alloc_hot_path_bytes_total': 0.0, 'gvfs_alloc_post_seal_total': 3076467.0} | elapsed 3508s
+- fable: failures 1 ["served .idx differs from git index-pack's"] | pipeline runs 672 total 96s max 81.5s {'15m': '504x avg 0.02s max 0.3s', '1h': '140x avg 0.02s max 0.1s', '6h': '14x avg 0.03s max 0.0s', '12h': '7x avg 0.03s max 0.0s', '24h': '6x avg 0.10s max 0.1s', '168h': '1x avg 81.53s max 81.5s'} | live wait p50 0.01s max 0.05s (n=1410) | metrics {'gvfs_alloc_sealed': 1.0, 'gvfs_alloc_post_seal_total': 2088974.0, 'gvfs_alloc_hot_path_total': 0.0, 'gvfs_alloc_hot_path_bytes_total': 0.0} | elapsed 3054s
+- sol: failures 0 [] | pipeline runs 672 total 2791s max 151.8s {'15m': '504x avg 3.93s max 5.9s', '1h': '140x avg 3.90s max 5.3s', '6h': '14x avg 4.08s max 4.7s', '12h': '7x avg 4.23s max 5.3s', '24h': '6x avg 4.19s max 4.7s', '168h': '1x avg 151.79s max 151.8s'} | live wait p50 0.4s max 1.54s (n=1410) | metrics {'gvfs_errors_total': 14763.0, 'gvfs_hot_allocations_total': 0.0} | elapsed 6713s
+## warm clients: MB received (pack+idx) / ideal, packs, worst response
+| client | opus | fable | sol |
+|---|---|---|---|
+| agent, every minute | 43.2 / 41.9 MB = **1.03×** (pack only 1.03×); 1404 packs / 10080 req; max 0.2 MB; fails 0 | 224.2 / 41.9 MB = **5.35×** (pack only 5.19×); 2778 packs / 10080 req; max 2.5 MB; fails 0 | 95.2 / 41.9 MB = **2.27×** (pack only 2.20×); 1810 packs / 10080 req; max 0.6 MB; fails 0 |
+| agent, every 15 min | 23.8 / 23.4 MB = **1.02×** (pack only 1.02×); 522 packs / 672 req; max 0.3 MB; fails 0 | 88.5 / 23.4 MB = **3.78×** (pack only 3.67×); 606 packs / 672 req; max 2.5 MB; fails 0 | 71.6 / 23.4 MB = **3.06×** (pack only 3.00×); 586 packs / 672 req; max 0.8 MB; fails 0 |
+| agent, hourly | 13.7 / 13.7 MB = **1.00×** (pack only 1.00×); 164 packs / 168 req; max 0.3 MB; fails 0 | 61.9 / 13.7 MB = **4.52×** (pack only 4.39×); 164 packs / 168 req; max 2.6 MB; fails 0 | 49.6 / 13.7 MB = **3.63×** (pack only 3.58×); 164 packs / 168 req; max 1.5 MB; fails 0 |
+| laptop, hourly 08-18 weekdays | 7.9 / 8.0 MB = **0.99×** (pack only 0.99×); 55 packs / 55 req; max 1.0 MB; fails 0 | 34.6 / 8.0 MB = **4.32×** (pack only 4.18×); 55 packs / 55 req; max 4.0 MB; fails 0 | 34.6 / 8.0 MB = **4.33×** (pack only 4.27×); 55 packs / 55 req; max 4.5 MB; fails 0 |
+| developer 09:00/13:00/17:30 | 5.2 / 5.3 MB = **0.98×** (pack only 0.98×); 15 packs / 15 req; max 1.0 MB; fails 0 | 25.7 / 5.3 MB = **4.87×** (pack only 4.69×); 15 packs / 15 req; max 4.0 MB; fails 0 | 33.8 / 5.3 MB = **6.41×** (pack only 6.32×); 15 packs / 15 req; max 4.7 MB; fails 0 |
+| developer, mornings | 3.5 / 3.7 MB = **0.97×** (pack only 0.97×); 5 packs / 5 req; max 1.2 MB; fails 0 | 11.5 / 3.7 MB = **3.13×** (pack only 2.95×); 5 packs / 5 req; max 4.0 MB; fails 0 | 19.5 / 3.7 MB = **5.33×** (pack only 5.22×); 5 packs / 5 req; max 5.1 MB; fails 0 |
+| back after 6 days off | 2.6 / 2.8 MB = **0.94×** (pack only 0.94×); 2 packs / 2 req; max 2.2 MB; fails 0 | 5.2 / 2.8 MB = **1.85×** (pack only 1.70×); 2 packs / 2 req; max 4.0 MB; fails 0 | 10.3 / 2.8 MB = **3.65×** (pack only 3.52×); 2 packs / 2 req; max 7.5 MB; fails 0 |
+| stale client (cursor 1) | 2596.6 / 3.0 MB = **875.92×** (pack only 875.92×); 1 packs / 1 req; max 2596.6 MB; fails 0 | 2882.4 / 3.0 MB = **972.31×** (pack only 878.10×); 1 packs / 1 req; max 2882.4 MB; fails 0 | 2663.6 / 3.0 MB = **898.53×** (pack only 810.49×); 1 packs / 1 req; max 2663.6 MB; fails 0 |
+## latency of warm prefetch requests (client-side, ms)
+- opus: all p50 0.09 p99 3.77 max 155.1 | with data p50 0.11 p99 8.74 max 155.1
+- fable: all p50 0.11 p99 0.65 max 6.8 | with data p50 0.32 p99 1.10 max 6.8
+- sol: all p50 0.11 p99 0.54 max 50.9 | with data p50 0.17 p99 1.07 max 7.4
+## cold clones
+- opus: 84 clones, 84 exact; bytes min/avg/max 2.594/2.595/2.597 GB; time p50 1.42s max 1.87s
+- fable: 84 clones, 84 exact; bytes min/avg/max 2.875/2.878/2.882 GB; time p50 1.90s max 2.18s
+- sol: 84 clones, 84 exact; bytes min/avg/max 2.645/2.653/2.663 GB; time p50 3.56s max 4.17s
+## resent objects (already held by the client) and non-advancing responses
+- opus: resent objects 2523, non-advancing responses 0
+- fable: resent objects 256125, non-advancing responses 0
+- sol: resent objects 23416, non-advancing responses 0

@@ -1,0 +1,2387 @@
+[
+ {
+  "impl": "opus-orig",
+  "passed": 901,
+  "failed": 12,
+  "failures": [
+   [
+    "revert-15m:cold:idx_identical",
+    false,
+    "git verify-pack -v /home/muks/gvfs-bench/conf-final/opus-orig/ipx/tmpyby7m1ks.idx failed (1): fatal: The same object cf8b272bc7fe151ae970c0fa3a98046e7e546a97 appears twice in the pack\n"
+   ],
+   [
+    "revert-15m:cold:index_pack_strict",
+    false,
+    "fatal: The same object cf8b272bc7fe151ae970c0fa3a98046e7e546a97 appears twice in the pack\n"
+   ],
+   [
+    "restart-15m:cold:idx_identical",
+    false,
+    "git verify-pack -v /home/muks/gvfs-bench/conf-final/opus-orig/ipx/tmp5heohqup.idx failed (1): fatal: The same object cf8b272bc7fe151ae970c0fa3a98046e7e546a97 appears twice in the pack\n"
+   ],
+   [
+    "restart-15m:cold:index_pack_strict",
+    false,
+    "fatal: The same object cf8b272bc7fe151ae970c0fa3a98046e7e546a97 appears twice in the pack\n"
+   ],
+   [
+    "readd-15m:cold:idx_identical",
+    false,
+    "git verify-pack -v /home/muks/gvfs-bench/conf-final/opus-orig/ipx/tmpcgnuyep4.idx failed (1): fatal: The same object 00670726298af0b7e7ce069d27cb1ad444136249 appears twice in the pack\n"
+   ],
+   [
+    "readd-15m:cold:index_pack_strict",
+    false,
+    "fatal: The same object 00670726298af0b7e7ce069d27cb1ad444136249 appears twice in the pack\n"
+   ],
+   [
+    "12h-12h:cold:idx_identical",
+    false,
+    "git verify-pack -v /home/muks/gvfs-bench/conf-final/opus-orig/ipx/tmp06dxhs19.idx failed (1): fatal: The same object 00670726298af0b7e7ce069d27cb1ad444136249 appears twice in the pack\n"
+   ],
+   [
+    "12h-12h:cold:index_pack_strict",
+    false,
+    "fatal: The same object 00670726298af0b7e7ce069d27cb1ad444136249 appears twice in the pack\n"
+   ],
+   [
+    "rewrite-15m:cold:idx_identical",
+    false,
+    "git verify-pack -v /home/muks/gvfs-bench/conf-final/opus-orig/ipx/tmpq8dm7n3v.idx failed (1): fatal: The same object 00670726298af0b7e7ce069d27cb1ad444136249 appears twice in the pack\n"
+   ],
+   [
+    "rewrite-15m:cold:index_pack_strict",
+    false,
+    "fatal: The same object 00670726298af0b7e7ce069d27cb1ad444136249 appears twice in the pack\n"
+   ],
+   [
+    "robust:idle300_dont_starve",
+    false,
+    "opened 300/300, latency None"
+   ],
+   [
+    "robust:idle1000_dont_starve",
+    false,
+    "opened 385/1000, latency None"
+   ]
+  ],
+  "info": {
+   "genesis_s": [
+    0.015
+   ],
+   "ready_s": 0.484,
+   "cold_bytes": [
+    21733,
+    31836,
+    35631,
+    38069,
+    41407,
+    43714,
+    47518,
+    49964,
+    53757,
+    56287,
+    59774,
+    62086,
+    65915,
+    68372,
+    72156,
+    74605,
+    78165,
+    80490,
+    84244,
+    86754,
+    90505,
+    92959,
+    96555,
+    98850,
+    102573,
+    105014,
+    105014,
+    105679,
+    109808,
+    112143,
+    113757,
+    116239,
+    116239
+   ],
+   "step_s": [
+    [
+     "s1",
+     0.015
+    ],
+    [
+     "s2",
+     0.015
+    ],
+    [
+     "s3",
+     0.015
+    ],
+    [
+     "s4",
+     0.015
+    ],
+    [
+     "s5",
+     0.015
+    ],
+    [
+     "s6",
+     0.015
+    ],
+    [
+     "s7",
+     0.015
+    ],
+    [
+     "s8",
+     0.015
+    ],
+    [
+     "s9",
+     0.015
+    ],
+    [
+     "s10",
+     0.015
+    ],
+    [
+     "s11",
+     0.015
+    ],
+    [
+     "s12",
+     0.015
+    ],
+    [
+     "s13",
+     0.015
+    ],
+    [
+     "s14",
+     0.015
+    ],
+    [
+     "s15",
+     0.015
+    ],
+    [
+     "s16",
+     0.015
+    ],
+    [
+     "s17",
+     0.007
+    ],
+    [
+     "s18",
+     0.015
+    ],
+    [
+     "s19",
+     0.015
+    ],
+    [
+     "s20",
+     0.015
+    ],
+    [
+     "s21",
+     0.015
+    ],
+    [
+     "s22",
+     0.015
+    ],
+    [
+     "s23",
+     0.015
+    ],
+    [
+     "s24",
+     0.015
+    ],
+    [
+     "s25",
+     0.015
+    ],
+    [
+     "s26",
+     0.007
+    ],
+    [
+     "merge",
+     0.016
+    ],
+    [
+     "revert",
+     0.015
+    ],
+    [
+     "after-restart",
+     0.016
+    ],
+    [
+     "readd",
+     0.015
+    ],
+    [
+     "12h",
+     0.032
+    ],
+    [
+     "rewrite",
+     0.015
+    ],
+    [
+     "sun-weekly",
+     0.031
+    ],
+    [
+     "sun-15m",
+     0.015
+    ],
+    [
+     "mon-weekly",
+     0.015
+    ],
+    [
+     "mon-15m",
+     0.015
+    ],
+    [
+     "mon-1h",
+     0.003
+    ]
+   ],
+   "live_in_prefetch": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "unseen_branch_get": 404,
+   "post_extra_objects": 823,
+   "closure_d1": {
+    "objects": 33,
+    "required": 33,
+    "blobs": 0
+   },
+   "closure_d2": {
+    "objects": 38,
+    "required": 38,
+    "blobs": 0
+   },
+   "closure_d3": {
+    "objects": 43,
+    "required": 43,
+    "blobs": 0
+   },
+   "unknown_in_post": 404,
+   "unknown_in_sizes": [
+    404,
+    "not found\n"
+   ],
+   "post_loose_accept": [
+    200,
+    "application/x-git-packfile"
+   ],
+   "robustness_status": {
+    "get_short_oid": 404,
+    "get_nonhex_oid": 404,
+    "get_uppercase_oid": 200,
+    "prefetch_bad_ts": 200,
+    "prefetch_negative_ts": 200,
+    "post_bad_json": 400,
+    "post_empty_ids": 400,
+    "post_bad_oid": 400,
+    "post_neg_depth": 200,
+    "sizes_not_array": 200,
+    "sizes_empty": 200,
+    "unknown_path": 404,
+    "big_body": "EXC ConnectionResetError"
+   },
+   "idle100": {
+    "opened": 100,
+    "config_latency_s": 0.0
+   },
+   "idle300": {
+    "opened": 300,
+    "config_latency_s": null
+   },
+   "idle1000": {
+    "opened": 385,
+    "config_latency_s": null
+   },
+   "max_batch_ok": {
+    "sizes": 16000,
+    "objects": 16000
+   },
+   "hot_allocs": [
+    0.0
+   ],
+   "metric_errors": {},
+   "clients": {
+    "poller": {
+     "bytes": 607563,
+     "ideal": 500548,
+     "packs": 48,
+     "responses": 50,
+     "nonadvancing": 0
+    },
+    "hourly": {
+     "bytes": 254206,
+     "ideal": 192903,
+     "packs": 16,
+     "responses": 17,
+     "nonadvancing": 0
+    },
+    "dev": {
+     "bytes": 216443,
+     "ideal": 155982,
+     "packs": 12,
+     "responses": 13,
+     "nonadvancing": 0
+    },
+    "late": {
+     "bytes": 171723,
+     "ideal": 117197,
+     "packs": 8,
+     "responses": 9,
+     "nonadvancing": 0
+    },
+    "stale": {
+     "bytes": 152087,
+     "ideal": 74105,
+     "packs": 1,
+     "responses": 1,
+     "nonadvancing": 0
+    }
+   },
+   "live_latency_s": [
+    0.4,
+    0.7,
+    0.7,
+    0.7,
+    0.6,
+    0.7,
+    0.7,
+    0.7,
+    0.7,
+    0.7,
+    0.7,
+    0.7,
+    1.01,
+    0.7,
+    0.0
+   ]
+  }
+ },
+ {
+  "impl": "opus",
+  "passed": 918,
+  "failed": 0,
+  "failures": [],
+  "info": {
+   "genesis_s": [
+    0.015
+   ],
+   "ready_s": 0.483,
+   "cold_bytes": [
+    26866,
+    37063,
+    41086,
+    43624,
+    47147,
+    49554,
+    53586,
+    56132,
+    60126,
+    62750,
+    66439,
+    68845,
+    72893,
+    75445,
+    79422,
+    81965,
+    85707,
+    88108,
+    92078,
+    94683,
+    98653,
+    101201,
+    104976,
+    107365,
+    111301,
+    113837,
+    113837,
+    114576,
+    114838,
+    116776,
+    116913,
+    119145,
+    123361,
+    118903,
+    121289,
+    122954,
+    125487,
+    125487
+   ],
+   "step_s": [
+    [
+     "s1",
+     0.015
+    ],
+    [
+     "s2",
+     0.015
+    ],
+    [
+     "s3",
+     0.015
+    ],
+    [
+     "s4",
+     0.015
+    ],
+    [
+     "s5",
+     0.015
+    ],
+    [
+     "s6",
+     0.015
+    ],
+    [
+     "s7",
+     0.015
+    ],
+    [
+     "s8",
+     0.015
+    ],
+    [
+     "s9",
+     0.015
+    ],
+    [
+     "s10",
+     0.015
+    ],
+    [
+     "s11",
+     0.015
+    ],
+    [
+     "s12",
+     0.015
+    ],
+    [
+     "s13",
+     0.015
+    ],
+    [
+     "s14",
+     0.015
+    ],
+    [
+     "s15",
+     0.015
+    ],
+    [
+     "s16",
+     0.015
+    ],
+    [
+     "s17",
+     0.015
+    ],
+    [
+     "s18",
+     0.015
+    ],
+    [
+     "s19",
+     0.015
+    ],
+    [
+     "s20",
+     0.015
+    ],
+    [
+     "s21",
+     0.015
+    ],
+    [
+     "s22",
+     0.015
+    ],
+    [
+     "s23",
+     0.015
+    ],
+    [
+     "s24",
+     0.015
+    ],
+    [
+     "s25",
+     0.015
+    ],
+    [
+     "s26",
+     0.007
+    ],
+    [
+     "merge",
+     0.016
+    ],
+    [
+     "revert",
+     0.015
+    ],
+    [
+     "after-restart",
+     0.015
+    ],
+    [
+     "readd",
+     0.015
+    ],
+    [
+     "12h",
+     0.031
+    ],
+    [
+     "rewrite",
+     0.015
+    ],
+    [
+     "sun-weekly",
+     0.032
+    ],
+    [
+     "sun-15m",
+     0.015
+    ],
+    [
+     "mon-weekly",
+     0.015
+    ],
+    [
+     "mon-15m",
+     0.015
+    ],
+    [
+     "mon-1h",
+     0.003
+    ]
+   ],
+   "live_in_prefetch": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "unseen_branch_get": 404,
+   "post_extra_objects": 617,
+   "closure_d1": {
+    "objects": 33,
+    "required": 33,
+    "blobs": 0
+   },
+   "closure_d2": {
+    "objects": 38,
+    "required": 38,
+    "blobs": 0
+   },
+   "closure_d3": {
+    "objects": 43,
+    "required": 43,
+    "blobs": 0
+   },
+   "unknown_in_post": 404,
+   "unknown_in_sizes": [
+    404,
+    "not found\n"
+   ],
+   "post_loose_accept": [
+    200,
+    "application/x-git-packfile"
+   ],
+   "robustness_status": {
+    "get_short_oid": 404,
+    "get_nonhex_oid": 404,
+    "get_uppercase_oid": 200,
+    "prefetch_bad_ts": 200,
+    "prefetch_negative_ts": 200,
+    "post_bad_json": 400,
+    "post_empty_ids": 400,
+    "post_bad_oid": 400,
+    "post_neg_depth": 200,
+    "sizes_not_array": 200,
+    "sizes_empty": 200,
+    "unknown_path": 404,
+    "big_body": "EXC BrokenPipeError"
+   },
+   "idle100": {
+    "opened": 100,
+    "config_latency_s": 0.0
+   },
+   "idle300": {
+    "opened": 300,
+    "config_latency_s": 0.106
+   },
+   "idle1000": {
+    "opened": 1000,
+    "config_latency_s": 0.0
+   },
+   "max_batch_ok": {
+    "sizes": 16000,
+    "objects": 16000
+   },
+   "hot_allocs": [
+    0.0
+   ],
+   "metric_errors": {},
+   "clients": {
+    "poller": {
+     "bytes": 618636,
+     "ideal": 500548,
+     "packs": 48,
+     "responses": 50,
+     "nonadvancing": 0
+    },
+    "hourly": {
+     "bytes": 264128,
+     "ideal": 192903,
+     "packs": 16,
+     "responses": 17,
+     "nonadvancing": 0
+    },
+    "dev": {
+     "bytes": 226365,
+     "ideal": 155982,
+     "packs": 12,
+     "responses": 13,
+     "nonadvancing": 0
+    },
+    "late": {
+     "bytes": 181645,
+     "ideal": 117197,
+     "packs": 8,
+     "responses": 9,
+     "nonadvancing": 0
+    },
+    "stale": {
+     "bytes": 161335,
+     "ideal": 74105,
+     "packs": 1,
+     "responses": 1,
+     "nonadvancing": 0
+    }
+   },
+   "live_latency_s": [
+    0.4,
+    0.7,
+    0.7,
+    0.7,
+    0.6,
+    0.7,
+    0.7,
+    0.7,
+    0.7,
+    0.7,
+    0.7,
+    0.7,
+    1.01,
+    0.7,
+    0.0
+   ]
+  }
+ },
+ {
+  "impl": "fable",
+  "passed": 923,
+  "failed": 0,
+  "failures": [],
+  "info": {
+   "genesis_s": [
+    0.016
+   ],
+   "ready_s": 0.051,
+   "cold_bytes": [
+    26866,
+    36929,
+    48616,
+    59164,
+    70814,
+    81359,
+    93529,
+    104541,
+    117134,
+    128675,
+    141389,
+    152861,
+    165972,
+    177914,
+    191418,
+    203813,
+    217513,
+    229683,
+    243408,
+    256096,
+    270278,
+    283362,
+    297802,
+    309505,
+    322746,
+    334903,
+    334903,
+    335638,
+    335779,
+    337999,
+    338136,
+    340358,
+    342577,
+    66860,
+    69237,
+    68132,
+    70658,
+    70658
+   ],
+   "step_s": [
+    [
+     "s1",
+     0.015
+    ],
+    [
+     "s2",
+     0.015
+    ],
+    [
+     "s3",
+     0.007
+    ],
+    [
+     "s4",
+     0.007
+    ],
+    [
+     "s5",
+     0.007
+    ],
+    [
+     "s6",
+     0.015
+    ],
+    [
+     "s7",
+     0.007
+    ],
+    [
+     "s8",
+     0.007
+    ],
+    [
+     "s9",
+     0.007
+    ],
+    [
+     "s10",
+     0.015
+    ],
+    [
+     "s11",
+     0.007
+    ],
+    [
+     "s12",
+     0.007
+    ],
+    [
+     "s13",
+     0.007
+    ],
+    [
+     "s14",
+     0.015
+    ],
+    [
+     "s15",
+     0.007
+    ],
+    [
+     "s16",
+     0.007
+    ],
+    [
+     "s17",
+     0.007
+    ],
+    [
+     "s18",
+     0.015
+    ],
+    [
+     "s19",
+     0.007
+    ],
+    [
+     "s20",
+     0.007
+    ],
+    [
+     "s21",
+     0.007
+    ],
+    [
+     "s22",
+     0.015
+    ],
+    [
+     "s23",
+     0.007
+    ],
+    [
+     "s24",
+     0.007
+    ],
+    [
+     "s25",
+     0.007
+    ],
+    [
+     "s26",
+     0.007
+    ],
+    [
+     "merge",
+     0.007
+    ],
+    [
+     "revert",
+     0.007
+    ],
+    [
+     "after-restart",
+     0.007
+    ],
+    [
+     "readd",
+     0.007
+    ],
+    [
+     "12h",
+     0.015
+    ],
+    [
+     "rewrite",
+     0.007
+    ],
+    [
+     "sun-weekly",
+     0.031
+    ],
+    [
+     "sun-15m",
+     0.007
+    ],
+    [
+     "mon-weekly",
+     0.031
+    ],
+    [
+     "mon-15m",
+     0.007
+    ],
+    [
+     "mon-1h",
+     0.003
+    ]
+   ],
+   "live_in_prefetch": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "unseen_branch_get": 200,
+   "post_extra_objects": 0,
+   "closure_d1": {
+    "objects": 33,
+    "required": 33,
+    "blobs": 0
+   },
+   "closure_d2": {
+    "objects": 38,
+    "required": 38,
+    "blobs": 0
+   },
+   "closure_d3": {
+    "objects": 43,
+    "required": 43,
+    "blobs": 0
+   },
+   "unknown_in_post": 200,
+   "unknown_in_sizes": [
+    200,
+    "[{\"Id\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"Size\":0}]"
+   ],
+   "post_loose_accept": [
+    200,
+    "application/x-git-packfile"
+   ],
+   "robustness_status": {
+    "get_short_oid": 400,
+    "get_nonhex_oid": 400,
+    "get_uppercase_oid": 200,
+    "prefetch_bad_ts": 200,
+    "prefetch_negative_ts": 200,
+    "post_bad_json": 404,
+    "post_empty_ids": 404,
+    "post_bad_oid": 404,
+    "post_neg_depth": 200,
+    "sizes_not_array": 200,
+    "sizes_empty": 200,
+    "unknown_path": 404,
+    "big_body": 200
+   },
+   "idle100": {
+    "opened": 100,
+    "config_latency_s": 0.0
+   },
+   "idle300": {
+    "opened": 300,
+    "config_latency_s": 0.0
+   },
+   "idle1000": {
+    "opened": 1000,
+    "config_latency_s": 0.0
+   },
+   "max_batch_ok": {
+    "sizes": 64000,
+    "objects": 64000
+   },
+   "hot_allocs": [
+    0.0
+   ],
+   "metric_errors": {},
+   "clients": {
+    "poller": {
+     "bytes": 1255216,
+     "ideal": 500548,
+     "packs": 49,
+     "responses": 50,
+     "nonadvancing": 0
+    },
+    "hourly": {
+     "bytes": 826089,
+     "ideal": 192903,
+     "packs": 16,
+     "responses": 17,
+     "nonadvancing": 0
+    },
+    "dev": {
+     "bytes": 878011,
+     "ideal": 155982,
+     "packs": 12,
+     "responses": 13,
+     "nonadvancing": 0
+    },
+    "late": {
+     "bytes": 793687,
+     "ideal": 117197,
+     "packs": 8,
+     "responses": 9,
+     "nonadvancing": 0
+    },
+    "stale": {
+     "bytes": 99730,
+     "ideal": 74105,
+     "packs": 1,
+     "responses": 1,
+     "nonadvancing": 0
+    }
+   },
+   "live_latency_s": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ]
+  }
+ },
+ {
+  "impl": "sol",
+  "passed": 918,
+  "failed": 0,
+  "failures": [],
+  "info": {
+   "genesis_s": [
+    0.214
+   ],
+   "ready_s": 0.251,
+   "cold_bytes": [
+    30901,
+    40964,
+    63173,
+    73721,
+    96123,
+    106668,
+    129819,
+    140831,
+    164851,
+    176392,
+    200739,
+    212211,
+    237229,
+    249171,
+    275038,
+    287433,
+    313468,
+    325638,
+    351963,
+    364651,
+    391892,
+    404976,
+    431149,
+    442852,
+    468253,
+    480410,
+    480410,
+    481161,
+    481302,
+    483528,
+    483665,
+    485893,
+    488115,
+    130181,
+    132561,
+    134737,
+    137266,
+    137266
+   ],
+   "step_s": [
+    [
+     "s1",
+     0.114
+    ],
+    [
+     "s2",
+     0.129
+    ],
+    [
+     "s3",
+     0.114
+    ],
+    [
+     "s4",
+     0.114
+    ],
+    [
+     "s5",
+     0.114
+    ],
+    [
+     "s6",
+     0.129
+    ],
+    [
+     "s7",
+     0.114
+    ],
+    [
+     "s8",
+     0.114
+    ],
+    [
+     "s9",
+     0.114
+    ],
+    [
+     "s10",
+     0.129
+    ],
+    [
+     "s11",
+     0.114
+    ],
+    [
+     "s12",
+     0.114
+    ],
+    [
+     "s13",
+     0.114
+    ],
+    [
+     "s14",
+     0.129
+    ],
+    [
+     "s15",
+     0.114
+    ],
+    [
+     "s16",
+     0.113
+    ],
+    [
+     "s17",
+     0.114
+    ],
+    [
+     "s18",
+     0.129
+    ],
+    [
+     "s19",
+     0.113
+    ],
+    [
+     "s20",
+     0.114
+    ],
+    [
+     "s21",
+     0.114
+    ],
+    [
+     "s22",
+     0.129
+    ],
+    [
+     "s23",
+     0.114
+    ],
+    [
+     "s24",
+     0.114
+    ],
+    [
+     "s25",
+     0.114
+    ],
+    [
+     "s26",
+     0.019
+    ],
+    [
+     "merge",
+     0.114
+    ],
+    [
+     "revert",
+     0.114
+    ],
+    [
+     "after-restart",
+     0.164
+    ],
+    [
+     "readd",
+     0.114
+    ],
+    [
+     "12h",
+     0.129
+    ],
+    [
+     "rewrite",
+     0.114
+    ],
+    [
+     "sun-weekly",
+     0.227
+    ],
+    [
+     "sun-15m",
+     0.114
+    ],
+    [
+     "mon-weekly",
+     0.227
+    ],
+    [
+     "mon-15m",
+     0.113
+    ],
+    [
+     "mon-1h",
+     0.019
+    ]
+   ],
+   "live_in_prefetch": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "unseen_branch_get": 404,
+   "post_extra_objects": 406,
+   "closure_d1": {
+    "objects": 33,
+    "required": 33,
+    "blobs": 0
+   },
+   "closure_d2": {
+    "objects": 38,
+    "required": 38,
+    "blobs": 0
+   },
+   "closure_d3": {
+    "objects": 43,
+    "required": 43,
+    "blobs": 0
+   },
+   "unknown_in_post": 404,
+   "unknown_in_sizes": [
+    404,
+    "object not found\n"
+   ],
+   "post_loose_accept": [
+    200,
+    "application/x-git-packfile"
+   ],
+   "robustness_status": {
+    "get_short_oid": 400,
+    "get_nonhex_oid": 400,
+    "get_uppercase_oid": 200,
+    "prefetch_bad_ts": 400,
+    "prefetch_negative_ts": 400,
+    "post_bad_json": 400,
+    "post_empty_ids": 200,
+    "post_bad_oid": 400,
+    "post_neg_depth": 400,
+    "sizes_not_array": 400,
+    "sizes_empty": 200,
+    "unknown_path": 404,
+    "big_body": 413
+   },
+   "idle100": {
+    "opened": 100,
+    "config_latency_s": 0.018
+   },
+   "idle300": {
+    "opened": 300,
+    "config_latency_s": 0.0
+   },
+   "idle1000": {
+    "opened": 1000,
+    "config_latency_s": 0.0
+   },
+   "max_batch_ok": {
+    "sizes": 16000,
+    "objects": 16000
+   },
+   "hot_allocs": [
+    0.0
+   ],
+   "metric_errors": {
+    "gvfs_errors_total": 7.0
+   },
+   "clients": {
+    "poller": {
+     "bytes": 733714,
+     "ideal": 500548,
+     "packs": 48,
+     "responses": 50,
+     "nonadvancing": 0
+    },
+    "hourly": {
+     "bytes": 550188,
+     "ideal": 192903,
+     "packs": 16,
+     "responses": 17,
+     "nonadvancing": 0
+    },
+    "dev": {
+     "bytes": 545772,
+     "ideal": 155982,
+     "packs": 12,
+     "responses": 13,
+     "nonadvancing": 0
+    },
+    "late": {
+     "bytes": 541356,
+     "ideal": 117197,
+     "packs": 8,
+     "responses": 9,
+     "nonadvancing": 0
+    },
+    "stale": {
+     "bytes": 166338,
+     "ideal": 74105,
+     "packs": 1,
+     "responses": 1,
+     "nonadvancing": 0
+    }
+   },
+   "live_latency_s": [
+    0.2,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.5,
+    0.4,
+    0.5,
+    0.5,
+    0.4,
+    0.5,
+    0.5,
+    0.81,
+    0.4,
+    0.0
+   ]
+  }
+ },
+ {
+  "impl": "astra",
+  "passed": 784,
+  "failed": 6,
+  "failures": [
+   [
+    "prefetch:future_zero",
+    false,
+    "bad GPRE header b'request '"
+   ],
+   [
+    "stale:status200",
+    false,
+    "status 503 b'request failed\\n'"
+   ],
+   [
+    "robust:no_5xx_or_drop",
+    false,
+    "{'get_short_oid': 'EXC RemoteDisconnected', 'get_nonhex_oid': 'EXC RemoteDisconnected', 'prefetch_bad_ts': 'EXC RemoteDisconnected', 'prefetch_negative_ts': 'EXC RemoteDisconnected', 'post_bad_json': 503, 'post_empty_ids': 503, 'post_bad_oid': 503, 'post_neg_depth': 503, 'sizes_not_array': 503}"
+   ],
+   [
+    "robust:idle100_dont_starve",
+    false,
+    "opened 100/100, latency None"
+   ],
+   [
+    "robust:idle300_dont_starve",
+    false,
+    "opened 137/300, latency None"
+   ],
+   [
+    "robust:idle1000_dont_starve",
+    false,
+    "opened 137/1000, latency None"
+   ]
+  ],
+  "info": {
+   "genesis_s": [
+    0.114
+   ],
+   "ready_s": 0.11,
+   "cold_bytes": [
+    30720,
+    40783,
+    62992,
+    73540,
+    95942,
+    106487,
+    129638,
+    140650,
+    164670,
+    176211,
+    200558,
+    212030,
+    237048,
+    248990,
+    274857,
+    287252,
+    313287,
+    325457,
+    351782,
+    364470,
+    391711,
+    404795,
+    430968,
+    442671,
+    468072,
+    480229,
+    480229,
+    480980,
+    481121,
+    483347,
+    483484,
+    485712,
+    487934,
+    181558,
+    183938,
+    178937,
+    181466,
+    181466
+   ],
+   "step_s": [
+    [
+     "s1",
+     0.114
+    ],
+    [
+     "s2",
+     0.067
+    ],
+    [
+     "s3",
+     0.063
+    ],
+    [
+     "s4",
+     0.064
+    ],
+    [
+     "s5",
+     0.063
+    ],
+    [
+     "s6",
+     0.071
+    ],
+    [
+     "s7",
+     0.064
+    ],
+    [
+     "s8",
+     0.064
+    ],
+    [
+     "s9",
+     0.063
+    ],
+    [
+     "s10",
+     0.071
+    ],
+    [
+     "s11",
+     0.064
+    ],
+    [
+     "s12",
+     0.063
+    ],
+    [
+     "s13",
+     0.064
+    ],
+    [
+     "s14",
+     0.071
+    ],
+    [
+     "s15",
+     0.064
+    ],
+    [
+     "s16",
+     0.063
+    ],
+    [
+     "s17",
+     0.063
+    ],
+    [
+     "s18",
+     0.071
+    ],
+    [
+     "s19",
+     0.063
+    ],
+    [
+     "s20",
+     0.064
+    ],
+    [
+     "s21",
+     0.064
+    ],
+    [
+     "s22",
+     0.071
+    ],
+    [
+     "s23",
+     0.064
+    ],
+    [
+     "s24",
+     0.064
+    ],
+    [
+     "s25",
+     0.063
+    ],
+    [
+     "s26",
+     0.01
+    ],
+    [
+     "merge",
+     0.064
+    ],
+    [
+     "revert",
+     0.063
+    ],
+    [
+     "after-restart",
+     0.114
+    ],
+    [
+     "readd",
+     0.063
+    ],
+    [
+     "12h",
+     0.079
+    ],
+    [
+     "rewrite",
+     0.064
+    ],
+    [
+     "sun-weekly",
+     0.095
+    ],
+    [
+     "sun-15m",
+     0.064
+    ],
+    [
+     "mon-weekly",
+     0.177
+    ],
+    [
+     "mon-15m",
+     0.063
+    ],
+    [
+     "mon-1h",
+     0.011
+    ]
+   ],
+   "resend_after_complete": [
+    "s2:poller-live 10259B",
+    "s4:poller-live 10735B",
+    "s6:poller-live 10799B",
+    "s8:poller-live 11201B",
+    "s10:poller-live 11657B",
+    "s12:poller-live 11661B",
+    "s14:poller-live 12123B",
+    "s16:poller-live 12653B",
+    "s18:poller-live 12354B",
+    "s20:poller-live 12811B",
+    "s22:poller-live 13277B",
+    "s24:poller-live 11884B"
+   ],
+   "live_in_prefetch": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "unseen_branch_get": 404,
+   "post_extra_objects": 56,
+   "closure_d1": {
+    "objects": 476,
+    "required": 33,
+    "blobs": 443
+   },
+   "closure_d2": {
+    "objects": 482,
+    "required": 38,
+    "blobs": 444
+   },
+   "closure_d3": {
+    "objects": 488,
+    "required": 43,
+    "blobs": 445
+   },
+   "unknown_in_post": 404,
+   "unknown_in_sizes": [
+    404,
+    "request failed\n"
+   ],
+   "post_loose_accept": [
+    200,
+    "application/x-git-packfile"
+   ],
+   "robustness_status": {
+    "get_short_oid": "EXC RemoteDisconnected",
+    "get_nonhex_oid": "EXC RemoteDisconnected",
+    "get_uppercase_oid": 200,
+    "prefetch_bad_ts": "EXC RemoteDisconnected",
+    "prefetch_negative_ts": "EXC RemoteDisconnected",
+    "post_bad_json": 503,
+    "post_empty_ids": 503,
+    "post_bad_oid": 503,
+    "post_neg_depth": 503,
+    "sizes_not_array": 503,
+    "sizes_empty": 200,
+    "unknown_path": 404,
+    "big_body": 404
+   },
+   "idle100": {
+    "opened": 100,
+    "config_latency_s": null
+   },
+   "idle300": {
+    "opened": 137,
+    "config_latency_s": null
+   },
+   "idle1000": {
+    "opened": 137,
+    "config_latency_s": null
+   },
+   "max_batch_ok": {
+    "sizes": 64000,
+    "objects": 64000
+   },
+   "hot_allocs": [
+    0.0
+   ],
+   "metric_errors": {
+    "gvfs_errors_total": 16.0
+   },
+   "clients": {
+    "poller": {
+     "bytes": 640133,
+     "ideal": 500548,
+     "packs": 48,
+     "responses": 50,
+     "nonadvancing": 24
+    },
+    "hourly": {
+     "bytes": 498079,
+     "ideal": 192903,
+     "packs": 16,
+     "responses": 17,
+     "nonadvancing": 0
+    },
+    "dev": {
+     "bytes": 497951,
+     "ideal": 155984,
+     "packs": 12,
+     "responses": 13,
+     "nonadvancing": 0
+    },
+    "late": {
+     "bytes": 497823,
+     "ideal": 117197,
+     "packs": 8,
+     "responses": 9,
+     "nonadvancing": 0
+    },
+    "stale": {
+     "bytes": 0,
+     "ideal": 0,
+     "packs": 0,
+     "responses": 0,
+     "nonadvancing": 0
+    }
+   },
+   "live_latency_s": [
+    0.3,
+    0.6,
+    0.7,
+    0.6,
+    0.6,
+    0.6,
+    0.7,
+    0.6,
+    0.6,
+    0.6,
+    0.6,
+    0.6,
+    1.0,
+    0.6,
+    0.0
+   ]
+  }
+ },
+ {
+  "impl": "argon",
+  "passed": 490,
+  "failed": 115,
+  "failures": [
+   [
+    "s1-15m:poller:complete",
+    false,
+    "1 missing of tip 49385d62ae: ['49385d62aeeb320d7e3af831c88deea49903da90']"
+   ],
+   [
+    "s2:poller-live:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 49385d62aeeb320d7e3af831c88deea49903da90\n"
+   ],
+   [
+    "s2:poller-live:has_sealed",
+    false,
+    ""
+   ],
+   [
+    "s2-1h:poller:complete",
+    false,
+    "1 missing of tip 5e5dd68939: ['5e5dd6893941bdbdf4340d96205af4b8ebc51500']"
+   ],
+   [
+    "s2-1h:hourly:complete",
+    false,
+    "1 missing of tip 5e5dd68939: ['5e5dd6893941bdbdf4340d96205af4b8ebc51500']"
+   ],
+   [
+    "s3-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 042062dcc64758c3e31bf31e68bc8e0cb7b66bab\n"
+   ],
+   [
+    "s4:poller-live:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 042062dcc64758c3e31bf31e68bc8e0cb7b66bab\n"
+   ],
+   [
+    "s4:poller-live:has_sealed",
+    false,
+    ""
+   ],
+   [
+    "s4-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 042062dcc64758c3e31bf31e68bc8e0cb7b66bab\n"
+   ],
+   [
+    "s5-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 042062dcc64758c3e31bf31e68bc8e0cb7b66bab\n"
+   ],
+   [
+    "s6:poller-live:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 042062dcc64758c3e31bf31e68bc8e0cb7b66bab\n"
+   ],
+   [
+    "s6:poller-live:has_sealed",
+    false,
+    ""
+   ],
+   [
+    "s6-6h:poller:complete",
+    false,
+    "1 missing of tip 1e613fe120: ['1e613fe120809fc284a4e66c5ee76c146df43512']"
+   ],
+   [
+    "s6-6h:hourly:complete",
+    false,
+    "1 missing of tip 1e613fe120: ['1e613fe120809fc284a4e66c5ee76c146df43512']"
+   ],
+   [
+    "s7-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+   ],
+   [
+    "s8:poller-live:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+   ],
+   [
+    "s8:poller-live:has_sealed",
+    false,
+    ""
+   ],
+   [
+    "s8-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+   ],
+   [
+    "s8-15m:dev:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+   ],
+   [
+    "s9-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+   ],
+   [
+    "s10:poller-live:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+   ],
+   [
+    "s10:poller-live:has_sealed",
+    false,
+    ""
+   ],
+   [
+    "s10-1h:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+   ],
+   [
+    "s10-1h:hourly:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+   ],
+   [
+    "s11-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+   ],
+   [
+    "s12:poller-live:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s12:poller-live:has_sealed",
+    false,
+    ""
+   ],
+   [
+    "s12-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s13-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s14:poller-live:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s14:poller-live:has_sealed",
+    false,
+    ""
+   ],
+   [
+    "s14-1h:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s14-1h:hourly:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s15-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s16:poller-live:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s16:poller-live:has_sealed",
+    false,
+    ""
+   ],
+   [
+    "s16-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s16-15m:dev:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s17-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s18:poller-live:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s18:poller-live:has_sealed",
+    false,
+    ""
+   ],
+   [
+    "s18-1h:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s18-1h:hourly:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s19-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s20:poller-live:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s20:poller-live:has_sealed",
+    false,
+    ""
+   ],
+   [
+    "s20-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s21-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s22:poller-live:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s22:poller-live:has_sealed",
+    false,
+    ""
+   ],
+   [
+    "s22-1h:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s22-1h:hourly:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s23-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s24:poller-live:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s24:poller-live:has_sealed",
+    false,
+    ""
+   ],
+   [
+    "s24-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s24-15m:dev:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s25-15m:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s26-1h:poller:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ],
+   [
+    "s26-1h:hourly:index_pack_strict",
+    false,
+    "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+   ]
+  ],
+  "info": {
+   "genesis_s": [
+    0.064
+   ],
+   "ready_s": 0.351,
+   "cold_bytes": [
+    31263,
+    41980,
+    48020,
+    59223,
+    73565,
+    84770,
+    68394,
+    80059,
+    95153,
+    107349,
+    94374,
+    106499,
+    122268,
+    134857,
+    121027,
+    134070,
+    150454,
+    163273,
+    149126,
+    162470,
+    179172,
+    192912,
+    176571,
+    188937,
+    204709,
+    217541,
+    197122,
+    197878,
+    198019,
+    200253,
+    200390
+   ],
+   "step_s": [
+    [
+     "s1",
+     0.064
+    ],
+    [
+     "s2",
+     0.114
+    ],
+    [
+     "s3",
+     0.064
+    ],
+    [
+     "s4",
+     0.064
+    ],
+    [
+     "s5",
+     0.063
+    ],
+    [
+     "s6",
+     0.114
+    ],
+    [
+     "s7",
+     0.064
+    ],
+    [
+     "s8",
+     0.063
+    ],
+    [
+     "s9",
+     0.063
+    ],
+    [
+     "s10",
+     0.113
+    ],
+    [
+     "s11",
+     0.063
+    ],
+    [
+     "s12",
+     0.063
+    ],
+    [
+     "s13",
+     0.063
+    ],
+    [
+     "s14",
+     0.114
+    ],
+    [
+     "s15",
+     0.063
+    ],
+    [
+     "s16",
+     0.063
+    ],
+    [
+     "s17",
+     0.063
+    ],
+    [
+     "s18",
+     0.114
+    ],
+    [
+     "s19",
+     0.064
+    ],
+    [
+     "s20",
+     0.064
+    ],
+    [
+     "s21",
+     0.063
+    ],
+    [
+     "s22",
+     0.114
+    ],
+    [
+     "s23",
+     0.063
+    ],
+    [
+     "s24",
+     0.064
+    ],
+    [
+     "s25",
+     0.063
+    ],
+    [
+     "s26",
+     0.114
+    ],
+    [
+     "merge",
+     0.064
+    ],
+    [
+     "revert",
+     0.063
+    ],
+    [
+     "after-restart",
+     0.064
+    ],
+    [
+     "readd",
+     0.063
+    ],
+    [
+     "12h",
+     0.114
+    ],
+    [
+     "rewrite",
+     0.064
+    ],
+    [
+     "sun-weekly",
+     0.114
+    ],
+    [
+     "sun-15m",
+     0.063
+    ],
+    [
+     "mon-weekly",
+     0.164
+    ],
+    [
+     "mon-15m",
+     0.064
+    ],
+    [
+     "mon-1h",
+     0.064
+    ]
+   ],
+   "live_in_prefetch": [
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false
+   ],
+   "unseen_branch_get": 404,
+   "post_extra_objects": 0,
+   "closure_d1": {
+    "objects": 33,
+    "required": 33,
+    "blobs": 0
+   },
+   "closure_d2": {
+    "objects": 38,
+    "required": 38,
+    "blobs": 0
+   },
+   "closure_d3": {
+    "objects": 43,
+    "required": 43,
+    "blobs": 0
+   },
+   "unknown_in_post": 404,
+   "unknown_in_sizes": [
+    404,
+    "object not found\n"
+   ],
+   "post_loose_accept": [
+    200,
+    "application/x-git-packfile"
+   ],
+   "robustness_status": {
+    "get_short_oid": 400,
+    "get_nonhex_oid": 400,
+    "get_uppercase_oid": 200,
+    "prefetch_bad_ts": 500,
+    "prefetch_negative_ts": 500,
+    "post_bad_json": 400,
+    "post_empty_ids": 400,
+    "post_bad_oid": 400,
+    "post_neg_depth": 400,
+    "sizes_not_array": 400,
+    "sizes_empty": 200,
+    "unknown_path": 404,
+    "big_body": 404
+   },
+   "idle100": {
+    "opened": 100,
+    "config_latency_s": 0.017
+   },
+   "idle300": {
+    "opened": 300,
+    "config_latency_s": 0.0
+   },
+   "idle1000": {
+    "opened": 1000,
+    "config_latency_s": 0.0
+   },
+   "max_batch_ok": {
+    "sizes": 16000,
+    "objects": 64000
+   },
+   "hot_allocs": [
+    5944.0
+   ],
+   "metric_errors": {},
+   "clients": {
+    "poller": {
+     "bytes": 42667,
+     "ideal": 27702,
+     "packs": 1,
+     "responses": 46,
+     "nonadvancing": 0
+    },
+    "hourly": {
+     "bytes": 42667,
+     "ideal": 27702,
+     "packs": 1,
+     "responses": 13,
+     "nonadvancing": 0
+    },
+    "dev": {
+     "bytes": 42667,
+     "ideal": 27702,
+     "packs": 1,
+     "responses": 9,
+     "nonadvancing": 0
+    },
+    "late": {
+     "bytes": 42667,
+     "ideal": 27702,
+     "packs": 1,
+     "responses": 5,
+     "nonadvancing": 0
+    },
+    "stale": {
+     "bytes": 0,
+     "ideal": 0,
+     "packs": 0,
+     "responses": 0,
+     "nonadvancing": 0
+    }
+   },
+   "live_latency_s": [
+    0.3,
+    0.5,
+    0.7,
+    0.5,
+    0.6,
+    0.6,
+    0.6,
+    0.5,
+    0.6,
+    0.6,
+    0.6,
+    0.5,
+    0.81,
+    0.6,
+    0.0
+   ]
+  }
+ }
+]

@@ -1,0 +1,38 @@
+## failures / pipeline / freshness
+- opus-75271a2: failures 0 [] | pipeline runs 672 total 24s max 6.9s {'15m': '504x avg 0.02s max 0.1s', '1h': '140x avg 0.03s max 0.1s', '6h': '14x avg 0.04s max 0.1s', '12h': '7x avg 0.07s max 0.1s', '24h': '6x avg 0.10s max 0.1s', '168h': '1x avg 6.93s max 6.9s'} | live wait p50 0.45s max 1.06s (n=1410) | metrics {'gvfs_errors_total': 0.0, 'gvfs_alloc_hot_path_total': 0.0, 'gvfs_alloc_hot_path_bytes_total': 0.0, 'gvfs_alloc_post_seal_total': 3145157.0} | elapsed 3646s
+- opus-70091b7: failures 0 [] | pipeline runs 672 total 25s max 7.2s {'15m': '504x avg 0.02s max 0.2s', '1h': '140x avg 0.03s max 0.1s', '6h': '14x avg 0.05s max 0.1s', '12h': '7x avg 0.08s max 0.1s', '24h': '6x avg 0.10s max 0.1s', '168h': '1x avg 7.18s max 7.2s'} | live wait p50 0.45s max 1.05s (n=1410) | metrics {'gvfs_errors_total': 0.0, 'gvfs_alloc_hot_path_total': 0.0, 'gvfs_alloc_hot_path_bytes_total': 0.0, 'gvfs_alloc_post_seal_total': 3164729.0} | elapsed 3631s
+
+## warm clients: MB received (pack+idx) / ideal, packs, worst response
+| client | opus-75271a2 | opus-70091b7 |
+|---|---|---|
+| agent, every minute | 43.2 / 41.9 MB = **1.03×** (pack only 1.03×); 1404 packs / 10080 req; max 0.2 MB; fails 0 | 43.2 / 41.9 MB = **1.03×** (pack only 1.03×); 1404 packs / 10080 req; max 0.2 MB; fails 0 |
+| agent, every 15 min | 23.8 / 23.4 MB = **1.02×** (pack only 1.02×); 522 packs / 672 req; max 0.3 MB; fails 0 | 23.8 / 23.4 MB = **1.02×** (pack only 1.02×); 522 packs / 672 req; max 0.3 MB; fails 0 |
+| agent, hourly | 13.7 / 13.7 MB = **1.00×** (pack only 1.00×); 164 packs / 168 req; max 0.3 MB; fails 0 | 13.7 / 13.7 MB = **1.00×** (pack only 1.00×); 164 packs / 168 req; max 0.3 MB; fails 0 |
+| laptop, hourly 08-18 weekdays | 7.9 / 8.0 MB = **0.99×** (pack only 0.99×); 55 packs / 55 req; max 1.0 MB; fails 0 | 7.9 / 8.0 MB = **0.99×** (pack only 0.99×); 55 packs / 55 req; max 1.0 MB; fails 0 |
+| developer 09:00/13:00/17:30 | 5.2 / 5.3 MB = **0.98×** (pack only 0.98×); 15 packs / 15 req; max 1.0 MB; fails 0 | 5.2 / 5.3 MB = **0.98×** (pack only 0.98×); 15 packs / 15 req; max 1.0 MB; fails 0 |
+| developer, mornings | 3.5 / 3.7 MB = **0.97×** (pack only 0.97×); 5 packs / 5 req; max 1.2 MB; fails 0 | 3.5 / 3.7 MB = **0.97×** (pack only 0.97×); 5 packs / 5 req; max 1.2 MB; fails 0 |
+| back after 6 days off | 2.6 / 2.8 MB = **0.94×** (pack only 0.94×); 2 packs / 2 req; max 2.2 MB; fails 0 | 2.6 / 2.8 MB = **0.94×** (pack only 0.94×); 2 packs / 2 req; max 2.2 MB; fails 0 |
+| stale client (cursor 1) | 2599.1 / 3.0 MB = **876.77×** (pack only 876.77×); 1 packs / 1 req; max 2599.1 MB; fails 0 | 2599.1 / 3.0 MB = **876.77×** (pack only 876.77×); 1 packs / 1 req; max 2599.1 MB; fails 0 |
+
+## latency of warm prefetch requests (client-side, ms)
+- opus-75271a2: all p50 0.09 p99 3.64 max 144.6 | with data p50 0.13 p99 8.74 max 144.6
+- opus-70091b7: all p50 0.09 p99 3.63 max 144.9 | with data p50 0.13 p99 8.70 max 144.9
+
+## cold clones
+- opus-75271a2: 84 clones, 84 exact; bytes min/avg/max 2.596/2.598/2.599 GB; time p50 1.16s max 1.55s
+- opus-70091b7: 84 clones, 84 exact; bytes min/avg/max 2.596/2.598/2.599 GB; time p50 1.17s max 1.44s
+
+## resent objects (already held by the client) and non-advancing responses
+- opus-75271a2: resent objects 2523, non-advancing responses 0
+- opus-70091b7: resent objects 2523, non-advancing responses 0
+
+## same window for all: until 1792281600 — MB received / MB ideal (ratio), packs
+| client | opus-75271a2 | opus-70091b7 |
+|---|---|---|
+| agent, every minute | **1.04×** (1.03× pack only), 30.6 MB, 998 packs | **1.04×** (1.03× pack only), 30.6 MB, 998 packs |
+| agent, every 15 min | **1.02×** (1.02× pack only), 17.0 MB, 374 packs | **1.02×** (1.02× pack only), 17.0 MB, 374 packs |
+| agent, hourly | **1.00×** (1.00× pack only), 9.7 MB, 116 packs | **1.00×** (1.00× pack only), 9.7 MB, 116 packs |
+| laptop, hourly 08-18 weekdays | **0.99×** (0.99× pack only), 5.4 MB, 44 packs | **0.99×** (0.99× pack only), 5.4 MB, 44 packs |
+| developer 09:00/13:00/17:30 | **0.98×** (0.98× pack only), 3.5 MB, 12 packs | **0.98×** (0.98× pack only), 3.5 MB, 12 packs |
+| developer, mornings | **0.97×** (0.97× pack only), 2.3 MB, 4 packs | **0.97×** (0.97× pack only), 2.3 MB, 4 packs |
+| back after 6 days off | **1.00×** (1.00× pack only), 0.4 MB, 1 packs | **1.00×** (1.00× pack only), 0.4 MB, 1 packs |

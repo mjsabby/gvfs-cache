@@ -1,6 +1,7 @@
 """A/B: frozen baseline binary vs candidate binary, alternating runs, same pinning.
 
-usage: ab.py <impl> <candidate-binary> <workload> [<workload>...]   (env ROUNDS, DUR)
+usage: ab.py <impl> <candidate-binary> <workload> [<workload>...]
+       (env ROUNDS, DUR, AB_BASE, AB_BASE_WORK, AB_CAND_WORK, AB_EXTRA_SERVE, AB_LOADGEN_CPUS)
 """
 import json
 import os
@@ -16,8 +17,8 @@ LG = os.environ.get("AB_LOADGEN_CPUS", "4-7,20-23")
 
 
 def one(name, binary, wl, dur, work=None):
-    im = impls.ALL[name](work or os.path.join(SG, name), binary=binary,
-                         extra_serve=load_bench.SERVE_EXTRA.get(name, []))
+    extra = load_bench.SERVE_EXTRA.get(name, []) + os.environ.get("AB_EXTRA_SERVE", "").split()
+    im = impls.ALL[name](work or os.path.join(SG, name), binary=binary, extra_serve=extra)
     srv = im.serve(os.path.join(SG, "up.git"), live=False, taskset=SERVER_CPUS, ready_timeout=900)
     try:
         cursor = load_bench.peek_cold_ts(srv.port)

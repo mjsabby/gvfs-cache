@@ -75,8 +75,9 @@ def stream_to(port, method, path, body, out_prefix, headers=None):
 
 
 def verify(name, out_root):
-    work = os.path.join(SG, name)
-    vdir = os.path.join(SG, "verify", name)
+    # VERIFY_WORK: another store for the same implementation (e.g. one written by a newer build)
+    work = os.environ.get("VERIFY_WORK") or os.path.join(SG, name)
+    vdir = os.path.join(SG, "verify", name + os.environ.get("VERIFY_TAG", ""))
     shutil.rmtree(vdir, ignore_errors=True)
     os.makedirs(vdir)
     res = {"impl": name}

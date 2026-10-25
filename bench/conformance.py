@@ -64,9 +64,15 @@ class Client:
         self.ideal = 0
 
 
+VARIANTS = {  # name -> (adapter, binary)
+    "opus-orig": ("opus", "/home/muks/gvfs-bench/frozen/opus-orig-gvfs-daemon"),
+}
+
+
 class Suite:
     def __init__(self, name, src, oids, base=BASE):
         self.name = name
+        impl, binary = VARIANTS.get(name, (name, None))
         self.work = os.path.join(base, name)
         shutil.rmtree(self.work, ignore_errors=True)
         os.makedirs(self.work)
@@ -77,7 +83,7 @@ class Suite:
         self.checks = []
         self.info = {}
         self.clock = impls.Clock(os.path.join(self.work, "faketime"), corpus.T0)
-        self.im = impls.ALL[name](self.work, clock=self.clock)
+        self.im = impls.ALL[impl](self.work, clock=self.clock, binary=binary)
         self.up = None
         self.srv = None
         self.clients = {}
@@ -620,6 +626,7 @@ def run_one(name, src, oids):
 
 def main():
     names = sys.argv[1:] or list(impls.ALL)
+    names = [n for n in names if n in impls.ALL or n in VARIANTS]
     os.makedirs(BASE, exist_ok=True)
     src = os.path.join(BASE, "src.git")
     shutil.rmtree(src, ignore_errors=True)
