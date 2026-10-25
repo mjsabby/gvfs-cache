@@ -297,6 +297,7 @@ class Suite:
         t = self.im.step(self.up, "15m")
         self.note("genesis_s", round(t, 3))
         self.sealed_tip = git_out(self.up, "rev-parse", "main")
+        self.genesis_tip = self.sealed_tip
         self.srv = self.im.serve(self.up, poll_s=1)
         self.info["ready_s"] = round(self.srv.ready_secs, 3)
         self.basic(self.sealed_tip)
@@ -358,6 +359,7 @@ class Suite:
         # ---------------- jump to 12:00 (12h), force-push rewrite, Sunday weekly, Monday weekly
         day0 = (F // 86400) * 86400
         for label, when, action in (
+                ("readd", day0 + 11 * 3600 + 45 * 60 + 5, "readd"),
                 ("12h", day0 + 12 * 3600 + 5, "commit"),
                 ("rewrite", day0 + 12 * 3600 + 900 + 5, "rewrite"),
                 ("sun-weekly", day0 + 86400 + 5, "commit"),
@@ -369,6 +371,12 @@ class Suite:
             self.clock.set(F)
             if action == "commit":
                 self.push(self.newer_commit(F - 60))
+            elif action == "readd":
+                # restore c1's tree: re-adds objects the baseline already holds that the
+                # upstream re-sends (c1 is history, not a tip negotiation can name)
+                x = corpus.restore_commit(self.src, git_out(self.up, "rev-parse", "main"),
+                                          self.oids["c1"], F - 60)
+                self.push(x)
             elif action == "rewrite":
                 base = oids["c30"]
                 self.extra_k += 1

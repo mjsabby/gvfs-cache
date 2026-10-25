@@ -126,7 +126,12 @@ def build_source(path, n=40, pointers_per_commit=6, wide=300, seed_commits=0):
                              "-m", "revert to c{n-1} tree", env=envr)
     for name, oid in oids.items():
         git(path, "update-ref", f"refs/tags/{name}", oid)
-    git(path, "repack", "-adf", "-q", "--window=50", "--depth=30")
+    # No reachability bitmaps (like SearchGold's clone): upload-pack then re-sends objects that
+    # older history already has (deleted and re-added files), as many real upstreams do.
+    git(path, "-c", "repack.writeBitmaps=false", "repack", "-adf", "-q", "--window=50", "--depth=30")
+    for f in os.listdir(os.path.join(path, "objects", "pack")):
+        if f.endswith(".bitmap"):
+            os.remove(os.path.join(path, "objects", "pack", f))
     return oids
 
 
@@ -141,6 +146,14 @@ def make_upstream(src, path, at):
 
 def move_main(up, oid):
     git(up, "update-ref", "refs/heads/main", oid)
+
+
+def restore_commit(src, parent, tree_of, when, msg="restore an old tree"):
+    """A commit on `parent` whose tree is `tree_of`'s tree: every object of that old tree is
+    re-added (upstream fetches re-send such objects; servers must not duplicate them)."""
+    tree = git_out(src, "rev-parse", f"{tree_of}^{{tree}}")
+    env = {"GIT_AUTHOR_DATE": f"{when} +0000", "GIT_COMMITTER_DATE": f"{when} +0000"}
+    return git_out(src, "commit-tree", tree, "-p", parent, "-m", msg, env=env)
 
 
 def extra_commit(src, parent, when, k, pointers=4):

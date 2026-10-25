@@ -154,7 +154,7 @@ impl View {
             Some((cell, from)) if client_ts >= self.warm_floor => {
                 let plan = cell.get_or_init(|| {
                     let _cold = gvfs_alloc_guard::cold_section();
-                    let (slabs, sources) = self.covered(from);
+                    let (slabs, sources, _) = self.covered(from, &[]);
                     (!slabs.is_empty()).then(|| Arc::new(PackPlan::with_sources(slabs, sources)))
                 });
                 match plan {
@@ -168,9 +168,19 @@ impl View {
                         let _cold = gvfs_alloc_guard::cold_section();
                         let mut slabs: Vec<Arc<Slab>> =
                             self.all.get(self.baseline).cloned().into_iter().collect();
-                        let (tail, sources) = self.covered(self.manifest.baseline.end_ts);
+                        // The tail is concatenated after the baseline in ONE pack: it must
+                        // not repeat any baseline object (upstreams re-send objects that
+                        // older history already has, e.g. after a revert), or the pack has
+                        // duplicate entries that `index-pack --strict` rejects.
+                        let base = slabs.clone();
+                        let (tail, sources, end) =
+                            self.covered(self.manifest.baseline.end_ts, &base);
                         slabs.extend(tail);
-                        Arc::new(PackPlan::with_sources(slabs, sources.saturating_add(1)))
+                        let mut plan = PackPlan::with_sources(slabs, sources.saturating_add(1));
+                        // Even when every tail object was already in the baseline, the
+                        // client is now current up to the cover's end.
+                        plan.timestamp = plan.timestamp.max(end);
+                        Arc::new(plan)
                     })
                     .clone(),
             ),
@@ -186,9 +196,10 @@ impl View {
     }
 
     /// The slabs that take a client at boundary `from` to the tip: the timeline's cover,
-    /// repacked into one slab when it has several. Also returns how many timeline slabs the
-    /// answer is made of.
-    fn covered(&self, from: u64) -> (Vec<Arc<Slab>>, usize) {
+    /// repacked into one slab when it has several, or when it shares objects with `exclude`
+    /// (slabs sent in the same pack ahead of it), which the result then leaves out. Also
+    /// returns how many timeline slabs the answer is made of and the cover's end.
+    fn covered(&self, from: u64, exclude: &[Arc<Slab>]) -> (Vec<Arc<Slab>>, usize, u64) {
         let mut idx = Vec::new();
         let cover: Vec<Arc<Slab>> =
             if crate::timeline::cover(&self.spans, from, self.tip_ts, &mut idx) {
@@ -211,26 +222,46 @@ impl View {
                     .collect()
             };
         let n = cover.len();
-        if n > 1 {
-            if let Some(one) = merge(&cover) {
-                return (vec![one], n);
+        let end = cover.iter().map(|s| s.meta.end_ts).max().unwrap_or(0);
+        let overlaps = !exclude.is_empty()
+            && cover.iter().any(|s| {
+                s.records()
+                    .any(|r| exclude.iter().any(|e| e.find(&r.oid).is_some()))
+            });
+        if n > 1 || overlaps {
+            match merge(&cover, exclude) {
+                Merged::One(one) => return (vec![one], n, end),
+                Merged::Nothing => return (Vec::new(), n, end),
+                // Never concatenate overlapping slabs: the client gets what `exclude`
+                // holds now and the rest from its next (warm) prefetch.
+                Merged::Failed if overlaps => return (Vec::new(), n, 0),
+                Merged::Failed => {}
             }
         }
-        (cover, n)
+        (cover, n, end)
     }
 }
 
-/// One slab with the objects of `cover` (consecutive slabs), trees re-deltified across
-/// them. `None` (send the slabs as they are) if repacking fails.
-fn merge(cover: &[Arc<Slab>]) -> Option<Arc<Slab>> {
-    let (first, last) = (cover.first()?, cover.last()?);
+enum Merged {
+    One(Arc<Slab>),
+    /// Every object of the cover is in the excluded slabs.
+    Nothing,
+    Failed,
+}
+
+/// One slab with the objects of `cover` (consecutive slabs) that are not in `exclude`, trees
+/// re-deltified across them. [`Merged::Failed`]: send the slabs as they are.
+fn merge(cover: &[Arc<Slab>], exclude: &[Arc<Slab>]) -> Merged {
+    let (Some(first), Some(last)) = (cover.first(), cover.last()) else {
+        return Merged::Nothing;
+    };
     let mut repacker = Repacker::new();
     repacker.quiet = true;
     let mut indexer = Indexer::new(1);
     let input = Input {
         slabs: cover,
         frozen: None,
-        exclude: &[],
+        exclude,
         mode: Mode::Trees,
     };
     let range = (first.meta.start_ts, last.meta.end_ts);
@@ -242,13 +273,14 @@ fn merge(cover: &[Arc<Slab>]) -> Option<Arc<Slab>> {
         (first.meta.have, last.meta.want),
         Dest::Memory,
     ) {
-        Ok(s) => s.map(|s| s.slab),
+        Ok(Some(s)) => Merged::One(s.slab),
+        Ok(None) => Merged::Nothing,
         Err(e) => {
             crate::log!(
                 "serve: repacking a prefetch plan failed ({e}); sending its {} slabs as they are",
                 cover.len()
             );
-            None
+            Merged::Failed
         }
     }
 }
