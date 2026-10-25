@@ -13,7 +13,7 @@ import load_bench
 
 SG = load_bench.SG
 SERVER_CPUS = os.environ.get("SERVER_CPUS", "0-3,16-19")
-LG = os.environ.get("AB_LOADGEN_CPUS", "4-7,20-23")
+LG = os.environ.get("AB_LOADGEN_CPUS", load_bench.LOADGEN_CPUS)  # the other CCD, as in load_bench
 
 
 def one(name, binary, wl, dur, work=None):
