@@ -488,7 +488,13 @@ impl<'a> PacketSink<'a> {
             }
             let payload = take(self.payload, 0, self.expected)?;
             if let Some(data) = payload.strip_prefix(&[1]) {
-                if self.total == 0 && !data.starts_with(b"PACK") {
+                if data.is_empty() {
+                    // An empty band-1 packet is upload-pack's keep-alive (uploadpack.keepAlive),
+                    // sent while a large pack is still being counted.
+                    self.expected = 0;
+                    continue;
+                }
+                if self.total == 0 && !(data.starts_with(b"PACK") || b"PACK".starts_with(data)) {
                     return Err(Error::Invalid("sideband PACK signature"));
                 }
                 self.total = self

@@ -234,7 +234,7 @@ class Astra(Impl):
 
     def serve_cmd(self, upstream, port, poll_s, live):
         c = [self.bin, "serve", "--store", self.store, "--bind", f"127.0.0.1:{port}",
-             "--branch", "main", "--work-dir", os.path.join(self.work, f"swork-{port}"),
+             "--branch", "main", "--work-dir", os.path.join(self.work, "swork"),
              "--manifest-poll-seconds", str(max(1, int(poll_s)))]
         if live and upstream:
             c += ["--upstream", upstream, "--poll-seconds", str(max(1, int(poll_s)))]
