@@ -662,6 +662,48 @@ bitmaps), and a window needs no walk.
 | cold clone | 2.60 GB | 2.27 GB; 2.36 GB with `X-GVFS-Sizes: 1` (sizes of every history blob), 0.7 s on loopback |
 | `POST /gvfs/sizes`, 4,000 blob ids | — | 1–1.5 ms per request, answered from the table |
 
+**Whole-history validation** (`bench/separate_history.py`, results in
+`bench/results/separate-history-{sg,synth}.json`; stock git judges every check):
+
+* *SearchGold's main* (5.88M commits and trees, 3,342,769 blobs of pointer content, 319 MiB),
+  mirrored into a copy of the separate genesis store from the local repository: **14.8 s**
+  (planning 7.6 s, one parallel pass over 5.2M trees; 226K blobs/s, 8 jobs), peak RSS 3.0 GiB
+  (mostly the mapped 2.1 GiB baseline). The blobs listed are exactly git's blobs of main: 0
+  missing, 0 listed twice, every size git's; all 10 packs pass `index-pack --strict`. An edge
+  with no upstream (nothing can be proxied), `--alloc-guard strict`: 3,000 sampled GETs, a
+  4,000-blob POST and 4,000 sizes exact; 0 hot-path allocations, 0 proxied, 0 missing.
+* *Folding at that scale:* the same mirror forced to publish after every pack (160 publishes)
+  folded 87 times and ended with 2 segments (3,307,098 and 35,671 blobs), rewriting 4.9 records
+  per blob in all. Simulated with equal publishes, the old policy (merge everything beyond 16
+  segments) rewrites 156 records per blob at 5,000 publishes, the geometric one 6.2, with at
+  most 12 segments.
+* *Serving blobs from blob packs vs from slabs* (the same 145,326 SearchGold blobs, the same
+  binary, CPU-pinned, median of 3 interleaved rounds):
+
+  | | separate | inline |
+  |---|---|---|
+  | GET blob, 64 conns | 987,648 req/s, p50 54 µs, p99 306 µs | 989,168 req/s, p50 54 µs, p99 307 µs |
+  | POST 4,000 blobs, 32 conns | 3,434 req/s (1,341 MB/s), p50 9.2 ms | 3,600 req/s (1,410 MB/s), p50 8.7 ms |
+
+  Single GETs are equal; batches are 5% slower, since a blob id first misses every slab index
+  before its segment answers.
+* *Real content with history:* a synthetic repository (20,208 files: text, 1-8 MB binaries, 64-512
+  MB incompressible files) and 30 commits of new versions before genesis: 26,871 blobs, 4.21 GB
+  in main's history. The mirror, capped at 400 Mbps so that commits land while it runs, took
+  80.3 s (52.4 MB/s) at a 497 MiB peak RSS. Six 15-minute runs sealed commits during the mirror,
+  one restoring a pre-genesis version of a large file, one restoring a whole old directory against
+  a bitmap upstream. Afterwards the store lists exactly git's 26,871 blobs, each once, in 4.02 GB
+  of packs (the content's size); every pack passes `index-pack --strict`; an edge with no upstream
+  returned all 26,871 blobs by POST (4.02 GB in 17.7 s) byte for byte, and 8 ranges of the largest
+  blob; 0 hot-path allocations.
+* *A bug the synthetic run found* (fixed in `2b64c9b`): a window running before the mirror had
+  finished copied every unlisted blob its new trees name, unchanged files of changed directories
+  included. One window copied 1.71 GiB of untouched large files the mirror was copying at the same
+  time (1,265 records twice, 1.65 GB of duplicate packs); at TB scale a window could miss its slot.
+  Until the mirror is done, a window now copies only blobs no sizes table has. Re-run: each window
+  copied its 100 new blobs in 0.1 s, and nothing was copied twice.
+* *Inline stores unchanged:* opus conformance re-run with this binary, 918 passed, 0 failed.
+
 **Seeding real content** (`bench/separate_seed.py`): a synthetic corpus shaped like
 SearchGold (20,216 files, 5.99 GB of which 4.7 GB in 16 large incompressible files),
 `mirror --jobs 8` copied it in 35.5 s (169 MB/s), at an 84 MiB peak RSS. perf: 95% of the CPU
@@ -693,7 +735,7 @@ SHA-1s), so ADO's serving rate, not the daemon, will set the seed time.
   stores whole files, so the chunk-level dedup HFS had is gone: a small edit to a 10 GB file
   costs 10 GB again, upstream and here.
 * *Not done from the plan:*
-  * the 100–200 GB P0 corpus (the seed benchmark is 6 GB);
+  * the 100–200 GB P0 corpus (the seed benchmark is 6 GB, the history validation 4.2 GB);
   * the 7-day replay in separate mode, with its oracle extended to blobs;
   * client-side lifecycles with blob packs (each gvfs-helper POST is a pack);
   * a reference client for `GSZ1` and ranges;

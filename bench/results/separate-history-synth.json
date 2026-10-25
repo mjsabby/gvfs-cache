@@ -1,0 +1,111 @@
+{
+  "corpus": {
+    "files": 20208,
+    "by_class": {
+      "small": 328949794,
+      "medium": 959430009,
+      "large": 2324399903
+    },
+    "history_commits": 30,
+    "build_s": 247.5
+  },
+  "main_blobs": 26871,
+  "main_blob_bytes": 4207432783,
+  "genesis": {
+    "s": 0.1,
+    "peak_rss_mib": 265
+  },
+  "mirror": {
+    "s": 80.3,
+    "MBps": 52.4,
+    "peak_rss_mib": 497,
+    "jobs": 8,
+    "blob_pack_mib": 256,
+    "rate_mbps_cap": 400,
+    "items_skipped_listed_meanwhile": 0,
+    "planned_s": 0.0
+  },
+  "windows_during_mirror": [
+    {
+      "s": 0.1,
+      "peak_rss_mib": 7,
+      "mirror_running_at_start": true,
+      "copied_blobs": 100,
+      "copied": "1.34 MiB"
+    },
+    {
+      "s": 0.1,
+      "peak_rss_mib": 7,
+      "mirror_running_at_start": true,
+      "copied_blobs": 100,
+      "copied": "1.48 MiB"
+    },
+    {
+      "s": 0.1,
+      "peak_rss_mib": 8,
+      "mirror_running_at_start": true,
+      "copied_blobs": 100,
+      "copied": "1.78 MiB"
+    },
+    {
+      "s": 0.1,
+      "peak_rss_mib": 7,
+      "mirror_running_at_start": true,
+      "copied_blobs": 100,
+      "copied": "1.29 MiB"
+    },
+    {
+      "s": 0.1,
+      "peak_rss_mib": 7,
+      "mirror_running_at_start": true,
+      "copied_blobs": 100,
+      "copied": "1.43 MiB"
+    },
+    {
+      "s": 0.1,
+      "peak_rss_mib": 7,
+      "mirror_running_at_start": true,
+      "copied_blobs": 100,
+      "copied": "1.79 MiB"
+    }
+  ],
+  "store": {
+    "generation": 28,
+    "complete": true,
+    "segments": 2,
+    "segment_blob_counts": [
+      26867,
+      4
+    ],
+    "segments_geometric": true,
+    "packs": 23,
+    "pack_bytes": 4018694297,
+    "every_pack_indexed_by_one_segment": true,
+    "git_blobs": 26871,
+    "listed_distinct": 26871,
+    "records": 26871,
+    "listed_twice": 0,
+    "missing": 0,
+    "wrong_size": 0,
+    "not_in_git": 0,
+    "index_pack_strict_all": true,
+    "index_pack_s": 13.0
+  },
+  "edge": {
+    "ready_s": 0.31,
+    "post_all_blobs": 26871,
+    "post_batches": 10,
+    "post_bytes": 4018693881,
+    "post_s": 17.7,
+    "ranges_checked": 8,
+    "counters": {
+      "gvfs_alloc_hot_path_total": 0,
+      "gvfs_blobs_missing_total": 0,
+      "gvfs_blobs_proxied_total": 0,
+      "gvfs_blobs_unavailable_total": 0,
+      "gvfs_blobs_from_store_total": 26879,
+      "gvfs_errors_total": 0
+    }
+  },
+  "binary_commit": "2b64c9b"
+}

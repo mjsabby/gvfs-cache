@@ -1,0 +1,87 @@
+{
+  "mirror": {
+    "s": 14.8,
+    "planned_s": 7.6,
+    "items": 10,
+    "publishes": 1,
+    "folds": 0,
+    "peak_rss_mib": 3051,
+    "jobs": 8,
+    "blob_pack_mib": 32,
+    "blobs_per_s": 225986
+  },
+  "git_rev_list_s": 52.2,
+  "store": {
+    "generation": 3,
+    "complete": true,
+    "segments": 1,
+    "segment_blob_counts": [
+      3342769
+    ],
+    "segments_geometric": true,
+    "packs": 10,
+    "pack_bytes": 332262221,
+    "every_pack_indexed_by_one_segment": true,
+    "git_blobs": 3342769,
+    "listed_distinct": 3342769,
+    "records": 3342769,
+    "listed_twice": 0,
+    "missing": 0,
+    "wrong_size": 0,
+    "not_in_git": 0,
+    "index_pack_strict_all": true,
+    "index_pack_s": 6.8
+  },
+  "edge": {
+    "ready_s": 0.35,
+    "get_sampled": 3000,
+    "get_s": 0.12,
+    "post_blobs": 4000,
+    "post_bytes": 395245,
+    "post_s": 0.003,
+    "sizes_checked": 4000,
+    "counters": {
+      "gvfs_alloc_hot_path_total": 0,
+      "gvfs_blobs_missing_total": 0,
+      "gvfs_blobs_proxied_total": 0,
+      "gvfs_blobs_unavailable_total": 0,
+      "gvfs_blobs_from_store_total": 7000,
+      "gvfs_errors_total": 0
+    }
+  },
+  "load": {
+    "separate": {
+      "get_blob": {
+        "ok_rps": 987648.2,
+        "MBps": 108.7,
+        "p50_us": 54,
+        "p99_us": 306,
+        "all_200": true
+      },
+      "post_4000_blobs": {
+        "ok_rps": 3433.5,
+        "MBps": 1341.3,
+        "p50_us": 9167,
+        "p99_us": 19695,
+        "all_200": true
+      }
+    },
+    "inline": {
+      "get_blob": {
+        "ok_rps": 989167.9,
+        "MBps": 108.9,
+        "p50_us": 54,
+        "p99_us": 307,
+        "all_200": true
+      },
+      "post_4000_blobs": {
+        "ok_rps": 3599.8,
+        "MBps": 1410.1,
+        "p50_us": 8695,
+        "p99_us": 18383,
+        "all_200": true
+      }
+    }
+  },
+  "binary_commit": "4b47a46"
+}
