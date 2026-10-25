@@ -1,0 +1,25 @@
+[package]
+name = "gvfs-mmap"
+description = "Read-only memory maps of immutable slab files: the one place that calls mmap(2)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# `Mmap::map` is an `unsafe fn` (the mapped file must not change underneath the map), so
+# this crate cannot inherit `unsafe_code = "forbid"`. It has exactly one `unsafe` block.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[dependencies]
+memmap2.workspace = true

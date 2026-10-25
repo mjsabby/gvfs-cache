@@ -1,0 +1,4 @@
+mode,objects,pack_bytes,build_seconds,hot_allocations
+delta,9224930,2673226062,98.369,0
+clustered,9224930,4405522013,167.353,0
+full,9224930,21386711153,223.749,0

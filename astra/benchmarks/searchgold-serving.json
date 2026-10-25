@@ -1,0 +1,92 @@
+[
+  {
+    "mode": "delta",
+    "objects": 9224930,
+    "oid_set_sha256": "8ee9eddde1aa708d68c3dd9abab96d1b2ce2c7e46b8a4f25d5b91489318e17e3",
+    "index_bytes": 562800272,
+    "boot_seconds": 1.6075323199911509,
+    "get": {
+      "pointer": {
+        "samples": 40,
+        "p50_us": 22.7,
+        "p99_us": 93.451
+      },
+      "head_tree": {
+        "samples": 40,
+        "p50_us": 20.18,
+        "p99_us": 25.29
+      },
+      "historical_tree": {
+        "samples": 2560,
+        "p50_us": 32.52,
+        "p99_us": 47.131
+      }
+    },
+    "prefetch_packs": 1,
+    "prefetch_bytes": 2953123502,
+    "prefetch_verified_seconds": 1.134888405998936,
+    "prefetch_verified_GB_per_second": 2.6021267416161877,
+    "prefetch_server_cpu_seconds": 0.10999999999999988,
+    "hot_allocations": 0
+  },
+  {
+    "mode": "clustered",
+    "objects": 9224930,
+    "oid_set_sha256": "8ee9eddde1aa708d68c3dd9abab96d1b2ce2c7e46b8a4f25d5b91489318e17e3",
+    "index_bytes": 562904032,
+    "boot_seconds": 1.0561336009996012,
+    "get": {
+      "pointer": {
+        "samples": 40,
+        "p50_us": 27.171,
+        "p99_us": 65.701
+      },
+      "head_tree": {
+        "samples": 40,
+        "p50_us": 19.83,
+        "p99_us": 23.56
+      },
+      "historical_tree": {
+        "samples": 2560,
+        "p50_us": 24.33,
+        "p99_us": 26.79
+      }
+    },
+    "prefetch_packs": 1,
+    "prefetch_bytes": 4680864093,
+    "prefetch_verified_seconds": 2.098374543013051,
+    "prefetch_verified_GB_per_second": 2.2307095158897408,
+    "prefetch_server_cpu_seconds": 0.17999999999999994,
+    "hot_allocations": 0
+  },
+  {
+    "mode": "full",
+    "objects": 9224930,
+    "oid_set_sha256": "8ee9eddde1aa708d68c3dd9abab96d1b2ce2c7e46b8a4f25d5b91489318e17e3",
+    "index_bytes": 582500592,
+    "boot_seconds": 0.9849659760075156,
+    "get": {
+      "pointer": {
+        "samples": 40,
+        "p50_us": 31.84,
+        "p99_us": 75.521
+      },
+      "head_tree": {
+        "samples": 40,
+        "p50_us": 23.42,
+        "p99_us": 29.981
+      },
+      "historical_tree": {
+        "samples": 2560,
+        "p50_us": 23.14,
+        "p99_us": 27.891
+      }
+    },
+    "prefetch_packs": 1,
+    "prefetch_bytes": 21690762049,
+    "prefetch_verified_seconds": 8.878943104005884,
+    "prefetch_verified_GB_per_second": 2.442944139062435,
+    "prefetch_server_cpu_seconds": 0.6799999999999999,
+    "hot_allocations": 0
+  }
+]

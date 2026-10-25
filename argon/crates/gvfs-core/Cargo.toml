@@ -1,0 +1,18 @@
+[package]
+name = "gvfs-core"
+description = "Zero-allocation wire formats, arena slabs, Git-hfs 1.0 + 100B parsers, Packed-u64 MPHF, range coalescing, and pack splicing."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+gvfs-alloc-guard = { workspace = true }
+bytes = { workspace = true }
+crc32fast = { workspace = true }
+flate2 = { workspace = true }
+sha1 = { workspace = true }
+
+[lints]
+workspace = true

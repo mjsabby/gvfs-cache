@@ -1,0 +1,52 @@
+[workspace]
+members = [".", "crates/gvfs-platform"]
+resolver = "3"
+
+[package]
+name = "gvfs-daemon"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[dependencies]
+gvfs-platform = { path = "crates/gvfs-platform" }
+bytes = "1.12"
+crc32fast = "1.5"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+sha1 = "0.10"
+ring = "0.17"
+fs2 = "0.4"
+http = "1.5"
+http-body = "1.0"
+hyper = { version = "1.12", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "net", "sync", "time", "signal", "macros", "io-util"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+webpki-roots = "1"
+time = { version = "0.3", features = ["formatting", "macros"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1

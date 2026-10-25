@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/gvfs-alloc-guard",
+    "crates/gvfs-core",
+    "crates/gvfs-storage",
+    "crates/gvfs-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+gvfs-alloc-guard = { path = "crates/gvfs-alloc-guard" }
+gvfs-core = { path = "crates/gvfs-core" }
+gvfs-storage = { path = "crates/gvfs-storage" }
+gvfs-daemon = { path = "crates/gvfs-daemon" }
+
+bytes = "1.12"
+crc32fast = "1.5"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+sha1 = "0.10"
+http = "1.5"
+http-body = "1.1"
+hyper = { version = "1.12", features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1.21", features = ["tokio", "server", "server-auto", "http1", "http2"] }
+tokio = { version = "1.54", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util", "signal"] }
+libc = "0.2"
+nix = { version = "0.29", default-features = false, features = ["fs", "zerocopy"] }
+
+# Invariant 1 (100% safe Rust) and invariant 2 (zero panics) are enforced for every
+# member crate that opts into `[lints] workspace = true`. The only crate that does not
+# is `gvfs-alloc-guard`, which contains the isolated `unsafe impl GlobalAlloc` and
+# read-only OS `mmap` wrapper, and re-declares the same clippy denials.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1

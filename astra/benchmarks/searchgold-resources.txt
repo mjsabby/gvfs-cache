@@ -1,0 +1,23 @@
+	Command being timed: "target/release/gvfs-daemon benchmark --upstream /home/muks/SearchGold --store target/searchgold-benchmark --work-dir target/searchgold-work --strict-alloc"
+	User time (seconds): 443.81
+	System time (seconds): 16.97
+	Percent of CPU this job got: 94%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 8:09.95
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 6291144
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 4893083
+	Voluntary context switches: 177652
+	Involuntary context switches: 22953
+	Swaps: 0
+	File system inputs: 42558008
+	File system outputs: 121222632
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

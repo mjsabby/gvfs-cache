@@ -1,0 +1,10 @@
+replay: seed_objects=9224930 initial_body_bytes=4680864093 days=8 change_minutes=5 files=256 start=1792972800
+day=1 commits=288 active=2 elapsed_seconds=8.4
+day=2 commits=576 active=3 elapsed_seconds=10.3
+day=3 commits=864 active=4 elapsed_seconds=12.1
+day=4 commits=1152 active=5 elapsed_seconds=13.8
+day=5 commits=1440 active=6 elapsed_seconds=15.7
+day=6 commits=1728 active=7 elapsed_seconds=17.5
+day=7 commits=2016 active=1 elapsed_seconds=105.8
+day=8 commits=2304 active=2 elapsed_seconds=108.0
+complete: commits=2304 max_sealed_slabs=17 max_active_with_live=18 hot_allocations=0 elapsed_seconds=108.0

@@ -1,0 +1,9 @@
+scenario,requests,cold_clones,pack_responses,unique_pack_files,retained_packs_per_cache,gvfs_body_bytes,after_initial_clone_bytes,duplicate_pack_responses,largest_incremental_bytes,last_incremental_bytes
+fresh_isolated_cache_every_5m,2304,2304,2304,2304,1,10155745785023,0,0,0,0
+warm_cache_poll_every_1m,11521,1,8449,2305,2305,4790124599,109260506,6144,55271,7975
+warm_cache_poll_every_15m,769,1,769,769,769,4698553863,17689770,0,55271,7975
+warm_cache_poll_every_1h,193,1,193,193,193,4697605483,16741390,0,122423,13130
+developer_four_fetches_per_workday,25,1,25,25,25,4691376101,10512008,0,1459107,264320
+developer_one_fetch_per_workday,7,1,7,7,7,4687182111,6318018,0,1571944,1571944
+friday_evening_then_monday_morning,3,1,3,3,3,4685116267,4252174,0,2793067,1459107
+idle_repo_poll_every_1m,11521,1,1,1,1,4680956253,92160,0,8,8

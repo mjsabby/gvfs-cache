@@ -1,0 +1,15 @@
+delta:
+warning: object d5804d9bb1cd0749db0b37727b7231e3a2259ab9: gitmodulesParse: could not parse gitmodules blob
+warning: object b7aad543dd1ce2c4aa30c8506882bfb7c1fb0a88: gitmodulesParse: could not parse gitmodules blob
+warning: object 6079c2d73a8c0b48e2e476be1fba4881eb9ff421: gitmodulesParse: could not parse gitmodules blob
+native Git verification passed
+clustered:
+warning: object 6079c2d73a8c0b48e2e476be1fba4881eb9ff421: gitmodulesParse: could not parse gitmodules blob
+warning: object d5804d9bb1cd0749db0b37727b7231e3a2259ab9: gitmodulesParse: could not parse gitmodules blob
+warning: object b7aad543dd1ce2c4aa30c8506882bfb7c1fb0a88: gitmodulesParse: could not parse gitmodules blob
+native Git verification passed
+full:
+warning: object d5804d9bb1cd0749db0b37727b7231e3a2259ab9: gitmodulesParse: could not parse gitmodules blob
+warning: object b7aad543dd1ce2c4aa30c8506882bfb7c1fb0a88: gitmodulesParse: could not parse gitmodules blob
+warning: object 6079c2d73a8c0b48e2e476be1fba4881eb9ff421: gitmodulesParse: could not parse gitmodules blob
+native Git verification passed

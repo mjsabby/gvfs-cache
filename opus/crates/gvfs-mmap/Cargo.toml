@@ -1,0 +1,26 @@
+[package]
+name = "gvfs-mmap"
+description = "Read-only memory maps of immutable slab files (the workspace's only mmap)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Like `gvfs-alloc-guard`, this crate cannot inherit `forbid(unsafe_code)`: creating a
+# mapping is `unsafe` because the kernel cannot stop another process from truncating the
+# file. It contains exactly one `unsafe` block.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[dependencies]
+memmap2 = "0.9"

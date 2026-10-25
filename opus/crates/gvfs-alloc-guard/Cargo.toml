@@ -1,0 +1,23 @@
+[package]
+name = "gvfs-alloc-guard"
+description = "SealedAllocator: counts (or rejects) heap allocations on the hot path after warmup."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# This crate intentionally does NOT inherit `[workspace.lints]`: `GlobalAlloc` can only be
+# implemented through an `unsafe impl`, and `forbid` cannot be locally relaxed. Everything
+# else in the crate is held to the same rules as the rest of the workspace.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+undocumented_unsafe_blocks = "deny"
