@@ -143,6 +143,10 @@ pub fn main(args: &[String]) -> Result<()> {
     };
     let m = run(&mut opts)?;
     crate::log!("published manifest:\n{}", m.describe());
+    crate::log!(
+        "peak RSS {}",
+        crate::util::human_bytes(crate::util::peak_rss())
+    );
     Ok(())
 }
 

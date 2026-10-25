@@ -403,3 +403,130 @@ fn azure_pipeline_and_serve() {
     drop(backend);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A `--blobs separate` store on Azure: the large blob streamed into a block blob by the
+/// mirror, and an edge that reads blob packs by range where they are (never downloading
+/// one), every byte checked by git.
+#[test]
+fn azure_separate_store() {
+    let Some(backend) = Backend::new("sep") else {
+        return;
+    };
+    let root = tempdir("azure-sep");
+    let env = [("GVD_AZ_CS", backend.cs.as_str())];
+    let store = format!("azure:{}", backend.spec);
+    let up = Upstream::new(&root);
+    let upstream = up.bare.to_str().unwrap().to_string();
+    let noise_bytes = noise(2 << 20, 11);
+    commit_files(
+        &up,
+        "c1",
+        &[
+            ("a/text.txt", Some(text(1))),
+            ("b/noise.bin", Some(noise_bytes.clone())),
+            ("big/large.bin", Some(large((16 << 20) + 9))),
+        ],
+    );
+    let g = commit_files(&up, "c2", &[("a/text.txt", Some(text(2)))]);
+    let run = |extra: &[&str]| {
+        let mut args = vec!["--store-auth-env", "GVD_AZ_CS"];
+        args.extend(extra);
+        pipeline_at(&root, &store, &upstream, "15m", &args, &env)
+            .unwrap_or_else(|log| panic!("pipeline: {log}"))
+    };
+    run(&["--blobs", "separate"]);
+    let work = root.join("mirror-work");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gvfs-daemon"));
+    cmd.args(["mirror", "--store", &store, "--store-auth-env", "GVD_AZ_CS"])
+        .args([
+            "--upstream",
+            &upstream,
+            "--work-dir",
+            work.to_str().unwrap(),
+        ])
+        .args(["--publish-secs", "0", "--blob-pack-mib", "1", "--jobs", "2"])
+        .envs(env.iter().copied());
+    gvfs_daemon::upstream::hermetic_git_env(&mut cmd);
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let t = commit_files(
+        &up,
+        "c3",
+        &[
+            ("n/new.txt", Some(b"new\n".to_vec())),
+            ("a/text.txt", Some(text(3))),
+        ],
+    );
+    run(&[]);
+
+    let cache = root.join("cache");
+    let server = Server::start_with_env(
+        &[
+            "--store",
+            &store,
+            "--store-auth-env",
+            "GVD_AZ_CS",
+            "--upstream",
+            &upstream,
+            "--poll-ms",
+            "100",
+            "--cache-dir",
+            cache.to_str().unwrap(),
+        ],
+        &env,
+    );
+    // Every blob of history as a loose object: the store's read by range, old versions
+    // through the proxy.
+    let history = git_blobs(&up.bare, &["--all"]);
+    let ids: Vec<String> = history.keys().cloned().collect();
+    let loose = fresh_repo(&root, "loose");
+    for id in &ids {
+        let (status, ct, body) = server.get(&format!("/gvfs/objects/{id}"));
+        assert_eq!((status, ct.as_str()), (200, CT_LOOSE), "{id}");
+        let dir = loose.join("objects").join(&id[..2]);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&id[2..]), body).unwrap();
+    }
+    git(&loose, &["fsck", "--strict", "--no-dangling"]);
+    assert_eq!(cat_batch(&loose, &ids), cat_batch(&up.bare, &ids));
+    let tip = commit_blobs(&up.bare, &["-1", &t]);
+    assert!(server.metric("gvfs_blobs_from_store_total") >= tip.len() as u64);
+    // One pack of every blob.
+    let (status, _, pack) = server.post("/gvfs/objects", json_ids(&ids, None).as_bytes(), CT_PACK);
+    assert_eq!(status, 200);
+    let posted = fresh_repo(&root, "post");
+    git_stdin(
+        &posted,
+        &["index-pack", "--stdin", "--strict", "--keep=t"],
+        &pack,
+    );
+    assert_eq!(cat_batch(&posted, &ids), cat_batch(&up.bare, &ids));
+    // Ranges of a stored and of a compressed blob.
+    let noise_id = rev(&up.bare, &format!("{g}:b/noise.bin"));
+    let text_id = rev(&up.bare, &format!("{t}:a/text.txt"));
+    for (id, content) in [(noise_id, noise_bytes), (text_id, text(3))] {
+        let n = content.len();
+        for (off, len) in [(0usize, 7usize), (65_533, 9), (n - 2, 2), (3, n - 6)] {
+            let (status, _, body) =
+                server.get(&format!("/gvfs/blobs/{id}?offset={off}&length={len}"));
+            assert_eq!(status, 200);
+            assert!(body == content[off..off + len], "{id} {off}+{len}");
+        }
+    }
+    // Blob packs stay in the store: the edge holds their indexes only.
+    let local: Vec<String> = std::fs::read_dir(cache.join("blobs"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !local.is_empty() && local.iter().all(|f| f.ends_with(".bidx")),
+        "{local:?}"
+    );
+    server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}

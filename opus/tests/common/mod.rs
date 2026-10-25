@@ -9,6 +9,7 @@
     clippy::arithmetic_side_effects
 )]
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -271,8 +272,8 @@ impl Server {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    fn client(&self) -> Client {
-        Client::new(Url::parse(&self.url()).unwrap(), Duration::from_secs(60))
+    pub fn client(&self) -> Client {
+        Client::new(Url::parse(&self.url()).unwrap(), Duration::from_secs(600))
     }
 
     fn try_get(&self, path: &str) -> gvfs_daemon::util::Result<(u16, String, Vec<u8>)> {
@@ -716,4 +717,121 @@ fn smart_http_connection(
             out.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")?;
         }
     }
+}
+
+// Separate-blob store helpers (real blob content).
+
+/// Commits `files` (`None` deletes) and pushes; returns the new tip.
+pub fn commit_files(up: &Upstream, msg: &str, files: &[(&str, Option<Vec<u8>>)]) -> String {
+    for (path, content) in files {
+        let p = up.work.join(path);
+        match content {
+            Some(c) => {
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(&p, c).unwrap();
+            }
+            None => std::fs::remove_file(&p).unwrap(),
+        }
+    }
+    git(&up.work, &["add", "-A"]);
+    git(
+        &up.work,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            msg,
+        ],
+    );
+    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
+    up.tip()
+}
+
+pub fn text(version: u32) -> Vec<u8> {
+    (0..3000u32)
+        .map(|l| {
+            if l % 211 == version % 211 {
+                format!("line {l} edited in version {version}\n")
+            } else {
+                format!("line {l} of a text file that changes a little\n")
+            }
+        })
+        .collect::<String>()
+        .into_bytes()
+}
+
+pub fn noise(n: usize, seed: u64) -> Vec<u8> {
+    let mut x = seed | 1;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u8
+        })
+        .collect()
+}
+
+/// Compressible, but large enough to be copied alone.
+pub fn large(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i / 4096) as u8 ^ (i % 7) as u8).collect()
+}
+
+/// `(id, size)` of every blob `rev-list --objects <revs>` lists, from git.
+pub fn git_blobs(bare: &Path, revs: &[&str]) -> BTreeMap<String, u64> {
+    let mut args = vec!["rev-list", "--objects"];
+    args.extend_from_slice(revs);
+    let ids: Vec<String> = git(bare, &args)
+        .lines()
+        .map(|l| l[..40].to_string())
+        .collect();
+    let input: String = ids.iter().map(|i| format!("{i}\n")).collect();
+    let out = git_stdin(
+        bare,
+        &[
+            "cat-file",
+            "--batch-check=%(objectname) %(objecttype) %(objectsize)",
+        ],
+        input.as_bytes(),
+    );
+    String::from_utf8(out)
+        .unwrap()
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(' ').collect();
+            (f[1] == "blob").then(|| (f[0].to_string(), f[2].parse().unwrap()))
+        })
+        .collect()
+}
+
+pub fn cat_blob(bare: &Path, id: &str) -> Vec<u8> {
+    let mut cmd = git_cmd(bare);
+    let out = cmd.args(["cat-file", "blob", id]).output().unwrap();
+    assert!(out.status.success());
+    out.stdout
+}
+
+/// Blob ids (with their paths) of every commit in `revs`, from git.
+pub fn commit_blobs(bare: &Path, revs: &[&str]) -> BTreeMap<String, String> {
+    let mut args = vec!["rev-list"];
+    args.extend_from_slice(revs);
+    let mut out = BTreeMap::new();
+    for c in git(bare, &args).lines() {
+        for l in git(bare, &["ls-tree", "-r", c]).lines() {
+            let (meta, path) = l.split_once('\t').unwrap();
+            let f: Vec<&str> = meta.split(' ').collect();
+            if f[1] == "blob" {
+                out.insert(f[2].to_string(), format!("{c}:{path}"));
+            }
+        }
+    }
+    out
+}
+
+pub fn rev(bare: &Path, spec: &str) -> String {
+    git(bare, &["rev-parse", spec]).trim().to_string()
 }

@@ -23,93 +23,6 @@ use gvfs_daemon::slab::{Slab, SlabMeta};
 use gvfs_daemon::store::Store;
 use gvfs_daemon::util::Oid;
 
-/// Commits `files` (`None` deletes) and pushes; returns the new tip.
-fn commit_files(up: &Upstream, msg: &str, files: &[(&str, Option<Vec<u8>>)]) -> String {
-    for (path, content) in files {
-        let p = up.work.join(path);
-        match content {
-            Some(c) => {
-                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-                std::fs::write(&p, c).unwrap();
-            }
-            None => std::fs::remove_file(&p).unwrap(),
-        }
-    }
-    git(&up.work, &["add", "-A"]);
-    git(
-        &up.work,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-q",
-            "-m",
-            msg,
-        ],
-    );
-    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
-    up.tip()
-}
-
-fn text(version: u32) -> Vec<u8> {
-    (0..3000u32)
-        .map(|l| {
-            if l % 211 == version % 211 {
-                format!("line {l} edited in version {version}\n")
-            } else {
-                format!("line {l} of a text file that changes a little\n")
-            }
-        })
-        .collect::<String>()
-        .into_bytes()
-}
-
-fn noise(n: usize, seed: u64) -> Vec<u8> {
-    let mut x = seed | 1;
-    (0..n)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x as u8
-        })
-        .collect()
-}
-
-/// Compressible, but large enough to be copied alone.
-fn large(n: usize) -> Vec<u8> {
-    (0..n).map(|i| (i / 4096) as u8 ^ (i % 7) as u8).collect()
-}
-
-/// `(id, size)` of every blob `rev-list --objects <revs>` lists, from git.
-fn git_blobs(bare: &Path, revs: &[&str]) -> BTreeMap<String, u64> {
-    let mut args = vec!["rev-list", "--objects"];
-    args.extend_from_slice(revs);
-    let ids: Vec<String> = git(bare, &args)
-        .lines()
-        .map(|l| l[..40].to_string())
-        .collect();
-    let input: String = ids.iter().map(|i| format!("{i}\n")).collect();
-    let out = git_stdin(
-        bare,
-        &[
-            "cat-file",
-            "--batch-check=%(objectname) %(objecttype) %(objectsize)",
-        ],
-        input.as_bytes(),
-    );
-    String::from_utf8(out)
-        .unwrap()
-        .lines()
-        .filter_map(|l| {
-            let f: Vec<&str> = l.split(' ').collect();
-            (f[1] == "blob").then(|| (f[0].to_string(), f[2].parse().unwrap()))
-        })
-        .collect()
-}
-
 fn sizes_of(store_dir: &Path, meta: &SlabMeta) -> BTreeMap<String, u64> {
     Sizes::open(&store_dir.join(meta.sizes_key()))
         .unwrap()
@@ -168,13 +81,6 @@ fn store_blobs(root: &Path, store_dir: &Path) -> HashMap<String, Vec<u8>> {
         }
     }
     out
-}
-
-fn cat_blob(bare: &Path, id: &str) -> Vec<u8> {
-    let mut cmd = git_cmd(bare);
-    let out = cmd.args(["cat-file", "blob", id]).output().unwrap();
-    assert!(out.status.success());
-    out.stdout
 }
 
 #[test]
@@ -369,23 +275,6 @@ fn mirror(root: &Path, store: &str, up: &Upstream, extra: &[&str]) -> Result<Str
     }
 }
 
-/// Blob ids (with their paths) of every commit in `revs`, from git.
-fn commit_blobs(bare: &Path, revs: &[&str]) -> BTreeMap<String, String> {
-    let mut args = vec!["rev-list"];
-    args.extend_from_slice(revs);
-    let mut out = BTreeMap::new();
-    for c in git(bare, &args).lines() {
-        for l in git(bare, &["ls-tree", "-r", c]).lines() {
-            let (meta, path) = l.split_once('\t').unwrap();
-            let f: Vec<&str> = meta.split(' ').collect();
-            if f[1] == "blob" {
-                out.insert(f[2].to_string(), format!("{c}:{path}"));
-            }
-        }
-    }
-    out
-}
-
 #[test]
 fn mirror_completes_every_commit_since_genesis_and_resumes() {
     let root = tempdir("sep-mirror");
@@ -528,10 +417,6 @@ fn parse_sizes_json(body: &[u8]) -> BTreeMap<String, u64> {
             (id, digits.parse().unwrap())
         })
         .collect()
-}
-
-fn rev(bare: &Path, spec: &str) -> String {
-    git(bare, &["rev-parse", spec]).trim().to_string()
 }
 
 #[test]
@@ -934,6 +819,232 @@ fn stock_gvfs_helper_checks_out_a_separate_store() {
         missing(&sparse, &g).contains(&large_id),
         "outside the cone: not fetched"
     );
+    server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Writes `n` incompressible bytes to `path` without holding them in memory; returns
+/// the blob id git gives them.
+fn write_noise_file(path: &Path, n: u64, seed: u64) -> Oid {
+    use sha1::{Digest, Sha1};
+    use std::io::Write;
+    let mut f = std::io::BufWriter::with_capacity(8 << 20, std::fs::File::create(path).unwrap());
+    let mut h = Sha1::new();
+    h.update(format!("blob {n}\0").as_bytes());
+    let mut x = seed | 1;
+    let mut buf = vec![0u8; 8 << 20];
+    let mut left = n;
+    while left > 0 {
+        for w in buf.chunks_mut(8) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            w.copy_from_slice(&x.to_le_bytes()[..w.len()]);
+        }
+        let k = left.min(buf.len() as u64) as usize;
+        f.write_all(&buf[..k]).unwrap();
+        h.update(&buf[..k]);
+        left -= k as u64;
+    }
+    f.flush().unwrap();
+    Oid(h.finalize().into())
+}
+
+/// Reads `len` bytes of `path` at `at`.
+fn file_range(path: &Path, at: u64, len: usize) -> Vec<u8> {
+    use std::os::unix::fs::FileExt;
+    let mut b = vec![0u8; len];
+    std::fs::File::open(path)
+        .unwrap()
+        .read_exact_at(&mut b, at)
+        .unwrap();
+    b
+}
+
+/// A blob over 4 GiB, end to end: the pipeline streams it into a blob pack with memory
+/// bounded by its buffers; the edge sends it loose and in a pack (git verifies both) and
+/// serves ranges beyond 4 GiB. Writes ~13 GB under the target directory:
+/// `cargo test --release --test separate -- --ignored blob_over_4gib`.
+#[test]
+#[ignore = "writes ~13 GB; run explicitly"]
+fn blob_over_4gib_end_to_end() {
+    use sha1::{Digest, Sha1};
+    use std::io::Read;
+    let root = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("sep-huge");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let up = Upstream::new(&root);
+    for (k, v) in [
+        ("core.compression", "0"),
+        ("core.looseCompression", "0"),
+        ("pack.compression", "0"),
+    ] {
+        git(&up.bare, &["config", k, v]);
+    }
+    commit_files(&up, "c1", &[("a/small.txt", Some(b"small\n".to_vec()))]);
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    pipeline(&root, &store, &up, "15m", &["--blobs", "separate"]);
+    mirror(&root, &store, &up, &[]).unwrap();
+
+    // The huge commit, made with plumbing in the upstream (no 4 GiB push).
+    let n: u64 = (4 << 30) + 12_345;
+    let src = root.join("huge.bin");
+    let want = write_noise_file(&src, n, 99);
+    let blob = git(&up.bare, &["hash-object", "-w", src.to_str().unwrap()])
+        .trim()
+        .to_string();
+    assert_eq!(blob, want.to_string());
+    let index = root.join("tmp-index");
+    let with_index = |args: &[&str]| -> String {
+        let mut c = git_cmd(&up.bare);
+        c.env("GIT_INDEX_FILE", &index).args(args);
+        let out = c.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    with_index(&["read-tree", "main"]);
+    with_index(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("100644,{blob},big/huge.bin"),
+    ]);
+    let tree = with_index(&["write-tree"]);
+    let commit = with_index(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit-tree",
+        &tree,
+        "-p",
+        "main",
+        "-m",
+        "huge",
+    ]);
+    git(&up.bare, &["update-ref", "refs/heads/main", &commit]);
+
+    // The window copies it, streamed, in bounded memory.
+    // (The daemon's own peak: the upstream's git processes are not ours to bound.)
+    let t0 = std::time::Instant::now();
+    let log = pipeline(&root, &store, &up, "15m", &[]);
+    let rss = log
+        .lines()
+        .find_map(|l| l.split("peak RSS ").nth(1))
+        .unwrap()
+        .to_string();
+    eprintln!(
+        "pipeline window with a {n}-byte blob: {:.1}s, peak RSS {rss}",
+        t0.elapsed().as_secs_f64()
+    );
+    assert!(
+        rss.ends_with("KiB")
+            || (rss.ends_with("MiB")
+                && rss.trim_end_matches(" MiB").parse::<f64>().unwrap() < 256.0),
+        "RSS bounded by buffers, not blob size: {rss}"
+    );
+
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--upstream",
+        up.bare.to_str().unwrap(),
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ]);
+    // Loose: inflated and hashed as it streams in.
+    let t0 = std::time::Instant::now();
+    let mut c = server.client();
+    let mut r = c
+        .request("GET", &format!("/gvfs/objects/{blob}"), &[], b"")
+        .unwrap();
+    assert_eq!(r.status, 200);
+    let mut z = zlib_rs::Inflate::new(true, 15);
+    let mut h = Sha1::new();
+    let (mut inbuf, mut outbuf) = (vec![0u8; 1 << 20], vec![0u8; 4 << 20]);
+    let mut total_out = 0u64;
+    loop {
+        let k = r.read(&mut inbuf).unwrap();
+        if k == 0 {
+            break;
+        }
+        let mut input = &inbuf[..k];
+        while !input.is_empty() {
+            let (i0, o0) = (z.total_in(), z.total_out());
+            z.decompress(input, &mut outbuf, zlib_rs::InflateFlush::NoFlush)
+                .unwrap();
+            let used = (z.total_in() - i0) as usize;
+            let made = (z.total_out() - o0) as usize;
+            h.update(&outbuf[..made]);
+            total_out += made as u64;
+            input = &input[used..];
+            if used == 0 && made == 0 {
+                break;
+            }
+        }
+    }
+    drop(r);
+    let header = format!("blob {n}\0");
+    assert_eq!(total_out, n + header.len() as u64);
+    assert_eq!(
+        Oid(h.finalize().into()).to_string(),
+        blob,
+        "loose object hashes to the blob"
+    );
+    eprintln!("loose GET of {n} bytes: {:.1}s", t0.elapsed().as_secs_f64());
+
+    // In a pack, piped into git index-pack (which re-hashes it).
+    let t0 = std::time::Instant::now();
+    let check = fresh_repo(&root, "check");
+    let mut ip = git_cmd(&check)
+        .args(["index-pack", "--stdin", "--strict", "--keep=t"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut sink = ip.stdin.take().unwrap();
+        let mut r = c
+            .request(
+                "POST",
+                "/gvfs/objects",
+                &[("Content-Type", "application/json"), ("Accept", CT_PACK)],
+                json_ids(std::slice::from_ref(&blob), None).as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(r.status, 200);
+        std::io::copy(&mut r, &mut sink).unwrap();
+    }
+    assert!(ip.wait().unwrap().success(), "index-pack accepted the pack");
+    let s: u64 = git(&check, &["cat-file", "-s", &blob])
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(s, n);
+    eprintln!(
+        "POST pack of {n} bytes into index-pack: {:.1}s",
+        t0.elapsed().as_secs_f64()
+    );
+
+    // Ranges beyond 4 GiB, in place.
+    for (off, len) in [
+        (0u64, 100usize),
+        ((4 << 30) - 50, 100),
+        (n - 777, 777),
+        (3 << 30, 65_536 * 3),
+    ] {
+        let (status, _, body) =
+            server.get(&format!("/gvfs/blobs/{blob}?offset={off}&length={len}"));
+        assert_eq!(status, 200);
+        assert!(body == file_range(&src, off, len), "range {off}+{len}");
+    }
     server.assert_clean();
     drop(server);
     let _ = std::fs::remove_dir_all(&root);

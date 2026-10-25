@@ -342,6 +342,13 @@ pub fn now_secs_f64() -> f64 {
 }
 
 /// Formats a byte count for logs.
+/// This process's peak resident set size in bytes (its own, not its children's).
+pub fn peak_rss() -> u64 {
+    nix::sys::resource::getrusage(nix::sys::resource::UsageWho::RUSAGE_SELF)
+        .map(|u| u64::try_from(u.max_rss()).unwrap_or(0).saturating_mul(1024))
+        .unwrap_or(0)
+}
+
 pub fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n as f64;
