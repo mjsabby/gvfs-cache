@@ -84,11 +84,19 @@ impl BlobRec {
     /// order (each at most one block).
     pub fn stored_ranges(&self, from: u64, len: u64, out: &mut Vec<(u64, u64)>) {
         out.clear();
+        out.extend(self.stored_range_iter(from, len));
+    }
+
+    /// [`BlobRec::stored_ranges`] without a buffer.
+    pub fn stored_range_iter(&self, from: u64, len: u64) -> impl Iterator<Item = (u64, u64)> {
         let block = u64_of(STORED_BLOCK);
         let end = from.saturating_add(len).min(self.size);
         let zlib = self.zlib().0.saturating_add(2);
         let mut at = from;
-        while at < end {
+        std::iter::from_fn(move || {
+            if at >= end {
+                return None;
+            }
             let k = at.checked_div(block).unwrap_or(0);
             let within = at.checked_rem(block).unwrap_or(0);
             let take = block.saturating_sub(within).min(end.saturating_sub(at));
@@ -96,9 +104,9 @@ impl BlobRec {
                 .saturating_add(k.saturating_mul(block.saturating_add(5)))
                 .saturating_add(5)
                 .saturating_add(within);
-            out.push((file, take));
             at = at.saturating_add(take);
-        }
+            Some((file, take))
+        })
     }
 }
 

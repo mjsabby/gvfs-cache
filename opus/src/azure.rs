@@ -348,6 +348,53 @@ impl AzureStore {
         })
     }
 
+    /// One ranged GET of `len` bytes from `offset`, streamed to `sink`.
+    pub fn read_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: u64,
+        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let blob = self.blob_path(key)?;
+        let last = offset.saturating_add(len).saturating_sub(1);
+        let h = [("x-ms-range", format!("bytes={offset}-{last}"))];
+        let mut c = self.client();
+        self.call(
+            &mut c,
+            Req {
+                method: "GET",
+                path: &blob,
+                query: &[],
+                headers: &h,
+                body: b"",
+            },
+            |resp| {
+                let mut resp = resp.ensure_ok(&format!("ranged GET {key}"))?;
+                let mut buf = vec![0u8; 256 << 10];
+                let mut got = 0u64;
+                loop {
+                    let n = resp.read(&mut buf).ctx(&format!("reading {key}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    got = got.saturating_add(crate::util::u64_of(n));
+                    if got > len {
+                        crate::bail!("ranged GET {key}: more bytes than asked for");
+                    }
+                    sink(buf.get(..n).unwrap_or(&[]))?;
+                }
+                if got != len {
+                    crate::bail!("ranged GET {key}: {got} of {len} bytes");
+                }
+                Ok(())
+            },
+        )
+    }
+
     pub fn download_file(&self, key: &str, path: &Path) -> Result<()> {
         let blob = self.blob_path(key)?;
         let tmp = crate::fsutil::temp_path(path);

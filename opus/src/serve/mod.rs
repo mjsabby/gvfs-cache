@@ -21,11 +21,21 @@
 //!
 //! Every change publishes a new immutable [`view::View`].
 //!
+//! **Stores with `--blobs separate`** ([`crate::separate`]): the slabs hold commits and
+//! trees, each with its sizes table; blobs come from the blob packs `blobs.bin` lists
+//! ([`blobs::BlobSet`], polled like the manifest), or, for blobs the store lacks (L0's,
+//! versions only commits before genesis reference), from the upstream through
+//! [`blobs::Proxy`]. A manifest is applied only once the `blobs.bin` generation it
+//! requires is loaded, and `/healthz` reports ready only once `blobs.bin` records `tip
+//! complete`. L0 fetches are `blob:none`, with the sizes their trees introduce asked of
+//! the upstream.
+//!
 //! Requests are served by a fixed set of threads, each with its own buffers, all waiting on
 //! one epoll set that holds the listening socket and every idle keep-alive connection
 //! ([`conns`]): an idle client costs a table slot, not a thread. POSTs lease a request arena.
 //! Large slab ranges leave through `sendfile(2)`.
 
+pub mod blobs;
 pub mod conns;
 pub mod handlers;
 pub mod httpd;
@@ -39,7 +49,7 @@ use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::arena::ArenaPool;
-use crate::ingest::{Dest, Indexer, ingest_git_delta};
+use crate::ingest::{Dest, Indexer, ingest_git_delta_with};
 use crate::manifest::{MANIFEST_KEY, Manifest};
 use crate::repack::{Mode, Repacker};
 use crate::slab::{Slab, Tier};
@@ -71,6 +81,10 @@ pub struct Ctx {
     pub prefetch_idx: IdxPolicy,
     /// A client was sent an `.idx`: the warmer builds the next cold plan's index too.
     pub idx_wanted: AtomicBool,
+    /// A client asked for sizes: the warmer builds the next cold plan's `GSZ1` section too.
+    pub sizes_wanted: AtomicBool,
+    /// Read-through of blobs the store lacks (`--blobs separate` stores with an upstream).
+    pub proxy: Option<blobs::Proxy>,
 }
 
 impl Ctx {
@@ -99,6 +113,10 @@ pub struct Worker {
 pub struct Options {
     pub store: Store,
     pub upstream: Option<Upstream>,
+    /// The upstream's spec, branch and credentials (for the blob proxy's connections).
+    pub upstream_spec: Option<(String, String, crate::upstream::Auth)>,
+    /// Bytes of proxied blobs kept on local disk (`--proxy-cache-mib`).
+    pub proxy_cache_bytes: u64,
     pub bind: String,
     pub cache_dir: PathBuf,
     pub poll: Duration,
@@ -151,6 +169,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "hold-ms",
             "prefetch-idx",
             "superset-tier",
+            "proxy-cache-mib",
         ],
     )?;
     match f.get("alloc-guard").unwrap_or("count") {
@@ -159,12 +178,16 @@ pub fn main(args: &[String]) -> Result<()> {
         "trace" => gvfs_alloc_guard::set_trace(true),
         other => crate::bail!("--alloc-guard must be count, strict or trace, not {other:?}"),
     }
-    let upstream = match f.get("upstream") {
-        Some(u) => Some(Upstream::open(
-            u,
-            f.get("branch").unwrap_or("main"),
-            &crate::ingest::auth_from_flags(&f)?,
-        )?),
+    let upstream_spec = match f.get("upstream") {
+        Some(u) => Some((
+            u.to_string(),
+            f.get("branch").unwrap_or("main").to_string(),
+            crate::ingest::auth_from_flags(&f)?,
+        )),
+        None => None,
+    };
+    let upstream = match &upstream_spec {
+        Some((u, branch, auth)) => Some(Upstream::open(u, branch, auth)?),
         None => None,
     };
     let mut cache_servers = Vec::new();
@@ -192,6 +215,8 @@ pub fn main(args: &[String]) -> Result<()> {
                 .unwrap_or("AZURE_STORAGE_CONNECTION_STRING"),
         )?,
         upstream,
+        upstream_spec,
+        proxy_cache_bytes: f.num("proxy-cache-mib", 10240u64)?.saturating_mul(1 << 20),
         bind: f.get("bind").unwrap_or("127.0.0.1:8080").to_string(),
         cache_dir: f
             .get("cache-dir")
@@ -238,6 +263,8 @@ pub fn run(o: Options) -> Result<()> {
     let Options {
         store,
         upstream,
+        upstream_spec,
+        proxy_cache_bytes,
         bind,
         cache_dir,
         poll,
@@ -255,7 +282,7 @@ pub fn run(o: Options) -> Result<()> {
         supersets,
     } = o;
     let mut live = Live {
-        store,
+        store: Arc::new(store),
         upstream,
         tip: LiveTip::default(),
         cache_dir,
@@ -265,12 +292,41 @@ pub fn run(o: Options) -> Result<()> {
         last_head: Oid::ZERO,
         generation: 0,
         supersets,
+        blobs: None,
+        waiting_for: 0,
     };
 
     // 1-3. Manifest, slabs, live tip.
     let (manifest, etag) = live.wait_for_manifest()?;
+    let separate = manifest.separate_blobs();
+    if separate {
+        live.tip.filter = Some("blob:none".to_string());
+        // The manifest's trees need the blobs.bin generation it names.
+        loop {
+            live.load_blobs()?;
+            if live.blobs_generation() >= manifest.blobs_generation {
+                break;
+            }
+            crate::log!(
+                "serve: waiting for blobs.bin generation {} (have {})",
+                manifest.blobs_generation,
+                live.blobs_generation()
+            );
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
     live.open_manifest(&manifest)?;
     let first = live.snapshot(manifest, etag);
+    let proxy = match (&upstream_spec, separate) {
+        (Some((u, branch, auth)), true) => Some(blobs::Proxy::new(
+            u,
+            branch,
+            auth,
+            &live.cache_dir.join("proxy"),
+            proxy_cache_bytes,
+        )?),
+        _ => None,
+    };
     let ctx = Arc::new(Ctx {
         view: RwLock::new(Arc::new(first)),
         arenas: ArenaPool::new(arenas.max(1), arena_bytes, arena_objects),
@@ -280,6 +336,8 @@ pub fn run(o: Options) -> Result<()> {
         ready: AtomicBool::new(false),
         prefetch_idx,
         idx_wanted: AtomicBool::new(prefetch_idx == IdxPolicy::Always),
+        sizes_wanted: AtomicBool::new(false),
+        proxy,
     });
     if let Err(e) = live.sync_upstream(&ctx) {
         crate::log!("serve: live tip not caught up at boot ({e}); serving sealed slabs");
@@ -482,6 +540,9 @@ impl Warmer {
             if let Some(plan) = view.cold_plan() {
                 let t0 = std::time::Instant::now();
                 plan.trailer();
+                if ctx.sizes_wanted.load(Ordering::Relaxed) {
+                    let _ = plan.sizes_section();
+                }
                 let idx_len = idx.then(|| plan.idx().map_or(0, <[u8]>::len));
                 if plan.len > (64 << 20) {
                     let idx_len = idx_len.map_or_else(String::new, |n| {
@@ -523,6 +584,8 @@ pub struct LiveTip {
     resolver: Resolver,
     /// Stamps of the commits in unsealed L0 slabs: parents later pushes may name.
     stamps: HashMap<Oid, u64>,
+    /// Fetch filter (`blob:none` for `--blobs separate` stores).
+    pub filter: Option<String>,
 }
 
 impl Default for LiveTip {
@@ -532,6 +595,7 @@ impl Default for LiveTip {
             repacker: Repacker::new(),
             resolver: Resolver::default(),
             stamps: HashMap::new(),
+            filter: None,
         }
     }
 }
@@ -556,11 +620,12 @@ impl LiveTip {
         }
         let mut haves = vec![from];
         haves.extend(m.known_tips().into_iter().filter(|t| *t != from));
-        let Some(raw) = ingest_git_delta(
+        let Some(raw) = ingest_git_delta_with(
             up,
             &mut self.indexer,
             &haves,
             head,
+            self.filter.as_deref(),
             Tier::L0,
             (from_ts, from_ts),
             Dest::Memory,
@@ -656,6 +721,10 @@ impl LiveTip {
                     (m.tip, s.meta.want),
                     Dest::Memory,
                 )? {
+                    // What follows the tip introduces no sizes its source slab did not.
+                    if let Some(t) = s.sizes() {
+                        rest.slab.set_sizes(Arc::clone(t));
+                    }
                     out.insert(j.saturating_add(1), rest.slab);
                 }
             } else {
@@ -681,7 +750,7 @@ fn keep_l0(end_ts: u64, max_ts: u64, newest: u64) -> bool {
 
 /// The live thread's state.
 struct Live {
-    store: Store,
+    store: Arc<Store>,
     upstream: Option<Upstream>,
     tip: LiveTip,
     cache_dir: PathBuf,
@@ -695,9 +764,70 @@ struct Live {
     last_head: Oid,
     generation: u64,
     supersets: Option<Tier>,
+    /// The loaded `blobs.bin` (`--blobs separate` stores).
+    blobs: Option<Arc<blobs::BlobSet>>,
+    /// A manifest generation held back until its `blobs.bin` generation loads (logged once).
+    waiting_for: u64,
 }
 
 impl Live {
+    fn blobs_generation(&self) -> u64 {
+        self.blobs.as_ref().map_or(0, |b| b.generation)
+    }
+
+    /// Loads `blobs.bin` if it changed. Returns whether it did.
+    fn load_blobs(&mut self) -> Result<bool> {
+        let Some((bytes, etag)) = self.store.get(crate::blobs::BLOBS_KEY)? else {
+            return Ok(false);
+        };
+        if self.blobs.as_ref().is_some_and(|b| b.etag == etag) {
+            return Ok(false);
+        }
+        let bm = crate::blobs::BlobManifest::decode(&bytes).ctx("reading blobs.bin")?;
+        let set = blobs::BlobSet::load(
+            &self.store,
+            &self.cache_dir.join("blobs"),
+            &bm,
+            etag,
+            self.blobs.as_deref(),
+        )?;
+        crate::log!(
+            "serve: blobs.bin generation {}: {} segments, {} packs{}",
+            set.generation,
+            set.segments(),
+            set.packs(),
+            if set.complete {
+                ", tip complete"
+            } else {
+                " (tip not complete: mirror running)"
+            }
+        );
+        self.blobs = Some(Arc::new(set));
+        Ok(true)
+    }
+
+    /// The sizes the trees of a new L0 slab introduce, asked of the upstream.
+    fn l0_sizes(&mut self, slab: &Arc<Slab>, view: &View) -> Result<()> {
+        let Some(up) = self.upstream.as_mut() else {
+            return Ok(());
+        };
+        let unknown: Vec<Oid> = crate::blobcopy::referenced_blobs(slab, 1)?
+            .into_iter()
+            .filter(|b| view.blob_size(b).is_none())
+            .collect();
+        let sizes = up.object_sizes(&unknown)?;
+        let mut pairs = Vec::with_capacity(unknown.len());
+        for (oid, size) in unknown.iter().zip(sizes) {
+            let Some(size) = size else {
+                crate::bail!("the upstream has no blob {oid}, which a tree references");
+            };
+            pairs.push((*oid, size));
+        }
+        slab.set_sizes(Arc::new(crate::sizes::Sizes::from_heap(
+            crate::sizes::build(&mut pairs),
+        )?));
+        Ok(())
+    }
     fn wait_for_manifest(&mut self) -> Result<(Manifest, String)> {
         let mut logged = false;
         loop {
@@ -722,7 +852,24 @@ impl Live {
         for meta in m.slabs() {
             let slab = match self.opened.get(&meta.id) {
                 Some(s) => s.clone(),
-                None => self.open(meta)?,
+                None => {
+                    let s = self.open(meta)?;
+                    if m.separate_blobs() {
+                        let path = match self.store.local_path(&meta.sizes_key()) {
+                            Some(p) => p,
+                            None => {
+                                let p = self.cache_dir.join(format!("{}.sizes", meta.id));
+                                hydrate(&self.store, &meta.sizes_key(), &p)?;
+                                p
+                            }
+                        };
+                        s.set_sizes(Arc::new(
+                            crate::sizes::Sizes::open(&path)
+                                .ctx(&format!("sizes of slab {}", meta.id))?,
+                        ));
+                    }
+                    s
+                }
             };
             keep.insert(meta.id.clone(), slab.clone());
             sealed.push(slab);
@@ -742,6 +889,7 @@ impl Live {
             self.sealed.clone(),
             self.l0.clone(),
             self.supersets,
+            self.blobs.clone(),
         )
     }
 
@@ -765,10 +913,26 @@ impl Live {
     /// One poll: a new manifest, then a moved upstream branch.
     fn tick(&mut self, ctx: &Ctx, warmer: &Warmer) -> Result<()> {
         let view = ctx.view();
+        if view.manifest.separate_blobs() && self.load_blobs()? {
+            let next = Arc::new(self.snapshot(view.manifest.clone(), view.etag.clone()));
+            ctx.publish(next);
+        }
+        let view = ctx.view();
         if let Some((bytes, etag)) = self.store.get(MANIFEST_KEY)? {
             if etag != view.etag {
                 let m = Manifest::decode(&bytes)?;
-                if m.generation > view.manifest.generation {
+                let blobs_behind =
+                    m.separate_blobs() && self.blobs_generation() < m.blobs_generation;
+                if blobs_behind && self.waiting_for != m.generation {
+                    crate::log!(
+                        "serve: manifest generation {} waits for blobs.bin generation {} (have {})",
+                        m.generation,
+                        m.blobs_generation,
+                        self.blobs_generation()
+                    );
+                    self.waiting_for = m.generation;
+                }
+                if m.generation > view.manifest.generation && !blobs_behind {
                     self.open_manifest(&m)?;
                     self.l0 = self.tip.prune(&self.l0, &view.manifest, &m, &self.sealed)?;
                     let next = self.snapshot(m, etag);
@@ -804,10 +968,14 @@ impl Live {
             return Ok(false);
         }
         let advanced = self.tip.advance(up, &view.manifest, &self.l0, head)?;
-        self.last_head = head;
         let Some(slab) = advanced else {
+            self.last_head = head;
             return Ok(false);
         };
+        if view.manifest.separate_blobs() {
+            self.l0_sizes(&slab, &view)?;
+        }
+        self.last_head = head;
         crate::log!(
             "serve: L0 {} ({} objects, {}) {}..{head}",
             slab.meta.id,
@@ -865,7 +1033,12 @@ pub fn metrics_text(ctx: &Ctx) -> String {
          gvfs_manifest_generation {}\n\
          gvfs_alloc_hot_path_total {}\n\
          gvfs_alloc_hot_path_bytes_total {}\n\
-         gvfs_alloc_post_seal_total {}\n",
+         gvfs_alloc_post_seal_total {}\n\
+         gvfs_blobs_from_store_total {}\n\
+         gvfs_blobs_proxied_total {}\n\
+         gvfs_blobs_unavailable_total {}\n\
+         gvfs_blobs_generation {}\n\
+         gvfs_blobs_complete {}\n",
         get(&m.prefetch),
         get(&m.object_get),
         get(&m.object_post),
@@ -884,7 +1057,12 @@ pub fn metrics_text(ctx: &Ctx) -> String {
         v.manifest.generation,
         a.hot_path,
         a.hot_path_bytes,
-        a.post_seal
+        a.post_seal,
+        get(&m.blobs_store),
+        get(&m.blobs_proxied),
+        get(&m.unavailable),
+        v.blobs.as_ref().map_or(0, |b| b.generation),
+        u8::from(v.blobs.as_ref().is_some_and(|b| b.complete))
     )
 }
 

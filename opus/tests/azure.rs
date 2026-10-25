@@ -286,6 +286,16 @@ fn azure_store_operations() {
             "{key} visible before finish"
         );
         w.finish().unwrap();
+        if len > 100 {
+            let mut got = Vec::new();
+            store
+                .read_range(key, 17, (len - 40) as u64, &mut |b| {
+                    got.extend_from_slice(b);
+                    Ok(())
+                })
+                .unwrap();
+            assert!(got == big[17..len - 23], "{key}: ranged read differs");
+        }
         if len == 0 {
             assert_eq!(store.get(key).unwrap().unwrap().0, b"");
         } else {

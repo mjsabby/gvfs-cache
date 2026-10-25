@@ -168,11 +168,19 @@ pub struct Arena {
     /// Small response bodies built in place (sizes JSON, resolved loose objects).
     pub out: Vec<u8>,
     pub deflater: crate::zlib::Deflater,
+    /// Blobs of the request (`--blobs separate` stores): their packs and records.
+    pub blobs: Vec<(
+        std::sync::Arc<crate::serve::blobs::BlobPack>,
+        crate::blobs::BlobRec,
+    )>,
     /// Commit expansion may outgrow the arena: allow its structures to grow (counted as
     /// cold allocations) for this request; `reset` shrinks them back.
     pub grow: bool,
     objects: usize,
 }
+
+/// Blobs one request holds without growing (gvfs-helper asks for a few thousand at once).
+const BLOBS: usize = 1 << 13;
 
 impl Arena {
     /// `bytes` is split between the body, response and splice buffers; `objects` bounds
@@ -191,6 +199,7 @@ impl Arena {
             resolver: Resolver::with_capacity(quarter.min(4 << 20)),
             out: Vec::with_capacity(quarter.saturating_mul(2)),
             deflater: crate::zlib::Deflater::new(1),
+            blobs: Vec::with_capacity(BLOBS),
             grow: false,
             objects,
         };
@@ -219,6 +228,11 @@ impl Arena {
         self.next_commits.clear();
         self.splice.clear();
         self.out.clear();
+        self.blobs.clear();
+        if self.blobs.capacity() > BLOBS.saturating_mul(2) {
+            let _cold = gvfs_alloc_guard::cold_section();
+            self.blobs.shrink_to(BLOBS);
+        }
     }
 }
 

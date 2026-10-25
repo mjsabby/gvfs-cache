@@ -112,6 +112,35 @@ impl Store {
         }
     }
 
+    /// Reads `len` bytes of the immutable object `key` from `offset`, handing them to
+    /// `sink` in pieces as they arrive (blob packs, read where they are).
+    pub fn read_range(
+        &self,
+        key: &str,
+        offset: u64,
+        len: u64,
+        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            Store::Fs(s) => {
+                use std::os::unix::fs::FileExt;
+                let f = File::open(s.path(key)?).ctx(&format!("opening {key}"))?;
+                let mut buf = vec![0u8; crate::util::us(len.min(1 << 20))];
+                let mut at = 0u64;
+                while at < len {
+                    let n = crate::util::us(len.saturating_sub(at)).min(buf.len());
+                    let piece = buf.get_mut(..n).ctx("read buffer")?;
+                    f.read_exact_at(piece, offset.saturating_add(at))
+                        .ctx(&format!("reading {key}"))?;
+                    sink(piece)?;
+                    at = at.saturating_add(crate::util::u64_of(n));
+                }
+                Ok(())
+            }
+            Store::Azure(a) => a.read_range(key, offset, len, sink),
+        }
+    }
+
     /// A streaming upload of an immutable object: it appears, whole, at
     /// [`StoreWriter::finish`] (never partially); dropped unfinished, it never appears.
     pub fn writer(&self, key: &str) -> Result<StoreWriter<'_>> {
@@ -390,6 +419,13 @@ mod tests {
         assert!(s.list("blobs/").unwrap().is_empty());
         w.finish().unwrap();
         assert_eq!(s.get("blobs/x.pack").unwrap().unwrap().0, b"whole");
+        let mut got = Vec::new();
+        s.read_range("blobs/x.pack", 1, 3, &mut |b| {
+            got.extend_from_slice(b);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(got, b"hol");
         assert!(s.list("slabs/").unwrap().is_empty());
         assert!(!valid_key("../x") && !valid_key("a//b") && valid_key("slabs/m15-1-ab.pack"));
         fs::remove_dir_all(&dir).unwrap();

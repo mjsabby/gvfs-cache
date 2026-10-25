@@ -217,7 +217,17 @@ impl Server {
         Server::start_with_env(args, &[])
     }
 
+    /// Like [`Server::start`], but returns as soon as the server answers `/healthz` at all
+    /// (a `--blobs separate` store is not ready until its tip is complete).
+    pub fn start_unready(args: &[&str]) -> Server {
+        Server::spawn(args, &[], false)
+    }
+
     pub fn start_with_env(args: &[&str], env: &[(&str, &str)]) -> Server {
+        Server::spawn(args, env, true)
+    }
+
+    fn spawn(args: &[&str], env: &[(&str, &str)], ready: bool) -> Server {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
             .local_addr()
@@ -244,8 +254,10 @@ impl Server {
         let mut s = Server { child, port };
         let deadline = Instant::now() + Duration::from_secs(30);
         while Instant::now() < deadline {
-            if let Ok((200, _, _)) = s.try_get("/healthz") {
-                return s;
+            match s.try_get("/healthz") {
+                Ok((200, _, _)) => return s,
+                Ok(_) if !ready => return s,
+                _ => {}
             }
             if let Ok(Some(status)) = s.child.try_wait() {
                 panic!("server exited during startup: {status}");
@@ -273,6 +285,23 @@ impl Server {
 
     pub fn get(&self, path: &str) -> (u16, String, Vec<u8>) {
         self.try_get(path).unwrap()
+    }
+
+    /// A GET with extra request headers: status, response headers asked for, body.
+    pub fn get_with(
+        &self,
+        path: &str,
+        headers: &[(&str, &str)],
+        want: &[&str],
+    ) -> (u16, Vec<Option<String>>, Vec<u8>) {
+        let mut c = self.client();
+        let mut r = c.request("GET", path, headers, b"").unwrap();
+        let got = want
+            .iter()
+            .map(|h| r.header(h).map(str::to_string))
+            .collect();
+        let body = r.body_vec(1 << 34).unwrap();
+        (r.status, got, body)
     }
 
     pub fn post(&self, path: &str, body: &[u8], accept: &str) -> (u16, String, Vec<u8>) {

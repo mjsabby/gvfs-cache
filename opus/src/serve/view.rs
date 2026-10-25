@@ -55,6 +55,8 @@ pub struct View {
     rollups: Vec<(u64, u64)>,
     plans: Vec<OnceLock<Option<Arc<PackPlan>>>>,
     cold_plan: OnceLock<Arc<PackPlan>>,
+    /// The store's blob packs (`--blobs separate` stores; `None`: blobs are inline).
+    pub blobs: Option<Arc<super::blobs::BlobSet>>,
 }
 
 /// A prefetch answer: nothing new, or one pack covering `(start, plan.timestamp]`
@@ -75,6 +77,7 @@ impl View {
         sealed: Vec<Arc<Slab>>,
         l0: Vec<Arc<Slab>>,
         supersets: Option<Tier>,
+        blobs: Option<Arc<super::blobs::BlobSet>>,
     ) -> View {
         let (nw, np) = (manifest.weekly.len(), manifest.pyramid.len());
         let weekly = sealed.get(1..nw.saturating_add(1)).unwrap_or(&[]);
@@ -146,7 +149,15 @@ impl View {
             rollups,
             plans,
             cold_plan: OnceLock::new(),
+            blobs,
         }
+    }
+
+    /// The size of a blob the trees of this view's slabs reference (from their sizes
+    /// tables; `--blobs separate` stores only).
+    #[inline]
+    pub fn blob_size(&self, oid: &Oid) -> Option<u64> {
+        self.all.iter().find_map(|s| s.sizes()?.get(oid))
     }
 
     /// Finds `oid` in the newest slab that has it.
@@ -299,7 +310,20 @@ fn merge(cover: &[Arc<Slab>], exclude: &[Arc<Slab>]) -> Merged {
         (first.meta.have, last.meta.want),
         Dest::Memory,
     ) {
-        Ok(Some(s)) => Merged::One(s.slab),
+        Ok(Some(s)) => {
+            // The merged slab carries what its parts' trees introduce.
+            let tables: Vec<&crate::sizes::Sizes> = cover
+                .iter()
+                .filter_map(|c| c.sizes().map(|t| t.as_ref()))
+                .collect();
+            if !tables.is_empty() {
+                match crate::sizes::Sizes::from_heap(crate::sizes::merge(&tables)) {
+                    Ok(t) => s.slab.set_sizes(Arc::new(t)),
+                    Err(e) => crate::log!("serve: merging sizes tables failed: {e}"),
+                }
+            }
+            Merged::One(s.slab)
+        }
         Ok(None) => Merged::Nothing,
         Err(e) => {
             crate::log!(

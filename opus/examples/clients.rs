@@ -205,6 +205,7 @@ impl Edge {
             self.sealed.clone(),
             self.l0.clone(),
             self.supersets,
+            None,
         )));
     }
 }

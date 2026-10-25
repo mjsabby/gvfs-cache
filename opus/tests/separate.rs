@@ -492,3 +492,449 @@ fn mirror_completes_every_commit_since_genesis_and_resumes() {
     assert_eq!(records, stored.len(), "a blob listed twice");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A prefetch body with a `GSZ1` section: the packs, then `(id, size)` of each record.
+#[allow(clippy::type_complexity)]
+fn parse_gpre_sizes(body: &[u8]) -> (Vec<(u64, Vec<u8>, Option<Vec<u8>>)>, BTreeMap<String, u64>) {
+    let at = body
+        .windows(4)
+        .rposition(|w| w == b"GSZ1")
+        .expect("a GSZ1 section");
+    let packs = parse_gpre(&body[..at]);
+    let n = u64::from_le_bytes(body[at + 4..at + 12].try_into().unwrap()) as usize;
+    let recs = &body[at + 12..];
+    assert_eq!(recs.len(), n * 28, "GSZ1 length");
+    let sizes = recs
+        .chunks(28)
+        .map(|r| {
+            (
+                Oid::from_slice(&r[..20]).unwrap().to_string(),
+                u64::from_le_bytes(r[20..].try_into().unwrap()),
+            )
+        })
+        .collect();
+    (packs, sizes)
+}
+
+/// `[{"Id":"..","Size":N},...]`.
+fn parse_sizes_json(body: &[u8]) -> BTreeMap<String, u64> {
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    text.split("{\"Id\":\"")
+        .skip(1)
+        .map(|item| {
+            let id = item[..40].to_string();
+            let size = item.split("\"Size\":").nth(1).unwrap();
+            let digits: String = size.chars().take_while(char::is_ascii_digit).collect();
+            (id, digits.parse().unwrap())
+        })
+        .collect()
+}
+
+fn rev(bare: &Path, spec: &str) -> String {
+    git(bare, &["rev-parse", spec]).trim().to_string()
+}
+
+#[test]
+fn edge_serves_blobs_from_the_store_and_through_the_proxy() {
+    let root = tempdir("sep-edge");
+    let up = Upstream::new(&root);
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    let noise_bytes = noise(2 << 20, 5);
+    commit_files(
+        &up,
+        "c1",
+        &[
+            ("a/text.txt", Some(text(1))),
+            ("a/gone.txt", Some(b"gone\n".to_vec())),
+            ("b/noise.bin", Some(noise_bytes.clone())),
+            ("big/large.bin", Some(large((16 << 20) + 3))),
+        ],
+    );
+    commit_files(
+        &up,
+        "c2",
+        &[("a/text.txt", Some(text(2))), ("a/gone.txt", None)],
+    );
+    let g = commit_files(&up, "c3", &[("c/small.txt", Some(b"small\n".to_vec()))]);
+    pipeline(&root, &store, &up, "15m", &["--blobs", "separate"]);
+    let cache = root.join("cache");
+    let server = Server::start_unready(&[
+        "--store",
+        &store,
+        "--upstream",
+        up.bare.to_str().unwrap(),
+        "--poll-ms",
+        "100",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ]);
+    let (status, _, body) = server.get("/healthz");
+    assert_eq!(status, 503);
+    assert!(String::from_utf8_lossy(&body).contains("blobs incomplete"));
+
+    // Before the mirror the tip's blobs come through the proxy.
+    let text2 = rev(&up.bare, &format!("{g}:a/text.txt"));
+    let (status, ct, _) = server.get(&format!("/gvfs/objects/{text2}"));
+    assert_eq!((status, ct.as_str()), (200, CT_LOOSE));
+    assert_eq!(server.metric("gvfs_blobs_proxied_total"), 1);
+
+    mirror(&root, &store, &up, &[]).unwrap();
+    server.wait_for("tip complete", |s| s.get("/healthz").0 == 200);
+
+    // Every blob of history as a loose object: the tip's from the store, old versions
+    // through the proxy. git re-hashes each one.
+    let history = git_blobs(&up.bare, &["--all"]);
+    let all_blobs: Vec<String> = history.keys().cloned().collect();
+    let tip_blobs = commit_blobs(&up.bare, &["-1", &g]);
+    let loose = fresh_repo(&root, "loose");
+    for id in &all_blobs {
+        let (status, ct, body) = server.get(&format!("/org/repo/gvfs/objects/{id}"));
+        assert_eq!((status, ct.as_str()), (200, CT_LOOSE), "{id}");
+        let dir = loose.join("objects").join(&id[..2]);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&id[2..]), body).unwrap();
+    }
+    git(&loose, &["fsck", "--strict", "--no-dangling"]);
+    assert_eq!(
+        cat_batch(&loose, &all_blobs),
+        cat_batch(&up.bare, &all_blobs)
+    );
+    assert!(server.metric("gvfs_blobs_from_store_total") >= tip_blobs.len() as u64);
+    let old_only = all_blobs
+        .iter()
+        .filter(|b| !tip_blobs.contains_key(*b))
+        .count() as u64;
+    assert_eq!(server.metric("gvfs_blobs_proxied_total"), 1 + old_only);
+    // Ids no tree of the store names are not proxied.
+    assert_eq!(
+        server.get(&format!("/gvfs/objects/{}", "0".repeat(40))).0,
+        404
+    );
+
+    // A POST of trees and blobs (stored and old versions): one pack git accepts.
+    let kinds = types(&up.bare, &up.objects(&g));
+    let mut batch: Vec<String> = kinds
+        .iter()
+        .filter(|(_, t)| t != "commit")
+        .map(|(o, _)| o.clone())
+        .collect();
+    batch.extend(
+        all_blobs
+            .iter()
+            .filter(|b| !tip_blobs.contains_key(*b))
+            .cloned(),
+    );
+    let (status, ct, pack) =
+        server.post("/gvfs/objects", json_ids(&batch, None).as_bytes(), CT_PACK);
+    assert_eq!((status, ct.as_str()), (200, CT_PACK));
+    let posted = fresh_repo(&root, "post");
+    git_stdin(
+        &posted,
+        &["index-pack", "--stdin", "--strict", "--keep=t"],
+        &pack,
+    );
+    assert_eq!(cat_batch(&posted, &batch), cat_batch(&up.bare, &batch));
+    let one = std::slice::from_ref(&text2);
+    let (status, ct, _) = server.post("/gvfs/objects", json_ids(one, None).as_bytes(), CT_LOOSE);
+    assert_eq!((status, ct.as_str()), (200, CT_LOOSE));
+
+    // Sizes of blobs (stored, old), trees and commits.
+    let mut ids: Vec<String> = all_blobs.clone();
+    ids.push(g.clone());
+    ids.push(rev(&up.bare, &format!("{g}^{{tree}}")));
+    let (status, _, body) = server.post(
+        "/gvfs/sizes",
+        json_ids(&ids, None).as_bytes(),
+        "application/json",
+    );
+    assert_eq!(status, 200);
+    let sizes = parse_sizes_json(&body);
+    assert_eq!(sizes.len(), ids.len());
+    for (id, size) in &sizes {
+        let s: u64 = git(&up.bare, &["cat-file", "-s", id])
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(*size, s, "{id}");
+    }
+
+    // Prefetch: unchanged without the header; with it, the history's sizes follow.
+    let agent = ("User-Agent", "git/2.45.2.vfs.0.0");
+    let (status, h, plain) = server.get_with("/gvfs/prefetch", &[agent], &["x-gvfs-sizes"]);
+    assert_eq!((status, h[0].clone()), (200, None));
+    let plain_packs = parse_gpre(&plain);
+    let (status, h, with) = server.get_with(
+        "/gvfs/prefetch",
+        &[agent, ("X-GVFS-Sizes", "1")],
+        &["x-gvfs-sizes"],
+    );
+    assert_eq!((status, h[0].as_deref()), (200, Some("1")));
+    let (packs, cold_sizes) = parse_gpre_sizes(&with);
+    assert_eq!(packs, plain_packs);
+    assert_eq!(cold_sizes, history);
+    let cold = fresh_repo(&root, "cold");
+    install_pack(&cold, &packs[0].1);
+    let in_pack = git(
+        &cold,
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objecttype)",
+        ],
+    );
+    assert!(!in_pack.contains("blob"), "prefetch packs carry no blobs");
+    let cold_ts = packs[0].0;
+
+    // Byte ranges: in place for stored (incompressible) blobs, inflated for compressed ones.
+    let noise_id = rev(&up.bare, &format!("{g}:b/noise.bin"));
+    for (id, content) in [
+        (noise_id.clone(), noise_bytes.clone()),
+        (text2.clone(), text(2)),
+    ] {
+        let n = content.len() as u64;
+        for (off, len) in [(0u64, 10u64), (65_530, 20), (n - 3, 3), (1, n - 2), (n, 5)] {
+            let (status, h, body) = server.get_with(
+                &format!("/gvfs/blobs/{id}?offset={off}&length={len}"),
+                &[],
+                &["x-gvfs-blob-size"],
+            );
+            assert_eq!(
+                (status, h[0].clone()),
+                (200, Some(n.to_string())),
+                "{id} {off}+{len}"
+            );
+            let end = (off + len).min(n) as usize;
+            assert!(body == content[off as usize..end], "{id} {off}+{len}");
+        }
+        let (_, _, rest) = server.get_with(&format!("/gvfs/blobs/{id}?offset=7"), &[], &[]);
+        assert!(rest == content[7..]);
+        assert_eq!(
+            server.get(&format!("/gvfs/blobs/{id}?offset={}", n + 1)).0,
+            416
+        );
+    }
+
+    // A push is served at once (L0): its blobs through the proxy, its sizes with the warm
+    // prefetch.
+    let t = commit_files(
+        &up,
+        "c4",
+        &[
+            ("n/new.txt", Some(b"brand new\n".to_vec())),
+            ("a/text.txt", Some(text(4))),
+        ],
+    );
+    server.wait_for("the push in L0", |s| {
+        s.get(&format!("/gvfs/objects/{t}")).0 == 200
+    });
+    let new_id = rev(&up.bare, &format!("{t}:n/new.txt"));
+    let proxied = server.metric("gvfs_blobs_proxied_total");
+    assert_eq!(server.get(&format!("/gvfs/objects/{new_id}")).0, 200);
+    assert_eq!(server.metric("gvfs_blobs_proxied_total"), proxied + 1);
+    let (_, _, warm) = server.get_with(
+        &format!("/gvfs/prefetch?lastPackTimestamp={cold_ts}"),
+        &[agent, ("X-GVFS-Sizes", "1")],
+        &[],
+    );
+    let (warm_packs, warm_sizes) = parse_gpre_sizes(&warm);
+    assert_eq!(warm_packs.len(), 1);
+    let introduced: BTreeMap<String, u64> = git_blobs(&up.bare, &[&format!("{g}..{t}")])
+        .into_iter()
+        .filter(|(id, _)| !history.contains_key(id))
+        .collect();
+    assert_eq!(warm_sizes, introduced);
+
+    // The pipeline seals it, blobs first; the edge then serves those blobs from the store.
+    pipeline(&root, &store, &up, "15m", &[]);
+    server.wait_for("the sealed window", |s| {
+        s.metric("gvfs_manifest_generation") >= 2
+    });
+    let text4 = rev(&up.bare, &format!("{t}:a/text.txt"));
+    let (stored, proxied) = (
+        server.metric("gvfs_blobs_from_store_total"),
+        server.metric("gvfs_blobs_proxied_total"),
+    );
+    assert_eq!(server.get(&format!("/gvfs/objects/{text4}")).0, 200);
+    assert_eq!(server.metric("gvfs_blobs_from_store_total"), stored + 1);
+    assert_eq!(server.metric("gvfs_blobs_proxied_total"), proxied);
+    server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Stock microsoft/git against an edge of a separate-blob store: gvfs-helper prefetches
+/// commits and trees, and a checkout faults the blobs in (GET singles, POST batches),
+/// byte for byte git's; old versions come through the proxy; a sparse cone fetches only
+/// its own blobs.
+#[test]
+fn stock_gvfs_helper_checks_out_a_separate_store() {
+    let Some(msgit) = msgit() else {
+        eprintln!("skipping: Microsoft git with gvfs-helper not found (set GVFS_TEST_MSGIT)");
+        return;
+    };
+    let root = tempdir("sep-helper");
+    let up = Upstream::new(&root);
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    let c1 = commit_files(
+        &up,
+        "c1",
+        &[
+            ("a/text.txt", Some(text(1))),
+            ("a/deep/more.txt", Some(text(7))),
+            ("b/noise.bin", Some(noise(2 << 20, 6))),
+            ("big/large.bin", Some(large((16 << 20) + 5))),
+        ],
+    );
+    let g = commit_files(
+        &up,
+        "c2",
+        &[
+            ("a/text.txt", Some(text(2))),
+            ("c/x.txt", Some(b"x\n".to_vec())),
+        ],
+    );
+    pipeline(&root, &store, &up, "15m", &["--blobs", "separate"]);
+    mirror(&root, &store, &up, &[]).unwrap();
+    let t = commit_files(
+        &up,
+        "c3",
+        &[
+            ("a/text.txt", Some(text(3))),
+            ("n/new.txt", Some(b"new\n".to_vec())),
+        ],
+    );
+    pipeline(&root, &store, &up, "15m", &[]);
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--upstream",
+        up.bare.to_str().unwrap(),
+        "--poll-ms",
+        "100",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ]);
+
+    let msg = |dir: &Path, args: &[&str]| -> Vec<u8> {
+        let mut c = std::process::Command::new(&msgit);
+        c.current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(args);
+        gvfs_daemon::upstream::hermetic_git_env(&mut c);
+        let out = c.output().unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    };
+    let client = |name: &str| {
+        let dir = root.join(name);
+        msg(&root, &["init", "-q", dir.to_str().unwrap()]);
+        msg(
+            &dir,
+            &[
+                "config",
+                "remote.origin.url",
+                &format!("{}/org/repo", server.url()),
+            ],
+        );
+        msg(&dir, &["config", "gc.auto", "0"]);
+        msg(&dir, &["gvfs-helper", "--cache-server=disable", "prefetch"]);
+        dir
+    };
+    let missing = |dir: &Path, rev: &str| -> Vec<String> {
+        String::from_utf8(msg(
+            dir,
+            &[
+                "-c",
+                "core.useGVFSHelper=false",
+                "rev-list",
+                "--objects",
+                "--missing=print",
+                rev,
+            ],
+        ))
+        .unwrap()
+        .lines()
+        .filter_map(|l| l.strip_prefix('?').map(str::to_string))
+        .collect()
+    };
+
+    // Full checkout: every file is git's.
+    let full = client("full");
+    let tip_blobs = commit_blobs(&up.bare, &["-1", &t]);
+    let reachable = git_blobs(&up.bare, &[&t]);
+    let mut gone = missing(&full, &t);
+    gone.sort();
+    assert_eq!(
+        gone,
+        reachable.keys().cloned().collect::<Vec<_>>(),
+        "prefetch brings no blobs"
+    );
+    msg(
+        &full,
+        &[
+            "-c",
+            "core.useGVFSHelper=true",
+            "checkout",
+            "-q",
+            "--detach",
+            &t,
+        ],
+    );
+    for line in git(&up.bare, &["ls-tree", "-r", &t]).lines() {
+        let (meta, path) = line.split_once('\t').unwrap();
+        let id = meta.split(' ').nth(2).unwrap();
+        assert!(
+            std::fs::read(full.join(path)).unwrap() == cat_blob(&up.bare, id),
+            "{path}"
+        );
+    }
+    let gone = missing(&full, &t);
+    assert!(
+        tip_blobs.keys().all(|b| !gone.contains(b)),
+        "the tip's blobs were faulted in"
+    );
+    // An old version, never mirrored: through the proxy.
+    let shown = msg(
+        &full,
+        &[
+            "-c",
+            "core.useGVFSHelper=true",
+            "show",
+            &format!("{c1}:a/text.txt"),
+        ],
+    );
+    assert!(shown == text(1));
+
+    // A sparse cone fetches its own blobs only.
+    let sparse = client("sparse");
+    msg(&sparse, &["sparse-checkout", "set", "--cone", "a"]);
+    msg(
+        &sparse,
+        &[
+            "-c",
+            "core.useGVFSHelper=true",
+            "checkout",
+            "-q",
+            "--detach",
+            &g,
+        ],
+    );
+    assert!(std::fs::read(sparse.join("a/text.txt")).unwrap() == text(2));
+    assert!(!sparse.join("big/large.bin").exists());
+    let large_id = rev(&up.bare, &format!("{g}:big/large.bin"));
+    assert!(
+        missing(&sparse, &g).contains(&large_id),
+        "outside the cone: not fetched"
+    );
+    server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}

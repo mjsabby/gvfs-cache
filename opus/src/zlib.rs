@@ -224,22 +224,37 @@ pub struct LooseSplice {
 impl LooseSplice {
     /// `zlib` is the complete zlib stream of a whole (non-delta) entry of `kind` / `size`.
     pub fn plan(kind: u8, size: u64, zlib: &[u8]) -> Result<LooseSplice, ZError> {
-        let [cmf, flg, ..] = *zlib else {
-            return Err(ZError::Truncated);
-        };
+        let head: [u8; 2] = zlib
+            .get(..2)
+            .and_then(|h| h.try_into().ok())
+            .ok_or(ZError::Truncated)?;
+        let tail: [u8; 4] = zlib
+            .len()
+            .checked_sub(4)
+            .and_then(|at| zlib.get(at..))
+            .and_then(|t| t.try_into().ok())
+            .ok_or(ZError::Truncated)?;
+        LooseSplice::plan_ends(kind, size, zlib.len(), head, tail)
+    }
+
+    /// The same plan from the stream's length, first two bytes (zlib header) and last
+    /// four (Adler-32): all the splice needs, so a remote entry is never read whole.
+    pub fn plan_ends(
+        kind: u8,
+        size: u64,
+        zlib_len: usize,
+        head: [u8; 2],
+        tail: [u8; 4],
+    ) -> Result<LooseSplice, ZError> {
+        let [cmf, flg] = head;
         let header_ok = cmf & 0x0F == 8
             && (u16::from(cmf).wrapping_shl(8) | u16::from(flg)).wrapping_rem(31) == 0;
         if !header_ok || flg & 0x20 != 0 {
             return Err(ZError::Corrupt);
         }
-        let body_end = zlib
-            .len()
+        let body_end = zlib_len
             .checked_sub(4)
             .filter(|&e| e >= 2)
-            .ok_or(ZError::Truncated)?;
-        let tail: [u8; 4] = zlib
-            .get(body_end..)
-            .and_then(|t| t.try_into().ok())
             .ok_or(ZError::Truncated)?;
         let content_adler = u32::from_be_bytes(tail);
 

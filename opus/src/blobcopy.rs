@@ -110,7 +110,7 @@ pub struct Copied {
 static NONCE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A pack id no other copy uses: a hash of the ids and a per-copy nonce.
-fn fresh_id(oids: &[Oid]) -> String {
+pub fn fresh_id(oids: &[Oid]) -> String {
     use std::hash::{BuildHasher, Hasher};
     let mut h = Sha1::new();
     let mut nonce = std::collections::hash_map::RandomState::new().build_hasher();

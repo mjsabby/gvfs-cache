@@ -403,6 +403,8 @@ pub struct Slab {
     records_at: usize,
     /// Entries in id order with their CRC-32s, for pack indexes (built on first use).
     sorted: std::sync::OnceLock<Option<crate::idx::SortedSlab>>,
+    /// The blob sizes its trees introduce (`--blobs separate` stores), once loaded.
+    sizes: std::sync::OnceLock<Arc<crate::sizes::Sizes>>,
 }
 
 impl Slab {
@@ -514,7 +516,18 @@ impl Slab {
             pilots_at,
             records_at,
             sorted: std::sync::OnceLock::new(),
+            sizes: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Attaches the slab's sizes table (the first one set stays).
+    pub fn set_sizes(&self, t: Arc<crate::sizes::Sizes>) {
+        let _ = self.sizes.set(t);
+    }
+
+    /// The slab's sizes table, if one is attached.
+    pub fn sizes(&self) -> Option<&Arc<crate::sizes::Sizes>> {
+        self.sizes.get()
     }
 
     #[inline]

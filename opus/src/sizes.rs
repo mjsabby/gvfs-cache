@@ -216,6 +216,29 @@ pub fn merge(tables: &[&Sizes]) -> Vec<u8> {
     encode_sorted(out.into_iter(), n)
 }
 
+/// The `GSZ1` section of a response carrying `tables`: `"GSZ1" | count u64 | records`
+/// (the union, sorted by id, 28 bytes each: id, size u64).
+pub fn wire_section(tables: &[&Sizes]) -> Vec<u8> {
+    let merged;
+    let (count, records): (usize, &[u8]) = match tables {
+        [] => (0, &[]),
+        [one] => (one.len(), one.records()),
+        _ => {
+            merged = merge(tables);
+            let n = us(le_u64(&merged, 8).unwrap_or(0));
+            (
+                n,
+                sub(&merged, HEADER_LEN, n.saturating_mul(REC_LEN)).unwrap_or(&[]),
+            )
+        }
+    };
+    let mut out = Vec::with_capacity(records.len().saturating_add(12));
+    out.extend_from_slice(WIRE_MAGIC);
+    out.extend_from_slice(&u64_of(count).to_le_bytes());
+    out.extend_from_slice(records);
+    out
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -252,6 +275,12 @@ mod tests {
             ]
         );
         assert_eq!(m.records().len(), 5 * REC_LEN);
+        let w = wire_section(&[&ta, &tb]);
+        assert_eq!(&w[..4], WIRE_MAGIC);
+        assert_eq!(le_u64(&w, 4), Some(5));
+        assert_eq!(&w[12..], m.records());
+        assert_eq!(&wire_section(&[&ta])[12..], ta.records());
+        assert_eq!(wire_section(&[]), b"GSZ1\0\0\0\0\0\0\0\0");
         assert!(Sizes::empty().is_empty());
         // Corruption is detected.
         let mut bad = build(&mut vec![(oid(3), 3)]);

@@ -69,6 +69,7 @@ pub struct PackPlan {
     pub sources: usize,
     trailer: OnceLock<[u8; 20]>,
     idx: OnceLock<Option<Vec<u8>>>,
+    sizes: OnceLock<Vec<u8>>,
 }
 
 impl PackPlan {
@@ -98,6 +99,7 @@ impl PackPlan {
             sources,
             trailer: OnceLock::new(),
             idx: OnceLock::new(),
+            sizes: OnceLock::new(),
         }
     }
 
@@ -140,6 +142,24 @@ impl PackPlan {
 
     pub fn idx_ready(&self) -> bool {
         self.idx.get().is_some()
+    }
+
+    /// The `GSZ1` section for this pack: the union of its slabs' sizes tables, built by
+    /// the first caller and shared after.
+    pub fn sizes_section(&self) -> &[u8] {
+        self.sizes.get_or_init(|| {
+            let _cold = gvfs_alloc_guard::cold_section();
+            let tables: Vec<&crate::sizes::Sizes> = self
+                .slabs
+                .iter()
+                .filter_map(|s| s.sizes().map(|t| t.as_ref()))
+                .collect();
+            crate::sizes::wire_section(&tables)
+        })
+    }
+
+    pub fn sizes_ready(&self) -> bool {
+        self.sizes.get().is_some()
     }
 }
 

@@ -38,6 +38,9 @@ pub struct Request {
     pub accepts_loose: bool,
     /// `User-Agent: git/...`: git itself (gvfs-helper), which always indexes packs itself.
     pub git_agent: bool,
+    /// `X-GVFS-Sizes: 1`: the client wants the blob sizes for a prefetch's trees (a `GSZ1`
+    /// section after the packs).
+    pub wants_sizes: bool,
     pub head_len: usize,
 }
 
@@ -202,6 +205,7 @@ fn parse_head(head: &[u8], head_len: usize) -> std::io::Result<Request> {
         expect_continue: false,
         accepts_loose: false,
         git_agent: false,
+        wants_sizes: false,
         head_len,
     };
     for line in lines {
@@ -232,6 +236,8 @@ fn parse_head(head: &[u8], head_len: usize) -> std::io::Result<Request> {
                 .any(|w| w.eq_ignore_ascii_case(b"application/x-git-loose-"));
         } else if name.eq_ignore_ascii_case(b"user-agent") {
             req.git_agent = value.starts_with(b"git/");
+        } else if name.eq_ignore_ascii_case(b"x-gvfs-sizes") {
+            req.wants_sizes = value == b"1";
         }
     }
     Ok(req)
@@ -506,18 +512,32 @@ impl<'a> Out<'a> {
 
     /// `slab.pack()[start .. start + len]`.
     pub fn slab(&mut self, slab: &Slab, start: u64, len: u64) -> std::io::Result<()> {
-        match slab.pack_file() {
+        self.mapped(slab.pack_file(), slab.pack(), start, len)
+    }
+
+    /// `len` bytes at `start` of an immutable file mapped as `bytes` (`sendfile(2)` from
+    /// `file` when large).
+    pub fn mapped(
+        &mut self,
+        file: Option<&std::fs::File>,
+        bytes: &[u8],
+        start: u64,
+        len: u64,
+    ) -> std::io::Result<()> {
+        match file {
             Some(file) if len >= SENDFILE_MIN => {
+                if crate::util::us(start.saturating_add(len)) > bytes.len() {
+                    return Err(bad("file range"));
+                }
                 self.flush()?;
                 sendfile_all(self.stream, file, start, len)?;
                 self.sent = self.sent.saturating_add(len);
                 Ok(())
             }
             _ => {
-                let bytes =
-                    crate::util::sub(slab.pack(), crate::util::us(start), crate::util::us(len))
-                        .ok_or_else(|| bad("slab range"))?;
-                self.bytes(bytes)
+                let range = crate::util::sub(bytes, crate::util::us(start), crate::util::us(len))
+                    .ok_or_else(|| bad("file range"))?;
+                self.bytes(range)
             }
         }
     }
