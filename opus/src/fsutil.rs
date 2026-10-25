@@ -19,7 +19,7 @@ pub fn temp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.tmp-{}-{seq}", std::process::id()))
 }
 
-fn sync_dir(path: &Path) {
+pub fn sync_dir(path: &Path) {
     if let Some(dir) = path.parent() {
         if let Ok(d) = File::open(dir) {
             let _ = d.sync_all();

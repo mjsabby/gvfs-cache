@@ -131,6 +131,11 @@ impl SlabMeta {
     pub fn index_key(&self) -> String {
         format!("slabs/{}.mphf", self.id)
     }
+
+    /// The slab's blob sizes table (stores with `--blobs separate`).
+    pub fn sizes_key(&self) -> String {
+        format!("slabs/{}.sizes", self.id)
+    }
 }
 
 /// Per-object facts the ingester hands to the index builder (indexed by entry number).

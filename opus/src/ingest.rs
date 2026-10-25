@@ -956,6 +956,22 @@ pub fn ingest_git_delta(
     range: (u64, u64),
     dest: Dest<'_>,
 ) -> Result<Option<Ingested>> {
+    ingest_git_delta_with(up, indexer, haves, want, None, tier, range, dest)
+}
+
+/// [`ingest_git_delta`] with a fetch filter (`blob:none`: commits and trees only, for
+/// stores that keep blobs in their own packs).
+#[allow(clippy::too_many_arguments)]
+pub fn ingest_git_delta_with(
+    up: &mut crate::upstream::Upstream,
+    indexer: &mut Indexer,
+    haves: &[Oid],
+    want: Oid,
+    filter: Option<&str>,
+    tier: crate::slab::Tier,
+    range: (u64, u64),
+    dest: Dest<'_>,
+) -> Result<Option<Ingested>> {
     let have = haves.first().copied().unwrap_or(Oid::ZERO);
     if have == want {
         return Ok(None);
@@ -964,7 +980,10 @@ pub fn ingest_git_delta(
     match dest {
         Dest::Memory => {
             let mut pack = Vec::new();
-            up.fetch(haves, &want, &mut pack)?;
+            match filter {
+                Some(f) => up.fetch_filtered(haves, &want, f, &mut pack)?,
+                None => up.fetch(haves, &want, &mut pack)?,
+            };
             if crate::pack::parse_pack_header(&pack) == Some(0) {
                 return Ok(None);
             }
@@ -976,7 +995,10 @@ pub fn ingest_git_delta(
             let fetched = (|| -> Result<bool> {
                 let file = std::fs::File::create(&tmp).ctx("creating pack file")?;
                 let mut w = std::io::BufWriter::with_capacity(1 << 20, file);
-                let n = up.fetch(haves, &want, &mut w)?;
+                let n = match filter {
+                    Some(f) => up.fetch_filtered(haves, &want, f, &mut w)?,
+                    None => up.fetch(haves, &want, &mut w)?,
+                };
                 let file = w
                     .into_inner()
                     .map_err(|e| crate::err!("writing pack: {e}"))?;

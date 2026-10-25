@@ -269,7 +269,6 @@ impl AzureStore {
         let blob = self.blob_path(key)?;
         let blocks = size.div_ceil(BLOCK);
         let next = AtomicU64::new(0);
-        let block_id = |i: u64| crate::b64::encode(format!("{i:016}").as_bytes());
         std::thread::scope(|s| -> Result<()> {
             let workers: Vec<_> = (0..PARALLEL)
                 .map(|_| {
@@ -285,18 +284,7 @@ impl AzureStore {
                             let len = crate::util::us(BLOCK.min(size.saturating_sub(off)));
                             let chunk = buf.get_mut(..len).ctx("block buffer")?;
                             file.read_exact_at(chunk, off)?;
-                            let q = [("comp", "block".to_string()), ("blockid", block_id(i))];
-                            self.call(
-                                &mut c,
-                                Req {
-                                    method: "PUT",
-                                    path: &blob,
-                                    query: &q,
-                                    headers: &[],
-                                    body: chunk,
-                                },
-                                |r| r.ensure_ok("Put Block")?.finish(),
-                            )?;
+                            self.put_block(&mut c, &blob, i, chunk)?;
                         }
                     })
                 })
@@ -307,6 +295,27 @@ impl AzureStore {
             }
             Ok(())
         })?;
+        self.put_block_list(&blob, blocks)
+    }
+
+    /// Stages block `i` of the blob at `blob` (a [`AzureStore::blob_path`]).
+    fn put_block(&self, c: &mut Client, blob: &str, i: u64, chunk: &[u8]) -> Result<()> {
+        let q = [("comp", "block".to_string()), ("blockid", block_id(i))];
+        self.call(
+            c,
+            Req {
+                method: "PUT",
+                path: blob,
+                query: &q,
+                headers: &[],
+                body: chunk,
+            },
+            |r| r.ensure_ok("Put Block")?.finish(),
+        )
+    }
+
+    /// Commits blocks `0..blocks`: the blob appears, whole, atomically.
+    fn put_block_list(&self, blob: &str, blocks: u64) -> Result<()> {
         let mut list = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>");
         for i in 0..blocks {
             list.push_str(&format!("<Latest>{}</Latest>", block_id(i)));
@@ -317,13 +326,26 @@ impl AzureStore {
             &mut c,
             Req {
                 method: "PUT",
-                path: &blob,
+                path: blob,
                 query: &[("comp", "blocklist".to_string())],
                 headers: &[],
                 body: list.as_bytes(),
             },
             |r| r.ensure_ok("Put Block List")?.finish(),
         )
+    }
+
+    /// A streaming upload of `key`: blocks are staged as they fill, and the blob appears
+    /// (atomically) at [`AzureWriter::finish`]. Memory: one block.
+    pub fn writer(&self, key: &str) -> Result<AzureWriter<'_>> {
+        Ok(AzureWriter {
+            key: key.to_string(),
+            blob: self.blob_path(key)?,
+            client: self.client(),
+            buf: Vec::with_capacity(crate::util::us(BLOCK)),
+            blocks: 0,
+            store: self,
+        })
     }
 
     pub fn download_file(&self, key: &str, path: &Path) -> Result<()> {
@@ -493,6 +515,63 @@ impl AzureStore {
 }
 
 /// Text of the first `<name>...</name>` element.
+fn block_id(i: u64) -> String {
+    crate::b64::encode(format!("{i:016}").as_bytes())
+}
+
+/// See [`AzureStore::writer`].
+pub struct AzureWriter<'a> {
+    store: &'a AzureStore,
+    key: String,
+    blob: String,
+    client: Client,
+    buf: Vec<u8>,
+    blocks: u64,
+}
+
+impl AzureWriter<'_> {
+    fn stage(&mut self) -> Result<()> {
+        let buf = std::mem::take(&mut self.buf);
+        let staged = self
+            .store
+            .put_block(&mut self.client, &self.blob, self.blocks, &buf);
+        self.buf = buf;
+        self.buf.clear();
+        staged?;
+        self.blocks = self.blocks.saturating_add(1);
+        Ok(())
+    }
+
+    /// Stages the rest and commits the block list.
+    pub fn finish(mut self) -> Result<()> {
+        if self.blocks == 0 {
+            self.store.put(&self.key, &self.buf, &Cond::None)?;
+            return Ok(());
+        }
+        if !self.buf.is_empty() {
+            self.stage()?;
+        }
+        self.store.put_block_list(&self.blob, self.blocks)
+    }
+}
+
+impl std::io::Write for AzureWriter<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let room = crate::util::us(BLOCK).saturating_sub(self.buf.len());
+        let n = room.min(data.len());
+        self.buf.extend_from_slice(data.get(..n).unwrap_or(&[]));
+        if self.buf.len() >= crate::util::us(BLOCK) {
+            self.stage()
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn tag(xml: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");
     let start = xml.find(&open)?.checked_add(open.len())?;

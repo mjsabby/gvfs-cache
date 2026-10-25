@@ -111,6 +111,95 @@ impl Store {
             Store::Azure(a) => a.delete(key),
         }
     }
+
+    /// A streaming upload of an immutable object: it appears, whole, at
+    /// [`StoreWriter::finish`] (never partially); dropped unfinished, it never appears.
+    pub fn writer(&self, key: &str) -> Result<StoreWriter<'_>> {
+        match self {
+            Store::Fs(s) => {
+                let path = s.path(key)?;
+                if let Some(dir) = path.parent() {
+                    fs::create_dir_all(dir).ctx(&format!("creating {}", dir.display()))?;
+                }
+                let tmp = crate::fsutil::temp_path(&path);
+                let file = File::create(&tmp).ctx(&format!("creating {}", tmp.display()))?;
+                Ok(StoreWriter::Fs(FsWriter {
+                    w: Some(std::io::BufWriter::with_capacity(1 << 20, file)),
+                    tmp,
+                    path,
+                }))
+            }
+            Store::Azure(a) => Ok(StoreWriter::Azure(a.writer(key)?)),
+        }
+    }
+}
+
+/// See [`Store::writer`].
+pub enum StoreWriter<'a> {
+    Fs(FsWriter),
+    Azure(crate::azure::AzureWriter<'a>),
+}
+
+/// A local upload: a temp file renamed into place when finished, removed if dropped.
+pub struct FsWriter {
+    w: Option<std::io::BufWriter<File>>,
+    tmp: PathBuf,
+    path: PathBuf,
+}
+
+impl FsWriter {
+    fn finish(mut self) -> Result<()> {
+        let w = self.w.take().ctx("upload already finished")?;
+        let file = w.into_inner().map_err(|e| crate::err!("writing: {e}"))?;
+        file.sync_all()?;
+        fs::rename(&self.tmp, &self.path).ctx(&format!("writing {}", self.path.display()))?;
+        crate::fsutil::sync_dir(&self.path);
+        Ok(())
+    }
+
+    fn out(&mut self) -> std::io::Result<&mut std::io::BufWriter<File>> {
+        self.w
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("upload already finished"))
+    }
+}
+
+impl Drop for FsWriter {
+    fn drop(&mut self) {
+        // Unfinished (or failed): no temp file is left behind. Finished: already renamed.
+        let _ = fs::remove_file(&self.tmp);
+    }
+}
+
+impl StoreWriter<'_> {
+    pub fn finish(self) -> Result<()> {
+        match self {
+            StoreWriter::Fs(f) => f.finish(),
+            StoreWriter::Azure(a) => a.finish(),
+        }
+    }
+}
+
+impl std::io::Write for StoreWriter<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        match self {
+            StoreWriter::Fs(f) => f.out()?.write(data),
+            StoreWriter::Azure(a) => a.write(data),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            StoreWriter::Fs(f) => f.out()?.flush(),
+            StoreWriter::Azure(a) => a.flush(),
+        }
+    }
+}
+
+impl crate::blobstream::Spool for StoreWriter<'_> {
+    fn read_back(&mut self, _: u64, _: &mut [u8]) -> Result<()> {
+        crate::bail!("a pack streamed to the store cannot be read back (deltas need a local spool)")
+    }
 }
 
 /// Keys are relative paths of `[A-Za-z0-9._-]` components.
@@ -290,6 +379,17 @@ mod tests {
             ("slabs/a.pack", 4)
         );
         s.delete("slabs/a.pack").unwrap();
+        // Streaming uploads appear only when finished.
+        let mut w = s.writer("blobs/x.pack").unwrap();
+        std::io::Write::write_all(&mut w, b"partial").unwrap();
+        drop(w);
+        assert!(s.list("blobs/").unwrap().is_empty());
+        assert_eq!(fs::read_dir(dir.join("blobs")).unwrap().count(), 0);
+        let mut w = s.writer("blobs/x.pack").unwrap();
+        std::io::Write::write_all(&mut w, b"whole").unwrap();
+        assert!(s.list("blobs/").unwrap().is_empty());
+        w.finish().unwrap();
+        assert_eq!(s.get("blobs/x.pack").unwrap().unwrap().0, b"whole");
         assert!(s.list("slabs/").unwrap().is_empty());
         assert!(!valid_key("../x") && !valid_key("a//b") && valid_key("slabs/m15-1-ab.pack"));
         fs::remove_dir_all(&dir).unwrap();

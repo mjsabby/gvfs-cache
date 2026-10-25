@@ -32,6 +32,9 @@ pub mod upstream;
 
 pub mod arena;
 pub mod azure;
+pub mod blobcopy;
+pub mod blobs;
+pub mod blobstream;
 pub mod manifest;
 pub mod store;
 
@@ -48,7 +51,9 @@ pub mod object;
 pub mod pack;
 pub mod pipeline;
 pub mod repack;
+pub mod separate;
 pub mod serve;
+pub mod sizes;
 pub mod slab;
 pub mod splice;
 pub mod timeline;

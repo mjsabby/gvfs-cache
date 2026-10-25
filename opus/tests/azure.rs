@@ -270,6 +270,36 @@ fn azure_store_operations() {
     // The prefix isolates repositories in one container.
     assert!(backend.store("/repo2").list("slabs/").unwrap().is_empty());
 
+    // Streaming uploads: blocks staged as they fill, the object appears only when finished.
+    for (key, len) in [
+        ("blobs/stream.pack", (40usize << 20) + 777),
+        ("blobs/exact.pack", 32 << 20),
+        ("blobs/small.pack", 1000),
+        ("blobs/empty.pack", 0),
+    ] {
+        let mut w = store.writer(key).unwrap();
+        for piece in big[..len].chunks(3 << 20) {
+            std::io::Write::write_all(&mut w, piece).unwrap();
+        }
+        assert!(
+            store.get(key).unwrap().is_none(),
+            "{key} visible before finish"
+        );
+        w.finish().unwrap();
+        if len == 0 {
+            assert_eq!(store.get(key).unwrap().unwrap().0, b"");
+        } else {
+            let down = root.join(format!("down/{}", key.replace('/', "_")));
+            store.download_file(key, &down).unwrap();
+            assert!(std::fs::read(&down).unwrap() == big[..len], "{key} differs");
+        }
+        store.delete(key).unwrap();
+    }
+    let mut w = store.writer("blobs/abandoned.pack").unwrap();
+    std::io::Write::write_all(&mut w, &big[..20 << 20]).unwrap();
+    drop(w);
+    assert!(store.get("blobs/abandoned.pack").unwrap().is_none());
+
     store.delete("slabs/big.pack").unwrap();
     store.delete("slabs/big.pack").unwrap();
     assert_eq!(store.list("slabs/").unwrap().len(), 1);

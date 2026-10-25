@@ -9,19 +9,32 @@
 //!   client is answered from exactly where its last pack ended (never in a cold plan).
 //!
 //! ```text
-//! "GVDMANI1" | version u32 | generation u64 | tip [20] | max_ts u64 | slab count u32
+//! "GVDMANI1" | version u32 | generation u64 | tip [20] | max_ts u64
+//! (version 3: flags u32 | blobs generation u64) | slab count u32
 //! slab*: role u8 | tier u8 | id_len u16 | id | start_ts u64 | end_ts u64 | have [20]
 //!        | want [20] | objects u32 | pack_len u64 | index_len u64 | pack_sha [20]
 //! SHA-256 of everything before it [32]
 //! ```
+//!
+//! A store made with `--blobs separate` keeps blobs out of its slabs ([`crate::blobs`]):
+//! its manifests carry [`FLAG_SEPARATE_BLOBS`], and every slab has a sizes table beside it
+//! ([`crate::sizes`]). Such a manifest names the `blobs.bin` generation its trees' blobs are
+//! in (`blobs_generation`); [`FLAG_BLOBS_PARTIAL`] says genesis history is not mirrored yet.
+//! Other stores keep writing version 2, byte for byte as before.
 
 use crate::slab::{SlabMeta, Tier};
 use crate::util::{Context, Oid, Result, le_u16, le_u32, le_u64, sub};
 
 pub const MANIFEST_KEY: &str = "manifest.bin";
 const MAGIC: &[u8; 8] = b"GVDMANI1";
-/// Version 2 added `retained`; version 1 manifests still decode.
-const VERSION: u32 = 2;
+/// Version 2 added `retained`, version 3 `flags` and `blobs_generation`; older manifests
+/// still decode. Version 3 is only written when one of those is set.
+const VERSION: u32 = 3;
+const VERSION_PLAIN: u32 = 2;
+/// Blobs live in blob packs (`blobs.bin`), not in slabs; slabs have sizes tables.
+pub const FLAG_SEPARATE_BLOBS: u32 = 1;
+/// The trees' blobs are not all in the store yet (genesis before `mirror --scope tip`).
+pub const FLAG_BLOBS_PARTIAL: u32 = 2;
 
 const ROLE_BASELINE: u8 = 0;
 const ROLE_WEEKLY: u8 = 1;
@@ -40,9 +53,21 @@ pub struct Manifest {
     pub weekly: Vec<SlabMeta>,
     pub pyramid: Vec<SlabMeta>,
     pub retained: Vec<SlabMeta>,
+    /// [`FLAG_SEPARATE_BLOBS`], [`FLAG_BLOBS_PARTIAL`].
+    pub flags: u32,
+    /// The `blobs.bin` generation holding the blobs these slabs' trees reference.
+    pub blobs_generation: u64,
 }
 
 impl Manifest {
+    pub fn separate_blobs(&self) -> bool {
+        self.flags & FLAG_SEPARATE_BLOBS != 0
+    }
+
+    pub fn blobs_partial(&self) -> bool {
+        self.flags & FLAG_BLOBS_PARTIAL != 0
+    }
+
     /// Every slab: baseline, weekly deltas, pyramid (each oldest first), then retained.
     pub fn slabs(&self) -> impl Iterator<Item = &SlabMeta> {
         std::iter::once(&self.baseline)
@@ -71,11 +96,16 @@ impl Manifest {
 
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(256);
+        let v3 = self.flags != 0 || self.blobs_generation != 0;
         out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&VERSION.to_le_bytes());
+        out.extend_from_slice(&if v3 { VERSION } else { VERSION_PLAIN }.to_le_bytes());
         out.extend_from_slice(&self.generation.to_le_bytes());
         out.extend_from_slice(&self.tip.0);
         out.extend_from_slice(&self.max_ts.to_le_bytes());
+        if v3 {
+            out.extend_from_slice(&self.flags.to_le_bytes());
+            out.extend_from_slice(&self.blobs_generation.to_le_bytes());
+        }
         let count = 1usize
             .saturating_add(self.weekly.len())
             .saturating_add(self.pyramid.len())
@@ -111,15 +141,25 @@ impl Manifest {
         if ring::digest::digest(&ring::digest::SHA256, body).as_ref() != digest {
             crate::bail!("manifest checksum mismatch");
         }
-        if body.get(..8) != Some(&MAGIC[..]) || !matches!(le_u32(body, 8), Some(1..=VERSION)) {
+        let version = le_u32(body, 8).unwrap_or(0);
+        if body.get(..8) != Some(&MAGIC[..]) || !(1..=VERSION).contains(&version) {
             crate::bail!("not a gvfs-daemon manifest (or an unsupported version)");
         }
         let generation = le_u64(body, 12).ctx("manifest header")?;
         let tip =
             Oid::from_slice(sub(body, 20, 20).ctx("manifest header")?).ctx("manifest header")?;
         let max_ts = le_u64(body, 40).ctx("manifest header")?;
-        let count = le_u32(body, 48).ctx("manifest header")?;
-        let mut at = 52usize;
+        let (flags, blobs_generation, count_at) = if version >= 3 {
+            (
+                le_u32(body, 48).ctx("manifest header")?,
+                le_u64(body, 52).ctx("manifest header")?,
+                60usize,
+            )
+        } else {
+            (0, 0, 48usize)
+        };
+        let count = le_u32(body, count_at).ctx("manifest header")?;
+        let mut at = count_at.wrapping_add(4);
         let mut baseline = None;
         let mut weekly = Vec::new();
         let mut pyramid = Vec::new();
@@ -174,6 +214,8 @@ impl Manifest {
             weekly,
             pyramid,
             retained,
+            flags,
+            blobs_generation,
         })
     }
 
@@ -183,6 +225,17 @@ impl Manifest {
             "generation {}  tip {}  max_ts {}\n",
             self.generation, self.tip, self.max_ts
         );
+        if self.separate_blobs() {
+            s.push_str(&format!(
+                "  blobs in blob packs (blobs.bin generation {}{})\n",
+                self.blobs_generation,
+                if self.blobs_partial() {
+                    ", genesis history partial"
+                } else {
+                    ""
+                }
+            ));
+        }
         let mut row = |role: &str, m: &SlabMeta| {
             s.push_str(&format!(
                 "  {role:8} {:5} {:>12} objects {:>12}  ({}..{}]  {}  {}..{}\n",
@@ -266,9 +319,27 @@ mod tests {
             weekly: vec![meta(Tier::Week, 2000)],
             pyramid: vec![meta(Tier::H1, 3000), meta(Tier::M15, 4000)],
             retained: vec![meta(Tier::M15, 2900), meta(Tier::M15, 3000)],
+            flags: 0,
+            blobs_generation: 0,
         };
         let b = m.encode();
+        assert_eq!(
+            le_u32(&b, 8),
+            Some(VERSION_PLAIN),
+            "plain stores stay version 2"
+        );
         assert_eq!(Manifest::decode(&b).unwrap(), m);
+        let sep = Manifest {
+            flags: FLAG_SEPARATE_BLOBS | FLAG_BLOBS_PARTIAL,
+            blobs_generation: 12,
+            ..m.clone()
+        };
+        let b3 = sep.encode();
+        assert_eq!(le_u32(&b3, 8), Some(VERSION));
+        let back = Manifest::decode(&b3).unwrap();
+        assert_eq!(back, sep);
+        assert!(back.separate_blobs() && back.blobs_partial());
+        assert!(sep.describe().contains("blobs.bin generation 12"));
         let mut bad = b.clone();
         bad[30] ^= 1;
         assert!(Manifest::decode(&bad).is_err());

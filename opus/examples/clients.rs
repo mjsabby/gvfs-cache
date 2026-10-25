@@ -362,6 +362,8 @@ fn main() {
         keep_weeks: 8,
         gc_grace: 7200,
         threads,
+        blobs: None,
+        blob_pack_bytes: gvfs_daemon::separate::ITEM_BYTES,
     };
     let mut edge = Edge {
         store: Store::open(&store_spec, "").unwrap(),
