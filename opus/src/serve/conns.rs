@@ -238,7 +238,11 @@ mod tests {
 
     #[test]
     fn tokens_round_trip() {
-        for (s, i, g) in [(0usize, 0u32, 0u32), (63, 0x00FF_FFFF, u32::MAX), (5, 1234, 77)] {
+        for (s, i, g) in [
+            (0usize, 0u32, 0u32),
+            (63, 0x00FF_FFFF, u32::MAX),
+            (5, 1234, 77),
+        ] {
             assert_eq!(split(token(s, i, g)), (s, usize::try_from(i).unwrap(), g));
         }
         assert_ne!(token(63, 0x00FF_FFFF, u32::MAX), LISTENER);
@@ -276,6 +280,10 @@ mod tests {
         assert_eq!(conns.parked.load(Ordering::Relaxed), 0);
         assert_eq!(conns.reaped.load(Ordering::Relaxed), 1);
         let mut rest = Vec::new();
-        assert_eq!(client.read_to_end(&mut rest).unwrap(), 0, "reaped connection is closed");
+        assert_eq!(
+            client.read_to_end(&mut rest).unwrap(),
+            0,
+            "reaped connection is closed"
+        );
     }
 }

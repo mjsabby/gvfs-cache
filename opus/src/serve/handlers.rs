@@ -12,6 +12,7 @@
 //! Any prefix before `/gvfs/` is accepted (`https://host/org/repo/gvfs/...`). Handlers use
 //! only the worker's buffers and a leased request arena: no heap allocation.
 
+use std::io::Write;
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -195,12 +196,12 @@ fn prefetch(
     keep: bool,
 ) -> std::io::Result<bool> {
     let view = ctx.view();
-    let plan = match view.prefetch(since) {
+    let (plan, start) = match view.prefetch(since) {
         Prefetch::UpToDate => {
             write_response(stream, 200, CT_PREFETCH, b"GPRE \x01\x00\x00", keep)?;
             return Ok(keep);
         }
-        Prefetch::Pack(plan) => plan,
+        Prefetch::Pack(plan, start) => (plan, start),
     };
     inc(&ctx.metrics.prefetch_packs);
     let idx = if want_idx {
@@ -224,8 +225,26 @@ fn prefetch(
         .len
         .saturating_add(32)
         .saturating_add(idx.map_or(0, |i| u64_of(i.len())));
+    // The interval the pack covers: an interval hook (fable's `client-prefetch`) unlinks
+    // every local pack whose own interval lies inside it.
+    let mut extra = [0u8; 96];
+    let extra_len = {
+        let mut cur = std::io::Cursor::new(extra.as_mut_slice());
+        let _ = write!(
+            cur,
+            "X-GVFS-Pack-Start: {start}\r\nX-GVFS-Pack-End: {}\r\n",
+            plan.timestamp
+        );
+        usize::try_from(cur.position()).unwrap_or(0)
+    };
     let mut out = Out::new(stream, &mut w.out);
-    out.head(200, CT_PREFETCH, body_len, keep)?;
+    out.head_with(
+        200,
+        CT_PREFETCH,
+        body_len,
+        keep,
+        extra.get(..extra_len).unwrap_or(&[]),
+    )?;
     out.bytes(&head)?;
     out.bytes(&plan.header)?;
     for (slab, start, len) in plan.bodies() {

@@ -399,6 +399,18 @@ pub fn format_head(
     len: u64,
     keep_alive: bool,
 ) -> usize {
+    format_head_with(buf, status, content_type, len, keep_alive, b"")
+}
+
+/// [`format_head`] with `extra` header lines (each ending in CRLF) before the blank line.
+pub fn format_head_with(
+    buf: &mut [u8],
+    status: u16,
+    content_type: &str,
+    len: u64,
+    keep_alive: bool,
+    extra: &[u8],
+) -> usize {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -412,9 +424,11 @@ pub fn format_head(
     let mut cur = std::io::Cursor::new(buf);
     let _ = write!(
         cur,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nConnection: {}\r\n\r\n",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nConnection: {}\r\n",
         if keep_alive { "keep-alive" } else { "close" }
     );
+    let _ = cur.write_all(extra);
+    let _ = cur.write_all(b"\r\n");
     usize::try_from(cur.position()).unwrap_or(0)
 }
 
@@ -455,8 +469,20 @@ impl<'a> Out<'a> {
         len: u64,
         keep_alive: bool,
     ) -> std::io::Result<()> {
+        self.head_with(status, content_type, len, keep_alive, b"")
+    }
+
+    /// [`Out::head`] with `extra` header lines (each ending in CRLF).
+    pub fn head_with(
+        &mut self,
+        status: u16,
+        content_type: &str,
+        len: u64,
+        keep_alive: bool,
+        extra: &[u8],
+    ) -> std::io::Result<()> {
         let mut h = [0u8; 320];
-        let n = format_head(&mut h, status, content_type, len, keep_alive);
+        let n = format_head_with(&mut h, status, content_type, len, keep_alive, extra);
         let h = h.get(..n).unwrap_or(&[]);
         if self.buf.len().saturating_add(h.len()) > self.buf.capacity() {
             self.flush()?;
@@ -558,7 +584,13 @@ mod tests {
             &buf[..n],
             b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\n"
         );
-        let n = format_head(&mut buf, 413, "text/plain", 18_446_744_073_709_551_615, false);
+        let n = format_head(
+            &mut buf,
+            413,
+            "text/plain",
+            18_446_744_073_709_551_615,
+            false,
+        );
         assert_eq!(
             &buf[..n],
             b"HTTP/1.1 413 Payload Too Large\r\nContent-Type: text/plain\r\nContent-Length: 18446744073709551615\r\nConnection: close\r\n\r\n"

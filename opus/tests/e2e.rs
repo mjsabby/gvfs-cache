@@ -592,6 +592,144 @@ fn pyramid_rollups_and_weekly_rebuilds() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Superset deliveries (`--superset-tier`, default 24h). Once the tip moves past a sealed
+/// day, a client inside it, or current at its end, receives the day whole with what
+/// follows: once, labelled with its interval. Stock client maintenance
+/// (`multi-pack-index expire`) then deletes the client's smaller packs from that day,
+/// which Scalar's default `incremental-repack` cannot do with exact covers. A server with
+/// `--superset-tier never` keeps answering exactly.
+#[test]
+fn sealed_days_reach_warm_clients_whole_once() {
+    let root = tempdir("supersets");
+    let mut up = Upstream::new(&root);
+    up.commit(4);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    let mut now = gvfs_daemon::util::now_secs();
+    step(&root, &store, &up, &mut now, "15m", &[]);
+    let cache = |n: &str| root.join(n).to_str().unwrap().to_string();
+    let (c1, c2) = (cache("cache1"), cache("cache2"));
+    let server = Server::start(&["--store", &store, "--poll-ms", "100", "--cache-dir", &c1]);
+    let exact = Server::start(&[
+        "--store",
+        &store,
+        "--poll-ms",
+        "100",
+        "--cache-dir",
+        &c2,
+        "--superset-tier",
+        "never",
+    ]);
+    let wait = |generation: u64| {
+        for s in [&server, &exact] {
+            s.wait_for("the manifest", |s| {
+                s.metric("gvfs_manifest_generation") == generation
+            });
+        }
+    };
+    // Stock clients (gvfs-helper) keep a .keep only on their newest pack.
+    let install = |repo: &std::path::Path, pack: &[u8], age: u64| {
+        let out = git_stdin(repo, &["index-pack", "--stdin"], pack);
+        let hash = String::from_utf8(out).unwrap().trim().replace("pack\t", "");
+        let stamp = format!("@{}", gvfs_daemon::util::now_secs() - age);
+        for ext in ["pack", "idx"] {
+            let f = repo.join(format!("objects/pack/pack-{hash}.{ext}"));
+            let ok = std::process::Command::new("touch")
+                .args(["-d", &stamp, f.to_str().unwrap()])
+                .status()
+                .unwrap();
+            assert!(ok.success());
+        }
+    };
+    let packs_in = |repo: &std::path::Path| {
+        std::fs::read_dir(repo.join("objects/pack"))
+            .unwrap()
+            .filter(|e| e.as_ref().unwrap().path().extension() == Some("pack".as_ref()))
+            .count()
+    };
+
+    let (cold, interval) = server.prefetch_interval(0);
+    assert_eq!(interval, Some((0, cold[0].0)));
+    let ts0 = cold[0].0;
+    let agent = fresh_repo(&root, "agent");
+    let laptop = fresh_repo(&root, "laptop");
+    install(&agent, &cold[0].1, 7200);
+    install(&laptop, &cold[0].1, 7200);
+
+    // A day of three runs: the agent takes each, the laptop only the first.
+    let (mut cursor, mut laptop_at) = (ts0, ts0);
+    for k in 0..3 {
+        up.commit(4);
+        step(&root, &store, &up, &mut now, "15m", &[]);
+        wait(manifest(&store_dir).generation);
+        let (packs, interval) = server.prefetch_interval(cursor);
+        assert_eq!(interval, Some((cursor, packs[0].0)), "exact inside the day");
+        install(&agent, &packs[0].1, 3600);
+        cursor = packs[0].0;
+        if k == 0 {
+            install(&laptop, &packs[0].1, 3600);
+            laptop_at = cursor;
+        }
+    }
+    let day_tip = up.tip();
+    step(&root, &store, &up, &mut now, "24h", &[]);
+    let m = manifest(&store_dir);
+    let day = m.pyramid.last().unwrap().clone();
+    assert_eq!(
+        (day.tier, day.start_ts, day.end_ts),
+        (Tier::H24, ts0, cursor)
+    );
+    wait(m.generation);
+    // Sealed, but the tip has not moved past it: nothing for the agent, the exact rest for
+    // the laptop.
+    assert!(server.prefetch(cursor).is_empty());
+    let (packs, interval) = server.prefetch_interval(laptop_at);
+    assert_eq!(interval, Some((laptop_at, cursor)));
+    assert!(install_count(&packs[0].1) > 0);
+
+    // The next commit: the day whole plus the commit, for the agent (current at the day's
+    // end) and for the laptop (inside it), once each.
+    let tip = up.commit(4);
+    step(&root, &store, &up, &mut now, "15m", &[]);
+    let m = manifest(&store_dir);
+    wait(m.generation);
+    let new_only = git(
+        &up.bare,
+        &["rev-list", "--objects", &tip, &format!("^{day_tip}")],
+    )
+    .lines()
+    .count();
+    for at in [cursor, laptop_at] {
+        let (packs, interval) = server.prefetch_interval(at);
+        assert_eq!(interval, Some((ts0, m.max_ts)), "the day whole from {at}");
+        assert_eq!(packs[0].0, m.max_ts);
+        assert_eq!(install_count(&packs[0].1), day.objects as usize + new_only);
+    }
+    assert!(server.prefetch(m.max_ts).is_empty(), "once");
+    let (packs, interval) = exact.prefetch_interval(cursor);
+    assert_eq!(interval, Some((cursor, m.max_ts)));
+    assert_eq!(install_count(&packs[0].1), new_only);
+
+    // Stock maintenance: every small pack of the day is redundant once the superset is the
+    // newest pack, so `expire` deletes them; the cold clone stays.
+    let (packs, _) = server.prefetch_interval(cursor);
+    install(&agent, &packs[0].1, 0);
+    assert_eq!(packs_in(&agent), 5);
+    git(&agent, &["multi-pack-index", "write"]);
+    git(&agent, &["multi-pack-index", "expire"]);
+    assert_eq!(packs_in(&agent), 2);
+    assert_complete(&agent, &tip);
+
+    server.assert_clean();
+    drop((server, exact));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Objects in a pack (its header count).
+fn install_count(pack: &[u8]) -> usize {
+    u32::from_be_bytes(pack[8..12].try_into().unwrap()) as usize
+}
+
 /// `ingest --pack` on a git-made pack reproduces git's own index.
 #[test]
 fn ingest_cli_matches_git_index() {
@@ -931,6 +1069,9 @@ fn busy_connections_beyond_the_workers_take_turns() {
     stop.store(true, Ordering::Relaxed);
     let answered: Vec<usize> = threads.into_iter().map(|t| t.join().unwrap()).collect();
     // Without turns, 4 of the 6 clients get their first answer only once the others stop.
-    assert!(answered.iter().all(|&n| n >= 20), "answers per client: {answered:?}");
+    assert!(
+        answered.iter().all(|&n| n >= 20),
+        "answers per client: {answered:?}"
+    );
     server.assert_clean();
 }

@@ -282,7 +282,8 @@ Every change publishes a new immutable `View`; requests hold an `Arc` to the vie
 started with. Object lookups go through the live L0 slabs, the pyramid, the weekly deltas
 and the baseline, newest first; retained slabs hold nothing those do not.
 
-**Prefetch plans.** Every response is one pack holding exactly what the client lacks:
+**Prefetch plans.** Every response is one pack holding what the client lacks (and, once
+per sealed day and week, that rollup whole):
 
 * The timeline is every slab a plan may use: weekly deltas, pyramid, retained slabs and L0
   slabs. Rollups keep their parts' bounds, so boundaries nest like a segment tree.
@@ -292,8 +293,27 @@ and the baseline, newest first; retained slabs hold nothing those do not.
   (`timeline::cover`); where none starts there, the narrowest slab containing the
   position. The baseline is never part of it.
 * **Cold** (no cursor, or an older one): the baseline plus the cover from its end.
+* **Superset deliveries** (`--superset-tier`, default `24h`). Once the tip has moved past
+  a sealed daily rollup or weekly delta, a client whose cursor lies inside it, or exactly
+  at its end, is answered from the rollup's start instead (`timeline::superset_start`, the
+  widest such rollup). It receives the rollup whole plus what follows, once, since its
+  cursor then lies past the rollup. Every pack it got inside that window is then
+  redundant, and that is what stock client maintenance needs: `git multi-pack-index
+  expire` deletes packs whose objects all have newer copies. With exact covers alone a
+  client keeps one pack per prefetch that brought news. Scalar's default
+  `incremental-repack` (batch size: the second-largest pack + 1) merges only a few of them
+  a day: over a replayed SearchGold week an agent prefetching every minute kept 1,280 of
+  its 1,405 packs, on its way to ~5,000 a month, where git pays ~3 ms for every lookup of
+  an absent object (it rescans the pack directory; a multi-pack-index does not help). With
+  superset deliveries it stays under two days of packs. VFS for Git's fixed 2 GB batch
+  and Scalar's `geometric` strategy keep up either way. The price is one daily rollup per
+  client per active day and one weekly delta per week (0.35-0.82 MiB and 1.9 MiB on
+  SearchGold): 1.11-1.53× the ideal instead of 1.00-1.02×. `168h` delivers weekly deltas
+  only (1.04-1.31×, packs bounded by a week's worth); `never` keeps exact covers.
 * A cover of several slabs is repacked into one, so the response is about the size of one
   upstream fetch of exactly that range.
+* Every response names the interval it covers (`X-GVFS-Pack-Start`/`X-GVFS-Pack-End`),
+  so an interval hook (fable's `client-prefetch`) can unlink the local packs it subsumes.
 * An up-to-date client (cursor at or past the tip's stamp) gets an empty `GPRE` stream.
 
 Plans are keyed by boundary: at most one per slab start per view, each built once (in a
@@ -301,11 +321,12 @@ Plans are keyed by boundary: at most one per slab start per view, each built onc
 and the plan for the previous view's tip, which is what up-to-date clients ask for next.
 
 **Warm traffic.** `examples/clients.rs` replays 14 days of SearchGold through the pipeline
-and the edge on a simulated clock (README, "Client traffic"). Every client pattern, from
-an agent prefetching every minute to a developer back after 8 days off, gets within 2% of
-the ideal: a self-contained pack of exactly what it lacks, as one upstream fetch would
-make it. Cold clones are 0.04 MiB over a fresh full fetch. Three changes got there from
-2.2-2.5×:
+and the edge on a simulated clock (README, "Client traffic"). With exact covers
+(`--superset-tier never`) every client pattern, from an agent prefetching every minute to
+a developer back after 8 days off, gets within 2% of the ideal: a self-contained pack of
+exactly what it lacks, as one upstream fetch would make it. Superset deliveries add each
+sealed day and week once (above). Cold clones are 0.04 MiB over a fresh full fetch. Three
+changes got there from 2.2-2.5×:
 
 * *Rollups used to replace finer slabs*, so a client whose cursor fell inside an hour, day
   or week was sent the whole rollup again. Replaced slabs now stay listed (`retained`),
@@ -382,6 +403,7 @@ front of an edge. The localhost proxy needs neither.
 | 8-byte packed descriptors with a 16-bit fingerprint | 40-byte records with the full id | Exact answers (404 for unknown ids, never a wrong object). Sizes, types, and delta bases come without inflation. 24-byte records would save about 150 MB on SearchGold. |
 | Edge range-reads slabs from S3/Blob (coalesced HTTP `Range`) | The edge hydrates slabs to local disk (`--cache-dir`) and maps them | Local reads cost microseconds: a deltified tree GET is 190 µs p50. The edge restarts from the store at any time. The cluster layout keeps range reads possible behind the same `Slab` type. |
 | Pack timestamps are creation times; warm clients get every slab newer than their cursor; rollups replace the slabs they fold | Timestamps are derived from commits; warm clients get the exact cover from their cursor (retained finer slabs, cascading rollups), repacked into one pack | An edge's L0 slab and the sealed slab that later ends at the same commit get the same stamp, so nothing is sent twice. Measured over 14 days of SearchGold, every client pattern gets within 2% of one upstream fetch of exactly what it lacks, against 2.2-2.5× before. |
+| Superset tombstoning: every rollup reaches clients whole, and a client hook unlinks the packs it subsumes | Only sealed days and weeks reach a client whole, once (`--superset-tier`); the response carries its interval for a hook, and stock `git multi-pack-index expire` does the unlinking | Stock clients (gvfs-helper, VFS for Git, Scalar) run no hook, but their maintenance expires packs that newer packs duplicate. Days and weeks suffice for daily maintenance; finer supersets would re-send each hour up to five times (fable: 1.9-5.3× the ideal). |
 | Tokio/Axum/Hyper, `DashMap` memtable for L0 | std threads, in-house HTTP/1.1, `sendfile`; L0 = heap slabs (one per push) in the same format as sealed slabs | Fewer dependencies (rule 4) and zero hot-path allocation (rule 3). One code path serves every slab. |
 | Parse every `Git-hfs 1.0` pointer during ingest; optional `.hfs` sidecar (content id + real size) | Ingest does not parse pointers. `inspect slab` uses the zero-allocation parser to report pointer coverage | No GVFS endpoint consumes real content sizes (`/gvfs/sizes` returns git object sizes), so the sidecar would be unused work on the critical path. |
 

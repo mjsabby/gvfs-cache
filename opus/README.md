@@ -153,22 +153,25 @@ minutes, tiers as in the cron script above) and the edge's L0 logic (an update o
 push), with each client's prefetches answered by the server's own plan selection. Ideal:
 one self-contained upstream pack of exactly the objects the client lacks.
 
-| Client | prefetches | packs received | slabs merged per pack (avg / max) | MiB received | MiB ideal | × ideal |
-|---|---:|---:|---:|---:|---:|---:|
-| CI agents: fresh clone every 30 min, 24×7 | 672 | 672 | 8.8 / 23 | 2.42 GiB each | +0.04 MiB each | 1.0000 |
-| agent VM: prefetch every minute, 24×7 | 20,159 | 2,839 | 1.2 / 8 | 83.5 | 83.1 | 1.00 |
-| agent VM: prefetch every 15 min, 24×7 | 1,343 | 1,053 | 2.9 / 31 | 46.4 | 46.1 | 1.01 |
-| agent VM: hourly maintenance prefetch, 24×7 | 335 | 321 | 3.3 / 4 | 26.5 | 26.4 | 1.01 |
-| dev laptop: hourly maintenance 08:00-18:00 weekdays | 109 | 105 | 3.9 / 12 | 13.2 | 13.1 | 1.01 |
-| developer: fetch 09:00, 13:00, 17:30 weekdays | 29 | 29 | 5.2 / 8 | 8.6 | 8.4 | 1.02 |
-| developer: fetch each weekday morning | 9 | 9 | 8.2 / 10 | 6.0 | 5.9 | 1.02 |
-| developer: back after 8 days off | 3 | 3 | 9.7 / 13 | 4.4 | 4.3 | 1.02 |
+| Client | prefetches | packs received | MiB received | MiB ideal | × ideal | `168h` | `never` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| CI agents: fresh clone every 30 min, 24×7 | 672 | 672 | 2.42 GiB each | +0.04 MiB each | 1.0000 | 1.0000 | 1.0000 |
+| agent VM: prefetch every minute, 24×7 | 20,159 | 2,839 | 92.6 | 83.1 | 1.11 | 1.04 | 1.00 |
+| agent VM: prefetch every 15 min, 24×7 | 1,343 | 1,053 | 55.3 | 46.1 | 1.20 | 1.07 | 1.01 |
+| agent VM: hourly maintenance prefetch, 24×7 | 335 | 321 | 35.2 | 26.4 | 1.33 | 1.12 | 1.01 |
+| dev laptop: hourly maintenance 08:00-18:00 weekdays | 109 | 105 | 17.6 | 13.1 | 1.34 | 1.15 | 1.01 |
+| developer: fetch 09:00, 13:00, 17:30 weekdays | 29 | 29 | 12.8 | 8.4 | 1.53 | 1.24 | 1.02 |
+| developer: fetch each weekday morning | 9 | 9 | 9.0 | 5.9 | 1.53 | 1.31 | 1.02 |
+| developer: back after 8 days off | 3 | 3 | 5.0 | 4.3 | 1.17 | 1.09 | 1.02 |
 
 Warm rows exclude each client's initial clone (one pack, 1.00× ideal). Every response is
 one pack: the slabs from the client's cursor to the tip, repacked together when there are
-several. Before plans were exact covers (DESIGN.md, "Warm traffic"), warm clients got
-2.2-2.5× the ideal. Keeping replaced slabs listed costs 277 slabs (29.5 MiB) and a 38 KB
-manifest.
+several. The default `--superset-tier 24h` also sends each sealed day and week to each
+client whole, once (0.65 MiB a day here), so that stock client maintenance can delete the
+small packs it subsumes; `168h` does it for weeks only and `never` sends exact covers
+(the last two columns; DESIGN.md, "Prefetch plans"). Before plans were exact covers
+(DESIGN.md, "Warm traffic"), warm clients got 2.2-2.5× the ideal. Keeping replaced slabs
+listed costs 277 slabs (29.5 MiB) and a 38 KB manifest.
 
 Load (`benches/load.sh`, loadgen on the same host, `--alloc-guard strict`: 0 hot-path
 allocations, 0 errors):

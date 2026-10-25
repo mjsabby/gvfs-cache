@@ -203,6 +203,9 @@ pub fn manifest(store_dir: &Path) -> Manifest {
     Manifest::decode(&bytes).unwrap()
 }
 
+/// Prefetch packs: (timestamp, pack bytes), oldest first.
+pub type Packs = Vec<(u64, Vec<u8>)>;
+
 /// The daemon's `serve` command, killed on drop.
 pub struct Server {
     child: Child,
@@ -308,6 +311,31 @@ impl Server {
                 (ts, pack)
             })
             .collect()
+    }
+
+    /// A prefetch as VFS for Git gets it, with the interval the pack covers
+    /// (`X-GVFS-Pack-Start`/`End`).
+    pub fn prefetch_interval(&self, since: u64) -> (Packs, Option<(u64, u64)>) {
+        let mut c = self.client();
+        let mut r = c
+            .request(
+                "GET",
+                &format!("/org/repo/gvfs/prefetch?lastPackTimestamp={since}"),
+                &[],
+                b"",
+            )
+            .unwrap();
+        assert_eq!(r.status, 200);
+        let num = |h: &str| r.header(h).map(|v| v.parse::<u64>().unwrap());
+        let interval = num("x-gvfs-pack-start").zip(num("x-gvfs-pack-end"));
+        let packs = parse_gpre(&r.body_vec(1 << 34).unwrap())
+            .into_iter()
+            .map(|(ts, pack, idx)| {
+                assert_idx_is_gits(&pack, &idx.expect("a .idx for clients other than git"));
+                (ts, pack)
+            })
+            .collect();
+        (packs, interval)
     }
 
     fn prefetch_as(&self, since: u64, agent: Option<&str>) -> Vec<(u64, Vec<u8>, Option<Vec<u8>>)> {

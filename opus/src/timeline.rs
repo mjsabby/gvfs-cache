@@ -130,6 +130,22 @@ pub fn cover(spans: &[(u64, u64)], from: u64, to: u64, out: &mut Vec<usize>) -> 
     true
 }
 
+/// Superset deliveries: where to answer a client at `cursor` from when sealed `rollups`
+/// (`(start, end]`, the 24h/168h slabs) are delivered whole. Returns the start of the widest
+/// rollup holding the cursor, once the tip has moved past its end. The client then receives
+/// the rollup whole (plus what follows), so every smaller pack it got inside the rollup's
+/// window becomes redundant: stock maintenance (`git multi-pack-index expire`) or an interval
+/// hook drops them. A client that is current sits exactly on a rollup's end and receives it
+/// with its next new commits; afterwards its cursor is past the end, so each rollup reaches a
+/// client once.
+pub fn superset_start(rollups: &[(u64, u64)], cursor: u64, tip: u64) -> Option<u64> {
+    rollups
+        .iter()
+        .filter(|&&(start, end)| start < cursor && cursor <= end && end < tip)
+        .map(|&(start, _)| start)
+        .min()
+}
+
 #[cfg(test)]
 #[allow(clippy::arithmetic_side_effects)]
 mod tests {
@@ -137,6 +153,26 @@ mod tests {
     use crate::ingest::{Indexer, memory_slab};
     use crate::slab::Tier;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn supersets_reach_each_client_once() {
+        // A sealed week (0, 100], then two sealed days; the tip is at 350.
+        let rollups = vec![(0, 100), (100, 200), (200, 300)];
+        // Inside a day, or current at its end: that day whole.
+        assert_eq!(superset_start(&rollups, 150, 350), Some(100));
+        assert_eq!(superset_start(&rollups, 200, 350), Some(100));
+        assert_eq!(superset_start(&rollups, 300, 350), Some(200));
+        // Inside the week: the week, the widest rollup holding the cursor.
+        assert_eq!(superset_start(&rollups, 50, 350), Some(0));
+        assert_eq!(superset_start(&rollups, 100, 350), Some(0));
+        // Not before the tip moves past the rollup (then the cursor moves past its end).
+        assert_eq!(superset_start(&rollups, 300, 300), None);
+        assert_eq!(superset_start(&rollups, 250, 300), None);
+        // Past every rollup, at a rollup's start, or a cold clone: the exact cover.
+        assert_eq!(superset_start(&rollups, 320, 350), None);
+        assert_eq!(superset_start(&rollups, 0, 350), None);
+        assert_eq!(superset_start(&[], 150, 350), None);
+    }
 
     #[test]
     fn covers_are_exact_and_minimal() {

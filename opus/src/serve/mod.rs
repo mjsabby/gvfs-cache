@@ -119,6 +119,9 @@ pub struct Options {
     /// While no worker is free, how long a worker keeps serving one connection before
     /// parking it between requests, so busy connections beyond `workers` take turns.
     pub hold: Duration,
+    /// Sealed rollups of this tier and above (24h, or the weekly delta) are delivered whole
+    /// to the warm clients inside them, once ([`view`]); `None`: exact covers only.
+    pub supersets: Option<Tier>,
 }
 
 /// `gvfs-daemon serve ...`
@@ -147,6 +150,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "linger-ms",
             "hold-ms",
             "prefetch-idx",
+            "superset-tier",
         ],
     )?;
     match f.get("alloc-guard").unwrap_or("count") {
@@ -174,6 +178,12 @@ pub fn main(args: &[String]) -> Result<()> {
         "never" => IdxPolicy::Never,
         other => crate::bail!("--prefetch-idx must be auto, always or never, not {other:?}"),
     };
+    let supersets = match f.get("superset-tier").unwrap_or("24h") {
+        "24h" => Some(Tier::H24),
+        "168h" => Some(Tier::Week),
+        "never" => None,
+        other => crate::bail!("--superset-tier must be 24h, 168h or never, not {other:?}"),
+    };
     let cores = crate::util::default_threads();
     let opts = Options {
         store: Store::open(
@@ -199,6 +209,7 @@ pub fn main(args: &[String]) -> Result<()> {
         max_idle_conns: f.num("max-idle-conns", 65536usize)?,
         linger: Duration::from_millis(f.num("linger-ms", 5u64)?),
         hold: Duration::from_millis(f.num("hold-ms", 5u64)?),
+        supersets,
     };
     run(opts)
 }
@@ -241,6 +252,7 @@ pub fn run(o: Options) -> Result<()> {
         max_idle_conns,
         linger,
         hold,
+        supersets,
     } = o;
     let mut live = Live {
         store,
@@ -252,6 +264,7 @@ pub fn run(o: Options) -> Result<()> {
         l0: Vec::new(),
         last_head: Oid::ZERO,
         generation: 0,
+        supersets,
     };
 
     // 1-3. Manifest, slabs, live tip.
@@ -485,7 +498,7 @@ impl Warmer {
                 }
             }
             if prev_tip_ts != 0 && prev_tip_ts < view.tip_ts {
-                if let Prefetch::Pack(plan) = view.prefetch(prev_tip_ts) {
+                if let Prefetch::Pack(plan, _) = view.prefetch(prev_tip_ts) {
                     plan.trailer();
                     if idx {
                         let _ = plan.idx();
@@ -681,6 +694,7 @@ struct Live {
     /// Upstream tip last ingested (or found to bring nothing).
     last_head: Oid,
     generation: u64,
+    supersets: Option<Tier>,
 }
 
 impl Live {
@@ -727,6 +741,7 @@ impl Live {
             etag,
             self.sealed.clone(),
             self.l0.clone(),
+            self.supersets,
         )
     }
 

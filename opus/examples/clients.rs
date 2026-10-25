@@ -15,6 +15,8 @@
 //! cargo run --release --example clients -- --repo ~/SearchGold --from 2026-10-10 \
 //!     --days 14 --work /path/to/scratch 2>clients.log
 //! ```
+//!
+//! `--superset-tier 24h|168h|never` as for `serve` (default 24h).
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -136,6 +138,7 @@ struct Edge {
     view: Option<Arc<View>>,
     generation: u64,
     l0_updates: u64,
+    supersets: Option<Tier>,
 }
 
 impl Edge {
@@ -201,6 +204,7 @@ impl Edge {
             etag,
             self.sealed.clone(),
             self.l0.clone(),
+            self.supersets,
         )));
     }
 }
@@ -288,7 +292,15 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let f = gvfs_daemon::cli::Flags::parse(
         &args,
-        &["repo", "from", "days", "work", "branch", "threads"],
+        &[
+            "repo",
+            "from",
+            "days",
+            "work",
+            "branch",
+            "threads",
+            "superset-tier",
+        ],
     )
     .unwrap();
     let repo = PathBuf::from(f.require("repo").unwrap());
@@ -362,6 +374,11 @@ fn main() {
         view: None,
         generation: 0,
         l0_updates: 0,
+        supersets: match f.get("superset-tier").unwrap_or("24h") {
+            "24h" => Some(Tier::H24),
+            "168h" => Some(Tier::Week),
+            _ => None,
+        },
     };
 
     let h = 3600;
@@ -472,7 +489,7 @@ fn main() {
                 let mut traced = String::new();
                 let (bytes, slabs) = match view.prefetch(c.cursor) {
                     Prefetch::UpToDate => (EMPTY, 0),
-                    Prefetch::Pack(plan) => {
+                    Prefetch::Pack(plan, _) => {
                         c.cursor = plan.timestamp;
                         for s in &plan.slabs {
                             traced.push_str(&format!(

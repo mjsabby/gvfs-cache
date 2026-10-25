@@ -9,6 +9,12 @@
 //! * Cold clients (no cursor, or one older than the oldest weekly delta's start) get the
 //!   baseline plus the cover from the baseline's end.
 //! * Warm clients get the cover from their cursor, never the baseline.
+//! * Superset deliveries (`--superset-tier`, default 24h): a client whose cursor lies in a
+//!   sealed daily or weekly rollup ([`crate::timeline::superset_start`]) is answered from the
+//!   rollup's start once the tip has moved past it, so it receives the rollup whole, once.
+//!   Its smaller packs from that window become redundant, which lets stock client
+//!   maintenance (`git multi-pack-index expire`) or an interval hook delete them: without
+//!   it, Scalar's default `incremental-repack` keeps nearly every small pack.
 //!
 //! A cursor is answered from the newest boundary at or before it (a slab start), so a
 //! snapshot has at most one plan per boundary; each is built on first use and shared.
@@ -45,25 +51,30 @@ pub struct View {
     starts: Vec<u64>,
     /// Clients older than this get the cold plan.
     warm_floor: u64,
+    /// Sealed rollups delivered whole to the clients inside them (`(start, end]`).
+    rollups: Vec<(u64, u64)>,
     plans: Vec<OnceLock<Option<Arc<PackPlan>>>>,
     cold_plan: OnceLock<Arc<PackPlan>>,
 }
 
-/// A prefetch answer: nothing new, or one pack.
+/// A prefetch answer: nothing new, or one pack covering `(start, plan.timestamp]`
+/// (`start` 0 for a cold clone).
 pub enum Prefetch {
     UpToDate,
-    Pack(Arc<PackPlan>),
+    Pack(Arc<PackPlan>, u64),
 }
 
 impl View {
     /// `sealed` in manifest order ([`Manifest::slabs`]: baseline, weekly deltas, pyramid,
-    /// retained); `l0` oldest first.
+    /// retained); `l0` oldest first. Sealed slabs of tier `supersets` and above (24h or the
+    /// weekly delta) are delivered whole to the clients inside them; `None`: never.
     pub fn new(
         generation: u64,
         manifest: Manifest,
         etag: String,
         sealed: Vec<Arc<Slab>>,
         l0: Vec<Arc<Slab>>,
+        supersets: Option<Tier>,
     ) -> View {
         let (nw, np) = (manifest.weekly.len(), manifest.pyramid.len());
         let weekly = sealed.get(1..nw.saturating_add(1)).unwrap_or(&[]);
@@ -108,6 +119,17 @@ impl View {
             .first()
             .map_or(manifest.baseline.end_ts, |w| w.start_ts);
         let plans = starts.iter().map(|_| OnceLock::new()).collect();
+        let mut rollups: Vec<(u64, u64)> = match supersets {
+            Some(min) => weekly
+                .iter()
+                .chain(pyramid)
+                .chain(retained)
+                .filter(|s| matches!(s.meta.tier, Tier::H24 | Tier::Week) && s.meta.tier >= min)
+                .map(|s| (s.meta.start_ts, s.meta.end_ts))
+                .collect(),
+            None => Vec::new(),
+        };
+        rollups.sort_unstable();
         View {
             generation,
             manifest,
@@ -121,6 +143,7 @@ impl View {
             spans,
             starts,
             warm_floor,
+            rollups,
             plans,
             cold_plan: OnceLock::new(),
         }
@@ -145,6 +168,8 @@ impl View {
         if client_ts != 0 && client_ts >= self.tip_ts {
             return Prefetch::UpToDate;
         }
+        let client_ts = crate::timeline::superset_start(&self.rollups, client_ts, self.tip_ts)
+            .unwrap_or(client_ts);
         let key = self
             .starts
             .partition_point(|&s| s <= client_ts)
@@ -158,7 +183,7 @@ impl View {
                     (!slabs.is_empty()).then(|| Arc::new(PackPlan::with_sources(slabs, sources)))
                 });
                 match plan {
-                    Some(p) => Prefetch::Pack(p.clone()),
+                    Some(p) => Prefetch::Pack(p.clone(), from),
                     None => Prefetch::UpToDate,
                 }
             }
@@ -183,6 +208,7 @@ impl View {
                         Arc::new(plan)
                     })
                     .clone(),
+                0,
             ),
         }
     }
@@ -190,7 +216,7 @@ impl View {
     /// The cold plan (built if needed), for warming its trailer in the background.
     pub fn cold_plan(&self) -> Option<Arc<PackPlan>> {
         match self.prefetch(0) {
-            Prefetch::Pack(p) => Some(p),
+            Prefetch::Pack(p, _) => Some(p),
             Prefetch::UpToDate => None,
         }
     }
