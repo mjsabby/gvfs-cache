@@ -1298,8 +1298,9 @@ fn reused_old_versions_are_in_the_store() {
 }
 
 /// A blob a sealed tree names that a complete store has lost track of (here: its segment
-/// dropped from `blobs.bin`) is a fault, not a 404: an edge stays ready, serves it through
-/// the proxy, and counts it in `gvfs_blobs_missing_total` once per upstream fetch.
+/// and packs dropped from `blobs.bin`) is a fault, not a 404: an edge stays ready, serves
+/// it through the proxy, and counts it in `gvfs_blobs_missing_total` once per upstream
+/// fetch. `gvfs-daemon mirror`, run on demand, copies it again.
 #[test]
 fn a_blob_missing_from_a_complete_store_is_served_and_counted() {
     let root = tempdir("sep-missing");
@@ -1338,6 +1339,7 @@ fn a_blob_missing_from_a_complete_store_is_served_and_counted() {
         .clone();
     blobcopy::update(&s, |bm| {
         bm.segments.retain(|x| x.id != dropped.id);
+        bm.packs.retain(|p| !dropped.packs.contains(&p.id));
         Ok(())
     })
     .unwrap();
@@ -1380,6 +1382,160 @@ fn a_blob_missing_from_a_complete_store_is_served_and_counted() {
     assert_eq!(server.get(&format!("/gvfs/objects/{new_id}")).0, 200);
     assert_eq!(server.metric("gvfs_blobs_from_store_total"), before + 1);
     assert_eq!(server.get("/healthz").0, 200);
+
+    // The repair: mirror copies what blobs.bin does not list, and the edge serves it from
+    // the store again.
+    let log = mirror(&root, &store, &up, &[]).unwrap();
+    assert!(
+        log.contains("6 (") && log.contains("to copy in 1 items"),
+        "{log}"
+    );
+    let (bm, _) = blobcopy::load(&s).unwrap();
+    server.wait_for("the repaired blobs.bin", |sv| {
+        sv.metric("gvfs_blobs_generation") >= bm.generation
+    });
+    let before = server.metric("gvfs_blobs_from_store_total");
+    for id in &lost {
+        assert_eq!(server.get(&format!("/gvfs/objects/{id}")).0, 200);
+    }
+    assert_eq!(
+        server.metric("gvfs_blobs_from_store_total"),
+        before + lost.len() as u64
+    );
+    assert_eq!(server.metric("gvfs_blobs_missing_total"), 3);
+    server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Storage loses a blob pack and a segment index of a complete store. Edges still boot and
+/// serve every blob (what the lost files held through the proxy, counted as missing) and
+/// pipeline runs go on; nothing repairs the store by itself. `gvfs-daemon mirror`, run on
+/// demand, takes the losses out of `blobs.bin` and copies those blobs again, each once.
+#[test]
+fn mirror_repairs_what_storage_lost() {
+    let root = tempdir("sep-lost");
+    let up = Upstream::new(&root);
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    let files: Vec<(String, Option<Vec<u8>>)> = (0..24u32)
+        .map(|i| {
+            (
+                format!("d{}/f{i}.bin", i % 4),
+                Some(noise(200_000 + i as usize * 101, u64::from(i) + 7)),
+            )
+        })
+        .collect();
+    let refs: Vec<(&str, Option<Vec<u8>>)> =
+        files.iter().map(|(p, c)| (p.as_str(), c.clone())).collect();
+    commit_files(&up, "c1", &refs);
+    pipeline(&root, &store, &up, "15m", &["--blobs", "separate"]);
+    mirror(&root, &store, &up, &["--blob-pack-mib", "1"]).unwrap();
+    let t = commit_files(&up, "c2", &[("n/new.txt", Some(b"new\n".to_vec()))]);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let s = Store::open(&store, "").unwrap();
+    let (bm, _) = blobcopy::load(&s).unwrap();
+    assert!(bm.complete());
+
+    // The window's segment and one of the mirror's packs disappear.
+    let new_id = Oid::from_hex(rev(&up.bare, &format!("{t}:n/new.txt")).as_bytes()).unwrap();
+    let window_seg = bm
+        .segments
+        .iter()
+        .find(|m| {
+            blobcopy::open_segment(&s, &root, m)
+                .unwrap()
+                .find(&new_id)
+                .is_some()
+        })
+        .unwrap()
+        .clone();
+    let pack = bm
+        .segments
+        .iter()
+        .find(|m| m.id != window_seg.id)
+        .unwrap()
+        .packs[0]
+        .clone();
+    std::fs::remove_file(store_dir.join(gvfs_daemon::blobs::segment_key(&window_seg.id))).unwrap();
+    std::fs::remove_file(store_dir.join(gvfs_daemon::blobs::pack_key(&pack))).unwrap();
+
+    // An edge boots and serves every blob of the history, byte for byte.
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--upstream",
+        up.bare.to_str().unwrap(),
+        "--poll-ms",
+        "100",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ]);
+    let ids: Vec<String> = git_blobs(&up.bare, &["--all"]).into_keys().collect();
+    let loose = fresh_repo(&root, "loose");
+    for id in &ids {
+        let (status, ct, body) = server.get(&format!("/gvfs/objects/{id}"));
+        assert_eq!((status, ct.as_str()), (200, CT_LOOSE), "{id}");
+        let dir = loose.join("objects").join(&id[..2]);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&id[2..]), body).unwrap();
+    }
+    git(&loose, &["fsck", "--strict", "--no-dangling"]);
+    assert_eq!(cat_batch(&loose, &ids), cat_batch(&up.bare, &ids));
+    let missing = server.metric("gvfs_blobs_missing_total");
+    assert!(
+        missing >= 2,
+        "the window's blob and the lost pack's: {missing}"
+    );
+    assert_eq!(server.get("/healthz").0, 200);
+
+    // Pipeline runs go on (a window copies again what it needs).
+    let t3 = commit_files(&up, "c3", &[("n/newer.txt", Some(b"newer\n".to_vec()))]);
+    let log = pipeline(&root, &store, &up, "15m", &[]);
+    assert!(log.contains("does not hold"), "{log}");
+    assert_eq!(manifest(&store_dir).tip.to_string(), t3);
+
+    // The repair, on demand.
+    let log = mirror(&root, &store, &up, &[]).unwrap();
+    assert!(
+        log.contains("lists 1 packs and 1 segments the store does not hold"),
+        "{log}"
+    );
+    let (bm, _) = blobcopy::load(&s).unwrap();
+    assert!(bm.complete());
+    assert!(!bm.packs.iter().any(|p| p.id == pack));
+    assert!(!bm.segments.iter().any(|m| m.id == window_seg.id));
+    let stored = store_blobs(&root, &store_dir);
+    let history = git_blobs(&up.bare, &["--all"]);
+    for id in history.keys() {
+        assert!(
+            stored.contains_key(id),
+            "{id} not in the store after the repair"
+        );
+    }
+    let records: usize = bm.segments.iter().map(|m| m.blobs as usize).sum();
+    assert_eq!(records, stored.len(), "a blob listed twice");
+    let log = mirror(&root, &store, &up, &[]).unwrap();
+    assert!(
+        log.contains("to copy in 0 items") && !log.contains("does not hold"),
+        "{log}"
+    );
+
+    // The edge serves them all from the store again.
+    server.wait_for("the repaired blobs.bin", |sv| {
+        sv.metric("gvfs_blobs_generation") >= bm.generation
+    });
+    let ids: Vec<String> = history.into_keys().collect();
+    let before = server.metric("gvfs_blobs_from_store_total");
+    for id in &ids {
+        assert_eq!(server.get(&format!("/gvfs/objects/{id}")).0, 200, "{id}");
+    }
+    assert_eq!(
+        server.metric("gvfs_blobs_from_store_total"),
+        before + ids.len() as u64
+    );
+    assert_eq!(server.metric("gvfs_blobs_missing_total"), missing);
     server.assert_clean();
     drop(server);
     let _ = std::fs::remove_dir_all(&root);

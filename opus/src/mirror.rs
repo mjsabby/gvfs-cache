@@ -17,6 +17,12 @@
 //! (seeding in slices). The run that copies the last item checks that every blob of the
 //! store's trees is listed, then records `blobs.bin` as mirrored.
 //!
+//! It is also the repair, run on demand (nothing runs it automatically): it first takes out
+//! of `blobs.bin` the packs and segments the store no longer holds
+//! ([`crate::separate::drop_lost`]), so their blobs are planned again, and on a store
+//! missing nothing it copies nothing. Edges count what they had to proxy for a complete
+//! store (`gvfs_blobs_missing_total`): the signal to run it.
+//!
 //! The pipeline copies each later window's new blobs before publishing its trees, so from
 //! then on every blob of every tree in the store is in it: a window's pack leaves out only
 //! what its haves reach, and the blobs of those trees are in the store already.
@@ -139,14 +145,19 @@ pub fn run(o: &Options) -> Result<BlobManifest> {
     if !m.separate_blobs() {
         crate::bail!("this store keeps blobs inline (chosen at genesis): nothing to mirror");
     }
+    let work = crate::fsutil::TempDir::new(&o.work_dir, "mirror")?;
+    let cache = work.path.join("store-cache");
+    std::fs::create_dir_all(&cache)?;
+    // What storage lost leaves blobs.bin first (listed after blobs.bin is read: everything
+    // it lists had been written by then), so its blobs are planned again.
+    let (bm, _) = crate::blobcopy::load(&o.store)?;
+    let lost = crate::separate::lost(&bm, &o.store.list("blobs/")?);
+    crate::separate::drop_lost(&o.store, &cache, o.threads, &lost)?;
     let (bm, _) = crate::blobcopy::load(&o.store)?;
     let genesis = bm.genesis;
     if genesis.is_zero() {
         crate::bail!("blobs.bin records no genesis");
     }
-    let work = crate::fsutil::TempDir::new(&o.work_dir, "mirror")?;
-    let cache = work.path.join("store-cache");
-    std::fs::create_dir_all(&cache)?;
     let t0 = Instant::now();
     let metas: Vec<SlabMeta> = std::iter::once(&m.baseline)
         .chain(&m.pyramid)
@@ -210,6 +221,9 @@ pub fn run(o: &Options) -> Result<BlobManifest> {
     let missing = targets.iter().filter(|b| index.find(b).is_none()).count();
     if missing > 0 {
         crate::bail!("{missing} blobs of the history are still missing after the copy");
+    }
+    if now_bm.complete() {
+        return Ok(now_bm);
     }
     update(&o.store, |bm| {
         if bm.genesis != genesis {

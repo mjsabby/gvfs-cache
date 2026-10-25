@@ -105,19 +105,24 @@ impl Drop for BlobPack {
     }
 }
 
+/// A segment's packs, indexed by a record's `pack` (`None`: a local pack the store lost).
+type SegmentPacks = Vec<Option<Arc<BlobPack>>>;
+
 /// The blob packs of one `blobs.bin` generation.
 pub struct BlobSet {
     pub generation: u64,
     /// Every blob of every sealed tree is in the store (`blobs.bin` complete).
     pub complete: bool,
     pub etag: String,
-    /// Biggest segment first (most lookups end there), each with its packs (indexed by a
-    /// record's `pack`).
-    segments: Vec<(Arc<Segment>, Vec<Arc<BlobPack>>)>,
+    /// Biggest segment first (most lookups end there), each with its packs.
+    segments: Vec<(Arc<Segment>, SegmentPacks)>,
 }
 
 impl BlobSet {
-    /// Opens what `bm` lists, reusing what `prev` already has open.
+    /// Opens what `bm` lists, reusing what `prev` already has open. What the store lost (a
+    /// segment, a local pack: gone, or another length) is left out with a warning, and its
+    /// blobs come through the proxy, counted as missing, until `gvfs-daemon mirror` repairs
+    /// `blobs.bin`. (A lost pack in object storage shows only when it is read.)
     pub fn load(
         store: &Arc<Store>,
         cache: &Path,
@@ -130,35 +135,56 @@ impl BlobSet {
         let mut packs: HashMap<&str, &Arc<BlobPack>> = HashMap::new();
         for (s, ps) in prev.map(|p| p.segments.as_slice()).unwrap_or(&[]) {
             segs.insert(s.id.as_str(), s);
-            for p in ps {
+            for p in ps.iter().flatten() {
                 packs.insert(p.id.as_str(), p);
             }
         }
+        let lost = |what: &str, id: &str, why: &str| {
+            crate::log!(
+                "serve: warning: blobs.bin generation {} lists {what} {id}, which the store does \
+                 not hold ({why}); its blobs come through the proxy, counted as missing, until \
+                 gvfs-daemon mirror repairs blobs.bin",
+                bm.generation
+            );
+        };
         std::fs::create_dir_all(cache).ctx(&format!("creating {}", cache.display()))?;
         let mut segments = Vec::with_capacity(bm.segments.len());
         for meta in bm.segments.iter().rev() {
             let seg = match segs.get(meta.id.as_str()) {
                 Some(s) => Arc::clone(s),
-                None => Arc::new(crate::blobcopy::open_segment(store, cache, meta)?),
+                None => match crate::blobcopy::open_segment(store, cache, meta) {
+                    Ok(s) => Arc::new(s),
+                    Err(e) if e.is_not_found() => {
+                        lost("segment", &meta.id, &e.to_string());
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                },
             };
             let mut list = Vec::with_capacity(seg.packs().len());
             for p in seg.packs() {
                 let pack = match packs.get(p.id.as_str()) {
                     Some(x) => Arc::clone(x),
                     None => Arc::new(match store.local_path(&pack_key(&p.id)) {
-                        Some(path) => BlobPack::open(&path, &p.id)?,
+                        Some(path) => match BlobPack::open(&path, &p.id) {
+                            Ok(pack) => pack,
+                            Err(e) if e.is_not_found() => {
+                                lost("pack", &p.id, &e.to_string());
+                                list.push(None);
+                                continue;
+                            }
+                            Err(e) => return Err(e),
+                        },
                         None => BlobPack::remote(Arc::clone(store), blocks, &p.id, p.len),
                     }),
                 };
                 if pack.len != p.len {
-                    crate::bail!(
-                        "blob pack {} is {} bytes, its segment says {}",
-                        p.id,
-                        pack.len,
-                        p.len
-                    );
+                    let why = format!("{} bytes, its segment says {}", pack.len, p.len);
+                    lost("pack", &p.id, &why);
+                    list.push(None);
+                    continue;
                 }
-                list.push(pack);
+                list.push(Some(pack));
             }
             segments.push((seg, list));
         }
@@ -176,7 +202,7 @@ impl BlobSet {
     pub fn find(&self, oid: &Oid) -> Option<(&Arc<BlobPack>, BlobRec)> {
         self.segments.iter().find_map(|(s, packs)| {
             let r = s.find(oid)?;
-            Some((packs.get(us(u64::from(r.pack)))?, r))
+            Some((packs.get(us(u64::from(r.pack)))?.as_ref()?, r))
         })
     }
 
@@ -188,7 +214,7 @@ impl BlobSet {
     pub fn packs(&self) -> usize {
         let mut ids = HashSet::new();
         for (_, ps) in &self.segments {
-            for p in ps {
+            for p in ps.iter().flatten() {
                 ids.insert(p.id.as_str());
             }
         }

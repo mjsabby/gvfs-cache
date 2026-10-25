@@ -104,10 +104,23 @@ pub struct BlobIndex {
 }
 
 impl BlobIndex {
+    /// The segments `bm` lists. One the store no longer holds is left out (its blobs count
+    /// as not copied, so a pipeline run copies again those its window needs), with a
+    /// warning: `gvfs-daemon mirror` repairs `blobs.bin`.
     pub fn load(store: &Store, work: &Path, bm: &BlobManifest) -> Result<BlobIndex> {
         let mut segments = Vec::with_capacity(bm.segments.len());
         for s in &bm.segments {
-            segments.push(crate::blobcopy::open_segment(store, work, s)?);
+            match crate::blobcopy::open_segment(store, work, s) {
+                Ok(seg) => segments.push(seg),
+                Err(e) if e.is_not_found() => crate::log!(
+                    "warning: blobs.bin generation {} lists segment {}, which the store does \
+                     not hold ({e}); its blobs count as missing until gvfs-daemon mirror \
+                     repairs blobs.bin",
+                    bm.generation,
+                    s.id
+                ),
+                Err(e) => return Err(e),
+            }
         }
         // Biggest first: most lookups end there.
         segments.sort_by_key(|s| std::cmp::Reverse(s.count()));
@@ -413,4 +426,96 @@ pub fn prune_segments(dir: &Path, bm: &BlobManifest) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+/// Packs and segments `blobs.bin` lists that the store does not hold (gone, or another
+/// length): storage lost them.
+#[derive(Debug, Default)]
+pub struct Lost {
+    pub packs: HashSet<String>,
+    pub segments: HashSet<String>,
+}
+
+impl Lost {
+    pub fn is_empty(&self) -> bool {
+        self.packs.is_empty() && self.segments.is_empty()
+    }
+}
+
+/// What `bm` lists that `listing` (of `blobs/`) lacks. The listing must be taken after `bm`
+/// was read: everything `bm` lists was written before it was published.
+pub fn lost(bm: &BlobManifest, listing: &[crate::store::ObjectInfo]) -> Lost {
+    let sizes: HashMap<&str, u64> = listing.iter().map(|o| (o.key.as_str(), o.size)).collect();
+    let gone = |key: String, len: u64| sizes.get(key.as_str()) != Some(&len);
+    Lost {
+        packs: bm
+            .packs
+            .iter()
+            .filter(|p| gone(crate::blobs::pack_key(&p.id), p.len))
+            .map(|p| p.id.clone())
+            .collect(),
+        segments: bm
+            .segments
+            .iter()
+            .filter(|s| gone(crate::blobs::segment_key(&s.id), s.index_len))
+            .map(|s| s.id.clone())
+            .collect(),
+    }
+}
+
+/// Takes what storage lost out of `blobs.bin`: lost segments are dropped, segments that
+/// index lost packs are rewritten without those records, and packs no segment indexes
+/// leave the list. The blobs involved are then unlisted: edges proxy them (counting them
+/// as missing) until `mirror` copies them again.
+pub fn drop_lost(store: &Store, work: &Path, threads: usize, lost: &Lost) -> Result<()> {
+    if lost.is_empty() {
+        return Ok(());
+    }
+    crate::log!(
+        "blobs.bin lists {} packs and {} segments the store does not hold; dropping them",
+        lost.packs.len(),
+        lost.segments.len()
+    );
+    let indexed = |bm: &BlobManifest| -> HashSet<String> {
+        bm.segments
+            .iter()
+            .flat_map(|s| s.packs.iter().cloned())
+            .collect()
+    };
+    if !lost.segments.is_empty() {
+        crate::blobcopy::update(store, |bm| {
+            bm.segments.retain(|s| !lost.segments.contains(&s.id));
+            let keep = indexed(bm);
+            bm.packs.retain(|p| keep.contains(&p.id));
+            Ok(())
+        })?;
+    }
+    if !lost.packs.is_empty() {
+        let pick = |bm: &BlobManifest| -> Vec<String> {
+            bm.segments
+                .iter()
+                .filter(|s| s.packs.iter().any(|p| lost.packs.contains(p)))
+                .map(|s| s.id.clone())
+                .collect()
+        };
+        for _ in 0..3 {
+            let (bm, _) = crate::blobcopy::load(store)?;
+            if pick(&bm).is_empty() {
+                break;
+            }
+            crate::blobcopy::fold(store, work, threads, pick, &lost.packs)?;
+        }
+        let (bm, _) = crate::blobcopy::load(store)?;
+        if !pick(&bm).is_empty() {
+            crate::bail!("blobs.bin kept changing; lost packs are still indexed");
+        }
+        if bm.packs.iter().any(|p| lost.packs.contains(&p.id)) {
+            crate::blobcopy::update(store, |bm| {
+                let keep = indexed(bm);
+                bm.packs.retain(|p| keep.contains(&p.id));
+                Ok(())
+            })?;
+        }
+    }
+    Ok(())
 }

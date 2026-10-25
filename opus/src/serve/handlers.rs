@@ -63,8 +63,8 @@ pub struct Metrics {
     /// Blobs served from the store's blob packs, and through the proxy.
     pub blobs_store: AtomicU64,
     pub blobs_proxied: AtomicU64,
-    /// Blobs a sealed tree names that a complete store lacked (a fault: the pipeline's
-    /// weekly run heals it).
+    /// Blobs a sealed tree names that a complete store lacked (a fault: `gvfs-daemon
+    /// mirror` repairs the store).
     pub blobs_missing: AtomicU64,
     pub unavailable: AtomicU64,
 }
@@ -257,8 +257,7 @@ fn missing(ctx: &Ctx, generation: u64, count: usize, first: &Oid) {
         .fetch_add(u64_of(count), Ordering::Relaxed);
     crate::log!(
         "serve: {count} blobs of sealed trees are not in blobs.bin generation {generation} \
-         (first: {first}); proxying them. The pipeline's weekly run (or gvfs-daemon mirror) \
-         copies them into the store"
+         (first: {first}); proxying them. gvfs-daemon mirror copies them into the store"
     );
 }
 
