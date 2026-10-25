@@ -214,6 +214,10 @@ pub fn main(args: &[String]) -> Result<()> {
         bm.blobs(),
         if bm.complete() { "; tip complete" } else { "" }
     );
+    crate::log!(
+        "peak RSS {}",
+        crate::util::human_bytes(crate::util::peak_rss())
+    );
     Ok(())
 }
 

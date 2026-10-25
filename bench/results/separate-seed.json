@@ -1,0 +1,27 @@
+{
+  "files": 20216,
+  "content_bytes": 5992041478,
+  "by_class": {
+    "small": 328949794,
+    "medium": 959430009,
+    "large": 4703661675
+  },
+  "corpus_gen_s": 16.1,
+  "git_add_s": 82.5,
+  "genesis_s": 0.2,
+  "mirror_s": 35.5,
+  "mirror_MBps": 168.7,
+  "mirror_items": 17,
+  "mirror_large_items": 16,
+  "mirror_peak_rss": "83.61 MiB",
+  "jobs": 8,
+  "blob_pack_bytes": 5851776685,
+  "sample_post": {
+    "blobs": 400,
+    "bytes": 17272301,
+    "s": 0.008,
+    "git_verified": true
+  },
+  "edge_hot_path_allocs": 0,
+  "profile_note": "perf record of a repeat mirror run (167.2 MB/s, daemon peak RSS 34.9 MiB): 95.0% of CPU samples in git (upload-pack/pack-objects: SHA-1DC and zlib), 5.0% in gvfs-daemon (3.75% SHA-1 verification). The local upstream bounds the rate."
+}

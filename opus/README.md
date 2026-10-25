@@ -55,6 +55,8 @@ Some tests also use extra tools when present and skip otherwise:
 | Test | Needs |
 |---|---|
 | `tests/e2e.rs` `gvfs_helper_against_the_daemon` | Microsoft git with `gvfs-helper` (`GVFS_TEST_MSGIT`, default `~/git/bin-wrappers/git`) |
+| `tests/separate.rs` `stock_gvfs_helper_checks_out_a_separate_store` | Microsoft git with `gvfs-helper`, as above |
+| `tests/separate.rs` `blob_over_4gib_end_to_end` | `#[ignore]`d: writes ~13 GB under `target/`; run with `cargo test --release --test separate -- --ignored blob_over_4gib` |
 | `tests/azure.rs` | the Azurite emulator (`azurite-blob` on PATH via `npm install -g azurite`, or `GVFS_TEST_AZURITE`), or a real account: `GVFS_TEST_AZURE_CS_FILE` (file holding a connection string) + `GVFS_TEST_AZURE_CONTAINER` (existing container; the tests use and delete a unique prefix) |
 
 ## Usage
@@ -101,6 +103,35 @@ gvfs-daemon pipeline --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT 
 A crashed or skipped run only makes the next 15m slab wider. Slab files that no manifest
 references are deleted after `--gc-grace-secs` (default 2 h).
 
+### Real blobs in their own packs (`--blobs separate`)
+
+For repositories whose files are real content (no `Git-hfs` pointers), a store created
+with `--blobs separate` keeps commits and trees in the slabs, each slab with a table of
+the sizes of the blobs its trees introduce, and every blob in blob packs of their own.
+Prefetch and cold clones then carry no blobs at all. See [DESIGN.md](DESIGN.md#stores-with-real-blobs---blobs-separate).
+
+```sh
+# Genesis: the history's commits and trees, and every blob's size, from the upstream.
+gvfs-daemon pipeline --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT \
+    --tier 15m --blobs separate
+
+# The seed of the blobs: resumable, verified by id, published as it goes. `tip` (the
+# genesis tip; then edges report ready) can add `since:30d` or `history`.
+gvfs-daemon mirror --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT \
+    --scope tip --jobs 16 [--rate-mbps 4000] [--max-items N]
+
+# Then schedule the pipeline as below: every run copies its window's new blobs before
+# publishing the trees that reference them. Edges serve blobs from the blob packs (read
+# in place, or by range from Azure) and proxy only what the store lacks.
+gvfs-daemon serve --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT ...
+```
+
+An edge of such a store reports ready (`/healthz`) once the mirror recorded `tip
+complete`. Stock gvfs-helper works unchanged: it prefetches commits and trees and faults
+blobs in (`GET`/`POST /gvfs/objects`). Clients that want sizes without blobs send
+`X-GVFS-Sizes: 1` with a prefetch and get a `GSZ1` section after the packs; large files
+can be read piecewise with `GET /gvfs/blobs/<oid>?offset=&length=`.
+
 ### Inspecting
 
 ```sh
@@ -117,7 +148,9 @@ with that pack. `gvfs-daemon repack --out <dir> [--frozen <base.mphf>] <slab.mph
 the optimal splice by hand.
 
 `curl http://edge:8080/metrics` reports request, byte, and L0 counters, the manifest
-generation, and `gvfs_alloc_hot_path_total`, which must stay 0.
+generation, and `gvfs_alloc_hot_path_total`, which must stay 0. Separate-blob stores add
+`gvfs_blobs_from_store_total`, `gvfs_blobs_proxied_total`, `gvfs_blobs_unavailable_total`,
+`gvfs_blobs_generation` and `gvfs_blobs_complete`.
 
 ## Performance
 
@@ -196,14 +229,20 @@ src/repack.rs              primitive 2 into a slab: the optimal splice (tree clu
 src/idx.rs                 the git .idx of a prefetch pack (merged per-slab sorted runs)
 src/slab.rs, mphf.rs       slab index format and the partitioned PTHash MPHF
 src/pipeline.rs            the scheduled job: genesis, 15m, rollups, weekly, GC
+src/mirror.rs              --blobs separate: the resumable seed of the blob packs
+src/separate.rs            --blobs separate: what pipeline, mirror and edge share (sizes, blob index)
+src/blobs.rs, sizes.rs     blob packs, segments, blobs.bin; sizes tables and the GSZ1 section
+src/blobstream.rs, blobcopy.rs   streaming whole-blob packs from upstream fetches; copy items, publish
 src/manifest.rs, store.rs, azure.rs    manifest.bin (CAS) and the fs / Azure stores
-src/serve/                 the server: view (prefetch plans), httpd, handlers, live L0 loop
+src/serve/                 the server: view (prefetch plans), httpd, handlers, live L0 loop,
+                           blobs (blob packs and the read-through proxy)
 src/upstream.rs, http.rs, pktline.rs   git protocol v2/v0 over smart HTTP or a local repo
 src/pack.rs, zlib.rs, delta.rs, object.rs, hfs.rs   git formats (delta.rs: tree delta encoder)
 src/arena.rs               per-request arenas (no allocation while serving)
 crates/gvfs-alloc-guard    counting global allocator that enforces zero hot-path allocations
 crates/gvfs-mmap           the one memory map (the only other `unsafe` in the workspace)
-tests/                     end-to-end tests (pipeline, serve, HTTP v2/v0, gvfs-helper, Azure)
+tests/                     end-to-end tests (pipeline, serve, HTTP v2/v0, gvfs-helper, Azure,
+                           separate blobs)
 benches/load.sh            the load table above
 benches/rollup.sh          the rollup table above (any repository, any week)
 examples/clients.rs        the client traffic table above (simulated clock, any window)

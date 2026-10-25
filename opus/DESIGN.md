@@ -393,6 +393,146 @@ cores arenas of 8 MiB and 2^18 ids). If all arenas are busy for 10 s, the reques
 it back. The server speaks plain HTTP/1.1: put TLS and HTTP/2 on the load balancer in
 front of an edge. The localhost proxy needs neither.
 
+## Stores with real blobs (`--blobs separate`)
+
+A store chooses at genesis how it keeps blobs. *Inline* (the default, everything above)
+keeps them in the slabs, as SearchGold's `Git-hfs` pointers are. *Separate* keeps every
+file as a real git blob in **blob packs** of their own, and only commits and trees in the
+slabs, each slab with a **sizes table** for the blobs its trees introduce. The mode is
+recorded in the manifest; every later run and every edge follows it. Inline stores are
+untouched: they still write manifest version 2, byte for byte as before.
+
+```text
+store/
+  manifest.bin            version 3: flags (separate, history partial) + the blobs.bin
+                          generation its trees need
+  slabs/<id>.pack|.mphf   commits and trees only
+  slabs/<id>.sizes        "GVDSIZE1" | count u64 | (id[20] | size u64)* sorted | SHA-256
+  blobs.bin               the blob packs and their segments (compare-and-swap), the
+                          genesis commit, `tip complete`, the mirrored history window
+  blobs/<id>.pack         whole blobs (a stock git pack, never deltas)
+  blobs/<id>.bidx         segment: PTHash MPHF + 48-byte records over one or more packs
+```
+
+**Blob packs** (`src/blobs.rs`) hold whole entries only, so any entry is served by
+splicing its own bytes. An entry keeps the upstream's zlib stream untouched, unless the
+blob is at least 1 MiB and its first MiB compresses by less than 5%: then it is rewritten
+as deflate *stored* blocks (65,535 content bytes each, 5-byte headers, 0.008% overhead),
+so every content byte has a computable offset and byte ranges are read in place. A
+**segment** record is `id | pack u32 | offset (48 bits) | header length (8) | stored (1) |
+entry length u64 | size u64`: 64-bit lengths, so entries beyond 4 GiB are ordinary.
+
+### The consistency rule
+
+Every blob that a tree of a published manifest references is in a blob pack listed in
+`blobs.bin` at the generation the manifest records, except blobs that only commits before
+genesis reference (copied by `mirror` for the genesis tip, optionally for a window or all
+of history; read through otherwise) and the edge's L0 overlay (read through). Separately,
+every such blob's size is in the sizes table of the slab whose trees introduced it, so
+sizes are complete for every tree, mirrored or not.
+
+* **Genesis** fetches `blob:none` (commits and trees), walks every tree for the blobs it
+  references, asks the upstream for their sizes (protocol v2 `object-info`, or ADO's
+  `POST /gvfs/sizes`, 4,000 ids per request), writes the baseline's sizes table, records
+  the genesis commit in `blobs.bin`, and flags the manifest `separate, history partial`.
+* **A 15m run works blobs first** (`pipeline::window_separate`): a `blob:none` fetch of
+  the window; the blobs its new trees reference that no segment lists (new content, and
+  old versions a revert or copy brings back); their sizes from the upstream (so a large
+  blob is fetched alone); the copy, each blob verified by id; `blobs.bin` published; only
+  then the slab, its sizes table (the sizes no earlier table has) and the manifest naming
+  the `blobs.bin` generation. A run that dies in between leaves blobs no tree references
+  yet, never a tree without its blobs.
+* **Rollups and the weekly rebuild** union their parts' tables. **GC** keeps the sizes
+  tables of listed slabs and the packs and segments `blobs.bin` lists; anything else in
+  `blobs/` older than `--gc-grace-secs` (a crashed copy's upload) is deleted.
+
+### Copying blobs (`src/blobstream.rs`, `src/blobcopy.rs`)
+
+`BlobSink` is the `Write` end of an upstream fetch (`POST /gvfs/objects` from a GVFS
+upstream, protocol v2 `want`s otherwise). It parses packs as they arrive and writes one
+whole-blob pack:
+
+* a whole entry streams through in fixed memory: inflated once in 64 KiB pieces to verify
+  its id (SHA-1 of `blob <size>\0` + content) and size, then written raw or stored;
+* a delta is inflated in memory and applied to its base, read back from the output (a REF
+  base may come later: the delta waits);
+* the output declares as many entries as blobs were asked for; any other object, a blob
+  twice, a blob missing, or a bad input trailer fails the pack.
+
+Work is cut into items in the order given. A blob of 16 MiB or more is an item of its
+own: one request whose single whole entry streams straight into the store (`fs`: a temp
+file renamed into place; Azure: Put Block per 16 MiB, Put Block List at the end), with no
+local disk. Smaller blobs are batched up to `--blob-pack-mib` (default 2 GiB) and spooled
+to a local file, where deltas can read their bases back. Pack ids are fresh per copy, so a
+published pack is never overwritten; segments are content-addressed; `blobs.bin` is
+replaced by compare-and-swap and its segments folded into one beyond 16.
+
+Measured (`tests/separate.rs`, `blob_over_4gib_end_to_end`): a pipeline window with a
+4,294,979,641-byte incompressible blob ran in 7.0 s at an 11 MiB peak RSS. The local git
+upstream's `pack-objects` held 4.1 GB to send it: that cost is the upstream's.
+
+### `gvfs-daemon mirror` (`src/mirror.rs`)
+
+The seed of the blobs, planned from the store, never from the upstream: blob ids from a
+depth-first walk of trees already in the slabs (path order, so a sparse cone maps to few
+packs), sizes from the sizes tables, minus what `blobs.bin` lists. `--scope tip` walks the
+genesis commit's tree: with every later window copied blobs first, that completes every
+commit since genesis, and the run records `tip complete` after checking that every target
+is listed. `since:<30d|date|seconds>` adds the trees of commits since then; `history`
+adds every tree. `--jobs` copies run in parallel, finished packs are published every
+`--publish-secs`, `--rate-mbps` paces all copies through one throttle, and `--max-items`
+seeds in slices. A restart re-plans and skips what was published; a killed run's
+unpublished uploads are never listed and GC removes them (tested by `SIGKILL` at several
+points).
+
+### Serving (`src/serve/blobs.rs`)
+
+* **Where a blob comes from.** A request id not in the slabs is looked up in the
+  segments of the loaded `blobs.bin` (newest first). Packs of a directory store are
+  mapped and leave through `sendfile(2)`; packs in Azure stay there and are read by
+  range when needed (the edge holds only the segment indexes). A miss goes to the proxy:
+  its cache, else the upstream, but only for ids a sizes table names (a 404 otherwise,
+  without touching the upstream). The proxy fetches each blob once per edge (requests for
+  a blob being fetched wait for that fetch), verifies it as it streams in, and keeps it
+  on local disk up to `--proxy-cache-mib`. An upstream failure is a 503, which clients
+  retry; gvfs-helper treats a 404 as fatal.
+* **Loose objects** are spliced from the entry's deflate blocks between a stored block
+  and the combined Adler-32, so nothing is inflated, and for a remote entry only its
+  first 2 and last 4 zlib bytes are read before streaming. **POST packs** append whole
+  blob entries after the slab splice and hash the trailer as the bytes go out, so a
+  remote entry is read once.
+* **Sizes.** `POST /gvfs/sizes` answers blobs from the sizes tables. A prefetch that
+  sends `X-GVFS-Sizes: 1` gets, after its packs, `"GSZ1" | count u64 | (id[20] | size
+  u64)*`: the union of the tables of the slabs in that response (a cold clone: the
+  history's; a warm prefetch: what its window introduced). The section is built once per
+  plan, and the response says `X-GVFS-Sizes: 1`. Without the header the stream is
+  unchanged.
+* **Ranges.** `GET /gvfs/blobs/<oid>?offset=&length=` returns content bytes with
+  `X-GVFS-Blob-Size`: read in place for stored entries, inflated from the start
+  otherwise. This is for clients that read large files piecewise.
+* **Consistency at the edge.** `blobs.bin` is polled with the manifest. A manifest is
+  applied only once the `blobs.bin` generation it names is loaded. `/healthz` stays 503
+  until `blobs.bin` says `tip complete`. L0 fetches are `blob:none`, with the sizes their
+  trees introduce asked of the upstream.
+
+Store hits allocate nothing (the edge tests run `--alloc-guard strict`). Proxy fetches
+and remote reads are cold sections.
+
+### Limits and open questions
+
+* ADO support for protocol v2 `filter blob:none` and `object-info` is assumed, not
+  verified. GVFS endpoints are used where the upstream offers them (`/gvfs/objects`,
+  `/gvfs/sizes`); a metadata-only fetch through `/gvfs/prefetch` would replace the filter.
+* Remote blob reads are not cached at the edge: each is a ranged GET. The plan's NVMe
+  LRU, and coalescing ranges for POST batches, are the next step.
+* Pipeline runners download every segment index (48 B per blob) and the manifest's sizes
+  tables each run: about 220 MB at SearchGold's scale, cacheable across runs.
+* Small blobs are stored whole (no deltas), trading storage on similar small files for
+  entries that always splice alone. Chunk-level dedup (HFS) is gone: git stores whole
+  files.
+* A blob request first misses every metadata slab's index, then probes the segments.
+* No reachability GC of blob packs (blobs of force-pushed-away commits stay).
+
 ## Departures from the PDF
 
 | PDF | Here | Why |
@@ -426,7 +566,8 @@ front of an edge. The localhost proxy needs neither.
 
 * Live Azure was not exercised. The store is tested against the Azurite emulator, and
   `tests/azure.rs` can target a real account.
-* Serving TLS/HTTP2 directly, and range-read (non-hydrating) slab access.
+* Serving TLS/HTTP2 directly, and range-read (non-hydrating) slab access. (Blob packs of
+  `--blobs separate` stores are read by range; slabs are still hydrated.)
 * Reachability GC of the baseline: it only grows by appends, so objects orphaned by a
   force push stay in it.
 * CAS pre-warming from pointer contents (the PDF's optional sidecar).
