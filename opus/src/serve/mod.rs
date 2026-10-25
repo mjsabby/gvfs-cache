@@ -197,7 +197,7 @@ pub fn main(args: &[String]) -> Result<()> {
         write_timeout: Duration::from_secs(120),
         prefetch_idx,
         max_idle_conns: f.num("max-idle-conns", 65536usize)?,
-        linger: Duration::from_millis(f.num("linger-ms", 100u64)?),
+        linger: Duration::from_millis(f.num("linger-ms", 5u64)?),
         hold: Duration::from_millis(f.num("hold-ms", 5u64)?),
     };
     run(opts)
@@ -277,6 +277,13 @@ pub fn run(o: Options) -> Result<()> {
     // 4. Workers, then seal.
     raise_fd_limit();
     let listener = TcpListener::bind(&bind).ctx(&format!("binding {bind}"))?;
+    // std listens with a backlog of 128: a burst of new clients (a fleet starting at 09:00,
+    // every client reconnecting after a restart) overflows it, and the rest wait for SYN
+    // retries (1 s, 3 s, ...). Listening again raises the queue to the system's limit
+    // (`net.core.somaxconn`).
+    if let Err(e) = nix::sys::socket::listen(&listener, nix::sys::socket::Backlog::MAXALLOWABLE) {
+        crate::log!("serve: could not raise the listen backlog: {e}");
+    }
     let conns = Arc::new(conns::Conns::new(&listener, max_idle_conns)?);
     let started = Arc::new(Barrier::new(workers.saturating_add(1)));
     for i in 0..workers {

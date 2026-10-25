@@ -352,13 +352,18 @@ warmer prepares it for each new cold plan once any client has asked for one.
 Any path prefix before `/gvfs/` is accepted.
 
 **Threads and memory.** A fixed set of worker threads (`--workers`, 256) waits on one epoll
-set that holds the listening socket and every idle keep-alive connection
+set that holds the listening socket (backlog raised to `net.core.somaxconn`; std's 128
+overflows when a fleet connects at once) and every idle keep-alive connection
 (`src/serve/conns.rs`). A worker keeps serving a connection while its requests keep coming
-(it waits up to `--linger-ms`, 100, for the next one, so a busy client pays no epoll round
-trip per request), then parks it: an idle client costs a table slot (`--max-idle-conns`,
-65,536), not a thread, and is closed after `--idle-secs` (30) without a request. While every
-worker is busy, a worker also parks its connection between requests once it has held it for
-`--hold-ms` (5), so busy connections beyond the worker count take turns instead of waiting
+(it waits up to `--linger-ms`, 5, for the next one, so a client sending requests back to back
+pays no epoll round trip per request), then parks it: an idle client costs a table slot
+(`--max-idle-conns`, 65,536), not a thread, and is closed after `--idle-secs` (30) without a
+request. The linger is short because every sporadic request (an agent polling once a minute)
+holds its worker for the whole linger: at 100 ms, 256 workers absorb only ~2,500 such requests
+a second before they queue (8,000/s over 2,048 connections: p50 145 ms, p99 2.5 s; at 5 ms:
+16 µs and 23 µs). While
+every worker is busy, a worker also parks its connection between requests once it has held it
+for `--hold-ms` (5), so busy connections beyond the worker count take turns instead of waiting
 for others to go idle. A response in progress holds its worker until it is written (blocking
 writes, 120 s timeout each). Each worker has a 16 KiB input buffer and a 256 KiB output
 buffer. POST bodies and their working sets live in a leased arena (default: 2 ×
