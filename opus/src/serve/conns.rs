@@ -3,11 +3,16 @@
 //!
 //! Every worker blocks in `epoll_wait` on the same set, which holds the listening socket
 //! (level-triggered) and every parked connection (`EPOLLONESHOT`). A worker that gets a
-//! connection serves requests for as long as the next one is already on the wire (one
-//! non-blocking `recv` after each response); when it is not, the connection is parked
-//! again and the worker takes whatever is ready next. So any number of idle clients (a
-//! fleet's connection pools) cost a table slot each instead of a thread each, and under
-//! load a worker goes from one ready connection to the next without sleeping.
+//! connection keeps serving it while its requests keep coming: it waits up to `--linger-ms`
+//! for the next one, so a busy client does not pay an epoll round trip per request. When
+//! the client pauses for longer, the connection is parked again and the worker takes
+//! whatever is ready next. So any number of idle clients (a fleet's connection pools) cost
+//! a table slot each instead of a thread each.
+//!
+//! While no worker is free ([`Conns::all_busy`]), a worker also parks its connection between
+//! requests once it has held it for `--hold-ms`. Connections that became ready meanwhile
+//! are ahead of it in epoll's ready list, so busy connections beyond the worker count take
+//! turns instead of waiting for the others to go idle.
 //!
 //! Tokens carry the slot and a generation, so an event that loses the race with the idle
 //! reaper (which closes the connection and frees the slot) can never pick up the slot's next
@@ -40,6 +45,8 @@ struct Shard {
 pub struct Conns {
     epoll: Epoll,
     shards: Vec<Mutex<Shard>>,
+    /// Workers blocked in [`Conns::next`].
+    waiting: AtomicU64,
     /// Connections waiting for their next request.
     pub parked: AtomicU64,
     /// Parked connections closed after `--idle-secs` without a request.
@@ -94,6 +101,7 @@ impl Conns {
         Ok(Conns {
             epoll,
             shards,
+            waiting: AtomicU64::new(0),
             parked: AtomicU64::new(0),
             reaped: AtomicU64::new(0),
             overflow: AtomicU64::new(0),
@@ -112,7 +120,10 @@ impl Conns {
     /// epoll set) or a parked one whose next request has arrived (`false`).
     pub fn next(&self, listener: &TcpListener) -> Option<(TcpStream, bool)> {
         let mut events = [EpollEvent::empty()];
-        match self.epoll.wait(&mut events, EpollTimeout::NONE) {
+        self.waiting.fetch_add(1, Ordering::Relaxed);
+        let woke = self.epoll.wait(&mut events, EpollTimeout::NONE);
+        self.waiting.fetch_sub(1, Ordering::Relaxed);
+        match woke {
             Ok(1) => {}
             _ => return None,
         }
@@ -133,6 +144,12 @@ impl Conns {
             };
         }
         self.take(t)
+    }
+
+    /// No worker is waiting in [`Conns::next`]: a connection that becomes ready now (a new
+    /// client, a parked client's next request) waits until some worker lets go of one.
+    pub fn all_busy(&self) -> bool {
+        self.waiting.load(Ordering::Relaxed) == 0
     }
 
     fn take(&self, t: u64) -> Option<(TcpStream, bool)> {

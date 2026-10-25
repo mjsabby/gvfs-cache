@@ -351,9 +351,17 @@ warmer prepares it for each new cold plan once any client has asked for one.
 
 Any path prefix before `/gvfs/` is accepted.
 
-**Threads and memory.** A fixed set of worker threads blocks on one listening socket. Each
-has a 16 KiB input buffer and a 256 KiB output buffer, and keep-alive connections time out
-after 30 s idle. POST bodies and their working sets live in a leased arena (default: 2 ×
+**Threads and memory.** A fixed set of worker threads (`--workers`, 256) waits on one epoll
+set that holds the listening socket and every idle keep-alive connection
+(`src/serve/conns.rs`). A worker keeps serving a connection while its requests keep coming
+(it waits up to `--linger-ms`, 100, for the next one, so a busy client pays no epoll round
+trip per request), then parks it: an idle client costs a table slot (`--max-idle-conns`,
+65,536), not a thread, and is closed after `--idle-secs` (30) without a request. While every
+worker is busy, a worker also parks its connection between requests once it has held it for
+`--hold-ms` (5), so busy connections beyond the worker count take turns instead of waiting
+for others to go idle. A response in progress holds its worker until it is written (blocking
+writes, 120 s timeout each). Each worker has a 16 KiB input buffer and a 256 KiB output
+buffer. POST bodies and their working sets live in a leased arena (default: 2 ×
 cores arenas of 8 MiB and 2^18 ids). If all arenas are busy for 10 s, the request gets a
 503. A commit closure larger than its arena grows it in a `cold_section`; `reset` shrinks
 it back. The server speaks plain HTTP/1.1: put TLS and HTTP/2 on the load balancer in

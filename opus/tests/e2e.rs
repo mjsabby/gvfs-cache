@@ -865,3 +865,72 @@ fn smart_http_upstream_v2_and_v0() {
         let _ = std::fs::remove_dir_all(&root);
     }
 }
+
+/// More continuously busy keep-alive clients than worker threads: each client keeps being
+/// answered while the others stay busy (a worker that has held a connection for
+/// `--hold-ms` while no worker is free parks it between requests), and every response is
+/// the right one for its connection.
+#[test]
+fn busy_connections_beyond_the_workers_take_turns() {
+    use gvfs_daemon::http::{Client, Url};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let root = tempdir("busy");
+    let mut up = Upstream::new(&root);
+    for _ in 0..2 {
+        up.commit(6);
+    }
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--cache-dir",
+        cache.to_str().unwrap(),
+        "--workers",
+        "2",
+    ]);
+    // Reference bodies, fetched one at a time (the end-to-end test checks them with git).
+    let refs: Vec<(String, Vec<u8>)> = up
+        .objects(&up.tip())
+        .into_iter()
+        .take(48)
+        .map(|oid| {
+            let (status, _, body) = server.get(&format!("/gvfs/objects/{oid}"));
+            assert_eq!(status, 200, "{oid}");
+            (oid, body)
+        })
+        .collect();
+    let refs = Arc::new(refs);
+    let stop = Arc::new(AtomicBool::new(false));
+    let clients = 6;
+    let threads: Vec<_> = (0..clients)
+        .map(|i| {
+            let (refs, stop, url) = (refs.clone(), stop.clone(), server.url());
+            std::thread::spawn(move || {
+                let mut c = Client::new(Url::parse(&url).unwrap(), Duration::from_secs(30));
+                let mut answered = 0usize;
+                while !stop.load(Ordering::Relaxed) {
+                    let (oid, body) = &refs[(i + answered * clients) % refs.len()];
+                    let mut r = c
+                        .request("GET", &format!("/gvfs/objects/{oid}"), &[], b"")
+                        .unwrap();
+                    assert_eq!(r.status, 200, "{oid}");
+                    assert_eq!(&r.body_vec(1 << 24).unwrap(), body, "{oid}");
+                    answered += 1;
+                }
+                answered
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(1500));
+    stop.store(true, Ordering::Relaxed);
+    let answered: Vec<usize> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    // Without turns, 4 of the 6 clients get their first answer only once the others stop.
+    assert!(answered.iter().all(|&n| n >= 20), "answers per client: {answered:?}");
+    server.assert_clean();
+}

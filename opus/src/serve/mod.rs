@@ -36,7 +36,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::arena::ArenaPool;
 use crate::ingest::{Dest, Indexer, ingest_git_delta};
@@ -116,6 +116,9 @@ pub struct Options {
     /// How long a worker waits on a keep-alive connection for its next request before
     /// parking it.
     pub linger: Duration,
+    /// While no worker is free, how long a worker keeps serving one connection before
+    /// parking it between requests, so busy connections beyond `workers` take turns.
+    pub hold: Duration,
 }
 
 /// `gvfs-daemon serve ...`
@@ -142,6 +145,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "idle-secs",
             "max-idle-conns",
             "linger-ms",
+            "hold-ms",
             "prefetch-idx",
         ],
     )?;
@@ -194,6 +198,7 @@ pub fn main(args: &[String]) -> Result<()> {
         prefetch_idx,
         max_idle_conns: f.num("max-idle-conns", 65536usize)?,
         linger: Duration::from_millis(f.num("linger-ms", 100u64)?),
+        hold: Duration::from_millis(f.num("hold-ms", 5u64)?),
     };
     run(opts)
 }
@@ -235,6 +240,7 @@ pub fn run(o: Options) -> Result<()> {
         prefetch_idx,
         max_idle_conns,
         linger,
+        hold,
     } = o;
     let mut live = Live {
         store,
@@ -288,7 +294,12 @@ pub fn run(o: Options) -> Result<()> {
                 };
                 w.input.patience = idle_timeout;
                 started.wait();
-                worker_loop(&listener, &conns, &ctx, &mut w, i, linger, write_timeout);
+                let pace = Pace {
+                    linger,
+                    hold,
+                    write: write_timeout,
+                };
+                worker_loop(&listener, &conns, &ctx, &mut w, i, pace);
             })?;
     }
     {
@@ -340,14 +351,21 @@ fn raise_fd_limit() {
     }
 }
 
+/// A worker's per-connection timeouts (see [`Options`]).
+#[derive(Clone, Copy)]
+struct Pace {
+    linger: Duration,
+    hold: Duration,
+    write: Duration,
+}
+
 fn worker_loop(
     listener: &TcpListener,
     conns: &conns::Conns,
     ctx: &Ctx,
     w: &mut Worker,
     index: usize,
-    linger: Duration,
-    write: Duration,
+    pace: Pace,
 ) {
     loop {
         let Some((mut stream, fresh)) = conns.next(listener) else {
@@ -355,27 +373,39 @@ fn worker_loop(
         };
         if fresh {
             let _ = stream.set_nodelay(true);
-            let _ = stream.set_read_timeout(Some(linger));
-            let _ = stream.set_write_timeout(Some(write));
+            let _ = stream.set_read_timeout(Some(pace.linger));
+            let _ = stream.set_write_timeout(Some(pace.write));
         }
         w.input.filled = 0;
         w.input.patient = false;
-        if serve_connection(ctx, w, &mut stream, linger) {
+        if serve_connection(ctx, conns, w, &mut stream, pace) {
             conns.park(stream, !fresh, index);
         }
     }
 }
 
-/// Serves requests until the client closes, errs, or pauses for longer than `linger`
-/// between requests: then `true`, and the idle connection is parked (it no longer holds
-/// this worker; the epoll set hands it to whichever worker is free when it speaks again).
-fn serve_connection(ctx: &Ctx, w: &mut Worker, stream: &mut TcpStream, linger: Duration) -> bool {
+/// Serves requests until the client closes, errs, or pauses for longer than `pace.linger`
+/// between requests, or — while no worker is free — until this worker has held the
+/// connection for `pace.hold`. Then `true`: the connection is parked between requests (it no
+/// longer holds this worker; the epoll set hands it to whichever worker is free when it
+/// speaks again, after the connections that were already waiting).
+fn serve_connection(
+    ctx: &Ctx,
+    conns: &conns::Conns,
+    w: &mut Worker,
+    stream: &mut TcpStream,
+    pace: Pace,
+) -> bool {
+    let picked = Instant::now();
     loop {
         if w.input.patient {
-            if stream.set_read_timeout(Some(linger)).is_err() {
+            if stream.set_read_timeout(Some(pace.linger)).is_err() {
                 return false;
             }
             w.input.patient = false;
+        }
+        if w.input.filled == 0 && conns.all_busy() && picked.elapsed() >= pace.hold {
+            return true;
         }
         let req = match httpd::read_head(stream, &mut w.input) {
             Ok(httpd::Head::Request(r)) => r,

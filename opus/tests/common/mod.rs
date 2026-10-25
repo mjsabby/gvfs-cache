@@ -222,8 +222,8 @@ impl Server {
             .port();
         let bind = format!("127.0.0.1:{port}");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_gvfs-daemon"));
+        // Defaults first: the last occurrence of a flag wins, so a test can override them.
         cmd.arg("serve")
-            .args(args)
             .args([
                 "--bind",
                 &bind,
@@ -234,6 +234,7 @@ impl Server {
                 "--alloc-guard",
                 "strict",
             ])
+            .args(args)
             .envs(env.iter().copied());
         gvfs_daemon::upstream::hermetic_git_env(&mut cmd);
         let child = cmd.spawn().unwrap();
