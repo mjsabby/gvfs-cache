@@ -143,6 +143,24 @@ def move_main(up, oid):
     git(up, "update-ref", "refs/heads/main", oid)
 
 
+def extra_commit(src, parent, when, k, pointers=4):
+    """Deterministic commit on top of `parent` (any oid) dated `when`; returns its oid."""
+    fi = FI()
+    ops = []
+    big = "".join(f"line {l}" + (f" xedit {k}" if l % 89 == k % 89 else "") + "\n" for l in range(600))
+    ops.append(f"M 100644 :{fi.blob(big.encode())} big.txt")
+    for i in range(pointers):
+        bid = f"{(k << 20) | i:064x}00"
+        ops.append(f"M 100644 :{fi.blob(_ptr(bid, k * 13 + i))} x{i % 3}/y{k % 5}/g{k}-{i}.dat")
+    fi.commit(f"refs/extra/x{k}", when, f"extra {k}", [parent], ops)
+    stream = b"".join(fi.out) + b"done\n"
+    p = subprocess.run(["git", f"--git-dir={src}", "fast-import", "--done", "--quiet", "--force"],
+                       input=stream, capture_output=True, env=clean_env())
+    if p.returncode != 0:
+        raise RuntimeError(p.stderr.decode())
+    return git_out(src, "rev-parse", f"refs/extra/x{k}")
+
+
 if __name__ == "__main__":
     import sys
     import json

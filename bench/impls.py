@@ -42,12 +42,39 @@ class Server:
             return ""
 
 
+FAKETIME_LIB = "/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1"
+
+
+class Clock:
+    """Harness-controlled wall clock shared by every process of one implementation (libfaketime
+    offset file: time keeps running at real speed from the last set point; monotonic is real)."""
+
+    def __init__(self, path, start):
+        self.path = path
+        self.set(start)
+
+    def set(self, fake_now):
+        self.now = int(fake_now)
+        self.set_at = time.time()
+        off = self.now - self.set_at
+        with open(self.path + ".tmp", "w") as f:
+            f.write(f"{int(round(off)):+d}s\n")
+        os.replace(self.path + ".tmp", self.path)
+
+    def current(self):
+        return int(self.now + (time.time() - self.set_at))
+
+    def env(self):
+        return {"LD_PRELOAD": FAKETIME_LIB, "FAKETIME_TIMESTAMP_FILE": self.path,
+                "FAKETIME_NO_CACHE": "1", "FAKETIME_DONT_FAKE_MONOTONIC": "1"}
+
+
 class Impl:
     name = "?"
     clock = "wall"          # 'commits' (opus) | 'flag' | 'env' | 'wall'
     poll_unit = "s"
 
-    def __init__(self, work, binary=None, extra_serve=(), extra_pipeline=(), env=None):
+    def __init__(self, work, binary=None, extra_serve=(), extra_pipeline=(), env=None, clock=None):
         self.work = work
         os.makedirs(work, exist_ok=True)
         self.bin = binary or os.path.join(ROOT, self.name, "target", "release", "gvfs-daemon")
@@ -55,6 +82,9 @@ class Impl:
         self.extra_serve = list(extra_serve)
         self.extra_pipeline = list(extra_pipeline)
         self.env = dict(env or {})
+        self.fake = clock
+        if clock is not None:
+            self.env.update(clock.env())
         self.pipeline_log = os.path.join(work, "pipeline.log")
         self.runs = 0
 
@@ -92,6 +122,8 @@ class Impl:
             return b"\n".join(f.read().splitlines()[-n:]).decode(errors="replace")
 
     def step(self, upstream, tier, now=None):
+        if now is None and self.fake is not None:
+            now = self.fake.current()
         dt = 0.0
         for t in self.steps_for(tier):
             dt += self.run(self.pipeline_cmd(upstream, t, now), env=self.pipeline_env(now))

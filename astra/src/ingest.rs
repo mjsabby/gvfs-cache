@@ -231,10 +231,13 @@ pub fn ingest_git_delta(
                         .reverse();
                 }
                 ObjType::Blob => {
-                    if bytes.starts_with(b"~~Git-hfs ") {
-                        crate::hfs::parse_git_hfs_v1(bytes).ok_or(Error::InvalidPointer(oid))?;
+                    if bytes.starts_with(b"~~Git-hfs ")
+                        && crate::hfs::parse_git_hfs_v1(bytes).is_some()
+                    {
                         scratch.pointers = scratch.pointers.saturating_add(1);
                     } else {
+                        // A blob that merely looks like a pointer (another pointer variant, docs
+                        // about the format) is still a Git blob: count it, never abort ingest.
                         // Historical ordinary blobs must not be dropped: that breaks Git reachability.
                         scratch.ordinary_blobs = scratch.ordinary_blobs.saturating_add(1);
                     }
