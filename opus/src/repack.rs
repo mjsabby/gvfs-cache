@@ -22,8 +22,10 @@
 //!    from its cluster's head.
 //! 4. **Everything else** (commits, `Git-hfs` pointer blobs, tags) keeps its compressed
 //!    bytes. Deltas among them are re-pointed as OFS_DELTA (ADO sends REF_DELTA, which
-//!    spends 20 bytes per entry on the base id); one whose base is not in the output is
-//!    stored whole.
+//!    spends 20 bytes per entry on the base id); one whose base is not in the output, or
+//!    which is at most [`WHOLE_MAX`] bytes (pointer blobs, commits), is stored whole: a
+//!    request for it is then a splice of its own bytes, not an inflate of its whole chain
+//!    (ADO's chains run 50 deep), and a pack of it needs no bases.
 //! 5. **Verification:** the output is indexed by the same indexer as an upstream pack,
 //!    which recomputes every id from content, and must hold exactly the expected objects.
 //!
@@ -52,6 +54,9 @@ use crate::zlib::{Deflater, Inflater, compress_bound};
 pub const MAX_DEPTH: u8 = 50;
 /// zlib level of re-encoded entries (git's default).
 const LEVEL: i32 = 6;
+/// Non-tree objects up to this size are stored whole even when they arrive as deltas
+/// (SearchGold: ~330K such deltas, a few MB more as whole objects).
+pub const WHOLE_MAX: u64 = 4 << 10;
 const NONE: u32 = u32::MAX;
 const NOT_WRITTEN: u64 = u64::MAX;
 /// A `map` value with this bit set is a slot of the frozen slab.
@@ -185,6 +190,11 @@ fn path_hash(parent: u64, name: &[u8]) -> u64 {
     h ^= h.wrapping_shr(27);
     h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
     h ^ h.wrapping_shr(31)
+}
+
+/// A delta that the output stores as a whole object (see [`WHOLE_MAX`]).
+fn stored_whole(rec: &crate::slab::Rec) -> bool {
+    rec.base != NO_BASE && rec.kind != OBJ_TREE && rec.size <= WHOLE_MAX
 }
 
 /// Orders `(time, index)` pairs newest first, ties by index.
@@ -888,7 +898,7 @@ impl Repacker {
                 .get(usize::from(o.slab))
                 .and_then(|s| s.rec(o.slot))
                 .ctx("record")?;
-            if rec.base == NO_BASE {
+            if rec.base == NO_BASE || stored_whole(&rec) {
                 break;
             }
             let m = self.base_of(&o, rec.base);
@@ -949,7 +959,7 @@ impl Repacker {
                 sink.put(entry)?;
                 self.stats.copied = self.stats.copied.saturating_add(1);
             }
-            Some((at, d)) if at < out_at => {
+            Some((at, d)) if at < out_at && !stored_whole(&rec) => {
                 let h = parse_entry_header(entry).ctx("entry header")?;
                 sink.put(HeaderBytes::ofs_delta(h.size, out_at.saturating_sub(at)).as_slice())?;
                 sink.put(entry.get(h.header_len..).ctx("entry")?)?;

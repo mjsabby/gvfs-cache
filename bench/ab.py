@@ -15,8 +15,8 @@ SERVER_CPUS = os.environ.get("SERVER_CPUS", "0-3,16-19")
 LG = os.environ.get("AB_LOADGEN_CPUS", "4-7,20-23")
 
 
-def one(name, binary, wl, dur):
-    im = impls.ALL[name](os.path.join(SG, name), binary=binary,
+def one(name, binary, wl, dur, work=None):
+    im = impls.ALL[name](work or os.path.join(SG, name), binary=binary,
                          extra_serve=load_bench.SERVE_EXTRA.get(name, []))
     srv = im.serve(os.path.join(SG, "up.git"), live=False, taskset=SERVER_CPUS, ready_timeout=900)
     try:
@@ -42,8 +42,9 @@ def main():
     for wl in wls:
         res = {"A": [], "B": []}
         for _ in range(rounds):
-            for tag, b in (("A", base), ("B", cand)):
-                r = one(name, b, wl, dur)
+            for tag, b, wk in (("A", base, os.environ.get("AB_BASE_WORK")),
+                               ("B", cand, os.environ.get("AB_CAND_WORK"))):
+                r = one(name, b, wl, dur, wk)
                 res[tag].append(r)
         def med(tag, k):
             return statistics.median([x.get(k) or 0 for x in res[tag]])
