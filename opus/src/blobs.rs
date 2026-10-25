@@ -6,10 +6,11 @@
 //!   content byte then sits at a computable file offset, so byte ranges are read in place.
 //! * **Segments** (`blobs/<id>.bidx`) index one or more blob packs: a minimal perfect hash
 //!   and one 48-byte record per blob (64-bit offsets, lengths and sizes). Each pipeline run
-//!   or mirror batch adds a segment and folds merge small ones, so a lookup probes a few.
+//!   or mirror batch adds a segment, and folds merge the small ones (a geometric
+//!   progression by blob count), so a lookup probes a few.
 //! * **`blobs.bin`** lists the segments and packs (compare-and-swap, like `manifest.bin`)
-//!   and how complete the store is: `tip complete` once every blob of the genesis tip's tree
-//!   is in a pack.
+//!   and whether the store is complete: mirrored once every blob of the history up to
+//!   genesis is in a pack (the pipeline copies each later window's blobs itself).
 //!
 //! ```text
 //! segment: "GVDBLOBX" | version u32 | count u32 | parts u32 | buckets u32 | seed u64

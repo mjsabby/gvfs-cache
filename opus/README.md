@@ -115,24 +115,31 @@ Prefetch and cold clones then carry no blobs at all. See [DESIGN.md](DESIGN.md#s
 gvfs-daemon pipeline --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT \
     --tier 15m --blobs separate
 
-# The seed of the blobs: resumable, verified by id, published as it goes. `tip` (the
-# genesis tip; then edges report ready) can add `since:30d` or `history`.
+# The seed of the blobs: every blob of the history (the tip's first), resumable,
+# verified by id and size, published as it goes; edges report ready once it is done.
 gvfs-daemon mirror --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT \
-    --scope tip --jobs 16 [--rate-mbps 4000] [--max-items N]
+    --jobs 16 [--rate-mbps 4000] [--max-items N]
 
 # Then schedule the pipeline as below: every run copies its window's new blobs before
 # publishing the trees that reference them (keep --work-dir, or --cache-dir, on a
 # persistent disk: a run reuses the store objects the previous one downloaded). Edges
 # serve blobs from the blob packs (read in place, or by range from Azure) and proxy only
-# what the store lacks.
+# the blobs of the commits the pipeline has not sealed yet.
 gvfs-daemon serve --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT ...
 ```
 
-An edge of such a store reports ready (`/healthz`) once the mirror recorded `tip
-complete`. Stock gvfs-helper works unchanged: it prefetches commits and trees and faults
+An edge of such a store reports ready (`/healthz`) once the mirror has copied the whole
+history. Stock gvfs-helper works unchanged: it prefetches commits and trees and faults
 blobs in (`GET`/`POST /gvfs/objects`). Clients that want sizes without blobs send
 `X-GVFS-Sizes: 1` with a prefetch and get a `GSZ1` section after the packs; large files
 can be read piecewise with `GET /gvfs/blobs/<oid>?offset=&length=`.
+
+Nothing repairs such a store by itself, and nothing should need to. If storage loses a
+blob pack or a segment index, edges and pipeline runs carry on (they log a warning, and
+edges serve the blobs involved through the proxy); an edge whose sealed trees name a blob
+the store lacks counts it in `gvfs_blobs_missing_total`. Either is the signal to run
+`gvfs-daemon mirror` again: it takes what the store lost out of `blobs.bin` and copies
+whatever is not listed, and on a whole store it copies nothing.
 
 ### Inspecting
 
@@ -151,8 +158,9 @@ the optimal splice by hand.
 
 `curl http://edge:8080/metrics` reports request, byte, and L0 counters, the manifest
 generation, and `gvfs_alloc_hot_path_total`, which must stay 0. Separate-blob stores add
-`gvfs_blobs_from_store_total`, `gvfs_blobs_proxied_total`, `gvfs_blobs_unavailable_total`,
-`gvfs_blobs_generation` and `gvfs_blobs_complete`, and for blob packs in object storage the
+`gvfs_blobs_from_store_total`, `gvfs_blobs_proxied_total`, `gvfs_blobs_missing_total`
+(should stay 0), `gvfs_blobs_unavailable_total`, `gvfs_blobs_generation` and
+`gvfs_blobs_complete`, and for blob packs in object storage the
 edge's block cache (`gvfs_blob_cache_{hits,misses,fetches,bypass}_total`, `gvfs_blob_cache_bytes`;
 size it with `--blob-cache-mib`, default 32 GiB).
 
@@ -233,8 +241,9 @@ src/repack.rs              primitive 2 into a slab: the optimal splice (tree clu
 src/idx.rs                 the git .idx of a prefetch pack (merged per-slab sorted runs)
 src/slab.rs, mphf.rs       slab index format and the partitioned PTHash MPHF
 src/pipeline.rs            the scheduled job: genesis, 15m, rollups, weekly, GC
-src/mirror.rs              --blobs separate: the resumable seed of the blob packs
-src/separate.rs            --blobs separate: what pipeline, mirror and edge share (sizes, blob index)
+src/mirror.rs              --blobs separate: the resumable seed (and on-demand repair) of the blob packs
+src/separate.rs            --blobs separate: what pipeline, mirror and edge share (sizes, blob index,
+                           the history's blobs, lost-object checks)
 src/blobs.rs, sizes.rs     blob packs, segments, blobs.bin; sizes tables and the GSZ1 section
 src/blobstream.rs, blobcopy.rs   streaming whole-blob packs from upstream fetches; copy items, publish
 src/manifest.rs, store.rs, azure.rs    manifest.bin (CAS) and the fs / Azure stores

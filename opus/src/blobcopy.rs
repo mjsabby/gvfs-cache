@@ -278,8 +278,8 @@ fn write_segment(
 }
 
 /// Indexes the `copied` packs with a new segment and appends both to `blobs.bin` in one
-/// compare-and-swap, together with `edit` (e.g. recording `tip complete`); then folds the
-/// segments if there are too many. Returns the published `blobs.bin`.
+/// compare-and-swap, together with `edit`; then folds the smallest segments if they are
+/// out of progression ([`fold_set`]). Returns the published `blobs.bin`.
 pub fn publish(
     store: &Store,
     work: &Path,

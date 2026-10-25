@@ -404,12 +404,12 @@ untouched: they still write manifest version 2, byte for byte as before.
 
 ```text
 store/
-  manifest.bin            version 3: flags (separate, history partial) + the blobs.bin
-                          generation its trees need
+  manifest.bin            version 3: flags (separate) + the blobs.bin generation its
+                          trees need
   slabs/<id>.pack|.mphf   commits and trees only
   slabs/<id>.sizes        "GVDSIZE1" | count u64 | (id[20] | size u64)* sorted | SHA-256
   blobs.bin               the blob packs and their segments (compare-and-swap), the
-                          genesis commit, `tip complete`, the mirrored history window
+                          genesis commit, whether the history is mirrored
   blobs/<id>.pack         whole blobs (a stock git pack, never deltas)
   blobs/<id>.bidx         segment: PTHash MPHF + 48-byte records over one or more packs
 ```
@@ -424,29 +424,37 @@ entry length u64 | size u64`: 64-bit lengths, so entries beyond 4 GiB are ordina
 
 ### The consistency rule
 
-Every blob introduced since genesis is in a blob pack listed in `blobs.bin` at the
-generation the manifest records, and so is every blob of the genesis tip once `mirror
---scope tip` has run. Blob versions that exist only in history before genesis are not
-copied (`mirror` can add a window of them, or all of history) and edges read them
-through, also when a later commit reuses one (a revert, an old branch merged): that is
-rare, and the proxy serves them like any other old version. The edge's L0 overlay is read
-through too. Separately, every blob any tree references has its size in the sizes table
-of the slab whose trees introduced it, so sizes are complete for every tree.
+Once `blobs.bin` is complete, every blob of every tree in the store is in a blob pack it
+lists (a manifest's trees' at the `blobs.bin` generation the manifest names). `gvfs-daemon
+mirror` makes that true for the history up to genesis; every pipeline run keeps it for its
+window by copying, before it publishes its trees, the blobs that the trees in its pack
+reference and the store lacks. That check is enough, whatever the upstream: an upstream
+leaves out of a pack only objects its haves reach, and the haves are the store's own
+earlier tips, so a tree it leaves out is in the store and so are its blobs. Plain git
+leaves out the trees of the edge commits (an old side branch's base), an upstream with
+reachability bitmaps everything the haves reach; either way a reused old version (a
+revert, an old branch merged, a restored directory) is in the pack's trees or in the store
+already. (The first version mirrored only the genesis tip: the haves then reached history
+the store lacked, and a window could reference an old version that was neither in its
+pack nor in the store.) Branches never merged into the followed branch are not in the
+store at all, trees or blobs. The edge's L0 overlay is read through until the pipeline
+seals it. Separately, every blob any tree references has its size in the sizes table of
+the slab whose trees introduced it, so sizes are complete for every tree, before and after
+the mirror.
 
 * **Genesis** fetches `blob:none` (commits and trees), walks every tree for the blobs it
   references, asks the upstream for their sizes (protocol v2 `object-info`, or ADO's
   `POST /gvfs/sizes`, 4,000 ids per request), writes the baseline's sizes table, records
-  the genesis commit in `blobs.bin`, and flags the manifest `separate, history partial`.
+  the genesis commit in `blobs.bin` (not mirrored yet), and flags the manifest `separate`.
 * **A 15m run works blobs first** (`pipeline::window_separate`): a `blob:none` fetch of
   the window; the blobs the trees in its pack reference that no segment lists (new
-  content, and old versions a changed directory brings back); their sizes from the
-  upstream (so a large blob is fetched alone); the copy, each blob verified by id;
-  `blobs.bin` published; only then the slab, its sizes table (the sizes no earlier table
-  has) and the manifest. A run that dies in between leaves blobs no tree references yet,
-  never a tree without its blobs. The upstream leaves out of the pack the subtrees its
-  haves reach: those hold blobs already in the store, or pre-genesis versions (read
-  through, as above). Pipeline runners keep the store objects a run reads (sizes tables,
-  segment indexes) in `--cache-dir` across runs, pruned to what the store lists.
+  content, and old versions a changed directory brings back before the mirror has them);
+  their sizes from the upstream (so a large blob is fetched alone); the copy, each blob
+  verified by id; `blobs.bin` published; only then the slab, its sizes table (the sizes no
+  earlier table has) and the manifest. A run that dies in between leaves blobs no tree
+  references yet, never a tree without its blobs. Pipeline runners keep the store objects
+  a run reads (sizes tables, segment indexes) in `--cache-dir` across runs, pruned to what
+  the store lists.
 * **The manifest names the `blobs.bin` generation** the run computed its copies against,
   or the one it published if newer, even when it copied nothing: a run that died after
   publishing `blobs.bin` left the blobs the next run's trees rely on.
@@ -473,7 +481,11 @@ file renamed into place; Azure: Put Block per 16 MiB, Put Block List at the end)
 local disk. Smaller blobs are batched up to `--blob-pack-mib` (default 2 GiB) and spooled
 to a local file, where deltas can read their bases back. Pack ids are fresh per copy, so a
 published pack is never overwritten; segments are content-addressed; `blobs.bin` is
-replaced by compare-and-swap and its segments folded into one beyond 16.
+replaced by compare-and-swap. Its segments are kept a geometric progression by blob count
+(each at least twice the next smaller, as git's `repack --geometric`): a publish merges only
+the smallest ones, plus any bigger one they would not be half of, so there are O(log n)
+segments and each record is rewritten (and downloaded again by edges) O(log n) times
+(100,000 single-blob publishes: at most 18 segments). Lookups probe the biggest first.
 
 Measured (`tests/separate.rs`, `blob_over_4gib_end_to_end`): a pipeline window with a
 4,294,979,641-byte incompressible blob ran in 7.0 s at an 11 MiB peak RSS. The local git
@@ -481,22 +493,37 @@ upstream's `pack-objects` held 4.1 GB to send it: that cost is the upstream's.
 
 ### `gvfs-daemon mirror` (`src/mirror.rs`)
 
-The seed of the blobs, planned from the store, never from the upstream: blob ids from a
-depth-first walk of trees already in the slabs (path order, so a sparse cone maps to few
-packs), sizes from the sizes tables, minus what `blobs.bin` lists. `--scope tip` walks the
-genesis commit's tree: with every later window's new blobs copied first, every blob
-introduced since genesis and every blob of the genesis tip is then in the store, and the
-run records `tip complete` after checking that every target is listed. `since:<30d|date|seconds>` adds the trees of commits since then; `history`
-adds every tree. `--jobs` copies run in parallel, finished packs are published every
-`--publish-secs`, `--rate-mbps` paces all copies through one throttle, and `--max-items`
-seeds in slices. A restart re-plans and skips what was published; a killed run's
-unpublished uploads are never listed and GC removes them (tested by `SIGKILL` at several
-points).
+The seed of the blobs: every blob of every tree in the store, planned from the store, never
+from the upstream (ids from the slabs' trees, sizes from the sizes tables, minus what
+`blobs.bin` lists). The plan is one parallel pass over every tree, each read once
+(`separate::history_blobs`): the current tip's tree first, depth first in path order (a
+checkout's blobs share packs and cache blocks), then the rest of the history by where the
+first tree naming each blob is stored (an upstream writes trees newest commit first, each
+commit's in path order). `--jobs` copies run in parallel, finished packs are published
+every `--publish-secs`, `--rate-mbps` paces all copies through one throttle, and
+`--max-items` seeds in slices. Before each pack, blobs that pipeline runs copied meanwhile
+are left out (the index is reloaded after each publish), and every copied blob's size is
+checked against the sizes table clients were given. The run that copies the last item
+checks that every blob is listed and records `blobs.bin` as mirrored: edges serve from
+then on. A restart re-plans and skips what was published; a killed run's unpublished
+uploads are never listed and GC removes them (tested by `SIGKILL` at several points).
+
+**Repair is on demand.** Nothing repairs a store by itself: once mirrored there is nothing
+to repair unless storage loses data or a bug drops something, so no pipeline run pays for
+a check. `mirror` is the repair. It lists `blobs/` first (after reading `blobs.bin`, so
+everything listed had been written) and takes out of `blobs.bin` what the store no longer
+holds: lost segments are dropped, segments that index a lost pack are refolded without
+it. It then copies whatever the trees reference and `blobs.bin` does not list; on a whole
+store it copies nothing and changes nothing. Meanwhile the store degrades instead of
+failing: edges and pipeline runs leave out a lost segment, or a lost or truncated local
+pack, with a warning; edges keep booting and proxy those blobs (counted in
+`gvfs_blobs_missing_total`, the signal to run `mirror`), and a window copies again what
+its own trees need. A lost pack in object storage shows only when it is read (a 5xx).
 
 ### Serving (`src/serve/blobs.rs`)
 
 * **Where a blob comes from.** A request id not in the slabs is looked up in the
-  segments of the loaded `blobs.bin` (newest first). Packs of a directory store are
+  segments of the loaded `blobs.bin` (biggest first). Packs of a directory store are
   mapped and leave through `sendfile(2)`. Packs in Azure stay there. The edge holds
   their segment indexes and reads the packs in 4 MiB blocks into a local cache
   (`src/serve/blobcache.rs`), at most 8 blocks per read at a time: a read fetches the
@@ -504,14 +531,18 @@ points).
   while it streams them. Unpinned blocks are evicted least recently used beyond
   `--blob-cache-mib` (default 32 GiB), so every read finishes, whatever the budget. A read
   of more than a quarter of the budget (one huge blob) streams straight from the store,
-  32 MiB at a time, instead of evicting everything else. Packs are in path order, so a
-  checkout's blobs share blocks; a block being fetched is fetched once. A miss goes to the
-  proxy: its cache, else the upstream, but only for ids a sizes table names (a 404
-  otherwise, without touching the upstream). The proxy fetches each blob once per edge
-  (requests for a blob being fetched wait for that fetch), verifies it as it streams in,
-  and keeps it on local disk up to `--proxy-cache-mib`. A request keeps the packs it
-  already holds, so eviction never makes it start over. An upstream failure is a 503,
-  which clients retry; gvfs-helper treats a 404 as fatal.
+  32 MiB at a time, instead of evicting everything else. The mirror writes the tip's
+  blobs first, in path order, so a checkout's blobs share blocks; a block being fetched is
+  fetched once.
+* **The proxy** serves blobs the store does not have, only for ids a sizes table names (a
+  404 otherwise, without touching the upstream): the L0 overlay's, copied when the
+  pipeline seals their trees, and blobs requested before the mirror has finished. A blob a
+  sealed tree names that a complete store lacks is a fault: still proxied (a 503 without
+  an upstream), but counted in `gvfs_blobs_missing_total` and logged. The proxy fetches
+  each blob once per edge (requests for a blob being fetched wait for that fetch),
+  verifies it as it streams in, and keeps it on local disk up to `--proxy-cache-mib`. A
+  request keeps the packs it already holds, so eviction never makes it start over. An
+  upstream failure is a 503, which clients retry; gvfs-helper treats a 404 as fatal.
 * **Loose objects** are spliced from the entry's deflate blocks between a stored block
   and the combined Adler-32, so nothing is inflated, and for a remote entry only its
   first 2 and last 4 zlib bytes are read before streaming. **POST packs** append whole
@@ -528,14 +559,18 @@ points).
   otherwise. This is for clients that read large files piecewise.
 * **Consistency at the edge.** `blobs.bin` is polled with the manifest. A manifest is
   applied only once the `blobs.bin` generation it names is loaded. `/healthz` stays 503
-  until `blobs.bin` says `tip complete`. L0 fetches are `blob:none`, with the sizes their
-  trees introduce asked of the upstream.
+  until `blobs.bin` is complete (the history mirrored). L0 fetches are `blob:none`, with
+  the sizes their trees introduce asked of the upstream.
 
 Store hits allocate nothing (the edge tests run `--alloc-guard strict`). Proxy fetches
 and remote reads are cold sections.
 
 ### Limits and open questions
 
+* Mirroring the whole history costs what the history weighs (SearchGold's main: 3.34M
+  pointers standing for 256 TiB, per `inspect slab`), once, before edges serve; the
+  mirror is resumable, parallel and rate-capped, and ADO's serving rate decides how long
+  it takes.
 * ADO support for protocol v2 `filter blob:none` and `object-info` is assumed, not
   verified. GVFS endpoints are used where the upstream offers them (`/gvfs/objects`,
   `/gvfs/sizes`); a metadata-only fetch through `/gvfs/prefetch` would replace the filter.

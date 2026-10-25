@@ -605,17 +605,17 @@ consumer needs the HFS side channel. The alternative adopted here:
 * commits and trees travel in one set of packs, blobs in another;
 * the blob sizes a client needs to project a tree travel with the trees, as a side table.
 
-**What it is** (opus `5870cd0`…`60e9164`; formats and algorithms in `opus/DESIGN.md`,
-"Stores with real blobs"). A store chooses its mode at genesis
+**What it is** (opus `5870cd0`…`60e9164`, whole-history mirror `aa475fa`…`37a4ded`;
+formats and algorithms in `opus/DESIGN.md`, "Stores with real blobs"). A store chooses its mode at genesis
 (`pipeline --blobs separate`); inline stores are unchanged, manifest byte for byte.
 
 | piece | what it does |
 |---|---|
 | sizes tables | `slabs/<id>.sizes`: sorted `(id, size)` of the blobs a slab's trees introduce; rollups union them |
-| blob packs + segments + `blobs.bin` | whole-blob git packs (upstream zlib kept, or stored blocks when incompressible: byte ranges in place); 48-byte records with 64-bit offsets and lengths; a CAS'd list |
+| blob packs + segments + `blobs.bin` | whole-blob git packs (upstream zlib kept, or stored blocks when incompressible: byte ranges in place); 48-byte records with 64-bit offsets and lengths; a CAS'd list whose segments stay a geometric progression by blob count (O(log n) segments, each record rewritten O(log n) times) |
 | pipeline, blobs first | `blob:none` window; copy the blobs its new trees reference that the store lacks; publish `blobs.bin`; only then the slab and the manifest naming that `blobs.bin` generation |
-| `gvfs-daemon mirror` | the seed of the blobs, planned from the store's own trees and sizes (path order), resumable, parallel, rate-capped; records `tip complete` for the genesis tree |
-| edge | blobs from the packs (mapped, or from Azure through a local 4 MiB block cache, never downloaded whole); a single-flight read-through proxy for blobs the store lacks (L0, old versions), only for ids the trees name; `GSZ1` sizes section on opt-in; `GET /gvfs/blobs/<oid>?offset&length`; ready only once `tip complete` |
+| `gvfs-daemon mirror` | the seed of the blobs: every blob of the history, planned from the store's own trees and sizes in one parallel pass (the tip's tree first, in path order), resumable, parallel, rate-capped, never re-copying what windows copied meanwhile, sizes checked; records `blobs.bin` as mirrored. Also the repair, on demand |
+| edge | blobs from the packs (mapped, or from Azure through a local 4 MiB block cache, never downloaded whole); a single-flight read-through proxy for the L0 overlay's blobs, only for ids the trees name (a sealed tree's blob that a complete store lacks is proxied too, but counted as `gvfs_blobs_missing_total`); `GSZ1` sizes section on opt-in; `GET /gvfs/blobs/<oid>?offset&length`; ready only once the history is mirrored |
 
 **Gates** (stock git judges every byte):
 
@@ -624,13 +624,15 @@ consumer needs the HFS side channel. The alternative adopted here:
 | Blob packs valid, sizes exact | every pack passes `index-pack --strict`; every table and every `/gvfs/sizes` answer equals `git cat-file -s` |
 | Streaming copy: chunking, OFS/REF/forward deltas, stored vs raw, wrong/missing/extra objects, bad trailers | unit tests (`blobstream.rs`) |
 | Pipeline blobs first | every blob of every window byte-exact in the store, including a revert to a never-copied version; the window's table holds exactly the new sizes; `blobs.bin` published before the manifest; rollups/weekly union; GC keeps exactly what is listed |
-| Pre-genesis versions reused after genesis | an old side branch merged (plain git leaves its base's subtrees out of the window's pack) and a revert against an upstream with reachability bitmaps: everything new since genesis and the genesis tip's blobs are in the store; the two reused pre-genesis versions are not copied, and an edge serves them through the proxy; every blob of every commit since genesis byte-exact |
+| Old versions reused after genesis | an old side branch merged (plain git leaves its base's subtrees out of the window's pack) and a revert against an upstream with reachability bitmaps: with the mirror run before the windows and with it run after them, every blob of every commit is in the store, listed once; an edge serves them all from the store, none through the proxy |
 | Recovery after a dead run | a run that published `blobs.bin` and died before the manifest: the next run copies nothing and its manifest still names that generation |
-| Mirror | sliced (`--max-items`) and resumed; `SIGKILL`ed at several points, two runs leaving unpublished uploads: completes, every blob once, GC removes exactly the orphans |
+| Mirror | every blob of the history byte-exact, each listed once; the first slice (`--max-items`) holds only tip blobs; segments end a geometric progression after folding; `--scope` is gone; `SIGKILL`ed at several points, two runs leaving unpublished uploads: completes, every blob once, GC removes exactly the orphans |
+| A complete store missing blobs | `blobs.bin` loses a segment: an edge stays ready, serves those blobs through the proxy (GET and POST), counts each upstream fetch in `gvfs_blobs_missing_total`; `mirror` copies them back and the edge serves them from the store |
+| Storage loses a pack and a segment | edges boot and serve every blob of the history byte-exact (the lost ones proxied, counted); pipeline runs go on; `mirror` drops the losses from `blobs.bin` and copies those blobs again, every blob listed once, every listed pack present |
 | Edge | every history blob loose (`fsck --strict`), POST packs (`index-pack --strict`), ranges of stored and compressed blobs (pipelined requests too), `GSZ1` equal to git's history (cold) and to the window's new blobs (warm), L0 blobs through the proxy and then from the store once sealed; 0 hot-path allocations in strict mode |
 | Inline stores unchanged | opus conformance re-run at `f7a34df`: 918 passed, 0 failed. Cross-client matrix: gvfs-helper 18/18 and fable's hook 15/15; astra's sync client 2/15 as before, since it needs astra's ETag (`bench/results/*-opus-sep.json`). The 7-day replay was not re-run |
 | Caches never livelock | block cache: a read larger than the budget, a read spanning more blocks than the budget holds, 8 threads racing over a 2-block cache; proxy: a request needing a cached and an uncached proxied blob with room for one pack. The three single-request cases hung before the fix |
-| Stock microsoft/git 2.56 | `gvfs-helper prefetch` (no blobs), a checkout faulting every blob byte for byte (16 MiB included), an old version through the proxy, a sparse cone that never fetches blobs outside it |
+| Stock microsoft/git 2.56 | `gvfs-helper prefetch` (no blobs), a checkout faulting every blob byte for byte (16 MiB included), an old version (from the store: nothing proxied), a sparse cone that never fetches blobs outside it |
 | Azure (Azurite) | streaming block uploads; an edge serving every blob loose and in packs by ranged reads, holding only segment indexes locally |
 | Beyond 4 GiB | a 4,294,979,641-byte blob: copied by a pipeline window in 7.0 s at an **11 MiB** peak RSS; served loose (hashes to its id), in a pack (`index-pack --strict`), and by ranges past 4 GiB |
 
@@ -641,11 +643,14 @@ each with a regression test that failed before the fix:
   their budget;
 * a manifest could name an older `blobs.bin` generation than its trees needed.
 
-The fourth: a window copies only the blobs of trees in its pack, and the upstream leaves out
-subtrees its haves reach, which can hold pre-genesis versions a later commit reuses (a
-revert, an old branch merged). That is by design: like every pre-genesis version, they are
-proxied. The docs now state the guarantee as "everything new since genesis, plus the genesis
-tip", not "every commit since genesis".
+The fourth was a design gap, not a bug: a window copies only the blobs of trees in its pack,
+and the upstream leaves out subtrees its haves reach. With only the genesis tip mirrored, the
+haves reached history the store lacked, so a later commit reusing an old version (a revert,
+an old branch merged) could reference a blob that was in neither. A first fix walked every
+new commit's whole tree each run (and made Azure runners download the baseline); it was
+reverted. The fix is the store's contents: the mirror now copies the whole history, so
+whatever a pack leaves out is in the store already, for any upstream (plain git or
+bitmaps), and a window needs no walk.
 
 **Scale: SearchGold's history in separate mode** (commits and trees real; its blobs are the
 3.34M pointer files, so this measures the metadata side):
@@ -664,6 +669,14 @@ was the local git upstream (`pack-objects`: SHA-1DC, zlib), 5% the daemon (mostl
 SHA-1s), so ADO's serving rate, not the daemon, will set the seed time.
 
 **Trade-offs and open questions:**
+
+* *Mirroring the whole history* costs what it weighs (SearchGold's main: 3.34M pointers
+  standing for 256 TiB), once, before edges serve: resumable, parallel, rate-capped, the tip's
+  blobs first. ADO's serving rate decides how long it takes.
+* *Repair is on demand.* No run checks or repairs the store by itself. If storage loses a pack
+  or a segment, edges and runs carry on (warnings; edges proxy those blobs and count them as
+  missing), and `gvfs-daemon mirror`, run again, repairs `blobs.bin`. A lost pack in Azure shows
+  only when it is read (5xx for its blobs until the repair).
 
 * *ADO capabilities are assumed, not verified:* protocol v2 `filter blob:none` and `object-info`
   for genesis, the 15-minute runs and L0. `/gvfs/objects` and `/gvfs/sizes` are used when
