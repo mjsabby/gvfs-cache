@@ -1,0 +1,373 @@
+{
+ "impl": "astra",
+ "passed": 754,
+ "failed": 6,
+ "failures": [
+  [
+   "prefetch:future_zero",
+   false,
+   "bad GPRE header b'request '"
+  ],
+  [
+   "stale:status200",
+   false,
+   "status 503 b'request failed\\n'"
+  ],
+  [
+   "robust:no_5xx_or_drop",
+   false,
+   "{'get_short_oid': 'EXC RemoteDisconnected', 'get_nonhex_oid': 'EXC RemoteDisconnected', 'prefetch_bad_ts': 'EXC RemoteDisconnected', 'prefetch_negative_ts': 'EXC RemoteDisconnected', 'post_bad_json': 503, 'post_empty_ids': 503, 'post_bad_oid': 503, 'post_neg_depth': 503, 'sizes_not_array': 503}"
+  ],
+  [
+   "robust:idle100_dont_starve",
+   false,
+   "opened 100/100, latency None"
+  ],
+  [
+   "robust:idle300_dont_starve",
+   false,
+   "opened 137/300, latency None"
+  ],
+  [
+   "robust:idle1000_dont_starve",
+   false,
+   "opened 137/1000, latency None"
+  ]
+ ],
+ "info": {
+  "genesis_s": [
+   0.114
+  ],
+  "ready_s": 0.07,
+  "cold_bytes": [
+   30720,
+   40783,
+   62992,
+   73540,
+   95937,
+   106482,
+   129633,
+   140645,
+   164665,
+   176206,
+   199668,
+   211140,
+   236158,
+   248100,
+   273967,
+   286362,
+   312397,
+   324567,
+   350892,
+   363580,
+   390821,
+   403905,
+   430078,
+   441781,
+   467182,
+   479339,
+   479339,
+   480090,
+   480231,
+   482457,
+   484763,
+   486985,
+   180603,
+   182983,
+   177982,
+   180511,
+   180511
+  ],
+  "step_s": [
+   [
+    "s1",
+    0.064
+   ],
+   [
+    "s2",
+    0.067
+   ],
+   [
+    "s3",
+    0.063
+   ],
+   [
+    "s4",
+    0.063
+   ],
+   [
+    "s5",
+    0.064
+   ],
+   [
+    "s6",
+    0.071
+   ],
+   [
+    "s7",
+    0.063
+   ],
+   [
+    "s8",
+    0.063
+   ],
+   [
+    "s9",
+    0.064
+   ],
+   [
+    "s10",
+    0.071
+   ],
+   [
+    "s11",
+    0.064
+   ],
+   [
+    "s12",
+    0.064
+   ],
+   [
+    "s13",
+    0.063
+   ],
+   [
+    "s14",
+    0.071
+   ],
+   [
+    "s15",
+    0.063
+   ],
+   [
+    "s16",
+    0.063
+   ],
+   [
+    "s17",
+    0.063
+   ],
+   [
+    "s18",
+    0.071
+   ],
+   [
+    "s19",
+    0.063
+   ],
+   [
+    "s20",
+    0.063
+   ],
+   [
+    "s21",
+    0.064
+   ],
+   [
+    "s22",
+    0.071
+   ],
+   [
+    "s23",
+    0.064
+   ],
+   [
+    "s24",
+    0.063
+   ],
+   [
+    "s25",
+    0.064
+   ],
+   [
+    "s26",
+    0.011
+   ],
+   [
+    "merge",
+    0.064
+   ],
+   [
+    "revert",
+    0.063
+   ],
+   [
+    "after-restart",
+    0.064
+   ],
+   [
+    "12h",
+    0.079
+   ],
+   [
+    "rewrite",
+    0.064
+   ],
+   [
+    "sun-weekly",
+    0.095
+   ],
+   [
+    "sun-15m",
+    0.063
+   ],
+   [
+    "mon-weekly",
+    0.177
+   ],
+   [
+    "mon-15m",
+    0.064
+   ],
+   [
+    "mon-1h",
+    0.011
+   ]
+  ],
+  "resend_after_complete": [
+   "s2:poller-live 10259B",
+   "s4:poller-live 10735B",
+   "s6:poller-live 10799B",
+   "s8:poller-live 11201B",
+   "s10:poller-live 11657B",
+   "s12:poller-live 11661B",
+   "s14:poller-live 12123B",
+   "s16:poller-live 12653B",
+   "s18:poller-live 12354B",
+   "s20:poller-live 12811B",
+   "s22:poller-live 13277B",
+   "s24:poller-live 11884B"
+  ],
+  "live_in_prefetch": [
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true
+  ],
+  "unseen_branch_get": 404,
+  "post_extra_objects": 56,
+  "closure_d1": {
+   "objects": 476,
+   "required": 33,
+   "blobs": 443
+  },
+  "closure_d2": {
+   "objects": 482,
+   "required": 38,
+   "blobs": 444
+  },
+  "closure_d3": {
+   "objects": 488,
+   "required": 43,
+   "blobs": 445
+  },
+  "unknown_in_post": 404,
+  "unknown_in_sizes": [
+   404,
+   "request failed\n"
+  ],
+  "post_loose_accept": [
+   200,
+   "application/x-git-packfile"
+  ],
+  "robustness_status": {
+   "get_short_oid": "EXC RemoteDisconnected",
+   "get_nonhex_oid": "EXC RemoteDisconnected",
+   "get_uppercase_oid": 200,
+   "prefetch_bad_ts": "EXC RemoteDisconnected",
+   "prefetch_negative_ts": "EXC RemoteDisconnected",
+   "post_bad_json": 503,
+   "post_empty_ids": 503,
+   "post_bad_oid": 503,
+   "post_neg_depth": 503,
+   "sizes_not_array": 503,
+   "sizes_empty": 200,
+   "unknown_path": 404,
+   "big_body": 404
+  },
+  "idle100": {
+   "opened": 100,
+   "config_latency_s": null
+  },
+  "idle300": {
+   "opened": 137,
+   "config_latency_s": null
+  },
+  "idle1000": {
+   "opened": 137,
+   "config_latency_s": null
+  },
+  "max_batch_ok": {
+   "sizes": 64000,
+   "objects": 64000
+  },
+  "hot_allocs": [
+   0.0
+  ],
+  "metric_errors": {
+   "gvfs_errors_total": 16.0
+  },
+  "clients": {
+   "poller": {
+    "bytes": 639152,
+    "ideal": 477502,
+    "packs": 47,
+    "responses": 49,
+    "nonadvancing": 24
+   },
+   "hourly": {
+    "bytes": 497098,
+    "ideal": 172472,
+    "packs": 15,
+    "responses": 16,
+    "nonadvancing": 0
+   },
+   "dev": {
+    "bytes": 496970,
+    "ideal": 140063,
+    "packs": 11,
+    "responses": 12,
+    "nonadvancing": 0
+   },
+   "late": {
+    "bytes": 496842,
+    "ideal": 108941,
+    "packs": 7,
+    "responses": 8,
+    "nonadvancing": 0
+   },
+   "stale": {
+    "bytes": 0,
+    "ideal": 0,
+    "packs": 0,
+    "responses": 0,
+    "nonadvancing": 0
+   }
+  },
+  "live_latency_s": [
+   0.4,
+   0.6,
+   0.6,
+   0.7,
+   0.7,
+   0.6,
+   0.7,
+   0.6,
+   0.6,
+   0.6,
+   0.7,
+   0.5,
+   1.01,
+   0.7,
+   0.0
+  ]
+ }
+}

@@ -1,0 +1,45 @@
+{
+ "impl": "astra",
+ "ready_s": 2.089050531387329,
+ "cold": {
+  "status": 200,
+  "ttfb_s": 0.00018124200869351625,
+  "packs": 1,
+  "ts": 1792907286,
+  "pack_len": 4404204861,
+  "idx_len": -1,
+  "pack_bytes": 4404204861,
+  "trailing": 0,
+  "total_s": 2.2983840400120243
+ },
+ "index_pack_ok": true,
+ "index_pack_s": 52.4,
+ "pack_objects": 9224930,
+ "object_set_equal": true,
+ "connectivity_ok": true,
+ "connectivity_missing": 0,
+ "connectivity_s": 42.8,
+ "closure": {
+  "status": 200,
+  "ttfb_s": 1.10092675301712,
+  "pack_bytes": 383933060,
+  "trailing": 0,
+  "total_s": 1.3058815160184167
+ },
+ "closure_index_ok": true,
+ "closure_complete": true,
+ "closure_missing": 0,
+ "closure_extra": 2469256,
+ "get_sample_bad": [],
+ "get_sample_bad_n": 0,
+ "get_sample_s": 0.2,
+ "sizes_ok": true,
+ "post4000_complete": true,
+ "post4000_extra": 1638,
+ "metrics": {
+  "gvfs_errors_total": 0.0,
+  "gvfs_alloc_hot_path_total": 0.0,
+  "gvfs_alloc_post_seal_total": 450.0
+ },
+ "alive": true
+}

@@ -1,0 +1,612 @@
+{
+ "impl": "argon",
+ "passed": 645,
+ "failed": 76,
+ "failures": [
+  [
+   "s1-15m:poller:complete",
+   false,
+   "1 missing of tip 49385d62ae: ['49385d62aeeb320d7e3af831c88deea49903da90']"
+  ],
+  [
+   "s2:poller-live:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 49385d62aeeb320d7e3af831c88deea49903da90\n"
+  ],
+  [
+   "s2:poller-live:has_sealed",
+   false,
+   ""
+  ],
+  [
+   "s2-1h:poller:complete",
+   false,
+   "1 missing of tip 5e5dd68939: ['5e5dd6893941bdbdf4340d96205af4b8ebc51500']"
+  ],
+  [
+   "s2-1h:hourly:complete",
+   false,
+   "1 missing of tip 5e5dd68939: ['5e5dd6893941bdbdf4340d96205af4b8ebc51500']"
+  ],
+  [
+   "s3-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 042062dcc64758c3e31bf31e68bc8e0cb7b66bab\n"
+  ],
+  [
+   "s4:poller-live:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 042062dcc64758c3e31bf31e68bc8e0cb7b66bab\n"
+  ],
+  [
+   "s4:poller-live:has_sealed",
+   false,
+   ""
+  ],
+  [
+   "s4-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 042062dcc64758c3e31bf31e68bc8e0cb7b66bab\n"
+  ],
+  [
+   "s5-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 042062dcc64758c3e31bf31e68bc8e0cb7b66bab\n"
+  ],
+  [
+   "s6:poller-live:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 042062dcc64758c3e31bf31e68bc8e0cb7b66bab\n"
+  ],
+  [
+   "s6:poller-live:has_sealed",
+   false,
+   ""
+  ],
+  [
+   "s6-6h:poller:complete",
+   false,
+   "1 missing of tip 1e613fe120: ['1e613fe120809fc284a4e66c5ee76c146df43512']"
+  ],
+  [
+   "s6-6h:hourly:complete",
+   false,
+   "1 missing of tip 1e613fe120: ['1e613fe120809fc284a4e66c5ee76c146df43512']"
+  ],
+  [
+   "s7-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+  ],
+  [
+   "s8:poller-live:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+  ],
+  [
+   "s8:poller-live:has_sealed",
+   false,
+   ""
+  ],
+  [
+   "s8-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+  ],
+  [
+   "s8-15m:dev:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+  ],
+  [
+   "s9-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+  ],
+  [
+   "s10:poller-live:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+  ],
+  [
+   "s10:poller-live:has_sealed",
+   false,
+   ""
+  ],
+  [
+   "s10-1h:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+  ],
+  [
+   "s10-1h:hourly:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+  ],
+  [
+   "s11-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 033cae12b7e42531ee863427813940dfb2cc371b\n"
+  ],
+  [
+   "s12:poller-live:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s12:poller-live:has_sealed",
+   false,
+   ""
+  ],
+  [
+   "s12-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s13-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s14:poller-live:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s14:poller-live:has_sealed",
+   false,
+   ""
+  ],
+  [
+   "s14-1h:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s14-1h:hourly:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s15-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s16:poller-live:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s16:poller-live:has_sealed",
+   false,
+   ""
+  ],
+  [
+   "s16-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s16-15m:dev:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s17-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s18:poller-live:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s18:poller-live:has_sealed",
+   false,
+   ""
+  ],
+  [
+   "s18-1h:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s18-1h:hourly:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s19-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s20:poller-live:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s20:poller-live:has_sealed",
+   false,
+   ""
+  ],
+  [
+   "s20-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s21-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s22:poller-live:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s22:poller-live:has_sealed",
+   false,
+   ""
+  ],
+  [
+   "s22-1h:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s22-1h:hourly:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s23-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s24:poller-live:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s24:poller-live:has_sealed",
+   false,
+   ""
+  ],
+  [
+   "s24-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s24-15m:dev:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s25-15m:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s26-1h:poller:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ],
+  [
+   "s26-1h:hourly:index_pack_strict",
+   false,
+   "fatal: did not receive expected object 0c60367badae04976a12ed6055c44e9e246ac5db\n"
+  ]
+ ],
+ "info": {
+  "genesis_s": [
+   0.064
+  ],
+  "ready_s": 0.352,
+  "cold_bytes": [
+   31263,
+   41980,
+   48020,
+   59223,
+   73565,
+   84770,
+   68394,
+   80059,
+   95153,
+   107349,
+   93492,
+   105617,
+   121386,
+   133975,
+   120145,
+   133188,
+   149572,
+   162391,
+   148244,
+   161588,
+   178290,
+   192030,
+   175689,
+   188055,
+   203827,
+   216659,
+   196240,
+   196996,
+   197137,
+   199371,
+   199271,
+   201501,
+   201539,
+   203923,
+   204024,
+   206555,
+   206555
+  ],
+  "step_s": [
+   [
+    "s1",
+    0.064
+   ],
+   [
+    "s2",
+    0.114
+   ],
+   [
+    "s3",
+    0.063
+   ],
+   [
+    "s4",
+    0.063
+   ],
+   [
+    "s5",
+    0.063
+   ],
+   [
+    "s6",
+    0.114
+   ],
+   [
+    "s7",
+    0.063
+   ],
+   [
+    "s8",
+    0.064
+   ],
+   [
+    "s9",
+    0.063
+   ],
+   [
+    "s10",
+    0.114
+   ],
+   [
+    "s11",
+    0.063
+   ],
+   [
+    "s12",
+    0.063
+   ],
+   [
+    "s13",
+    0.064
+   ],
+   [
+    "s14",
+    0.114
+   ],
+   [
+    "s15",
+    0.064
+   ],
+   [
+    "s16",
+    0.063
+   ],
+   [
+    "s17",
+    0.063
+   ],
+   [
+    "s18",
+    0.114
+   ],
+   [
+    "s19",
+    0.063
+   ],
+   [
+    "s20",
+    0.063
+   ],
+   [
+    "s21",
+    0.064
+   ],
+   [
+    "s22",
+    0.114
+   ],
+   [
+    "s23",
+    0.063
+   ],
+   [
+    "s24",
+    0.064
+   ],
+   [
+    "s25",
+    0.064
+   ],
+   [
+    "s26",
+    0.114
+   ],
+   [
+    "merge",
+    0.064
+   ],
+   [
+    "revert",
+    0.064
+   ],
+   [
+    "after-restart",
+    0.064
+   ],
+   [
+    "12h",
+    0.114
+   ],
+   [
+    "rewrite",
+    0.063
+   ],
+   [
+    "sun-weekly",
+    0.114
+   ],
+   [
+    "sun-15m",
+    0.063
+   ],
+   [
+    "mon-weekly",
+    0.114
+   ],
+   [
+    "mon-15m",
+    0.064
+   ],
+   [
+    "mon-1h",
+    0.114
+   ]
+  ],
+  "live_in_prefetch": [
+   false,
+   false,
+   false,
+   false,
+   false,
+   false,
+   false,
+   false,
+   false,
+   false,
+   false,
+   false
+  ],
+  "unseen_branch_get": 404,
+  "post_extra_objects": 0,
+  "closure_d1": {
+   "objects": 33,
+   "required": 33,
+   "blobs": 0
+  },
+  "closure_d2": {
+   "objects": 38,
+   "required": 38,
+   "blobs": 0
+  },
+  "closure_d3": {
+   "objects": 43,
+   "required": 43,
+   "blobs": 0
+  },
+  "unknown_in_post": 404,
+  "unknown_in_sizes": [
+   404,
+   "object not found\n"
+  ],
+  "post_loose_accept": [
+   200,
+   "application/x-git-packfile"
+  ],
+  "robustness_status": {
+   "get_short_oid": 400,
+   "get_nonhex_oid": 400,
+   "get_uppercase_oid": 200,
+   "prefetch_bad_ts": 200,
+   "prefetch_negative_ts": 200,
+   "post_bad_json": 400,
+   "post_empty_ids": 400,
+   "post_bad_oid": 400,
+   "post_neg_depth": 400,
+   "sizes_not_array": 400,
+   "sizes_empty": 200,
+   "unknown_path": 404,
+   "big_body": 404
+  },
+  "config_with_400_idle_conns_s": 0.0,
+  "hot_allocs": [
+   135.0
+  ],
+  "metric_errors": {},
+  "clients": {
+   "poller": {
+    "bytes": 262563,
+    "ideal": 88577,
+    "packs": 6,
+    "responses": 49,
+    "nonadvancing": 0
+   },
+   "hourly": {
+    "bytes": 262563,
+    "ideal": 88577,
+    "packs": 6,
+    "responses": 16,
+    "nonadvancing": 0
+   },
+   "dev": {
+    "bytes": 262563,
+    "ideal": 88577,
+    "packs": 6,
+    "responses": 12,
+    "nonadvancing": 0
+   },
+   "late": {
+    "bytes": 262563,
+    "ideal": 88577,
+    "packs": 6,
+    "responses": 8,
+    "nonadvancing": 0
+   },
+   "stale": {
+    "bytes": 242375,
+    "ideal": 75794,
+    "packs": 1,
+    "responses": 1,
+    "nonadvancing": 0
+   }
+  },
+  "live_latency_s": [
+   0.3,
+   0.5,
+   0.7,
+   0.5,
+   0.6,
+   0.6,
+   0.6,
+   0.5,
+   0.6,
+   0.6,
+   0.6,
+   0.5,
+   0.81,
+   0.6,
+   0.0
+  ]
+ }
+}

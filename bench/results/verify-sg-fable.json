@@ -1,0 +1,48 @@
+{
+ "impl": "fable",
+ "ready_s": 0.10078263282775879,
+ "cold": {
+  "status": 200,
+  "ttfb_s": 0.00023607301409356296,
+  "packs": 1,
+  "ts": 1792907198,
+  "pack_len": 2600554148,
+  "idx_len": 279692312,
+  "pack_bytes": 2600554148,
+  "idx_bytes": 279692312,
+  "trailing": 0,
+  "total_s": 1.3442313530249521
+ },
+ "index_pack_ok": true,
+ "index_pack_s": 36.6,
+ "idx_identical": true,
+ "pack_objects": 9224930,
+ "object_set_equal": true,
+ "connectivity_ok": true,
+ "connectivity_missing": 0,
+ "connectivity_s": 45.8,
+ "closure": {
+  "status": 200,
+  "ttfb_s": 0.5478412249940448,
+  "pack_bytes": 136560960,
+  "trailing": 0,
+  "total_s": 0.8316448169935029
+ },
+ "closure_index_ok": true,
+ "closure_complete": true,
+ "closure_missing": 0,
+ "closure_extra": 0,
+ "get_sample_bad": [],
+ "get_sample_bad_n": 0,
+ "get_sample_s": 0.35,
+ "sizes_ok": true,
+ "post4000_complete": true,
+ "post4000_extra": 0,
+ "metrics": {
+  "gvfs_alloc_sealed": 1.0,
+  "gvfs_alloc_post_seal_total": 63436.0,
+  "gvfs_alloc_hot_path_total": 0.0,
+  "gvfs_alloc_hot_path_bytes_total": 0.0
+ },
+ "alive": true
+}

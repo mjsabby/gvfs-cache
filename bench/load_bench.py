@@ -27,7 +27,7 @@ HZ = os.sysconf("SC_CLK_TCK")
 
 SOL_SERVE = ["--max-objects", "16777216", "--max-links", "2147483647", "--pack-mib", "65536",
              "--object-mib", "128", "--delta-cache-mib", "512", "--arenas", "8",
-             "--max-request-objects", "16384"]
+             "--max-request-objects", "16384", "--max-ranges", "8388608"]
 SERVE_EXTRA = {"sol": SOL_SERVE, "astra": ["--workers", "64"], "opus": [], "fable": []}
 
 

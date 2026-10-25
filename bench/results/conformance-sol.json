@@ -1,0 +1,334 @@
+{
+ "impl": "sol",
+ "passed": 882,
+ "failed": 1,
+ "failures": [
+  [
+   "robust:concurrent_mix",
+   false,
+   "1 errors"
+  ]
+ ],
+ "info": {
+  "genesis_s": [
+   0.164
+  ],
+  "ready_s": 0.251,
+  "cold_bytes": [
+   30901,
+   40964,
+   63173,
+   73721,
+   96118,
+   106663,
+   129814,
+   140826,
+   164846,
+   176387,
+   199849,
+   211321,
+   236339,
+   248281,
+   274148,
+   286543,
+   312578,
+   324748,
+   351073,
+   363761,
+   391002,
+   404086,
+   430259,
+   441962,
+   467363,
+   479520,
+   479520,
+   480271,
+   480412,
+   482638,
+   484944,
+   487166,
+   129291,
+   131671,
+   133847,
+   136376,
+   136376
+  ],
+  "step_s": [
+   [
+    "s1",
+    0.114
+   ],
+   [
+    "s2",
+    0.129
+   ],
+   [
+    "s3",
+    0.114
+   ],
+   [
+    "s4",
+    0.114
+   ],
+   [
+    "s5",
+    0.114
+   ],
+   [
+    "s6",
+    0.129
+   ],
+   [
+    "s7",
+    0.114
+   ],
+   [
+    "s8",
+    0.114
+   ],
+   [
+    "s9",
+    0.114
+   ],
+   [
+    "s10",
+    0.129
+   ],
+   [
+    "s11",
+    0.114
+   ],
+   [
+    "s12",
+    0.114
+   ],
+   [
+    "s13",
+    0.114
+   ],
+   [
+    "s14",
+    0.129
+   ],
+   [
+    "s15",
+    0.114
+   ],
+   [
+    "s16",
+    0.114
+   ],
+   [
+    "s17",
+    0.114
+   ],
+   [
+    "s18",
+    0.129
+   ],
+   [
+    "s19",
+    0.114
+   ],
+   [
+    "s20",
+    0.114
+   ],
+   [
+    "s21",
+    0.114
+   ],
+   [
+    "s22",
+    0.129
+   ],
+   [
+    "s23",
+    0.114
+   ],
+   [
+    "s24",
+    0.114
+   ],
+   [
+    "s25",
+    0.114
+   ],
+   [
+    "s26",
+    0.019
+   ],
+   [
+    "merge",
+    0.114
+   ],
+   [
+    "revert",
+    0.114
+   ],
+   [
+    "after-restart",
+    0.114
+   ],
+   [
+    "12h",
+    0.129
+   ],
+   [
+    "rewrite",
+    0.114
+   ],
+   [
+    "sun-weekly",
+    0.227
+   ],
+   [
+    "sun-15m",
+    0.114
+   ],
+   [
+    "mon-weekly",
+    0.227
+   ],
+   [
+    "mon-15m",
+    0.114
+   ],
+   [
+    "mon-1h",
+    0.019
+   ]
+  ],
+  "live_in_prefetch": [
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true
+  ],
+  "unseen_branch_get": 404,
+  "post_extra_objects": 406,
+  "closure_d1": {
+   "objects": 33,
+   "required": 33,
+   "blobs": 0
+  },
+  "closure_d2": {
+   "objects": 38,
+   "required": 38,
+   "blobs": 0
+  },
+  "closure_d3": {
+   "objects": 43,
+   "required": 43,
+   "blobs": 0
+  },
+  "unknown_in_post": 404,
+  "unknown_in_sizes": [
+   404,
+   "object not found\n"
+  ],
+  "post_loose_accept": [
+   200,
+   "application/x-git-packfile"
+  ],
+  "robustness_status": {
+   "get_short_oid": 400,
+   "get_nonhex_oid": 400,
+   "get_uppercase_oid": 200,
+   "prefetch_bad_ts": 400,
+   "prefetch_negative_ts": 400,
+   "post_bad_json": 400,
+   "post_empty_ids": 200,
+   "post_bad_oid": 400,
+   "post_neg_depth": 400,
+   "sizes_not_array": 400,
+   "sizes_empty": 200,
+   "unknown_path": 404,
+   "big_body": 413
+  },
+  "idle100": {
+   "opened": 100,
+   "config_latency_s": 0.012
+  },
+  "idle300": {
+   "opened": 300,
+   "config_latency_s": 0.0
+  },
+  "idle1000": {
+   "opened": 1000,
+   "config_latency_s": 0.0
+  },
+  "max_batch_ok": {
+   "sizes": 16000,
+   "objects": 16000
+  },
+  "hot_allocs": [
+   0.0
+  ],
+  "metric_errors": {
+   "gvfs_errors_total": 8.0
+  },
+  "clients": {
+   "poller": {
+    "bytes": 731633,
+    "ideal": 477502,
+    "packs": 47,
+    "responses": 49,
+    "nonadvancing": 0
+   },
+   "hourly": {
+    "bytes": 548107,
+    "ideal": 172472,
+    "packs": 15,
+    "responses": 16,
+    "nonadvancing": 0
+   },
+   "dev": {
+    "bytes": 543691,
+    "ideal": 140063,
+    "packs": 11,
+    "responses": 12,
+    "nonadvancing": 0
+   },
+   "late": {
+    "bytes": 539275,
+    "ideal": 108941,
+    "packs": 7,
+    "responses": 8,
+    "nonadvancing": 0
+   },
+   "stale": {
+    "bytes": 165448,
+    "ideal": 75468,
+    "packs": 1,
+    "responses": 1,
+    "nonadvancing": 0
+   }
+  },
+  "live_latency_s": [
+   0.2,
+   0.5,
+   0.5,
+   0.5,
+   0.91,
+   0.51,
+   0.5,
+   0.4,
+   0.4,
+   0.5,
+   0.4,
+   0.5,
+   0.71,
+   0.5,
+   0.0
+  ]
+ }
+}

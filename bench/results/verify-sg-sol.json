@@ -1,0 +1,46 @@
+{
+ "impl": "sol",
+ "ready_s": 5.8287694454193115,
+ "cold": {
+  "status": 200,
+  "ttfb_s": 0.00014892197214066982,
+  "packs": 1,
+  "ts": 1792907583,
+  "pack_len": 2393031787,
+  "idx_len": 261310488,
+  "pack_bytes": 2393031787,
+  "idx_bytes": 261310488,
+  "trailing": 0,
+  "total_s": 0.48835403099656105
+ },
+ "index_pack_ok": true,
+ "index_pack_s": 33.7,
+ "idx_identical": true,
+ "pack_objects": 9224930,
+ "object_set_equal": true,
+ "connectivity_ok": true,
+ "connectivity_missing": 0,
+ "connectivity_s": 35.5,
+ "closure": {
+  "status": 200,
+  "ttfb_s": 0.2050304840086028,
+  "pack_bytes": 139402899,
+  "trailing": 0,
+  "total_s": 0.7325925320037641
+ },
+ "closure_index_ok": true,
+ "closure_complete": true,
+ "closure_missing": 0,
+ "closure_extra": 0,
+ "get_sample_bad": [],
+ "get_sample_bad_n": 0,
+ "get_sample_s": 0.22,
+ "sizes_ok": true,
+ "post4000_complete": true,
+ "post4000_extra": 657911,
+ "metrics": {
+  "gvfs_errors_total": 0.0,
+  "gvfs_hot_allocations_total": 0.0
+ },
+ "alive": true
+}

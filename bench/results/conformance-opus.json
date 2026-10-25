@@ -1,0 +1,337 @@
+{
+ "impl": "opus",
+ "passed": 881,
+ "failed": 2,
+ "failures": [
+  [
+   "robust:idle300_dont_starve",
+   false,
+   "opened 300/300, latency None"
+  ],
+  [
+   "robust:idle1000_dont_starve",
+   false,
+   "opened 385/1000, latency None"
+  ]
+ ],
+ "info": {
+  "genesis_s": [
+   0.015
+  ],
+  "ready_s": 0.429,
+  "cold_bytes": [
+   21823,
+   31925,
+   35720,
+   38158,
+   41513,
+   43820,
+   47622,
+   50068,
+   53864,
+   56394,
+   61001,
+   63313,
+   67141,
+   69598,
+   73379,
+   75828,
+   79387,
+   81712,
+   85466,
+   87976,
+   91725,
+   94179,
+   97775,
+   100070,
+   103793,
+   106234,
+   106234,
+   106899,
+   107161,
+   109051,
+   110946,
+   115111,
+   110602,
+   112937,
+   114551,
+   117033,
+   117033
+  ],
+  "step_s": [
+   [
+    "s1",
+    0.007
+   ],
+   [
+    "s2",
+    0.015
+   ],
+   [
+    "s3",
+    0.015
+   ],
+   [
+    "s4",
+    0.015
+   ],
+   [
+    "s5",
+    0.015
+   ],
+   [
+    "s6",
+    0.015
+   ],
+   [
+    "s7",
+    0.007
+   ],
+   [
+    "s8",
+    0.015
+   ],
+   [
+    "s9",
+    0.007
+   ],
+   [
+    "s10",
+    0.015
+   ],
+   [
+    "s11",
+    0.015
+   ],
+   [
+    "s12",
+    0.007
+   ],
+   [
+    "s13",
+    0.015
+   ],
+   [
+    "s14",
+    0.015
+   ],
+   [
+    "s15",
+    0.007
+   ],
+   [
+    "s16",
+    0.015
+   ],
+   [
+    "s17",
+    0.015
+   ],
+   [
+    "s18",
+    0.015
+   ],
+   [
+    "s19",
+    0.015
+   ],
+   [
+    "s20",
+    0.015
+   ],
+   [
+    "s21",
+    0.015
+   ],
+   [
+    "s22",
+    0.015
+   ],
+   [
+    "s23",
+    0.015
+   ],
+   [
+    "s24",
+    0.015
+   ],
+   [
+    "s25",
+    0.015
+   ],
+   [
+    "s26",
+    0.007
+   ],
+   [
+    "merge",
+    0.007
+   ],
+   [
+    "revert",
+    0.007
+   ],
+   [
+    "after-restart",
+    0.015
+   ],
+   [
+    "12h",
+    0.031
+   ],
+   [
+    "rewrite",
+    0.007
+   ],
+   [
+    "sun-weekly",
+    0.031
+   ],
+   [
+    "sun-15m",
+    0.007
+   ],
+   [
+    "mon-weekly",
+    0.015
+   ],
+   [
+    "mon-15m",
+    0.015
+   ],
+   [
+    "mon-1h",
+    0.003
+   ]
+  ],
+  "live_in_prefetch": [
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true,
+   true
+  ],
+  "unseen_branch_get": 404,
+  "post_extra_objects": 827,
+  "closure_d1": {
+   "objects": 33,
+   "required": 33,
+   "blobs": 0
+  },
+  "closure_d2": {
+   "objects": 38,
+   "required": 38,
+   "blobs": 0
+  },
+  "closure_d3": {
+   "objects": 43,
+   "required": 43,
+   "blobs": 0
+  },
+  "unknown_in_post": 404,
+  "unknown_in_sizes": [
+   404,
+   "not found\n"
+  ],
+  "post_loose_accept": [
+   200,
+   "application/x-git-packfile"
+  ],
+  "robustness_status": {
+   "get_short_oid": 404,
+   "get_nonhex_oid": 404,
+   "get_uppercase_oid": 200,
+   "prefetch_bad_ts": 200,
+   "prefetch_negative_ts": 200,
+   "post_bad_json": 400,
+   "post_empty_ids": 400,
+   "post_bad_oid": 400,
+   "post_neg_depth": 200,
+   "sizes_not_array": 200,
+   "sizes_empty": 200,
+   "unknown_path": 404,
+   "big_body": "EXC ConnectionResetError"
+  },
+  "idle100": {
+   "opened": 100,
+   "config_latency_s": 0.0
+  },
+  "idle300": {
+   "opened": 300,
+   "config_latency_s": null
+  },
+  "idle1000": {
+   "opened": 385,
+   "config_latency_s": null
+  },
+  "max_batch_ok": {
+   "sizes": 16000,
+   "objects": 16000
+  },
+  "hot_allocs": [
+   0.0
+  ],
+  "metric_errors": {},
+  "clients": {
+   "poller": {
+    "bytes": 583123,
+    "ideal": 477502,
+    "packs": 47,
+    "responses": 49,
+    "nonadvancing": 0
+   },
+   "hourly": {
+    "bytes": 230038,
+    "ideal": 172472,
+    "packs": 15,
+    "responses": 16,
+    "nonadvancing": 0
+   },
+   "dev": {
+    "bytes": 198026,
+    "ideal": 140063,
+    "packs": 11,
+    "responses": 12,
+    "nonadvancing": 0
+   },
+   "late": {
+    "bytes": 165052,
+    "ideal": 108941,
+    "packs": 7,
+    "responses": 8,
+    "nonadvancing": 0
+   },
+   "stale": {
+    "bytes": 152853,
+    "ideal": 75819,
+    "packs": 1,
+    "responses": 1,
+    "nonadvancing": 0
+   }
+  },
+  "live_latency_s": [
+   0.4,
+   0.7,
+   0.7,
+   0.7,
+   0.1,
+   0.6,
+   0.7,
+   0.7,
+   0.7,
+   0.7,
+   0.6,
+   0.7,
+   1.01,
+   0.7,
+   0.0
+  ]
+ }
+}
