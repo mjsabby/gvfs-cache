@@ -447,11 +447,16 @@ the mirror.
   `POST /gvfs/sizes`, 4,000 ids per request), writes the baseline's sizes table, records
   the genesis commit in `blobs.bin` (not mirrored yet), and flags the manifest `separate`.
 * **A 15m run works blobs first** (`pipeline::window_separate`): a `blob:none` fetch of
-  the window; the blobs the trees in its pack reference that no segment lists (new
-  content, and old versions a changed directory brings back before the mirror has them);
-  their sizes from the upstream (so a large blob is fetched alone); the copy, each blob
-  verified by id; `blobs.bin` published; only then the slab, its sizes table (the sizes no
-  earlier table has) and the manifest. A run that dies in between leaves blobs no tree
+  the window; the blobs the trees in its pack reference that no segment lists; their sizes
+  from the upstream (so a large blob is fetched alone); the copy, each blob verified by
+  id; `blobs.bin` published; only then the slab, its sizes table (the sizes no earlier
+  table has) and the manifest. Until the mirror has finished, a run copies only the blobs
+  no earlier tree references (no sizes table has them): an unchanged file in a changed
+  directory, or an old version brought back, is in the mirror's plan, and copying it too
+  would race the mirror a whole directory at a time (measured: one window copied 1.7 GiB of
+  untouched large files the mirror was copying). Every blob in a sizes table is then either
+  in the plan of the mirror, whose last run checks them all, or new in the window that
+  introduced it, which copied it. A run that dies in between leaves blobs no tree
   references yet, never a tree without its blobs. Pipeline runners keep the store objects
   a run reads (sizes tables, segment indexes) in `--cache-dir` across runs, pruned to what
   the store lists.

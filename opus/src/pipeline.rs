@@ -447,16 +447,20 @@ fn window_separate(
 
     // The trees in the window's pack: their blobs are copied (if the store lacks them) and
     // their sizes go in the slab's table. Subtrees the pack leaves out are trees the haves
-    // reach, so they and their blobs are in the store already (`crate::separate`).
+    // reach, so they and their blobs are in the store already (`crate::separate`). Until the
+    // mirror has finished, a blob an earlier tree names (an unchanged file of a changed
+    // directory, an old version) is the mirror's to copy: copying it here too would race the
+    // mirror, a whole directory of large files at a time.
     let referenced = crate::blobcopy::referenced_blobs(&raw.slab, o.threads)?;
     let cache = o.cache_dir.clone();
     std::fs::create_dir_all(&cache).ctx(&format!("creating {}", cache.display()))?;
     let known = crate::separate::known_sizes(&o.store, &cache, m)?;
     let (bm, _) = crate::blobcopy::load(&o.store)?;
     let index = crate::separate::BlobIndex::load(&o.store, &cache, &bm)?;
+    let mirrored = bm.complete();
     let need: Vec<Oid> = referenced
         .iter()
-        .filter(|b| index.find(b).is_none())
+        .filter(|b| index.find(b).is_none() && (mirrored || known.get(b).is_none()))
         .copied()
         .collect();
     let (published, copied) = crate::separate::copy_needed(

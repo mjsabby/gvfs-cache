@@ -161,14 +161,6 @@ fn separate_store_pipeline_copies_blobs_before_trees() {
     assert_eq!(slab_kinds(&store_dir, window), vec![OBJ_COMMIT, OBJ_TREE]);
     let range = format!("{g}..{t}");
     let introduced = git_blobs(&up.bare, &[&range]);
-    let stored = store_blobs(&root, &store_dir);
-    for (id, size) in &introduced {
-        let content = stored
-            .get(id)
-            .unwrap_or_else(|| panic!("blob {id} of the window is not in the store\n{log}"));
-        assert_eq!(content.len() as u64, *size);
-        assert!(*content == cat_blob(&up.bare, id), "blob {id} differs");
-    }
     // The window's table: exactly the sizes no earlier table had.
     let baseline_sizes = sizes_of(&store_dir, &m2.baseline);
     let expect: BTreeMap<String, u64> = introduced
@@ -178,6 +170,25 @@ fn separate_store_pipeline_copies_blobs_before_trees() {
         .collect();
     assert_eq!(sizes_of(&store_dir, window), expect);
     assert_eq!(expect.len(), 3, "text v4, large.bin, noise.bin");
+    // Before the mirror has finished, the window copies exactly those: the old versions it
+    // reuses (text v1, copy.dat's content) are in the mirror's plan.
+    let stored = store_blobs(&root, &store_dir);
+    let mut copied: Vec<&String> = stored.keys().collect();
+    copied.sort();
+    assert_eq!(copied, expect.keys().collect::<Vec<_>>(), "{log}");
+    for (id, size) in &expect {
+        assert_eq!(stored[id].len() as u64, *size);
+        assert!(stored[id] == cat_blob(&up.bare, id), "blob {id} differs");
+    }
+    // The mirror copies the history, those versions with it.
+    let log = mirror(&root, &store, &up, &[]).unwrap();
+    let stored = store_blobs(&root, &store_dir);
+    for id in git_blobs(&up.bare, &["--all"]).keys() {
+        let content = stored
+            .get(id)
+            .unwrap_or_else(|| panic!("blob {id} is not in the store\n{log}"));
+        assert!(*content == cat_blob(&up.bare, id), "blob {id} differs");
+    }
     assert_eq!(all_sizes(&store_dir, &m2), git_blobs(&up.bare, &["--all"]));
     let (bm, _) = blobcopy::load(&s).unwrap();
     assert!(m2.blobs_generation > m.blobs_generation && bm.generation >= m2.blobs_generation);
@@ -1238,6 +1249,18 @@ fn reused_old_versions_are_in_the_store() {
     git(&up.bare, &["repack", "-adbq"]);
     for (_, spec) in &stores {
         pipeline(&root, spec, &up, "15m", &[]);
+    }
+    // Store B's windows ran before its mirror: they copied only blobs no earlier tree
+    // references (the reused versions are the mirror's).
+    let (dir_b, _) = &stores[1];
+    let genesis_sizes = sizes_of(dir_b, &manifest(dir_b).baseline);
+    let early = store_blobs(&root, dir_b);
+    assert!(!early.is_empty());
+    for id in early.keys() {
+        assert!(
+            !genesis_sizes.contains_key(id),
+            "{id}: a window copied the mirror's blob"
+        );
     }
     let log = mirror(&root, store_b, &up, &[]).unwrap();
 

@@ -10,7 +10,11 @@
 //! `gvfs-daemon mirror` makes it true for the history up to genesis (every blob of every
 //! tree in the slabs). A pipeline run keeps it by working blobs first: it copies the blobs
 //! that the trees in its window's pack reference and the store lacks, publishes them in
-//! `blobs.bin`, and only then publishes the trees. That is enough because an upstream
+//! `blobs.bin`, and only then publishes the trees. (Until the mirror has finished, a run
+//! copies only those no earlier tree references, which no sizes table has: the rest are in
+//! the plan of the mirror, whose last run checks every blob of the trees it planned from.
+//! Every blob in a sizes table is then either the mirror's or new in the window that
+//! introduced it, and that window copied it.) That is enough because an upstream
 //! leaves out of a pack only objects its haves reach, and the haves are the store's own
 //! earlier tips: a tree it leaves out is in the store, and so are its blobs (by induction
 //! from the mirrored genesis). Whatever the upstream (plain git, bitmaps), a reused old
