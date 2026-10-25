@@ -33,6 +33,12 @@ SOL_CAP = ["--max-objects", "16777216", "--max-links", "2147483647", "--pack-mib
            "--object-mib", "128", "--delta-cache-mib", "512"]
 SOL_SERVE = SOL_CAP + ["--arenas", "8"]
 SCHED = {"opus": "cron", "fable": "cron", "sol": "auto", "astra": "auto"}
+FROZEN = os.environ.get("FROZEN", "/home/muks/gvfs-bench/frozen")
+
+
+def binary(name):
+    p = os.path.join(FROZEN, f"{name}-gvfs-daemon")
+    return p if os.path.exists(p) else None
 
 H = json.load(open(os.path.join(R, "history-w7.json")))
 S, E, SEED = H["start"], H["end"], H["seed"]
@@ -91,12 +97,13 @@ class Oracle:
         os.replace(os.path.join(R, "oracle.json.tmp"), os.path.join(R, "oracle.json"))
 
     def _once(self, key, fn, store):
+        ikey = (id(store), key)
         with self.lock:
             if key in store:
                 return store[key]
-            ev = self.inflight.get(key)
+            ev = self.inflight.get(ikey)
             if ev is None:
-                ev = self.inflight[key] = threading.Event()
+                ev = self.inflight[ikey] = threading.Event()
                 mine = True
             else:
                 mine = False
@@ -106,6 +113,7 @@ class Oracle:
         v = fn()
         with self.lock:
             store[key] = v
+            self.inflight.pop(ikey, None)
             ev.set()
         return v
 
@@ -182,7 +190,8 @@ class Replay:
         self.clock = impls.Clock(os.path.join(self.work, "faketime"), S - 300)
         extra_p = SOL_CAP if name == "sol" else []
         extra_s = SOL_SERVE if name == "sol" else (["--workers", "64"] if name == "astra" else [])
-        self.im = impls.ALL[name](self.work, clock=self.clock, extra_pipeline=extra_p, extra_serve=extra_s)
+        self.im = impls.ALL[name](self.work, clock=self.clock, extra_pipeline=extra_p, extra_serve=extra_s,
+                                  binary=binary(name))
         self.up = os.path.join(self.work, "up.git")
         self.scratch = os.path.join(self.work, "scratch")
         os.makedirs(self.scratch, exist_ok=True)
@@ -464,7 +473,14 @@ def main():
     oracle = Oracle(os.path.join(R, names[0], "up.git"))
     oracle.count(SEED)
     with cf.ThreadPoolExecutor(len(names)) as ex:
-        futs = {ex.submit(Replay(n, oracle).run): n for n in names}
+        def go(n):
+            rp = Replay(n, oracle)
+            try:
+                return rp.run()
+            finally:
+                if getattr(rp, "srv", None):
+                    rp.srv.stop()
+        futs = {ex.submit(go, n): n for n in names}
         for f in cf.as_completed(futs):
             n = futs[f]
             try:

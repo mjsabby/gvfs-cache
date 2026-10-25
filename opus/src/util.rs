@@ -305,6 +305,24 @@ pub fn try_push<T>(v: &mut Vec<T>, item: T) -> bool {
     true
 }
 
+/// `v` in decimal ASCII, written right-aligned into `buf`; returns the digits.
+#[inline]
+pub fn decimal(mut v: u64, buf: &mut [u8; 20]) -> &[u8] {
+    let mut i = buf.len();
+    loop {
+        i = i.saturating_sub(1);
+        if let Some(slot) = buf.get_mut(i) {
+            // `v % 10 < 10`, so the cast cannot truncate.
+            *slot = b'0'.wrapping_add(v.wrapping_rem(10) as u8);
+        }
+        v = v.wrapping_div(10);
+        if v == 0 || i == 0 {
+            break;
+        }
+    }
+    buf.get(i..).unwrap_or(&[])
+}
+
 // ---------------------------------------------------------------------------------------
 // Time, formatting, threads
 // ---------------------------------------------------------------------------------------
@@ -352,6 +370,14 @@ pub fn default_threads() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decimal_formats_like_display() {
+        let mut buf = [0u8; 20];
+        for v in [0u64, 7, 9, 10, 99, 100, 4167, 1 << 40, u64::MAX] {
+            assert_eq!(decimal(v, &mut buf), v.to_string().as_bytes());
+        }
+    }
 
     #[test]
     fn hex_roundtrip_and_rejects() {

@@ -45,6 +45,20 @@ pub struct Request {
 pub struct Input {
     pub buf: Vec<u8>,
     pub filled: usize,
+    /// How long a client may pause in the middle of a request (head or body). Between
+    /// requests the socket's read timeout is the much shorter linger (see `serve`).
+    pub patience: std::time::Duration,
+    /// The socket's read timeout is currently `patience` (a request is in progress).
+    pub patient: bool,
+}
+
+/// What [`read_head`] found on a connection.
+pub enum Head {
+    Request(Request),
+    /// No request arrived within the read timeout and nothing is buffered.
+    Idle,
+    /// The client closed the connection between requests.
+    Closed,
 }
 
 impl Input {
@@ -52,7 +66,18 @@ impl Input {
         Input {
             buf: vec![0u8; HEAD_MAX],
             filled: 0,
+            patience: std::time::Duration::from_secs(30),
+            patient: false,
         }
+    }
+
+    /// Switches the socket to the mid-request read timeout (once per request).
+    pub fn be_patient(&mut self, stream: &TcpStream) -> std::io::Result<()> {
+        if !self.patient {
+            stream.set_read_timeout(Some(self.patience))?;
+            self.patient = true;
+        }
+        Ok(())
     }
 
     pub fn bytes(&self, r: (usize, usize)) -> &[u8] {
@@ -73,11 +98,12 @@ impl Default for Input {
     }
 }
 
-/// Reads one request head. `Ok(None)` on a clean close / idle timeout between requests.
-pub fn read_head(stream: &mut TcpStream, input: &mut Input) -> std::io::Result<Option<Request>> {
+/// Reads one request head: [`Head::Idle`] when no request arrives within the socket's read
+/// timeout, [`Head::Closed`] on a clean close between requests.
+pub fn read_head(stream: &mut TcpStream, input: &mut Input) -> std::io::Result<Head> {
     loop {
         if let Some(end) = find_head_end(input.buf.get(..input.filled).unwrap_or(&[])) {
-            return parse_head(input.buf.get(..end).unwrap_or(&[]), end).map(Some);
+            return parse_head(input.buf.get(..end).unwrap_or(&[]), end).map(Head::Request);
         }
         if input.filled >= input.buf.len() {
             return Err(std::io::Error::new(
@@ -88,19 +114,27 @@ pub fn read_head(stream: &mut TcpStream, input: &mut Input) -> std::io::Result<O
         let n = match stream.read(input.buf.get_mut(input.filled..).unwrap_or(&mut [])) {
             Ok(n) => n,
             Err(e)
-                if input.filled == 0
-                    && matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
             {
-                return Ok(None);
+                if input.filled == 0 {
+                    return Ok(Head::Idle);
+                }
+                if input.patient {
+                    return Err(e);
+                }
+                // Part of a head is here: wait for the rest with the mid-request timeout.
+                input.be_patient(stream)?;
+                continue;
             }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),
         };
         if n == 0 {
             return if input.filled == 0 {
-                Ok(None)
+                Ok(Head::Closed)
             } else {
                 Err(std::io::ErrorKind::UnexpectedEof.into())
             };
@@ -216,6 +250,8 @@ pub fn read_body(
         stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
     }
     input.consume(req.head_len);
+    // A body may take a while to arrive (a large POST over a slow link).
+    input.be_patient(stream)?;
     if req.chunked {
         loop {
             let n = line_len(stream, input)?;

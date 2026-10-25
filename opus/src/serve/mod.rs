@@ -21,10 +21,12 @@
 //!
 //! Every change publishes a new immutable [`view::View`].
 //!
-//! Requests are served by a fixed set of threads blocking on one listening socket, each
-//! with its own buffers; POSTs lease a request arena. Large slab ranges leave through
-//! `sendfile(2)`.
+//! Requests are served by a fixed set of threads, each with its own buffers, all waiting on
+//! one epoll set that holds the listening socket and every idle keep-alive connection
+//! ([`conns`]): an idle client costs a table slot, not a thread. POSTs lease a request arena.
+//! Large slab ranges leave through `sendfile(2)`.
 
+pub mod conns;
 pub mod handlers;
 pub mod httpd;
 pub mod view;
@@ -108,6 +110,12 @@ pub struct Options {
     pub idle_timeout: Duration,
     pub write_timeout: Duration,
     pub prefetch_idx: IdxPolicy,
+    /// Idle keep-alive connections that can wait at once (beyond that, the oldest idle
+    /// clients must reconnect).
+    pub max_idle_conns: usize,
+    /// How long a worker waits on a keep-alive connection for its next request before
+    /// parking it.
+    pub linger: Duration,
 }
 
 /// `gvfs-daemon serve ...`
@@ -132,6 +140,8 @@ pub fn main(args: &[String]) -> Result<()> {
             "cache-server",
             "alloc-guard",
             "idle-secs",
+            "max-idle-conns",
+            "linger-ms",
             "prefetch-idx",
         ],
     )?;
@@ -182,6 +192,8 @@ pub fn main(args: &[String]) -> Result<()> {
         idle_timeout: Duration::from_secs(f.num("idle-secs", 30u64)?),
         write_timeout: Duration::from_secs(120),
         prefetch_idx,
+        max_idle_conns: f.num("max-idle-conns", 65536usize)?,
+        linger: Duration::from_millis(f.num("linger-ms", 100u64)?),
     };
     run(opts)
 }
@@ -221,6 +233,8 @@ pub fn run(o: Options) -> Result<()> {
         idle_timeout,
         write_timeout,
         prefetch_idx,
+        max_idle_conns,
+        linger,
     } = o;
     let mut live = Live {
         store,
@@ -255,11 +269,14 @@ pub fn run(o: Options) -> Result<()> {
     warmer.offer(ctx.view());
 
     // 4. Workers, then seal.
+    raise_fd_limit();
     let listener = TcpListener::bind(&bind).ctx(&format!("binding {bind}"))?;
+    let conns = Arc::new(conns::Conns::new(&listener, max_idle_conns)?);
     let started = Arc::new(Barrier::new(workers.saturating_add(1)));
     for i in 0..workers {
         let listener = listener.try_clone()?;
         let ctx = ctx.clone();
+        let conns = conns.clone();
         let started = started.clone();
         std::thread::Builder::new()
             .name(format!("gvfs-w{i}"))
@@ -269,8 +286,20 @@ pub fn run(o: Options) -> Result<()> {
                     input: Input::new(),
                     out: Vec::with_capacity(256 << 10),
                 };
+                w.input.patience = idle_timeout;
                 started.wait();
-                worker_loop(&listener, &ctx, &mut w, idle_timeout, write_timeout);
+                worker_loop(&listener, &conns, &ctx, &mut w, i, linger, write_timeout);
+            })?;
+    }
+    {
+        let conns = conns.clone();
+        std::thread::Builder::new()
+            .name("gvfs-reaper".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(1));
+                    conns.reap(idle_timeout);
+                }
             })?;
     }
     {
@@ -301,34 +330,66 @@ pub fn run(o: Options) -> Result<()> {
     }
 }
 
-fn worker_loop(listener: &TcpListener, ctx: &Ctx, w: &mut Worker, idle: Duration, write: Duration) {
-    loop {
-        let Ok((mut stream, _)) = listener.accept() else {
-            std::thread::sleep(Duration::from_millis(10));
-            continue;
-        };
-        let _ = stream.set_nodelay(true);
-        let _ = stream.set_read_timeout(Some(idle));
-        let _ = stream.set_write_timeout(Some(write));
-        w.input.filled = 0;
-        serve_connection(ctx, w, &mut stream);
+/// Raises the soft open-file limit to the hard limit: every idle client holds a descriptor.
+fn raise_fd_limit() {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    if let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) {
+        if soft < hard {
+            let _ = setrlimit(Resource::RLIMIT_NOFILE, hard, hard);
+        }
     }
 }
 
-fn serve_connection(ctx: &Ctx, w: &mut Worker, stream: &mut TcpStream) {
+fn worker_loop(
+    listener: &TcpListener,
+    conns: &conns::Conns,
+    ctx: &Ctx,
+    w: &mut Worker,
+    index: usize,
+    linger: Duration,
+    write: Duration,
+) {
     loop {
+        let Some((mut stream, fresh)) = conns.next(listener) else {
+            continue;
+        };
+        if fresh {
+            let _ = stream.set_nodelay(true);
+            let _ = stream.set_read_timeout(Some(linger));
+            let _ = stream.set_write_timeout(Some(write));
+        }
+        w.input.filled = 0;
+        w.input.patient = false;
+        if serve_connection(ctx, w, &mut stream, linger) {
+            conns.park(stream, !fresh, index);
+        }
+    }
+}
+
+/// Serves requests until the client closes, errs, or pauses for longer than `linger`
+/// between requests: then `true`, and the idle connection is parked (it no longer holds
+/// this worker; the epoll set hands it to whichever worker is free when it speaks again).
+fn serve_connection(ctx: &Ctx, w: &mut Worker, stream: &mut TcpStream, linger: Duration) -> bool {
+    loop {
+        if w.input.patient {
+            if stream.set_read_timeout(Some(linger)).is_err() {
+                return false;
+            }
+            w.input.patient = false;
+        }
         let req = match httpd::read_head(stream, &mut w.input) {
-            Ok(Some(r)) => r,
-            Ok(None) => return,
+            Ok(httpd::Head::Request(r)) => r,
+            Ok(httpd::Head::Idle) => return w.input.filled == 0,
+            Ok(httpd::Head::Closed) => return false,
             Err(_) => {
                 let _ = httpd::respond_text(stream, 400, "bad request\n", false);
-                return;
+                return false;
             }
         };
         let _hot = gvfs_alloc_guard::hot_path();
         match handlers::handle(ctx, w, stream, &req) {
             Ok(true) => {}
-            Ok(false) | Err(_) => return,
+            Ok(false) | Err(_) => return false,
         }
     }
 }

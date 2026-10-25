@@ -25,7 +25,7 @@ use super::view::{Prefetch, View};
 use crate::arena::Arena;
 use crate::pack::{OBJ_COMMIT, OBJ_TREE, ObjectHeader, pack_header, parse_entry_header};
 use crate::splice::{ObjRef, Piece, piece_bytes};
-use crate::util::{Oid, u64_of, us};
+use crate::util::{Oid, u64_of};
 use crate::zlib::LooseSplice;
 
 const CT_PREFETCH: &str = "application/x-gvfs-timestamped-packfiles-indexes";
@@ -609,16 +609,27 @@ fn sizes(
             .and_then(|s| s.rec(slot))
             .map(|r| r.size)
             .unwrap_or(0);
-        let mut item = [0u8; 96];
-        let mut cur = std::io::Cursor::new(&mut item[..]);
         let hex = oid.to_hex();
-        let _ = write!(
-            cur,
-            "{}{{\"Id\":\"{}\",\"Size\":{size}}}",
-            if i == 0 { "" } else { "," },
-            std::str::from_utf8(&hex).unwrap_or("")
-        );
-        let n = us(cur.position());
+        let mut digits = [0u8; 20];
+        let digits = crate::util::decimal(size, &mut digits);
+        // `,{"Id":"<40 hex>","Size":<digits>}` built on the stack with constant-length copies.
+        let mut item = [0u8; 80];
+        let mut n = 0usize;
+        let mut put = |src: &[u8]| {
+            let end = n.saturating_add(src.len());
+            if let Some(dst) = item.get_mut(n..end) {
+                dst.copy_from_slice(src);
+                n = end;
+            }
+        };
+        if i != 0 {
+            put(b",");
+        }
+        put(b"{\"Id\":\"");
+        put(&hex);
+        put(b"\",\"Size\":");
+        put(digits);
+        put(b"}");
         ok &= crate::util::try_extend(out, item.get(..n).unwrap_or(&[]));
     }
     ok &= crate::util::try_push(out, b']');

@@ -54,7 +54,7 @@ zlib-rs = "0.6"
 # SHA-1 with runtime-detected SHA-NI.
 sha1 = "0.10"
 # Safe wrappers for sendfile(2).
-nix = { version = "0.29", default-features = false, features = ["fs", "zerocopy", "socket"] }
+nix = { version = "0.29", default-features = false, features = ["fs", "zerocopy", "socket", "event", "resource"] }
 # HTTPS to the upstream and to Azure Blob; ring also provides HMAC-SHA256 / SHA-256.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "1"
