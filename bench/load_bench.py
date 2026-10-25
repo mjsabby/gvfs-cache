@@ -29,6 +29,19 @@ SOL_SERVE = ["--max-objects", "16777216", "--max-links", "2147483647", "--pack-m
              "--object-mib", "128", "--delta-cache-mib", "512", "--arenas", "8",
              "--max-request-objects", "16384", "--max-ranges", "8388608"]
 SERVE_EXTRA = {"sol": SOL_SERVE, "astra": ["--workers", "64"], "opus": [], "fable": []}
+FROZEN = "/home/muks/gvfs-bench/frozen"
+# name -> (implementation adapter, work dir holding the store, binary)
+VARIANTS = {
+    "opus": ("opus", os.path.join(SG, "opus"), os.path.join(FROZEN, "opus-orig-gvfs-daemon")),
+    "opus-opt": ("opus", os.path.join(SG, "opus2"), os.path.join(FROZEN, "opus-opt-gvfs-daemon")),
+}
+
+
+def variant(name):
+    if name in VARIANTS:
+        return VARIANTS[name]
+    b = os.path.join(FROZEN, f"{name}-gvfs-daemon")
+    return name, os.path.join(SG, name), b if os.path.exists(b) else None
 
 
 def workloads(cursor):
@@ -97,8 +110,8 @@ def run_workload(port, pid, name, args, conns, warmup=2.0, duration=10.0, out_di
 
 
 def bench_impl(name, out_root, rnd, order_seed):
-    work = os.path.join(SG, name)
-    im = impls.ALL[name](work, extra_serve=SERVE_EXTRA.get(name, []))
+    impl, work, binary = variant(name)
+    im = impls.ALL[impl](work, binary=binary, extra_serve=SERVE_EXTRA.get(impl, []))
     srv = im.serve(impls_upstream(name), poll_s=1, live=False, taskset=SERVER_CPUS, ready_timeout=1800)
     out_dir = os.path.join(out_root, f"r{rnd}", name)
     os.makedirs(out_dir, exist_ok=True)
@@ -132,7 +145,7 @@ def impls_upstream(name):
 
 
 def main():
-    names = [a for a in sys.argv[1:] if a in impls.ALL] or ["opus", "fable", "sol", "astra"]
+    names = [a for a in sys.argv[1:] if a in impls.ALL or a in VARIANTS] or ["opus", "fable", "sol", "astra"]
     rounds = int(os.environ.get("ROUNDS", "3"))
     out_root = os.environ.get("OUT", os.path.join(SG, "load"))
     os.makedirs(out_root, exist_ok=True)
