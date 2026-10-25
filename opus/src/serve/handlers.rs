@@ -148,7 +148,7 @@ pub fn handle(
         }
         Route::Health => {
             let started = ctx.ready.load(Ordering::Relaxed);
-            // A separate-blob store is ready once every commit since genesis has its blobs.
+            // A separate-blob store is ready once the genesis tip's blobs are in the store.
             let blobs = ctx.view().blobs.as_ref().is_none_or(|b| b.complete);
             let (status, text) = match (started, blobs) {
                 (true, true) => (200, "ok\n"),

@@ -7,9 +7,11 @@
 //! where the published packs end, and nothing is copied twice.
 //!
 //! Scopes (`--scope`, comma-separated):
-//! * `tip`: the genesis commit's tree. The pipeline copies every later window's blobs
-//!   before publishing its trees, so this completes every commit since genesis: the run
-//!   then records `tip complete` in `blobs.bin`, and edges start serving.
+//! * `tip`: the genesis commit's tree. The pipeline copies every later window's new blobs
+//!   before publishing its trees, so with this every blob of the genesis tip and every
+//!   blob introduced since is in the store: the run then records `tip complete` in
+//!   `blobs.bin`, and edges start serving. Versions that exist only before genesis are
+//!   read through, also when a later commit reuses one.
 //! * `since:<when>`: every tree of commits since `<when>` (`30d`, `YYYY-MM-DD` or Unix
 //!   seconds): old versions that checking out recent history needs.
 //! * `history`: every tree.

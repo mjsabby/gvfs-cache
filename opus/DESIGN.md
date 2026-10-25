@@ -424,36 +424,29 @@ entry length u64 | size u64`: 64-bit lengths, so entries beyond 4 GiB are ordina
 
 ### The consistency rule
 
-Every blob that a tree of a published manifest references is in a blob pack listed in
-`blobs.bin` at the generation the manifest records, except blobs that only commits before
-genesis reference (copied by `mirror` for the genesis tip, optionally for a window or all
-of history; read through otherwise) and the edge's L0 overlay (read through). Separately,
-every such blob's size is in the sizes table of the slab whose trees introduced it, so
-sizes are complete for every tree, mirrored or not.
+Every blob introduced since genesis is in a blob pack listed in `blobs.bin` at the
+generation the manifest records, and so is every blob of the genesis tip once `mirror
+--scope tip` has run. Blob versions that exist only in history before genesis are not
+copied (`mirror` can add a window of them, or all of history) and edges read them
+through, also when a later commit reuses one (a revert, an old branch merged): that is
+rare, and the proxy serves them like any other old version. The edge's L0 overlay is read
+through too. Separately, every blob any tree references has its size in the sizes table
+of the slab whose trees introduced it, so sizes are complete for every tree.
 
 * **Genesis** fetches `blob:none` (commits and trees), walks every tree for the blobs it
   references, asks the upstream for their sizes (protocol v2 `object-info`, or ADO's
   `POST /gvfs/sizes`, 4,000 ids per request), writes the baseline's sizes table, records
   the genesis commit in `blobs.bin`, and flags the manifest `separate, history partial`.
 * **A 15m run works blobs first** (`pipeline::window_separate`): a `blob:none` fetch of
-  the window; the blobs its new commits' trees reference that no segment lists (new
-  content, and old versions a revert, a copy or a merge brings back); their sizes from the
+  the window; the blobs the trees in its pack reference that no segment lists (new
+  content, and old versions a changed directory brings back); their sizes from the
   upstream (so a large blob is fetched alone); the copy, each blob verified by id;
   `blobs.bin` published; only then the slab, its sizes table (the sizes no earlier table
   has) and the manifest. A run that dies in between leaves blobs no tree references yet,
-  never a tree without its blobs.
-* **Which blobs a window references** is not read off the trees in its pack: an upstream
-  leaves out every subtree its haves reach, and such a subtree may hold versions from
-  before genesis. Plain git leaves out the subtrees of a side branch's base, so an old
-  branch merged after genesis brings them in unseen; with reachability bitmaps every
-  subtree reachable from the haves is left out, so a revert does too. Instead
-  (`separate::window_blobs`), each new commit's whole tree is walked against the
-  manifest tip's tree: blobs and subtrees equal at the same path are skipped (that tree's
-  blobs are in the store, or will be once `mirror --scope tip` ends), and everything else
-  is walked, from the window's slab or the store's (baseline and pyramid). A tree walked
-  once is not walked again. The cost follows the diff against the tip, not the tree's
-  size. Pipeline runners keep the store objects this needs (slabs, sizes tables, segment
-  indexes) in `--cache-dir` across runs, pruned to what the store lists.
+  never a tree without its blobs. The upstream leaves out of the pack the subtrees its
+  haves reach: those hold blobs already in the store, or pre-genesis versions (read
+  through, as above). Pipeline runners keep the store objects a run reads (sizes tables,
+  segment indexes) in `--cache-dir` across runs, pruned to what the store lists.
 * **The manifest names the `blobs.bin` generation** the run computed its copies against,
   or the one it published if newer, even when it copied nothing: a run that died after
   publishing `blobs.bin` left the blobs the next run's trees rely on.
@@ -491,9 +484,9 @@ upstream's `pack-objects` held 4.1 GB to send it: that cost is the upstream's.
 The seed of the blobs, planned from the store, never from the upstream: blob ids from a
 depth-first walk of trees already in the slabs (path order, so a sparse cone maps to few
 packs), sizes from the sizes tables, minus what `blobs.bin` lists. `--scope tip` walks the
-genesis commit's tree: with every later window copied blobs first, that completes every
-commit since genesis, and the run records `tip complete` after checking that every target
-is listed. `since:<30d|date|seconds>` adds the trees of commits since then; `history`
+genesis commit's tree: with every later window's new blobs copied first, every blob
+introduced since genesis and every blob of the genesis tip is then in the store, and the
+run records `tip complete` after checking that every target is listed. `since:<30d|date|seconds>` adds the trees of commits since then; `history`
 adds every tree. `--jobs` copies run in parallel, finished packs are published every
 `--publish-secs`, `--rate-mbps` paces all copies through one throttle, and `--max-items`
 seeds in slices. A restart re-plans and skips what was published; a killed run's
@@ -548,10 +541,9 @@ and remote reads are cold sections.
   `/gvfs/sizes`); a metadata-only fetch through `/gvfs/prefetch` would replace the filter.
 * The edge's block cache lives in memory and on local disk and starts empty after a
   restart. Hot small-blob packs are not prefetched whole.
-* A window run reads the baseline and pyramid slabs, every segment index (48 B per blob)
-  and the manifest's sizes tables: about 2.7 GB at SearchGold's scale. A runner that keeps
-  `--cache-dir` downloads each once (the baseline once a week); an ephemeral runner, each
-  run.
+* A window run reads every segment index (48 B per blob) and the manifest's sizes tables:
+  about 220 MB at SearchGold's scale. A runner that keeps `--cache-dir` downloads each
+  once; an ephemeral runner, every run.
 * Small blobs are stored whole (no deltas), trading storage on similar small files for
   entries that always splice alone. Chunk-level dedup (HFS) is gone: git stores whole
   files.

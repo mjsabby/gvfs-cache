@@ -74,9 +74,9 @@ pub struct Options {
     pub blobs: Option<bool>,
     /// Bytes of small blobs per blob pack (`--blob-pack-mib`).
     pub blob_pack_bytes: u64,
-    /// Downloaded copies of immutable store objects (`--blobs separate`: the slabs, sizes
-    /// tables and segment indexes a window run reads), kept across runs and pruned to what
-    /// the store lists.
+    /// Downloaded copies of immutable store objects (`--blobs separate`: the sizes tables
+    /// and segment indexes a window run reads), kept across runs and pruned to what the
+    /// store lists.
     pub cache_dir: PathBuf,
 }
 
@@ -445,25 +445,17 @@ fn window_separate(
     let mut known_ts = crate::timeline::boundaries(m);
     let ts = crate::timeline::stamp(&raw.slab, &mut e.resolver, head, &mut known_ts, m.max_ts)?;
 
-    // The trees in the window's pack introduce the slab's sizes; the blobs to copy are
-    // those of every new commit's whole tree (the pack leaves out subtrees the haves
-    // reach, which may hold versions from before genesis).
+    // The trees in the window's pack: their blobs are copied (if the store lacks them) and
+    // their sizes go in the slab's table. Subtrees the pack leaves out (the haves reach
+    // them) hold blobs already in the store, or versions from before genesis, which edges
+    // proxy like every other pre-genesis version.
     let referenced = crate::blobcopy::referenced_blobs(&raw.slab, o.threads)?;
     let cache = o.cache_dir.clone();
     std::fs::create_dir_all(&cache).ctx(&format!("creating {}", cache.display()))?;
     let known = crate::separate::known_sizes(&o.store, &cache, m)?;
     let (bm, _) = crate::blobcopy::load(&o.store)?;
     let index = crate::separate::BlobIndex::load(&o.store, &cache, &bm)?;
-    let metas: Vec<SlabMeta> = std::iter::once(&m.baseline)
-        .chain(&m.pyramid)
-        .cloned()
-        .collect();
-    let stored = open_slabs(&o.store, &cache, &metas)?;
-    let walked = crate::separate::window_blobs(&raw.slab, &stored, m.tip)?;
-    let mut candidates: Vec<Oid> = referenced.iter().chain(&walked).copied().collect();
-    candidates.sort_unstable();
-    candidates.dedup();
-    let need: Vec<Oid> = candidates
+    let need: Vec<Oid> = referenced
         .iter()
         .filter(|b| index.find(b).is_none())
         .copied()

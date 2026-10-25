@@ -624,7 +624,7 @@ consumer needs the HFS side channel. The alternative adopted here:
 | Blob packs valid, sizes exact | every pack passes `index-pack --strict`; every table and every `/gvfs/sizes` answer equals `git cat-file -s` |
 | Streaming copy: chunking, OFS/REF/forward deltas, stored vs raw, wrong/missing/extra objects, bad trailers | unit tests (`blobstream.rs`) |
 | Pipeline blobs first | every blob of every window byte-exact in the store, including a revert to a never-copied version; the window's table holds exactly the new sizes; `blobs.bin` published before the manifest; rollups/weekly union; GC keeps exactly what is listed |
-| Old subtrees in a window | an old side branch merged after genesis (plain git leaves its base's subtrees out of the window's pack) and a revert against an upstream with reachability bitmaps (which leaves out every subtree the haves reach): every blob of every commit since genesis is in the store. The revert case fails without the whole-tree walk |
+| Pre-genesis versions reused after genesis | an old side branch merged (plain git leaves its base's subtrees out of the window's pack) and a revert against an upstream with reachability bitmaps: everything new since genesis and the genesis tip's blobs are in the store; the two reused pre-genesis versions are not copied, and an edge serves them through the proxy; every blob of every commit since genesis byte-exact |
 | Recovery after a dead run | a run that published `blobs.bin` and died before the manifest: the next run copies nothing and its manifest still names that generation |
 | Mirror | sliced (`--max-items`) and resumed; `SIGKILL`ed at several points, two runs leaving unpublished uploads: completes, every blob once, GC removes exactly the orphans |
 | Edge | every history blob loose (`fsck --strict`), POST packs (`index-pack --strict`), ranges of stored and compressed blobs (pipelined requests too), `GSZ1` equal to git's history (cold) and to the window's new blobs (warm), L0 blobs through the proxy and then from the store once sealed; 0 hot-path allocations in strict mode |
@@ -634,15 +634,18 @@ consumer needs the HFS side channel. The alternative adopted here:
 | Azure (Azurite) | streaming block uploads; an edge serving every blob loose and in packs by ranged reads, holding only segment indexes locally |
 | Beyond 4 GiB | a 4,294,979,641-byte blob: copied by a pipeline window in 7.0 s at an **11 MiB** peak RSS; served loose (hashes to its id), in a pack (`index-pack --strict`), and by ranges past 4 GiB |
 
-A code review of the separate-mode diff found four bugs, each now fixed with a regression test
-that failed before the fix:
+A code review of the separate-mode diff raised four findings. Three were bugs, now fixed,
+each with a regression test that failed before the fix:
 * a pipelined `/gvfs/blobs` request could be answered with the next request's range;
 * the edge's block cache and its blob proxy could livelock when one request needed more than
   their budget;
-* a window copied only the blobs of trees in its pack: subtrees the upstream leaves out
-  because its haves reach them could hold pre-genesis versions, so `tip complete` could
-  overstate;
 * a manifest could name an older `blobs.bin` generation than its trees needed.
+
+The fourth: a window copies only the blobs of trees in its pack, and the upstream leaves out
+subtrees its haves reach, which can hold pre-genesis versions a later commit reuses (a
+revert, an old branch merged). That is by design: like every pre-genesis version, they are
+proxied. The docs now state the guarantee as "everything new since genesis, plus the genesis
+tip", not "every commit since genesis".
 
 **Scale: SearchGold's history in separate mode** (commits and trees real; its blobs are the
 3.34M pointer files, so this measures the metadata side):
@@ -670,10 +673,9 @@ SHA-1s), so ADO's serving rate, not the daemon, will set the seed time.
   each run of missing blocks with one ranged GET, so a checkout's blobs, which sit together in path
   order, cost a few requests. Repeat reads cost none (tested on Azurite). The cache starts cold
   after a restart.
-* *Runner downloads:* a window run reads the baseline and pyramid slabs (its whole-tree walk), every
-  segment index (48 B per blob) and the manifest's sizes tables: ~2.7 GB at SearchGold's scale,
-  kept in `--cache-dir` across runs. A persistent runner downloads the baseline once a week; an
-  ephemeral one, every run.
+* *Runner downloads:* a window run reads every segment index (48 B per blob) and the manifest's
+  sizes tables: ~220 MB at SearchGold's scale, kept in `--cache-dir` across runs (an ephemeral
+  runner downloads them every run).
 * *Storage:* small blobs are stored whole (no deltas), so any blob leaves as its own bytes. Git
   stores whole files, so the chunk-level dedup HFS had is gone: a small edit to a 10 GB file
   costs 10 GB again, upstream and here.

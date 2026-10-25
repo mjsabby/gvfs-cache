@@ -595,8 +595,9 @@ pub struct BlobManifest {
     /// The commit the store's genesis was taken at (zero until genesis).
     pub genesis: Oid,
     /// Every blob of this commit's tree is in a pack (`mirror --scope tip` finished). With
-    /// the pipeline copying every later window's blobs first, `tip_complete == genesis`
-    /// means every commit since genesis has all its blobs in the store.
+    /// the pipeline copying every later window's new blobs first, `tip_complete == genesis`
+    /// means every blob of the genesis tip and every blob introduced since is in the store
+    /// (versions that exist only before genesis are read through).
     pub tip_complete: Option<Oid>,
     /// Old versions referenced since this commit stamp are mirrored too (0: none).
     pub since_ts: u64,

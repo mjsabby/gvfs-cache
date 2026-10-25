@@ -1174,13 +1174,15 @@ fn work_git(up: &Upstream, args: &[&str]) -> String {
     git(&up.work, &all)
 }
 
-/// Windows whose commits share subtrees with history before genesis: an old side branch
-/// merged (git leaves the branch point's subtrees out of the window's pack), and a revert
+/// Commits after genesis that reuse versions which exist only before genesis: an old side
+/// branch merged (git leaves its base's subtrees out of the window's pack) and a revert
 /// against an upstream with reachability bitmaps (which leaves out every subtree the haves
-/// reach). Every blob of every commit since genesis is in the store once they are sealed.
+/// reach). Windows copy what is new; those old versions are not copied, and an edge serves
+/// them through the proxy like any pre-genesis version. Every blob of every commit since
+/// genesis reaches a client, byte for byte.
 #[test]
-fn windows_copy_blobs_of_subtrees_shared_with_old_history() {
-    let root = tempdir("sep-restored");
+fn reused_pre_genesis_versions_come_through_the_proxy() {
+    let root = tempdir("sep-reused");
     let up = Upstream::new(&root);
     let store_dir = root.join("store");
     let store = format!("fs:{}", store_dir.display());
@@ -1211,24 +1213,68 @@ fn windows_copy_blobs_of_subtrees_shared_with_old_history() {
     );
     work_git(&up, &["push", "-q", "origin", "HEAD:main"]);
     pipeline(&root, &store, &up, "15m", &[]);
-    let stored = store_blobs(&root, &store_dir);
-    for (id, at) in commit_blobs(&up.bare, &["main", &format!("^{g}")]) {
-        assert!(stored.contains_key(&id), "{at} ({id}) not in the store");
-    }
-
-    // A revert of X restores lib/foo from before genesis (a v1); with bitmaps the upstream
-    // does not send that subtree again.
+    // A revert of X restores lib/foo from before genesis (a v1).
     work_git(&up, &["revert", "--no-edit", &x]);
     work_git(&up, &["push", "-q", "origin", "HEAD:main"]);
     git(&up.bare, &["repack", "-adbq"]);
     pipeline(&root, &store, &up, "15m", &[]);
+
+    // In the store: every blob no commit up to genesis has, and the genesis tip's blobs.
+    // (`rev-list --objects main ^G` is not that set: like upload-pack, it lists old
+    // objects deep in G's history.)
     let stored = store_blobs(&root, &store_dir);
-    for (id, at) in commit_blobs(&up.bare, &["main", &format!("^{g}")]) {
-        let content = stored
-            .get(&id)
-            .unwrap_or_else(|| panic!("{at} ({id}) not in the store"));
-        assert!(*content == cat_blob(&up.bare, &id), "{at} differs");
+    let since = format!("^{g}");
+    let referenced = commit_blobs(&up.bare, &["main", &since]);
+    let before = commit_blobs(&up.bare, &[&g]);
+    let at_genesis = commit_blobs(&up.bare, &["-1", &g]);
+    let new: Vec<&String> = referenced
+        .keys()
+        .filter(|id| !before.contains_key(*id))
+        .collect();
+    assert!(!new.is_empty());
+    for id in new.into_iter().chain(at_genesis.keys()) {
+        assert!(stored.contains_key(id), "{id} not in the store");
     }
+    // Not in the store: exactly the two reused pre-genesis versions.
+    let mut old: Vec<String> = referenced
+        .keys()
+        .filter(|id| !stored.contains_key(*id))
+        .cloned()
+        .collect();
+    old.sort();
+    let mut expect: Vec<String> = [format!("{x}^:lib/foo/a.c"), format!("{x}:lib/bar/c.c")]
+        .iter()
+        .map(|spec| rev(&up.bare, spec))
+        .collect();
+    expect.sort();
+    assert_eq!(old, expect, "a v1 and c v1 are the only blobs not copied");
+
+    // Every blob of every commit since genesis, through an edge: git re-hashes each one.
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--upstream",
+        up.bare.to_str().unwrap(),
+        "--poll-ms",
+        "100",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ]);
+    let ids: Vec<String> = referenced.keys().cloned().collect();
+    let loose = fresh_repo(&root, "loose");
+    for id in &ids {
+        let (status, ct, body) = server.get(&format!("/gvfs/objects/{id}"));
+        assert_eq!((status, ct.as_str()), (200, CT_LOOSE), "{}", referenced[id]);
+        let dir = loose.join("objects").join(&id[..2]);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&id[2..]), body).unwrap();
+    }
+    git(&loose, &["fsck", "--strict", "--no-dangling"]);
+    assert_eq!(cat_batch(&loose, &ids), cat_batch(&up.bare, &ids));
+    assert_eq!(server.metric("gvfs_blobs_proxied_total"), 2);
+    server.assert_clean();
+    drop(server);
     let _ = std::fs::remove_dir_all(&root);
 }
 

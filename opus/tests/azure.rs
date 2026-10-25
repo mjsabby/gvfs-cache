@@ -487,8 +487,8 @@ fn azure_separate_store() {
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     assert!(
-        cached.iter().any(|f| f.ends_with(".pack")),
-        "the window read the baseline: {cached:?}"
+        !cached.is_empty() && !cached.iter().any(|f| f.ends_with(".pack")),
+        "a window reads sizes tables and segment indexes, never a slab: {cached:?}"
     );
     assert!(cached.iter().all(|f| listed.contains(f)), "{cached:?}");
 
