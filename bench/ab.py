@@ -36,7 +36,7 @@ def one(name, binary, wl, dur):
 
 def main():
     name, cand, wls = sys.argv[1], sys.argv[2], sys.argv[3:]
-    base = os.path.join("/home/muks/gvfs-bench/frozen", f"{name}-gvfs-daemon")
+    base = os.environ.get("AB_BASE") or os.path.join("/home/muks/gvfs-bench/frozen", f"{name}-gvfs-daemon")
     rounds = int(os.environ.get("ROUNDS", "2"))
     dur = float(os.environ.get("DUR", "8"))
     for wl in wls:

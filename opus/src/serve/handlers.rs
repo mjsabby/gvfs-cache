@@ -12,7 +12,6 @@
 //! Any prefix before `/gvfs/` is accepted (`https://host/org/repo/gvfs/...`). Handlers use
 //! only the worker's buffers and a leased request arena: no heap allocation.
 
-use std::io::Write;
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,7 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sha1::{Digest, Sha1};
 
 use super::Ctx;
-use super::httpd::{Method, Out, Request, read_body, respond_text, write_head};
+use super::httpd::{Method, Out, Request, read_body, respond_text, write_response};
 use super::view::{Prefetch, View};
 use crate::arena::Arena;
 use crate::pack::{OBJ_COMMIT, OBJ_TREE, ObjectHeader, pack_header, parse_entry_header};
@@ -117,8 +116,7 @@ pub fn handle(
     match route {
         Route::Config => {
             inc(&ctx.metrics.config);
-            write_head(stream, 200, CT_JSON, u64_of(ctx.config_json.len()), keep)?;
-            stream.write_all(&ctx.config_json)?;
+            write_response(stream, 200, CT_JSON, &ctx.config_json, keep)?;
             Ok(keep)
         }
         Route::Health => {
@@ -199,8 +197,7 @@ fn prefetch(
     let view = ctx.view();
     let plan = match view.prefetch(since) {
         Prefetch::UpToDate => {
-            write_head(stream, 200, CT_PREFETCH, 8, keep)?;
-            stream.write_all(b"GPRE \x01\x00\x00")?;
+            write_response(stream, 200, CT_PREFETCH, b"GPRE \x01\x00\x00", keep)?;
             return Ok(keep);
         }
         Prefetch::Pack(plan) => plan,
@@ -227,8 +224,8 @@ fn prefetch(
         .len
         .saturating_add(32)
         .saturating_add(idx.map_or(0, |i| u64_of(i.len())));
-    write_head(stream, 200, CT_PREFETCH, body_len, keep)?;
     let mut out = Out::new(stream, &mut w.out);
+    out.head(200, CT_PREFETCH, body_len, keep)?;
     out.bytes(&head)?;
     out.bytes(&plan.header)?;
     for (slab, start, len) in plan.bodies() {
@@ -273,8 +270,8 @@ fn loose(
         if let Ok(plan) = LooseSplice::plan(rec.kind, rec.size, entry.get(hdr_len..).unwrap_or(&[]))
         {
             let zlib_at = rec.offset.saturating_add(u64_of(hdr_len));
-            write_head(stream, 200, CT_LOOSE, u64_of(plan.total_len()), keep)?;
             let mut out = Out::new(stream, &mut w.out);
+            out.head(200, CT_LOOSE, u64_of(plan.total_len()), keep)?;
             out.bytes(plan.prefix())?;
             out.slab(
                 slab,
@@ -332,8 +329,7 @@ fn loose(
             return Ok(false);
         }
     };
-    write_head(stream, 200, CT_LOOSE, u64_of(n), keep)?;
-    stream.write_all(buf.get(..n).unwrap_or(&[]))?;
+    write_response(stream, 200, CT_LOOSE, buf.get(..n).unwrap_or(&[]), keep)?;
     ctx.metrics
         .bytes_out
         .fetch_add(u64_of(n), Ordering::Relaxed);
@@ -439,8 +435,8 @@ fn objects_post(
         body_len = body_len.saturating_add(p.len());
     }
     let trailer: [u8; 20] = h.finalize().into();
-    write_head(stream, 200, CT_PACK, body_len.saturating_add(32), keep)?;
     let mut out = Out::new(stream, &mut w.out);
+    out.head(200, CT_PACK, body_len.saturating_add(32), keep)?;
     out.bytes(&header)?;
     for p in &arena.splice.pieces {
         match *p {
@@ -637,8 +633,7 @@ fn sizes(
         respond_text(stream, 413, "response too large\n", keep)?;
         return Ok(keep);
     }
-    write_head(stream, 200, CT_JSON, u64_of(out.len()), keep)?;
-    stream.write_all(out)?;
+    write_response(stream, 200, CT_JSON, out, keep)?;
     Ok(keep)
 }
 

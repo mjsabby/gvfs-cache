@@ -341,6 +341,43 @@ fn read_exact_into(
     Ok(())
 }
 
+/// Writes a whole response, head and body, in one `writev` when the socket takes it.
+pub fn write_response(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    keep_alive: bool,
+) -> std::io::Result<()> {
+    let mut buf = [0u8; 320];
+    let n = format_head(
+        &mut buf,
+        status,
+        content_type,
+        crate::util::u64_of(body.len()),
+        keep_alive,
+    );
+    write_all2(stream, buf.get(..n).unwrap_or(&[]), body)
+}
+
+/// `a` then `b`, with as few syscalls as possible (one, unless the socket buffer fills).
+fn write_all2(stream: &mut TcpStream, a: &[u8], b: &[u8]) -> std::io::Result<()> {
+    let (mut a, mut b) = (a, b);
+    while !a.is_empty() {
+        match stream.write_vectored(&[std::io::IoSlice::new(a), std::io::IoSlice::new(b)]) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) if n < a.len() => a = a.get(n..).unwrap_or(&[]),
+            Ok(n) => {
+                b = b.get(n.saturating_sub(a.len())..).unwrap_or(&[]);
+                a = &[];
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    stream.write_all(b)
+}
+
 /// Writes a response head (formatted on the stack).
 pub fn write_head(
     stream: &mut TcpStream,
@@ -388,14 +425,7 @@ pub fn respond_text(
     text: &str,
     keep_alive: bool,
 ) -> std::io::Result<()> {
-    write_head(
-        stream,
-        status,
-        "text/plain",
-        crate::util::u64_of(text.len()),
-        keep_alive,
-    )?;
-    stream.write_all(text.as_bytes())
+    write_response(stream, status, "text/plain", text.as_bytes(), keep_alive)
 }
 
 /// Response body writer: coalesces small writes, sendfiles large slab ranges.
@@ -414,6 +444,25 @@ impl<'a> Out<'a> {
             buf,
             sent: 0,
         }
+    }
+
+    /// The response head, into the same buffer as the start of the body: small responses
+    /// leave in one write. Not counted in `sent` (body bytes only).
+    pub fn head(
+        &mut self,
+        status: u16,
+        content_type: &str,
+        len: u64,
+        keep_alive: bool,
+    ) -> std::io::Result<()> {
+        let mut h = [0u8; 320];
+        let n = format_head(&mut h, status, content_type, len, keep_alive);
+        let h = h.get(..n).unwrap_or(&[]);
+        if self.buf.len().saturating_add(h.len()) > self.buf.capacity() {
+            self.flush()?;
+        }
+        self.buf.extend_from_slice(h);
+        Ok(())
     }
 
     pub fn bytes(&mut self, b: &[u8]) -> std::io::Result<()> {
@@ -505,5 +554,14 @@ mod tests {
         let mut buf = [0u8; 320];
         let n = format_head(&mut buf, 200, "application/json", 5, true);
         assert!(buf[..n].starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert_eq!(
+            &buf[..n],
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\n"
+        );
+        let n = format_head(&mut buf, 413, "text/plain", 18_446_744_073_709_551_615, false);
+        assert_eq!(
+            &buf[..n],
+            b"HTTP/1.1 413 Payload Too Large\r\nContent-Type: text/plain\r\nContent-Length: 18446744073709551615\r\nConnection: close\r\n\r\n"
+        );
     }
 }

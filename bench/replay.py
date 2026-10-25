@@ -76,22 +76,32 @@ def tip_at(t):
 
 # ------------------------------------------------------------------ shared oracle (cached)
 class Oracle:
+    """Exact object-set arithmetic.  `git rev-list --objects A ^B` is NOT a set difference: it
+    only excludes what B's boundary trees reach, so it lists old objects that were deleted and
+    re-added.  With S = objects(SEED) loaded exactly and SEED an ancestor of every tip:
+        objects(t) = S | R(t ^SEED)          NEW(t) = R(t ^SEED) - S
+        need(prev -> t) = NEW(t) - NEW(prev)  count(t) = |S| + |NEW(t)|"""
+
     def __init__(self, up):
         self.up = up
         self.lock = threading.Lock()
-        self.objs = {}
         self.ideal = {}
-        self.counts = {}
         self.inflight = {}
+        self.new = {}           # tip -> frozenset (small LRU)
+        self.order = []
         cache = os.path.join(R, "oracle.json")
         if os.path.exists(cache):
             d = json.load(open(cache))
             self.ideal = {tuple(k.split(":")): v for k, v in d.get("ideal", {}).items()}
-            self.counts = d.get("counts", {})
+        t0 = time.time()
+        out = subprocess.run(["git", f"--git-dir={up}", "rev-list", "--objects", SEED],
+                             capture_output=True, env=clean_env()).stdout
+        self.seed = frozenset(l[:40] for l in out.decode().splitlines() if l)
+        print(f"oracle: |objects(SEED)| = {len(self.seed)} in {time.time() - t0:.0f}s", flush=True)
 
     def save(self):
         with self.lock:
-            d = {"ideal": {f"{a}:{b}": v for (a, b), v in self.ideal.items()}, "counts": self.counts}
+            d = {"ideal": {f"{a}:{b}": v for (a, b), v in self.ideal.items()}}
         with open(os.path.join(R, "oracle.json.tmp"), "w") as f:
             json.dump(d, f)
         os.replace(os.path.join(R, "oracle.json.tmp"), os.path.join(R, "oracle.json"))
@@ -109,19 +119,31 @@ class Oracle:
                 mine = False
         if not mine:
             ev.wait()
-            return store[key]
+            with self.lock:
+                return store[key]
         v = fn()
         with self.lock:
             store[key] = v
+            if store is self.new:
+                self.order.append(key)
+                while len(self.order) > 64:
+                    old = self.order.pop(0)
+                    self.new.pop(old, None)
             self.inflight.pop(ikey, None)
             ev.set()
         return v
 
-    def new_objects(self, have, want):
+    def new_since_seed(self, tip):
+        if tip == SEED:
+            return frozenset()
+
         def f():
-            out = git_out(self.up, "rev-list", "--objects", want, f"^{have}")
-            return frozenset(l.split()[0] for l in out.splitlines() if l)
-        return self._once((have, want), f, self.objs)
+            out = git_out(self.up, "rev-list", "--objects", tip, f"^{SEED}")
+            return frozenset(o for o in (l[:40] for l in out.splitlines() if l) if o not in self.seed)
+        return self._once(tip, f, self.new)
+
+    def new_objects(self, have, want):
+        return self.new_since_seed(want) - self.new_since_seed(have)
 
     def ideal_bytes(self, have, want):
         def f():
@@ -131,14 +153,7 @@ class Oracle:
         return self._once((have, want), f, self.ideal)
 
     def count(self, tip):
-        def f():
-            if tip == SEED:
-                n = sum(1 for _ in subprocess.run(
-                    ["git", f"--git-dir={self.up}", "rev-list", "--objects", SEED],
-                    capture_output=True, env=clean_env()).stdout.splitlines())
-                return n
-            return self.count(SEED) + len(self.new_objects(SEED, tip))
-        return self._once(tip, f, self.counts)
+        return len(self.seed) + len(self.new_since_seed(tip))
 
 
 # ------------------------------------------------------------------ clients
@@ -196,6 +211,9 @@ class Replay:
         self.scratch = os.path.join(self.work, "scratch")
         os.makedirs(self.scratch, exist_ok=True)
         self.pipe = {"runs": 0, "by_tier": {}, "max_s": 0.0}
+        self.csv = open(os.path.join(self.work, "responses.csv"), "w")
+        self.csv.write("t,client,cursor,status,packs,ts,pack_bytes,idx_bytes,objects,need,missing,"
+                       "already_had,secs\n")
         self.live = []
         self.cold = []
 
@@ -273,6 +291,8 @@ class Replay:
             self.failure(f"{c.name} {len(packs)} packs")
         need = self.oracle.new_objects(c.tip, tip) if c.tip != tip else frozenset()
         if not packs:
+            self.csv.write(f"{self.clock.now},{c.name},{c.cursor},200,0,,0,0,0,{len(need)},"
+                           f"{len(need - c.got)},0,{secs:.6f}\n")
             c.st["empty"] += 1
             c.st["gpre_bytes"] += 8
             if need - c.got:
@@ -295,6 +315,9 @@ class Replay:
             return
         c.st["resent_objects"] += len(objs & c.got)
         missing = need - c.got - objs
+        self.csv.write(f"{self.clock.now},{c.name},{c.cursor},200,1,{ts},{len(pack)},"
+                       f"{len(idx) if idx else 0},{len(objs)},{len(need)},{len(missing)},"
+                       f"{len(objs & c.got) + len(objs & self.oracle.seed)},{secs:.6f}\n")
         if missing:
             c.st["failures"] += 1
             self.failure(f"{c.name} response at cursor {c.cursor} misses {len(missing)} objects of "
@@ -434,6 +457,7 @@ class Replay:
                 self.oracle.save()
         m = self.srv.metrics()
         self.srv.stop()
+        self.csv.close()
         res = dict(impl=self.name, failures=len(self.fail), failure_samples=self.fail[:20],
                    pipeline=self.pipe, live_wait_s=dict(n=len(self.live),
                    p50=sorted(self.live)[len(self.live) // 2] if self.live else None,
