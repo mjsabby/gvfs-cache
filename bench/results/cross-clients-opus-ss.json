@@ -1,0 +1,272 @@
+[
+ {
+  "server": "opus",
+  "client": "gvfs-helper",
+  "steps": [
+   [
+    "cold:rc0",
+    true,
+    ""
+   ],
+   [
+    "cold:one_pack",
+    true,
+    ""
+   ],
+   [
+    "cold:complete",
+    true,
+    ""
+   ],
+   [
+    "live:rc0",
+    true,
+    ""
+   ],
+   [
+    "live:complete",
+    true,
+    ""
+   ],
+   [
+    "idle_polls:no_new_packs",
+    true,
+    ""
+   ],
+   [
+    "sealed:rc0",
+    true,
+    ""
+   ],
+   [
+    "sealed:complete",
+    true,
+    ""
+   ],
+   [
+    "c20-1h:rc0",
+    true,
+    ""
+   ],
+   [
+    "c20-1h:complete",
+    true,
+    ""
+   ],
+   [
+    "c25-15m:rc0",
+    true,
+    ""
+   ],
+   [
+    "c25-15m:complete",
+    true,
+    ""
+   ],
+   [
+    "c30-168h:rc0",
+    true,
+    ""
+   ],
+   [
+    "c30-168h:complete",
+    true,
+    ""
+   ],
+   [
+    "faultin:get_rc0",
+    true,
+    ""
+   ],
+   [
+    "faultin:post_rc0",
+    true,
+    ""
+   ],
+   [
+    "faultin:complete",
+    true,
+    ""
+   ],
+   [
+    "server_alive",
+    true,
+    ""
+   ]
+  ],
+  "packs_after_live": 2,
+  "packs_after_idle_polls": 0,
+  "packs_final": 5,
+  "server_alive": true
+ },
+ {
+  "server": "opus",
+  "client": "fable-client-prefetch",
+  "steps": [
+   [
+    "cold:rc0",
+    true,
+    ""
+   ],
+   [
+    "cold:one_pack",
+    true,
+    ""
+   ],
+   [
+    "cold:complete",
+    true,
+    ""
+   ],
+   [
+    "live:rc0",
+    true,
+    ""
+   ],
+   [
+    "live:complete",
+    true,
+    ""
+   ],
+   [
+    "idle_polls:no_new_packs",
+    true,
+    ""
+   ],
+   [
+    "sealed:rc0",
+    true,
+    ""
+   ],
+   [
+    "sealed:complete",
+    true,
+    ""
+   ],
+   [
+    "c20-1h:rc0",
+    true,
+    ""
+   ],
+   [
+    "c20-1h:complete",
+    true,
+    ""
+   ],
+   [
+    "c25-15m:rc0",
+    true,
+    ""
+   ],
+   [
+    "c25-15m:complete",
+    true,
+    ""
+   ],
+   [
+    "c30-168h:rc0",
+    true,
+    ""
+   ],
+   [
+    "c30-168h:complete",
+    true,
+    ""
+   ],
+   [
+    "server_alive",
+    true,
+    ""
+   ]
+  ],
+  "packs_after_live": 2,
+  "packs_after_idle_polls": 0,
+  "packs_final": 5,
+  "server_alive": true
+ },
+ {
+  "server": "opus",
+  "client": "astra-sync",
+  "steps": [
+   [
+    "cold:rc0",
+    false,
+    "gvfs-daemon: invalid data: prefetch response has no ETag\n"
+   ],
+   [
+    "cold:one_pack",
+    false,
+    "0 packs: gvfs-daemon: invalid data: prefetch response has no ETag\n"
+   ],
+   [
+    "cold:complete",
+    false,
+    "1 missing"
+   ],
+   [
+    "live:rc0",
+    false,
+    "gvfs-daemon: invalid data: prefetch response has no ETag\n"
+   ],
+   [
+    "live:complete",
+    false,
+    "1 missing; gvfs-daemon: invalid data: prefetch response has no ETag\n"
+   ],
+   [
+    "idle_polls:no_new_packs",
+    true,
+    ""
+   ],
+   [
+    "sealed:rc0",
+    false,
+    "gvfs-daemon: invalid data: prefetch response has no ETag\n"
+   ],
+   [
+    "sealed:complete",
+    false,
+    "1 missing"
+   ],
+   [
+    "c20-1h:rc0",
+    false,
+    "gvfs-daemon: invalid data: prefetch response has no ETag\n"
+   ],
+   [
+    "c20-1h:complete",
+    false,
+    "1 missing; gvfs-daemon: invalid data: prefetch response has no ETag\n"
+   ],
+   [
+    "c25-15m:rc0",
+    false,
+    "gvfs-daemon: invalid data: prefetch response has no ETag\n"
+   ],
+   [
+    "c25-15m:complete",
+    false,
+    "1 missing; gvfs-daemon: invalid data: prefetch response has no ETag\n"
+   ],
+   [
+    "c30-168h:rc0",
+    false,
+    "gvfs-daemon: invalid data: prefetch response has no ETag\n"
+   ],
+   [
+    "c30-168h:complete",
+    false,
+    "1 missing; gvfs-daemon: invalid data: prefetch response has no ETag\n"
+   ],
+   [
+    "server_alive",
+    true,
+    ""
+   ]
+  ],
+  "packs_after_live": 0,
+  "packs_after_idle_polls": 0,
+  "packs_final": 0,
+  "server_alive": true
+ }
+]

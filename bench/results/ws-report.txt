@@ -1,0 +1,211 @@
+Bytes received over the week (GPRE bytes; x = / git's ideal for the same have->want)
+
+| client | opus | opus@ss | fable | fable@h24 |
+|---|---|---|---|---|
+| agent-1m | 43.3 MB (1.03x), 1404 packs | 48.1 MB (1.15x), 1404 packs | 222.6 MB (5.31x), 2733 packs | 184.2 MB (4.39x), 2706 packs |
+| agent-15m | 23.8 MB (1.02x), 522 packs | 28.6 MB (1.22x), 522 packs | 88.5 MB (3.78x), 606 packs | 50.1 MB (2.14x), 587 packs |
+| agent-1h | 13.7 MB (1.00x), 164 packs | 18.2 MB (1.33x), 164 packs | 61.9 MB (4.53x), 164 packs | 29.2 MB (2.13x), 164 packs |
+| dev-hourly | 7.9 MB (0.99x), 55 packs | 10.1 MB (1.27x), 55 packs | 34.6 MB (4.32x), 55 packs | 19.6 MB (2.45x), 55 packs |
+| dev-3x | 5.2 MB (0.98x), 15 packs | 7.4 MB (1.40x), 15 packs | 25.7 MB (4.87x), 15 packs | 19.0 MB (3.60x), 15 packs |
+| dev-morning | 3.5 MB (0.97x), 5 packs | 5.1 MB (1.40x), 5 packs | 11.5 MB (3.13x), 5 packs | 11.5 MB (3.13x), 5 packs |
+| dev-vacation | 2.6 MB (0.94x), 2 packs | 2.8 MB (0.98x), 2 packs | 5.2 MB (1.85x), 2 packs | 5.2 MB (1.85x), 2 packs |
+
+Packs on disk after the week (peak during the week) → after the next daily maintenance, seed clone included
+
+
+opus
+
+| client | stock | scalar | vfs | geometric | hook |
+|---|---|---|---|---|---|
+| agent-1m | 1405 (1405) | 1280 (1280) → 1247 | 396 (485) | 242 (281) | 1405 (1405) |
+| agent-15m | 523 (523) | 493 (493) → 482 | 151 (172) | 82 (89) | 523 (523) |
+| agent-1h | 165 (165) | 153 (153) → 147 | 52 (52) | 28 (28) | 165 (165) |
+| dev-hourly | 56 (56) | 48 (48) → 39 | 26 (26) | 14 (14) | 56 (56) |
+| dev-3x | 16 (16) | 13 (13) → 11 | 10 (10) | 6 (9) | 16 (16) |
+| dev-morning | 6 (6) | 6 (6) → 5 | 6 (6) | 4 (5) | 6 (6) |
+| dev-vacation | 3 (3) | 3 (3) → 3 | 3 (3) | 3 (3) | 3 (3) |
+
+opus@ss
+
+| client | stock | scalar | vfs | geometric | hook |
+|---|---|---|---|---|---|
+| agent-1m | 1405 (1405) | 395 (484) → 215 | 395 (484) | 241 (281) | 232 (272) |
+| agent-15m | 523 (523) | 149 (171) → 80 | 149 (171) | 81 (89) | 80 (89) |
+| agent-1h | 165 (165) | 50 (53) → 27 | 50 (51) | 27 (27) | 26 (28) |
+| dev-hourly | 56 (56) | 26 (26) → 13 | 25 (25) | 14 (14) | 12 (14) |
+| dev-3x | 16 (16) | 10 (10) → 5 | 9 (9) | 6 (7) | 4 (6) |
+| dev-morning | 6 (6) | 6 (6) → 2 | 6 (6) | 4 (5) | 2 (4) |
+| dev-vacation | 3 (3) | 3 (3) → 2 | 3 (3) | 3 (3) | 2 (2) |
+
+fable
+
+| client | stock | scalar | vfs | geometric | hook |
+|---|---|---|---|---|---|
+| agent-1m | 2734 (2734) | 444 (542) → 17 | 444 (542) | 436 (527) | 13 (15) |
+| agent-15m | 607 (607) | 101 (107) → 14 | 101 (107) | 94 (97) | 13 (14) |
+| agent-1h | 165 (165) | 33 (37) → 11 | 33 (35) | 27 (27) | 10 (12) |
+| dev-hourly | 56 (56) | 18 (18) → 5 | 17 (17) | 14 (14) | 4 (10) |
+| dev-3x | 16 (16) | 10 (10) → 5 | 9 (9) | 6 (7) | 4 (6) |
+| dev-morning | 6 (6) | 6 (6) → 2 | 6 (6) | 4 (5) | 2 (4) |
+| dev-vacation | 3 (3) | 3 (3) → 2 | 3 (3) | 3 (3) | 2 (2) |
+
+fable@h24
+
+| client | stock | scalar | vfs | geometric | hook |
+|---|---|---|---|---|---|
+| agent-1m | 2707 (2707) | 506 (616) → 88 | 506 (616) | 435 (529) | 86 (90) |
+| agent-15m | 588 (588) | 159 (180) → 86 | 159 (180) | 90 (96) | 86 (89) |
+| agent-1h | 165 (165) | 50 (53) → 27 | 50 (51) | 27 (27) | 26 (28) |
+| dev-hourly | 56 (56) | 26 (26) → 13 | 25 (25) | 14 (14) | 12 (14) |
+| dev-3x | 16 (16) | 10 (10) → 5 | 9 (9) | 6 (7) | 4 (6) |
+| dev-morning | 6 (6) | 6 (6) → 2 | 6 (6) | 4 (5) | 2 (4) |
+| dev-vacation | 3 (3) | 3 (3) → 2 | 3 (3) | 3 (3) | 2 (2) |
+
+Checks: missing objects after maintenance, gvfs-helper cursor lost, objects lost by the hook
+
+  0 problems
+
+Maintenance cost over the week (wall seconds incl. multi-pack-index write; MB of packs written)
+
+| impl | client | scalar | vfs | geometric |
+|---|---|---|---|---|
+| opus | agent-1m | 32 s, 0.7 MB | 34 s, 7.8 MB | 107 s, 5.9 MB |
+| opus | agent-15m | 34 s, 1.1 MB | 33 s, 7.5 MB | 109 s, 5.2 MB |
+| opus | dev-hourly | 21 s, 1.4 MB | 22 s, 3.9 MB | 95 s, 3.7 MB |
+| opus@ss | agent-1m | 34 s, 4.6 MB | 33 s, 8.7 MB | 113 s, 8.3 MB |
+| opus@ss | agent-15m | 33 s, 4.9 MB | 34 s, 8.4 MB | 114 s, 7.4 MB |
+| opus@ss | dev-hourly | 21 s, 2.8 MB | 22 s, 4.1 MB | 99 s, 3.7 MB |
+| fable | agent-1m | 35 s, 9.1 MB | 34 s, 9.2 MB | 114 s, 23.5 MB |
+| fable | agent-15m | 34 s, 9.2 MB | 32 s, 9.2 MB | 114 s, 23.4 MB |
+| fable | dev-hourly | 20 s, 4.9 MB | 19 s, 5.4 MB | 101 s, 9.5 MB |
+| fable@h24 | agent-1m | 32 s, 4.9 MB | 31 s, 8.2 MB | 114 s, 8.1 MB |
+| fable@h24 | agent-15m | 32 s, 4.9 MB | 30 s, 8.1 MB | 115 s, 7.6 MB |
+| fable@h24 | dev-hourly | 21 s, 5.3 MB | 19 s, 4.4 MB | 100 s, 5.8 MB |
+
+Projection (packs on disk). Growing regimes: linear in the growth of the troughs after each daily maintenance; bounded ones: ≤ the week's peak
+
+
+agent-1m
+
+| impl / regime | packs/day | 1 week | 1 month | 6 months | 2 years |
+|---|---|---|---|---|---|
+| opus / stock | 200.6 | 1405 | 6018 | 36505 | 146418 |
+| opus / scalar | 169.7 | 1247 | 5149 | 30939 | 123916 |
+| opus / vfs | 0.0 | ≤485 | ≤485 | ≤485 | ≤485 |
+| opus / geometric | 0.0 | ≤281 | ≤281 | ≤281 | ≤281 |
+| opus / hook | 192.7 | 1405 | 5836 | 35122 | 140703 |
+| opus@ss / stock | 200.6 | 1405 | 6018 | 36505 | 146418 |
+| opus@ss / scalar | 0.0 | ≤484 | ≤484 | ≤484 | ≤484 |
+| opus@ss / vfs | 0.0 | ≤484 | ≤484 | ≤484 | ≤484 |
+| opus@ss / geometric | 0.0 | ≤281 | ≤281 | ≤281 | ≤281 |
+| opus@ss / hook | 0.0 | ≤272 | ≤272 | ≤272 | ≤272 |
+| fable / stock | 390.4 | 2734 | 11714 | 71059 | 285014 |
+| fable / scalar | 0.0 | ≤542 | ≤542 | ≤542 | ≤542 |
+| fable / vfs | 0.0 | ≤542 | ≤542 | ≤542 | ≤542 |
+| fable / geometric | 0.0 | ≤527 | ≤527 | ≤527 | ≤527 |
+| fable / hook | 0.0 | ≤15 | ≤15 | ≤15 | ≤15 |
+| fable@h24 / stock | 386.6 | 2707 | 11598 | 70357 | 282198 |
+| fable@h24 / scalar | 0.0 | ≤616 | ≤616 | ≤616 | ≤616 |
+| fable@h24 / vfs | 0.0 | ≤616 | ≤616 | ≤616 | ≤616 |
+| fable@h24 / geometric | 0.0 | ≤529 | ≤529 | ≤529 | ≤529 |
+| fable@h24 / hook | 0.0 | ≤90 | ≤90 | ≤90 | ≤90 |
+
+agent-15m
+
+| impl / regime | packs/day | 1 week | 1 month | 6 months | 2 years |
+|---|---|---|---|---|---|
+| opus / stock | 74.6 | 523 | 2238 | 13573 | 54438 |
+| opus / scalar | 65.0 | 482 | 1977 | 11857 | 47477 |
+| opus / vfs | 0.0 | ≤172 | ≤172 | ≤172 | ≤172 |
+| opus / geometric | 0.0 | ≤89 | ≤89 | ≤89 | ≤89 |
+| opus / hook | 73.3 | 523 | 2210 | 13356 | 53543 |
+| opus@ss / stock | 74.6 | 523 | 2238 | 13573 | 54438 |
+| opus@ss / scalar | 0.0 | ≤171 | ≤171 | ≤171 | ≤171 |
+| opus@ss / vfs | 0.0 | ≤171 | ≤171 | ≤171 | ≤171 |
+| opus@ss / geometric | 0.0 | ≤89 | ≤89 | ≤89 | ≤89 |
+| opus@ss / hook | 0.0 | ≤89 | ≤89 | ≤89 | ≤89 |
+| fable / stock | 86.6 | 607 | 2598 | 15757 | 63198 |
+| fable / scalar | 0.0 | ≤107 | ≤107 | ≤107 | ≤107 |
+| fable / vfs | 0.0 | ≤107 | ≤107 | ≤107 | ≤107 |
+| fable / geometric | 0.0 | ≤97 | ≤97 | ≤97 | ≤97 |
+| fable / hook | 0.0 | ≤14 | ≤14 | ≤14 | ≤14 |
+| fable@h24 / stock | 83.9 | 588 | 2517 | 15263 | 61217 |
+| fable@h24 / scalar | 0.0 | ≤180 | ≤180 | ≤180 | ≤180 |
+| fable@h24 / vfs | 0.0 | ≤180 | ≤180 | ≤180 | ≤180 |
+| fable@h24 / geometric | 0.0 | ≤96 | ≤96 | ≤96 | ≤96 |
+| fable@h24 / hook | 0.0 | ≤89 | ≤89 | ≤89 | ≤89 |
+
+agent-1h
+
+| impl / regime | packs/day | 1 week | 1 month | 6 months | 2 years |
+|---|---|---|---|---|---|
+| opus / stock | 23.4 | 165 | 704 | 4265 | 17104 |
+| opus / scalar | 19.7 | 147 | 599 | 3589 | 14366 |
+| opus / vfs | 0.0 | ≤52 | ≤52 | ≤52 | ≤52 |
+| opus / geometric | 0.0 | ≤28 | ≤28 | ≤28 | ≤28 |
+| opus / hook | 24.0 | 165 | 717 | 4365 | 17517 |
+| opus@ss / stock | 23.4 | 165 | 704 | 4265 | 17104 |
+| opus@ss / scalar | 0.0 | ≤53 | ≤53 | ≤53 | ≤53 |
+| opus@ss / vfs | 0.0 | ≤51 | ≤51 | ≤51 | ≤51 |
+| opus@ss / geometric | 0.0 | ≤27 | ≤27 | ≤27 | ≤27 |
+| opus@ss / hook | 0.0 | ≤28 | ≤28 | ≤28 | ≤28 |
+| fable / stock | 23.4 | 165 | 704 | 4265 | 17104 |
+| fable / scalar | 0.0 | ≤37 | ≤37 | ≤37 | ≤37 |
+| fable / vfs | 0.0 | ≤35 | ≤35 | ≤35 | ≤35 |
+| fable / geometric | 0.0 | ≤27 | ≤27 | ≤27 | ≤27 |
+| fable / hook | 0.0 | ≤12 | ≤12 | ≤12 | ≤12 |
+| fable@h24 / stock | 23.4 | 165 | 704 | 4265 | 17104 |
+| fable@h24 / scalar | 0.0 | ≤53 | ≤53 | ≤53 | ≤53 |
+| fable@h24 / vfs | 0.0 | ≤51 | ≤51 | ≤51 | ≤51 |
+| fable@h24 / geometric | 0.0 | ≤27 | ≤27 | ≤27 | ≤27 |
+| fable@h24 / hook | 0.0 | ≤28 | ≤28 | ≤28 | ≤28 |
+
+dev-hourly
+
+| impl / regime | packs/day | 1 week | 1 month | 6 months | 2 years |
+|---|---|---|---|---|---|
+| opus / stock | 7.9 | 56 | 237 | 1431 | 5737 |
+| opus / scalar | 5.3 | 39 | 162 | 972 | 3895 |
+| opus / vfs | 0.0 | ≤26 | ≤26 | ≤26 | ≤26 |
+| opus / geometric | 0.0 | ≤14 | ≤14 | ≤14 | ≤14 |
+| opus / hook | 11.0 | 56 | 309 | 1981 | 8009 |
+| opus@ss / stock | 7.9 | 56 | 237 | 1431 | 5737 |
+| opus@ss / scalar | 0.0 | ≤26 | ≤26 | ≤26 | ≤26 |
+| opus@ss / vfs | 0.0 | ≤25 | ≤25 | ≤25 | ≤25 |
+| opus@ss / geometric | 0.0 | ≤14 | ≤14 | ≤14 | ≤14 |
+| opus@ss / hook | 0.0 | ≤14 | ≤14 | ≤14 | ≤14 |
+| fable / stock | 7.9 | 56 | 237 | 1431 | 5737 |
+| fable / scalar | 0.0 | ≤18 | ≤18 | ≤18 | ≤18 |
+| fable / vfs | 0.0 | ≤17 | ≤17 | ≤17 | ≤17 |
+| fable / geometric | 0.0 | ≤14 | ≤14 | ≤14 | ≤14 |
+| fable / hook | 0.0 | ≤10 | ≤10 | ≤10 | ≤10 |
+| fable@h24 / stock | 7.9 | 56 | 237 | 1431 | 5737 |
+| fable@h24 / scalar | 0.0 | ≤26 | ≤26 | ≤26 | ≤26 |
+| fable@h24 / vfs | 0.0 | ≤25 | ≤25 | ≤25 | ≤25 |
+| fable@h24 / geometric | 0.0 | ≤14 | ≤14 | ≤14 | ≤14 |
+| fable@h24 / hook | 0.0 | ≤14 | ≤14 | ≤14 | ≤14 |
+
+dev-3x
+
+| impl / regime | packs/day | 1 week | 1 month | 6 months | 2 years |
+|---|---|---|---|---|---|
+| opus / stock | 2.1 | 16 | 65 | 391 | 1565 |
+| opus / scalar | 1.3 | 11 | 42 | 244 | 975 |
+| opus / vfs | 0.0 | ≤10 | ≤10 | ≤10 | ≤10 |
+| opus / geometric | 0.0 | ≤9 | ≤9 | ≤9 | ≤9 |
+| opus / hook | 3.0 | 16 | 85 | 541 | 2185 |
+| opus@ss / stock | 2.1 | 16 | 65 | 391 | 1565 |
+| opus@ss / scalar | 0.0 | ≤10 | ≤10 | ≤10 | ≤10 |
+| opus@ss / vfs | 0.0 | ≤9 | ≤9 | ≤9 | ≤9 |
+| opus@ss / geometric | 0.0 | ≤7 | ≤7 | ≤7 | ≤7 |
+| opus@ss / hook | 0.0 | ≤6 | ≤6 | ≤6 | ≤6 |
+| fable / stock | 2.1 | 16 | 65 | 391 | 1565 |
+| fable / scalar | 0.0 | ≤10 | ≤10 | ≤10 | ≤10 |
+| fable / vfs | 0.0 | ≤9 | ≤9 | ≤9 | ≤9 |
+| fable / geometric | 0.0 | ≤7 | ≤7 | ≤7 | ≤7 |
+| fable / hook | 0.0 | ≤6 | ≤6 | ≤6 | ≤6 |
+| fable@h24 / stock | 2.1 | 16 | 65 | 391 | 1565 |
+| fable@h24 / scalar | 0.0 | ≤10 | ≤10 | ≤10 | ≤10 |
+| fable@h24 / vfs | 0.0 | ≤9 | ≤9 | ≤9 | ≤9 |
+| fable@h24 / geometric | 0.0 | ≤7 | ≤7 | ≤7 | ≤7 |
+| fable@h24 / hook | 0.0 | ≤6 | ≤6 | ≤6 | ≤6 |

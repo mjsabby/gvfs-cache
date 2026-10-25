@@ -1,7 +1,7 @@
 # gvfs-daemon: five implementations, one standard comparison
 
 **Recommendation: opus**, with the fixes and optimizations made in this branch (`opus/`, commits
-`cdda1ae`…`9b736e2`). It is the only implementation that is correct on every check *and*
+`cdda1ae`…`f7d9bef`). It is the only implementation that is correct on every check *and*
 fastest or near-fastest on every workload that moves real bytes. Section 1 explains the call
 and its trade-offs; sections 3–8 are the evidence; section 9 lists every defect found, per
 implementation, including the opus defects this comparison found and fixed.
@@ -24,7 +24,8 @@ in `bench/` (Python, stock git as the only judge of correctness); raw results in
 | Tip commit closure (505,605 trees) | **0.69 s** | 1.06 s (413 by default) | 0.89 s | 1.55 s (+2.5M blobs, 391 MB) | — |
 | Genesis of SearchGold (9.22M objects) | **79 s** | 202 s (after fix) | 83 s | 267 s | — |
 | Peak serving RSS | 4.0 GiB | 11.9 GiB | **3.2 GiB** | 11.6 GiB | — |
-| Warm-client bytes vs git's ideal (7-day replay, 7 client patterns) | **0.97–1.04×** | 2.3–7.2× | 3.1–5.4× | 3.0–9.3×, then the pipeline aborts at its first weekly | — |
+| Warm-client bytes vs git's ideal (7-day replay, 7 client patterns) | **0.98–1.40×** with day/week supersets (§11); 0.94–1.04× exact (`--superset-tier never`) | 2.3–7.2× | 3.1–5.4× | 3.0–9.3×, then the pipeline aborts at its first weekly | — |
+| Packs a client keeps under Scalar's default maintenance (1-min / 15-min agent, after a week) | **215 / 80**, bounded (exact covers: 1,247 / 482, growing ~170 / 65 a day) | not measured | 17 / 14 (13 / 13 with its own hook) | not measured | — |
 | 7-day replay: missed objects / cold clones exact | **0 / 84 of 84** (3 builds) | 0 / 84 of 84 | 0 / 84 of 84 (1 non-canonical `.idx`) | 0 / — (aborted) | — |
 
 **Why opus.** With this branch's changes it ties sol on the tiniest requests (GET of a commit or
@@ -60,6 +61,15 @@ JSON, scale and replay check after the fixes below.
    Net, in the final interleaved run against the shipped binary: GET blob **1.69×**, GET commit
    1.29×, sizes 1.28×, up-to-date prefetch 1.23×, POSTs 1.05–1.07×; cold clones (memory-bandwidth
    bound) and closures (tree walks) unchanged.
+4. **Design gap — packs piling up on clients (§11).** opus sent exact covers only: one small
+   pack per prefetch that brought news, never a superset, so a client's maintenance had to
+   rewrite them. Scalar's default maintenance merges only a few a day: a 1-minute agent kept
+   1,247 of its 1,405 packs after a week, growing ~170 a day. At 5,000 packs every lookup
+   of an absent object costs git ~3 ms. Fixed (`--superset-tier 24h`, the default): once
+   the tip moves past a sealed day or week, a client inside it receives that rollup whole,
+   once, and stock `multi-pack-index expire` deletes the packs it subsumes. It now keeps
+   215 (15-minute agent: 80). This is fable's superset tombstoning at day/week granularity,
+   for 0.98–1.40× git's ideal bytes instead of fable's 1.85–5.3×.
 
 **Trade-offs of choosing opus** (none egregious; know them):
 
@@ -75,6 +85,11 @@ JSON, scale and replay check after the fixes below.
 * **First VFS-for-Git cold clone after each manifest change** waits ~4 s while the 280 MB `.idx`
   is built (gvfs-helper does not ask for it; later clones get the cached one).
 * **Genesis peaks at ~12–17 GB RSS** (pipeline runner sizing), more than fable (7 GB).
+* **Day/week supersets cost bytes**: each warm client receives every sealed day and week
+  whole once (0.3–0.7 MB a day per client on SearchGold), 0.98–1.40× git's ideal instead
+  of 0.94–1.04×. `--superset-tier 168h` (weeks only) or `never` (exact) trade that back for
+  more packs on Scalar-default clients (§11). With fable's own client hook, fable keeps
+  fewer packs (13 vs opus's 80–232 for agents) at 3.8–5.3× git's ideal bytes.
 
 **Why not the others** (details §9):
 
@@ -87,8 +102,11 @@ JSON, scale and replay check after the fixes below.
 * **fable** — the most conservative and correct out of the box (0 failures, exact POST packs,
   best memory), but 4–13× slower than opus on GET/POST/sizes: every request clears a bitset sized
   to the whole store (63 % of GET CPU in `memset`) and allocates/zero-fills fresh response frames
-  (~28 page faults per GET); warm clients receive 2.6–6× git's ideal bytes on the synthetic
-  lifecycle (superset rollups by design, for its client-side tombstoning hook).
+  (~28 page faults per GET); warm clients receive 1.9–5.3× git's ideal bytes on SearchGold
+  (superset rollups by design). That design has a real payoff that §6 did not credit: under
+  stock Scalar maintenance its supersets let `multi-pack-index expire` keep a client's packs
+  bounded, and with its own hook an agent keeps 13 packs (§11). opus now does the same at
+  day/week granularity.
 * **astra** — 6 conformance failures: clients with a cursor older than the store's genesis or
   ahead of it get errors forever (store rebuild/restore = permanent outage for every client);
   8 worker threads by default (8 idle clients stall it); malformed requests answered with 503
@@ -219,7 +237,9 @@ object counts compared exactly.
 | Other | — | 1: merged `.idx` of the stale client's full pack not byte-identical (64-bit offset table in slab order; lookups correct, `git verify-pack` rejects it) | 14,763 errors counted in `/metrics` (404 probes) | **pipeline aborted at its first weekly (Mon 00:00): `configured capacity exhausted: record arena`** — also with 2× and 4× `--max-objects`; with `auto` every later run retries it, so the store stops advancing |
 
 Each opus run is a separate seed and week; their warm-client bytes agree to 0.01 %, so the tables
-below show one opus column. The last commit, `9b736e2` (listen backlog, linger),
+below show one opus column. These three builds send exact covers; the final build (`f7d9bef`)
+also delivers each sealed day and week whole once, and its own replay is in §11 (0 failures,
+84/84 cold clones, 0.98–1.40×). The commit `9b736e2` (listen backlog, linger)
 changes no path this replay exercises: its client opens one connection per request. The
 original opus (before `50c4cc5`) failed this replay: from day 1 its cold clones carried 1–11
 duplicate entries (§8).
@@ -260,8 +280,8 @@ What the patterns mean in practice:
   the smallest it can be for its layout and streams via `sendfile`.
 * **Pack count on stock clients** is one per non-empty response for every implementation
   (gvfs-helper keeps each prefetch pack until Scalar's maintenance consolidates them); opus
-  creates the fewest because it never re-sends. fable's own `client-prefetch` hook can tombstone
-  subsumed packs instead (its superset rollups exist for that hook).
+  creates the fewest because it never re-sends. What maintenance can then delete is a
+  different matter, and it favours supersets: §11 measures it.
 
 ## 7. Load (median of 3 interleaved rounds)
 
@@ -318,8 +338,8 @@ Reading the table:
 All changes keep opus's invariants (`forbid(unsafe_code)`, the clippy deny list, zero hot-path
 allocations — `/metrics` `gvfs_alloc_hot_path_total` stayed 0 in every run). Each was A/B'd
 against the previous binary with alternating runs on the same pinned cores, then re-verified
-with opus's own suite (53 tests), the conformance suite (918/918), the cross-client suite,
-and the SearchGold scale checks.
+with opus's own suite (53 tests; 55 with `f7d9bef`), the conformance suite (918/918), the
+cross-client suite, and the SearchGold scale checks.
 
 | Commit | Change | Why (evidence) | Effect |
 |---|---|---|---|
@@ -329,6 +349,7 @@ and the SearchGold scale checks.
 | `9b736e2` | Listen backlog raised from std's 128 to `net.core.somaxconn`; keep-alive linger default 100 → 5 ms | 2,048 clients connecting at once: 14K listen overflows, SYN retries (p99 713 ms, max 2.1 s, server 4 % busy). Each sporadic request (one request, then idle) held its worker for the whole linger: 256 workers ≈ 2,500 such req/s before queueing; 8,000 req/s over 2,048 keep-alive clients: p50 145 ms, p99 2.5 s | No overflows; p50 16 µs, p99 23 µs. 512 clients at 20 ms think time: p99 8.9 ms → 18 µs (+0.01 core). Closed loop (back-to-back): 0.99–1.00×, same CPU and p99 |
 | `cdda1ae` | `/gvfs/sizes` items built without `core::fmt` / UTF-8 validation | profile: 52 % `from_utf8` + 17 % fmt | 1.24–1.25× req/s, CPU/request 916 → 724 µs |
 | `7e45558` | Response head and small body in one write (`Out::head`, `write_response` via `writev`) | two syscalls and two TCP segments per small request | GET blob 1.09×, GET commit 1.08×, up-to-date prefetch 1.15×, lower p99 |
+| `f7d9bef` | Superset deliveries (`--superset-tier 24h`, default): once the tip moves past a sealed daily rollup or weekly delta, a client whose cursor lies inside it (or at its end) is answered from its start, so it receives it whole, once; `X-GVFS-Pack-Start/End` on every prefetch | §11: exact covers left Scalar-default clients ~every pack (1-minute agent: 1,247 of 1,405 after maintenance, +170/day); git pays ~3 ms per absent-object lookup at 5,000 packs | Scalar-default 1-minute agent: 215 packs (15-minute: 80), bounded; warm bytes 0.94–1.04× → 0.98–1.40× (14-day sim 1.11–1.53×; `168h` 1.04–1.31×). Replay 0 failures, 84/84; conformance 918/0; cross-client unchanged; 55 tests |
 | `75271a2` | Repack stores non-tree objects ≤ 4 KiB whole (ADO deltifies pointer blobs and commits in chains up to 50 deep) | profile: ~31 % of GET-blob CPU inflating delta chains | GET-blob CPU/request 5.4 → 2.6 µs (perf; 1.12× req/s in an A/B whose load generator shared the server's CCD — §7 has the full-load effect); POST 64 ids 1.08×; baseline +2.5 MB (+0.1 %), 272,990 objects; warm-client bytes unchanged on SearchGold |
 
 Tried and rejected: re-arming epoll on every request (above); hand-formatting the response head
@@ -416,6 +437,153 @@ python3 ab.py opus <candidate-binary> get_blob ...       # A/B any change (AB_EX
 python3 busy_conns.py <opus-binary> 4 8                  # busy clients beyond --workers
 CONNS=2048 RATE=8000 python3 sporadic.py <opus-binary>   # sporadic keep-alive clients
 python3 profile.py opus get_tree                         # perf stat + perf record
+# §11: client-side pack lifecycles (REPLAY_WORK=~/gvfs-bench/ws; FROZEN: dirs of binaries)
+REPLAY_KEEP_RX=1 python3 replay.py opus fable fable@h24  # after --seed of each; keeps every response
+FROZEN=<dir with the superset build> python3 replay.py --seed opus@ss && \
+  FROZEN=<same> REPLAY_KEEP_RX=1 python3 replay.py opus@ss
+WS_REGIMES=scalar,vfs,geometric python3 workstation.py opus opus@ss fable fable@h24
+python3 ws_report.py opus opus@ss fable fable@h24        # bytes, packs per regime, projection
+PC_SIZES=0,100,1000,5000,20000 python3 packcount.py opus agent-1m   # what pack count costs git
+cargo run --release --example clients -- --repo ~/SearchGold --from 2026-10-10 --days 14 \
+  --work <scratch> --superset-tier 24h|168h|never      # (in opus/) opus's own 14-day simulator
 ```
 Scratch data lives under `~/gvfs-bench` (SearchGold stores ~16 GB); `/tmp` is a tmpfs here.
 The shell's injected `GIT_CONFIG_*` is stripped by `gvfslib.clean_env`.
+
+## 11. Client-side pack lifecycle: exact covers vs superset tombstoning
+
+**The question.** The design's "zero-GC workstation" fixes are: splice one pack per fetch
+(Fix 1), let clients unlink packs that a superset rollup subsumes (Fix 2), and use
+`multi-pack-index` instead of `git gc` (Fix 3). fable re-sends every rollup tier whole, so
+that a client can tombstone. §6 counted that only as extra bytes. Does it buy something
+that opus's exact covers lack?
+
+**What each server sends.** Neither sends loose objects: every prefetch answer is one pack.
+
+* *Inside the live window (< 15 min).* opus keeps one L0 slab per push, so a poller gets
+  exactly the pushes since its cursor: a 1-minute agent gets e.g. 10 objects / 26 KB per poll
+  that has news. fable keeps one growing live slab and re-sends it whole on each poll whose
+  slab end moved: e.g. 46 objects / 140 KB, and 140 objects again when only the end stamp
+  advanced. That is 5.3× git's ideal for a 1-minute agent, and 2× as many packs.
+* *Beyond it.* opus answers with the exact cover from the cursor through retained finer
+  slabs (1.0×). fable re-sends any rollup (1h…168h) whose window holds the cursor, whole
+  (1.9–4.9×), and labels it `X-GVFS-Pack-Start/End` for its `client-prefetch` hook.
+
+**Method.** The §6 week was replayed again keeping every response (`REPLAY_KEEP_RX=1`). It
+covered opus as before, fable, fable with `--leaf-tier h24` (its knob: leaves below a day),
+and opus with the superset deliveries below (`opus@ss`). `bench/workstation.py` then
+installs each client's responses into real repositories with microsoft/git 2.56, the
+client these servers serve, under five regimes:
+
+* **stock** — gvfs-helper as shipped: `prefetch-<ts>-<sha>` per response, `.keep` on the
+  newest only.
+* **scalar** — stock plus Scalar's default `incremental` strategy, run daily:
+  `incremental-repack`, i.e. `multi-pack-index write`, `expire`, and
+  `repack --batch-size=<2nd largest + 1>`.
+* **vfs** — stock plus VFS for Git's daily `PackfileMaintenanceStep`: `write`, `expire`,
+  `repack --batch-size=2g`.
+* **geometric** — stock plus `maintenance.strategy=geometric`, run daily.
+* **hook** — fable's tombstoning rule: unlink every pack whose interval lies inside another's.
+
+Every scalar/vfs/geometric client was checked complete with `rev-list --missing=print`. Every
+object an unlinked pack held was found again, and the gvfs-helper cursor (the newest prefetch
+pack) always survived: 0 problems in 112 client lifecycles.
+
+**Bytes over the week** (÷ git's ideal for the same have→want):
+
+| client | opus (exact) | **opus final** (`f7d9bef`, day/week supersets) | fable | fable `--leaf-tier h24` |
+|---|---|---|---|---|
+| agent, every minute | 43.3 MB (1.03×) | 48.1 MB (1.15×) | 222.6 MB (5.31×) | 184.2 MB (4.39×) |
+| agent, every 15 min | 23.8 MB (1.02×) | 28.6 MB (1.22×) | 88.5 MB (3.78×) | 50.1 MB (2.14×) |
+| agent, hourly | 13.7 MB (1.00×) | 18.2 MB (1.33×) | 61.9 MB (4.53×) | 29.2 MB (2.13×) |
+| laptop, hourly 08-18 weekdays | 7.9 MB (0.99×) | 10.1 MB (1.27×) | 34.6 MB (4.32×) | 19.6 MB (2.45×) |
+| developer 09:00/13:00/17:30 | 5.2 MB (0.98×) | 7.4 MB (1.40×) | 25.7 MB (4.87×) | 19.0 MB (3.60×) |
+| developer, mornings | 3.5 MB (0.97×) | 5.1 MB (1.40×) | 11.5 MB (3.13×) | 11.5 MB (3.13×) |
+| back after 6 days off | 2.6 MB (0.94×) | 2.8 MB (0.98×) | 5.2 MB (1.85×) | 5.2 MB (1.85×) |
+
+**Packs on disk** after the week (peak) → after the next daily maintenance; seed clone included:
+
+| client | regime | opus (exact) | **opus final** | fable | fable h24 |
+|---|---|---|---|---|---|
+| agent, every minute | stock | 1,405 | 1,405 | 2,734 | 2,707 |
+| | scalar | **1,280 → 1,247 (+170/day)** | 395 (484) → 215 | 444 (542) → 17 | 506 (616) → 88 |
+| | vfs | 396 (485) | 395 (484) | 444 (542) | 506 (616) |
+| | geometric | 242 (281) | 241 (281) | 436 (527) | 435 (529) |
+| | hook | 1,405 | 232 (272) | **13 (15)** | 86 (90) |
+| agent, every 15 min | stock | 523 | 523 | 607 | 588 |
+| | scalar | **493 → 482 (+65/day)** | 149 (171) → 80 | 101 (107) → 14 | 159 (180) → 86 |
+| | vfs | 151 (172) | 149 (171) | 101 (107) | 159 (180) |
+| | geometric | 82 (89) | 81 (89) | 94 (97) | 90 (96) |
+| | hook | 523 | 80 (89) | **13 (14)** | 86 (89) |
+| laptop, hourly 08-18 weekdays | scalar | 48 → 39 (+5/day) | 26 → 13 | 18 → 5 | 26 → 13 |
+| | hook | 56 | 12 (14) | 4 (10) | 12 (14) |
+| developer 09:00/13:00/17:30 | scalar | 13 → 11 (+1.3/day) | 10 → 5 | 10 → 5 | 10 → 5 |
+| | hook | 16 | 4 (6) | 4 (6) | 4 (6) |
+
+With no maintenance (stock) every server leaves one pack per response with news, and fable
+leaves the most. With maintenance the bound comes from *what maintenance can delete*. A pack
+whose objects all have newer copies is deleted by `multi-pack-index expire` for free.
+Otherwise it must be repacked, and Scalar's default batch size (second-largest pack + 1)
+repacks only a few packs a day. So with exact covers and Scalar defaults an agent's packs grow
+without bound: ~5,000 after a month for a 1-minute agent, ~2,000 for a 15-minute one. That
+was the one egregious usage pattern found for opus. Supersets fix it by making old packs
+deletable, and VFS for Git's fixed 2 GB batch or Scalar's `geometric` strategy fix it by
+repacking enough. fable's supersets did buy this, so its design was right about Scalar; its
+own hook additionally keeps an agent at 13 packs. fable pays 2–5× the bytes for this,
+because it re-sends every tier and the live slab.
+
+**What pack count costs git** (`bench/packcount.py`: the seed clone plus N of the 1-minute
+agent's real packs; median of 5; microsoft/git):
+
+| packs | absent-object lookup (2,000 ids), per id | `rev-parse` (command start) | `log -n 500` | with a multi-pack-index: absent / start |
+|---|---|---|---|---|
+| 1 | 5 µs | 0.8 ms | 4 ms | 4 µs / 0.8 ms |
+| 101 | 64 µs | 0.8 ms | 3 ms | 50 µs / 0.8 ms |
+| 1,001 | 0.49 ms | 2.5 ms | 7 ms | 0.42 ms / 1.3 ms |
+| 5,001 | 2.8 ms | 10 ms | 20 ms | 2.6 ms / 3.6 ms |
+| 20,001 | 12 ms | 53 ms | 98 ms | 11.6 ms / 12.6 ms |
+
+On a miss git rescans the pack directory, so a multi-pack-index does not help. GVFS clients
+miss on purpose: a blob not yet downloaded is a miss. A few hundred packs are harmless, but
+thousands add milliseconds to every miss.
+
+**The change** (`f7d9bef`, `--superset-tier 24h`, the default). A sealed daily rollup or
+weekly delta reaches each warm client whole, once. A client whose cursor lies inside one, or
+exactly at its end, is answered from its start once the tip has moved past it. Its cursor
+then lies past the rollup, so the rollup is not sent again. This is fable's superset
+tombstoning restricted to days and weeks, which is all that daily maintenance needs. opus's
+rollups are re-deltified and small: 0.35–0.82 MiB a day and 1.9 MiB a week on SearchGold.
+Every prefetch now carries `X-GVFS-Pack-Start/End`, so fable's hook also works against opus,
+with 0 objects lost.
+
+Over opus's own 14-day simulator (`examples/clients.rs`), warm clients get:
+
+| mode | warm bytes ÷ ideal |
+|---|---|
+| `24h` (default) | 1.11–1.53× |
+| `168h` (weeks only; packs bounded by a week's worth) | 1.04–1.31× |
+| `never` (exact covers, the old behaviour) | 1.00–1.02× |
+
+Validation: unit and e2e tests (the e2e test fails without the change; 55/55 pass); the
+replay (0 failures, 84/84 exact cold clones); conformance 918/0; cross-client unchanged;
+and the lifecycles above.
+
+**The design's checklist, as built:**
+
+| design item | opus (final) | fable |
+|---|---|---|
+| `manifest.bin` with If-Match CAS | ✅ (fs: `flock`; Azure: ETag; the loser retries 3×) | ✅ (`flock`) |
+| One-time bootstrap → one baseline slab | ✅ (79 s for SearchGold) | ✅ (83 s) |
+| Sub-second tailing (L0) | ✅ each edge polls the upstream (`--poll-ms`, 2 s default); one L0 slab per push; push → servable p50 0.35–0.5 s. No S3 WAL: N edges poll ADO N times | ✅ read-through on a miss (p50 0.01 s) + one live slab |
+| 15m → 1h → 6h → 12h → 24h → 168h | ✅ cascading; every rollup repacked, trees re-deltified | ✅ spliced intraday; re-fetched upstream from 24h |
+| Drop "intermediate trees" in rollups | ✗ by design: intermediate commits reach them | ✗ same |
+| Two tracks: cold = baseline + tail; warm never gets the baseline | ✅ | ✅ |
+| Warm retention window | ✅ 8 weekly deltas; retained finer slabs (15m 1 day, 1h–12h 1 week, days 8 weeks) | ✅ (`--retain-weeks`) |
+| Weekly re-bootstrap (fresh walk: defragments, drops garbage) | ⚠️ the baseline grows by appending the week (6–7 s, no upstream traffic); objects orphaned by a force push stay | ✅ `--baseline fetch` (re-fetches 2.6 GB, 81.5 s) or splice |
+| Point lookups: L0 + this week's slabs + baseline MPHF | ✅ | ✅ |
+| Fix 1: one pack per prefetch | ✅ (covers repacked into one) | ✅ (slab bodies concatenated) |
+| Fix 2: superset tombstoning | ✅ days and weeks, once per client, + interval headers (`f7d9bef`) | ✅ every tier and the live slab, + its hook |
+| Fix 3: client `multi-pack-index` instead of gc | ✅ client-side; bounded with VFS for Git, Scalar and its geometric strategy | ✅ (its hook's `--midx` failed after unlinking, §4) |
+| Weekly "aha" delta for warm workstations | ✅ (6 days off: 1 pack, 0.98×) | ✅ |
+| Cron jitter / overlapping runs | ✅ L0 bridges any gap; the next 15m slab gets wider; CAS | ✅ |
+| Cold clone = 1 pack | ✅ (84/84 exact) | ✅ |

@@ -35,11 +35,24 @@ SOL_CAP = ["--max-objects", "16777216", "--max-links", "2147483647", "--pack-mib
 SOL_SERVE = SOL_CAP + ["--arenas", "8"]
 SCHED = {"opus": "cron", "fable": "cron", "sol": "auto", "astra": "auto"}
 FROZEN = os.environ.get("FROZEN", "/home/muks/gvfs-bench/frozen")
+# `<impl>@<variant>`: the same binary with extra pipeline flags, in its own work dir.
+VARIANTS = {"fable@h24": ["--leaf-tier", "h24"], "opus@ss": []}   # opus@ss: run with FROZEN=<dir of a superset build>
+# Keep every warm response (pack, git's idx, interval headers) and the seed clone under
+# <work>/rx for client-side lifecycle studies (bench/workstation.py).
+KEEP_RX = os.environ.get("REPLAY_KEEP_RX") == "1"
+
+
+def base(name):
+    return name.split("@")[0]
 
 
 def binary(name):
-    p = os.path.join(FROZEN, f"{name}-gvfs-daemon")
+    p = os.path.join(FROZEN, f"{base(name)}-gvfs-daemon")
     return p if os.path.exists(p) else None
+
+
+def extra_pipeline(name):
+    return (SOL_CAP if base(name) == "sol" else []) + VARIANTS.get(name, [])
 
 H = json.load(open(os.path.join(R, "history-w7.json")))
 S, E, SEED = H["start"], H["end"], H["seed"]
@@ -224,10 +237,15 @@ class Replay:
         self.fail = []
         self.log = open(os.path.join(self.work, "replay.log"), "a")
         self.clock = impls.Clock(os.path.join(self.work, "faketime"), S - 300)
-        extra_p = SOL_CAP if name == "sol" else []
-        extra_s = SOL_SERVE if name == "sol" else (["--workers", "64"] if name == "astra" else [])
-        self.im = impls.ALL[name](self.work, clock=self.clock, extra_pipeline=extra_p, extra_serve=extra_s,
-                                  binary=binary(name))
+        extra_s = SOL_SERVE if base(name) == "sol" else (["--workers", "64"] if base(name) == "astra" else [])
+        self.im = impls.ALL[base(name)](self.work, clock=self.clock, extra_pipeline=extra_pipeline(name),
+                                        extra_serve=extra_s, binary=binary(name))
+        self.rx = os.path.join(self.work, "rx")
+        self.rx_seq = 0
+        if KEEP_RX:
+            shutil.rmtree(self.rx, ignore_errors=True)
+            os.makedirs(self.rx)
+            self.rx_log = open(os.path.join(self.rx, "rx.jsonl"), "w")
         self.up = os.path.join(self.work, "up.git")
         self.scratch = os.path.join(self.work, "scratch")
         os.makedirs(self.scratch, exist_ok=True)
@@ -247,7 +265,7 @@ class Replay:
 
     def pipeline(self, t):
         tier = cron_tier(t)
-        if SCHED[self.name] == "auto":
+        if SCHED[base(self.name)] == "auto":
             cmds = [self.im.pipeline_cmd(self.up, "auto", t)]
         else:
             cmds = [self.im.pipeline_cmd(self.up, tier, t)]
@@ -330,10 +348,24 @@ class Replay:
         c.st["pack_bytes"] += len(pack)
         c.st["idx_bytes"] += len(idx) if idx else 0
         c.st["gpre_bytes"] += 32 + len(pack) + (len(idx) if idx else 0)
-        objs = self.index(pack, idx)
+        keep = None
+        if KEEP_RX and len(pack) < (1 << 30):
+            self.rx_seq += 1
+            keep = os.path.join(self.rx, c.name, f"{self.rx_seq:06d}")
+            os.makedirs(os.path.dirname(keep), exist_ok=True)
+        objs = self.index(pack, idx, keep)
         if objs is None:
             c.st["failures"] += 1
             return
+        if keep:
+            hs = {k: r.headers.get(f"x-gvfs-pack-{k}") for k in ("start", "end")}
+            self.rx_log.write(json.dumps(dict(
+                t=self.clock.now, client=c.name, cursor=c.cursor, ts=ts,
+                start=int(hs["start"]) if hs["start"] else None,
+                end=int(hs["end"]) if hs["end"] else None,
+                pack=len(pack), idx=len(idx) if idx else 0, objects=len(objs), tip=tip,
+                stem=os.path.relpath(keep, self.rx))) + "\n")
+            self.rx_log.flush()
         c.st["resent_objects"] += len(objs & c.got)
         missing = need - c.got - objs
         self.csv.write(f"{self.clock.now},{c.name},{c.cursor},200,1,{ts},{len(pack)},"
@@ -350,7 +382,8 @@ class Replay:
         c.got |= objs
         c.cursor = max(c.cursor, ts)
 
-    def index(self, pack, idx):
+    def index(self, pack, idx, keep=None):
+        """The pack's object ids (None if git rejects it); `keep`: move pack + git's idx there."""
         d = tempfile.mkdtemp(dir=self.scratch)
         try:
             repo = init_bare(os.path.join(d, "r.git"))
@@ -366,6 +399,9 @@ class Replay:
                 self.failure("served .idx differs from git index-pack's")
             with open(pp[:-5] + ".idx", "rb") as f:
                 si = subprocess.run(["git", "show-index"], stdin=f, capture_output=True, env=clean_env())
+            if keep:
+                os.replace(pp, keep + ".pack")
+                os.replace(pp[:-5] + ".idx", keep + ".idx")
             return {l.split()[1] for l in si.stdout.decode().splitlines()}
         finally:
             shutil.rmtree(d, ignore_errors=True)
@@ -434,8 +470,21 @@ class Replay:
         c.request("GET", "/gvfs/prefetch?lastPackTimestamp=0", headers=UA)
         rr = c.getresponse()
         head = rr.read(32)
-        c.close()
         seed_ts = struct.unpack_from("<q", head, 8)[0]
+        if KEEP_RX:
+            # The clone every warm client starts from (its .idx is built offline by git).
+            plen = struct.unpack_from("<q", head, 16)[0]
+            with open(os.path.join(self.rx, "seed.pack"), "wb") as f:
+                left = plen
+                while left > 0:
+                    chunk = rr.read(min(16 << 20, left))
+                    if not chunk:
+                        raise RuntimeError("truncated seed clone")
+                    f.write(chunk)
+                    left -= len(chunk)
+            with open(os.path.join(self.rx, "seed.json"), "w") as f:
+                json.dump(dict(ts=seed_ts, tip=SEED, pack=plen), f)
+        c.close()
         names = ["agent-1m", "agent-15m", "agent-1h", "dev-hourly", "dev-3x", "dev-morning", "dev-vacation"]
         clients = {n: Client(n, seed_ts, SEED) for n in names}
         clients["stale"] = Client("stale", 1, SEED)
@@ -501,8 +550,7 @@ def seed(name):
         f.write(SGOBJ + "\n")
     git(up, "update-ref", "refs/heads/main", SEED)
     clock = impls.Clock(os.path.join(work, "faketime"), S - 300)
-    extra_p = SOL_CAP if name == "sol" else []
-    im = impls.ALL[name](work, clock=clock, extra_pipeline=extra_p)
+    im = impls.ALL[base(name)](work, clock=clock, extra_pipeline=extra_pipeline(name), binary=binary(name))
     t0 = time.time()
     im.run(im.pipeline_cmd(up, "15m", S - 300), env=im.pipeline_env(S - 300))
     print(f"seed {name}: {time.time() - t0:.1f}s", flush=True)

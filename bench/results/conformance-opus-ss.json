@@ -1,0 +1,333 @@
+[
+ {
+  "impl": "opus",
+  "passed": 918,
+  "failed": 0,
+  "failures": [],
+  "info": {
+   "genesis_s": [
+    0.015
+   ],
+   "ready_s": 0.423,
+   "cold_bytes": [
+    26866,
+    37063,
+    41086,
+    43624,
+    47147,
+    49554,
+    53586,
+    56132,
+    60126,
+    62750,
+    66439,
+    68845,
+    72893,
+    75445,
+    79422,
+    81965,
+    85707,
+    88108,
+    92078,
+    94683,
+    98653,
+    101201,
+    104976,
+    107365,
+    111301,
+    113837,
+    113837,
+    114576,
+    114838,
+    116776,
+    116913,
+    119145,
+    123361,
+    118903,
+    121289,
+    122954,
+    125487,
+    125487
+   ],
+   "step_s": [
+    [
+     "s1",
+     0.007
+    ],
+    [
+     "s2",
+     0.015
+    ],
+    [
+     "s3",
+     0.007
+    ],
+    [
+     "s4",
+     0.007
+    ],
+    [
+     "s5",
+     0.015
+    ],
+    [
+     "s6",
+     0.015
+    ],
+    [
+     "s7",
+     0.007
+    ],
+    [
+     "s8",
+     0.015
+    ],
+    [
+     "s9",
+     0.007
+    ],
+    [
+     "s10",
+     0.015
+    ],
+    [
+     "s11",
+     0.007
+    ],
+    [
+     "s12",
+     0.007
+    ],
+    [
+     "s13",
+     0.007
+    ],
+    [
+     "s14",
+     0.015
+    ],
+    [
+     "s15",
+     0.015
+    ],
+    [
+     "s16",
+     0.015
+    ],
+    [
+     "s17",
+     0.007
+    ],
+    [
+     "s18",
+     0.015
+    ],
+    [
+     "s19",
+     0.015
+    ],
+    [
+     "s20",
+     0.015
+    ],
+    [
+     "s21",
+     0.007
+    ],
+    [
+     "s22",
+     0.015
+    ],
+    [
+     "s23",
+     0.007
+    ],
+    [
+     "s24",
+     0.015
+    ],
+    [
+     "s25",
+     0.007
+    ],
+    [
+     "s26",
+     0.007
+    ],
+    [
+     "merge",
+     0.016
+    ],
+    [
+     "revert",
+     0.007
+    ],
+    [
+     "after-restart",
+     0.016
+    ],
+    [
+     "readd",
+     0.015
+    ],
+    [
+     "12h",
+     0.031
+    ],
+    [
+     "rewrite",
+     0.007
+    ],
+    [
+     "sun-weekly",
+     0.031
+    ],
+    [
+     "sun-15m",
+     0.007
+    ],
+    [
+     "mon-weekly",
+     0.015
+    ],
+    [
+     "mon-15m",
+     0.007
+    ],
+    [
+     "mon-1h",
+     0.003
+    ]
+   ],
+   "live_in_prefetch": [
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "unseen_branch_get": 404,
+   "post_extra_objects": 617,
+   "closure_d1": {
+    "objects": 33,
+    "required": 33,
+    "blobs": 0
+   },
+   "closure_d2": {
+    "objects": 38,
+    "required": 38,
+    "blobs": 0
+   },
+   "closure_d3": {
+    "objects": 43,
+    "required": 43,
+    "blobs": 0
+   },
+   "unknown_in_post": 404,
+   "unknown_in_sizes": [
+    404,
+    "not found\n"
+   ],
+   "post_loose_accept": [
+    200,
+    "application/x-git-packfile"
+   ],
+   "robustness_status": {
+    "get_short_oid": 404,
+    "get_nonhex_oid": 404,
+    "get_uppercase_oid": 200,
+    "prefetch_bad_ts": 200,
+    "prefetch_negative_ts": 200,
+    "post_bad_json": 400,
+    "post_empty_ids": 400,
+    "post_bad_oid": 400,
+    "post_neg_depth": 200,
+    "sizes_not_array": 200,
+    "sizes_empty": 200,
+    "unknown_path": 404,
+    "big_body": "EXC BrokenPipeError"
+   },
+   "idle100": {
+    "opened": 100,
+    "config_latency_s": 0.0
+   },
+   "idle300": {
+    "opened": 300,
+    "config_latency_s": 0.0
+   },
+   "idle1000": {
+    "opened": 1000,
+    "config_latency_s": 0.015
+   },
+   "max_batch_ok": {
+    "sizes": 16000,
+    "objects": 16000
+   },
+   "hot_allocs": [
+    0.0
+   ],
+   "metric_errors": {},
+   "clients": {
+    "poller": {
+     "bytes": 753037,
+     "ideal": 500548,
+     "packs": 48,
+     "responses": 50,
+     "nonadvancing": 0
+    },
+    "hourly": {
+     "bytes": 398529,
+     "ideal": 192903,
+     "packs": 16,
+     "responses": 17,
+     "nonadvancing": 0
+    },
+    "dev": {
+     "bytes": 360766,
+     "ideal": 155982,
+     "packs": 12,
+     "responses": 13,
+     "nonadvancing": 0
+    },
+    "late": {
+     "bytes": 316046,
+     "ideal": 117197,
+     "packs": 8,
+     "responses": 9,
+     "nonadvancing": 0
+    },
+    "stale": {
+     "bytes": 161335,
+     "ideal": 74105,
+     "packs": 1,
+     "responses": 1,
+     "nonadvancing": 0
+    }
+   },
+   "live_latency_s": [
+    0.4,
+    0.7,
+    0.7,
+    0.7,
+    0.6,
+    0.7,
+    0.7,
+    0.7,
+    0.7,
+    0.7,
+    0.6,
+    0.7,
+    1.0,
+    0.7,
+    0.0
+   ]
+  }
+ }
+]

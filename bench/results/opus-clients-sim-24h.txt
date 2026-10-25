@@ -1,0 +1,16 @@
+
+14 days of /home/muks/SearchGold from 2026-10-10 (3308 commits)
+
+Warm clients, after their initial clone (one pack each, about 2.4 GiB, 1.00x ideal):
+
+| Client | prefetches | packs received | slabs merged per pack (avg / max) | MiB received | MiB ideal | x ideal |
+|---|---:|---:|---:|---:|---:|---:|
+| agent VM: prefetch every minute, 24x7 | 20159 | 2839 | 1.2 / 8 | 92.6 | 83.1 | 1.11 |
+| agent VM: prefetch every 15 min, 24x7 | 1343 | 1053 | 2.9 / 31 | 55.3 | 46.1 | 1.20 |
+| agent VM: hourly maintenance prefetch, 24x7 | 335 | 321 | 3.3 / 4 | 35.2 | 26.4 | 1.33 |
+| dev laptop: hourly maintenance 08:00-18:00 weekdays | 109 | 105 | 3.5 / 6 | 17.6 | 13.1 | 1.34 |
+| developer: fetch 09:00, 13:00, 17:30 weekdays | 29 | 29 | 4.8 / 6 | 12.8 | 8.4 | 1.53 |
+| developer: fetch each weekday morning | 9 | 9 | 5.1 / 6 | 9.0 | 5.9 | 1.53 |
+| developer: back after 8 days off | 3 | 3 | 6.0 / 8 | 5.0 | 4.3 | 1.17 |
+
+Cold clones (CI agents: fresh clone every 30 min, 24x7): 672 clones, 672 packs (one each) made of 8.8 slabs on average, 23 at most; 2475.3-2480.2 MiB each; over a fresh full fetch: 0.04 MiB on average, 0.14 MiB at most (1.0000x)
