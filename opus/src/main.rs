@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use gvfs_alloc_guard::SealedAllocator;
-use gvfs_daemon::{cli, ingest, inspect, pipeline, repack, serve};
+use gvfs_daemon::{cli, ingest, inspect, mirror, pipeline, repack, serve};
 
 #[global_allocator]
 static GLOBAL: SealedAllocator = SealedAllocator;
@@ -15,6 +15,7 @@ fn main() -> std::process::ExitCode {
     };
     let result = match command.as_str() {
         "pipeline" => pipeline::main(rest),
+        "mirror" => mirror::main(rest),
         // `edge` and `proxy` are the same server; the bind address is the only difference.
         "serve" | "edge" | "proxy" => serve::main(rest),
         "ingest" => ingest::main(rest),

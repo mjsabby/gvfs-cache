@@ -576,6 +576,7 @@ pub struct PackMeta {
 ///
 /// ```text
 /// "GVDBLOBM" | version u32 | generation u64 | flags u32 | tip [20] | since_ts u64
+/// | genesis [20]
 /// | segments u32 | (id_len u16 | id | blobs u64 | index_len u64 | packs u32 | (len u16 | id)*)*
 /// | packs u32 | (id_len u16 | id | len u64 | trailer [20] | blobs u32)*
 /// | SHA-256 [32]
@@ -583,7 +584,11 @@ pub struct PackMeta {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BlobManifest {
     pub generation: u64,
-    /// Every blob of this commit's tree is in a pack (`mirror --scope tip` finished).
+    /// The commit the store's genesis was taken at (zero until genesis).
+    pub genesis: Oid,
+    /// Every blob of this commit's tree is in a pack (`mirror --scope tip` finished). With
+    /// the pipeline copying every later window's blobs first, `tip_complete == genesis`
+    /// means every commit since genesis has all its blobs in the store.
     pub tip_complete: Option<Oid>,
     /// Old versions referenced since this commit stamp are mirrored too (0: none).
     pub since_ts: u64,
@@ -624,6 +629,7 @@ impl BlobManifest {
         out.extend_from_slice(&flags.to_le_bytes());
         out.extend_from_slice(&self.tip_complete.unwrap_or(Oid::ZERO).0);
         out.extend_from_slice(&self.since_ts.to_le_bytes());
+        out.extend_from_slice(&self.genesis.0);
         out.extend_from_slice(&u32_of(self.segments.len()).to_le_bytes());
         for s in &self.segments {
             put_str(&mut out, &s.id);
@@ -660,7 +666,9 @@ impl BlobManifest {
         let tip =
             Oid::from_slice(sub(body, 24, 20).ctx("blobs.bin header")?).ctx("blobs.bin header")?;
         let since_ts = le_u64(body, 44).ctx("blobs.bin header")?;
-        let mut at = 52usize;
+        let genesis =
+            Oid::from_slice(sub(body, 52, 20).ctx("blobs.bin header")?).ctx("blobs.bin header")?;
+        let mut at = 72usize;
         let nseg = le_u32(body, at).ctx("truncated blobs.bin")?;
         at = at.saturating_add(4);
         let mut segments = Vec::new();
@@ -704,11 +712,17 @@ impl BlobManifest {
         }
         Ok(BlobManifest {
             generation,
+            genesis,
             tip_complete: (flags & FLAG_TIP_COMPLETE != 0).then_some(tip),
             since_ts,
             segments,
             packs,
         })
+    }
+
+    /// Every commit since genesis has all its blobs in the store (edges serve only then).
+    pub fn complete(&self) -> bool {
+        !self.genesis.is_zero() && self.tip_complete == Some(self.genesis)
     }
 
     /// Total blobs indexed (a blob in two segments counts twice).
@@ -865,6 +879,7 @@ mod tests {
     fn blobs_bin_roundtrip() {
         let m = BlobManifest {
             generation: 7,
+            genesis: Oid([4u8; 20]),
             tip_complete: Some(Oid([3u8; 20])),
             since_ts: 123,
             segments: vec![SegmentMeta {

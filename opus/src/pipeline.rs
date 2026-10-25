@@ -369,7 +369,14 @@ fn genesis_separate(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) ->
     let _ = std::fs::remove_dir_all(&raw_dir);
     upload(&o.store, work, &s)?;
     crate::separate::put_sizes(&o.store, &s, &crate::sizes::build(&mut pairs))?;
-    let bm = crate::blobcopy::update(&o.store, |_| Ok(()))?;
+    let bm = crate::blobcopy::update(&o.store, |bm| {
+        if bm.genesis != head {
+            // A new genesis (the store was reset): no earlier mirror covers its tip.
+            bm.genesis = head;
+            bm.tip_complete = None;
+        }
+        Ok(())
+    })?;
     let m = Manifest {
         generation: 1,
         tip: head,

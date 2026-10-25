@@ -150,8 +150,43 @@ pub struct Finished<S> {
     pub recs: Vec<BlobRec>,
 }
 
+/// A byte-rate cap shared by concurrent copies (`mirror --rate-mbps`).
+pub struct Throttle {
+    bytes_per_sec: u64,
+    start: std::time::Instant,
+    total: std::sync::atomic::AtomicU64,
+}
+
+impl Throttle {
+    pub fn new(bytes_per_sec: u64) -> Throttle {
+        Throttle {
+            bytes_per_sec: bytes_per_sec.max(1),
+            start: std::time::Instant::now(),
+            total: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Counts `n` bytes and sleeps while the copies are ahead of the rate.
+    pub fn account(&self, n: usize) {
+        let total = self
+            .total
+            .fetch_add(u64_of(n), std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(u64_of(n));
+        let due_ms = total
+            .saturating_mul(1000)
+            .checked_div(self.bytes_per_sec)
+            .unwrap_or(0);
+        let due = std::time::Duration::from_millis(due_ms);
+        let elapsed = self.start.elapsed();
+        if due > elapsed {
+            std::thread::sleep(due.saturating_sub(elapsed));
+        }
+    }
+}
+
 pub struct BlobSink<S: Spool> {
     out: PackWriter<S>,
+    throttle: Option<std::sync::Arc<Throttle>>,
     want: HashSet<Oid>,
     recs: Vec<BlobRec>,
     by_oid: HashMap<Oid, usize>,
@@ -200,6 +235,7 @@ impl<S: Spool> BlobSink<S> {
             .ctx("too many blobs for one pack")?;
         Ok(BlobSink {
             out: PackWriter::new(out, count)?,
+            throttle: None,
             recs: Vec::with_capacity(want.len()),
             by_oid: HashMap::with_capacity(want.len()),
             want,
@@ -231,6 +267,11 @@ impl<S: Spool> BlobSink<S> {
             target: Vec::new(),
             zbuf: Vec::new(),
         })
+    }
+
+    /// Paces the input to a shared byte rate.
+    pub fn throttle(&mut self, t: std::sync::Arc<Throttle>) {
+        self.throttle = Some(t);
     }
 
     /// The error that failed the sink, if any (taken: a write error only carries its text).
@@ -625,6 +666,9 @@ impl<S: Spool> Write for BlobSink<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if let Some(e) = &self.failed {
             return Err(std::io::Error::other(e.to_string()));
+        }
+        if let Some(t) = &self.throttle {
+            t.account(buf.len());
         }
         match self.feed(buf) {
             Ok(()) => Ok(buf.len()),

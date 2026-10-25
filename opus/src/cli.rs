@@ -16,6 +16,13 @@ USAGE:
         TIER by repacking slabs from the store. With no manifest yet: the one-time seed.
         TIER: 15m | 1h | 6h | 12h | 24h | 168h  (168h = weekly delta + new baseline)
 
+    gvfs-daemon mirror --store <SPEC> --upstream <URL|PATH> [--scope <SCOPE>] [OPTIONS]
+        Copies blobs into a --blobs separate store, resumably: planned from the store's
+        own trees and sizes tables, skipping blobs already copied, verified by id as they
+        stream in, published to blobs.bin as it goes. SCOPE (comma-separated):
+        tip (default; the genesis tip, then `tip complete` is recorded and edges serve),
+        since:<30d|YYYY-MM-DD|SECONDS> (every tree of commits since then), history.
+
     gvfs-daemon serve --store <SPEC> [--upstream <URL|PATH>] [--bind <ADDR>] [OPTIONS]
         GVFS server. Remote edge: --bind 0.0.0.0:8080. Localhost proxy: --bind
         127.0.0.1:8080 (the default). With --upstream it bridges the minutes since the
@@ -59,6 +66,20 @@ PIPELINE OPTIONS:
     --keep-weeks <N>           weekly deltas kept for warm clients (default: 8)
     --gc-grace-secs <N>        orphaned slab files older than this are deleted (default: 7200)
     --threads <N>              indexing threads (default: all cores)
+    --blobs <inline|separate>  at genesis: keep blobs in the slabs (inline, the default)
+                               or every blob, real content, in blob packs with sizes
+                               tables beside the slabs (separate); later runs follow
+                               the store
+    --blob-pack-mib <N>        small blobs per blob pack (default: 2048); blobs of 16 MiB
+                               or more always get a pack of their own, streamed
+
+MIRROR OPTIONS:
+    --jobs <N>                 parallel copies, one upstream connection each (default: 4)
+    --blob-pack-mib <N>        as for the pipeline
+    --publish-secs <N>         publish finished packs at least this often (default: 60)
+    --rate-mbps <N>            cap the combined download rate (megabits per second)
+    --max-items <N>            stop after N packs (seed in slices; run again to continue)
+    --work-dir, --threads      as for the pipeline
 
 SERVE OPTIONS:
     --bind <ADDR>              listen address (default: 127.0.0.1:8080)

@@ -19,6 +19,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use sha1::{Digest, Sha1};
@@ -27,7 +28,7 @@ use crate::blobs::{
     BLOBS_KEY, BlobManifest, BlobRec, PackMeta, PackRef, Segment, SegmentMeta, build_segment,
     pack_key, segment_key,
 };
-use crate::blobstream::{BlobSink, FileSpool, Spool};
+use crate::blobstream::{BlobSink, FileSpool, Spool, Throttle};
 use crate::object::TreeIter;
 use crate::pack::OBJ_TREE;
 use crate::slab::Slab;
@@ -140,9 +141,20 @@ fn fetch_into<S: Spool>(up: &mut Upstream, sink: &mut BlobSink<S>, oids: &[Oid])
 /// Copies `item` from the upstream into a new blob pack in the store (retrying transient
 /// failures); `work` holds the spool of a batch.
 pub fn copy_item(up: &mut Upstream, store: &Store, work: &Path, item: &Item) -> Result<Copied> {
+    copy_item_with(up, store, work, item, None)
+}
+
+/// [`copy_item`], paced by a shared [`Throttle`].
+pub fn copy_item_with(
+    up: &mut Upstream,
+    store: &Store,
+    work: &Path,
+    item: &Item,
+    throttle: Option<&Arc<Throttle>>,
+) -> Result<Copied> {
     let mut attempt = 0u32;
     loop {
-        match copy_once(up, store, work, item) {
+        match copy_once(up, store, work, item, throttle) {
             Err(e) if attempt.saturating_add(1) < COPY_ATTEMPTS => {
                 crate::log!("blob copy failed ({e}); retrying");
                 attempt = attempt.saturating_add(1);
@@ -155,13 +167,22 @@ pub fn copy_item(up: &mut Upstream, store: &Store, work: &Path, item: &Item) -> 
     }
 }
 
-fn copy_once(up: &mut Upstream, store: &Store, work: &Path, item: &Item) -> Result<Copied> {
+fn copy_once(
+    up: &mut Upstream,
+    store: &Store,
+    work: &Path,
+    item: &Item,
+    throttle: Option<&Arc<Throttle>>,
+) -> Result<Copied> {
     let id = fresh_id(item.oids());
     let key = pack_key(&id);
     let (len, sha, recs) = match item {
         Item::Large { oid, .. } => {
             let one = std::slice::from_ref(oid);
             let mut sink = BlobSink::new(store.writer(&key)?, one)?;
+            if let Some(t) = throttle {
+                sink.throttle(Arc::clone(t));
+            }
             fetch_into(up, &mut sink, one)?;
             let f = sink.finish()?;
             f.out.finish()?;
@@ -172,6 +193,9 @@ fn copy_once(up: &mut Upstream, store: &Store, work: &Path, item: &Item) -> Resu
             let path = work.join(format!("{id}.pack"));
             let result = (|| -> Result<(u64, [u8; 20], Vec<BlobRec>)> {
                 let mut sink = BlobSink::new(FileSpool::create(&path)?, oids)?;
+                if let Some(t) = throttle {
+                    sink.throttle(Arc::clone(t));
+                }
                 for chunk in oids.chunks(BATCH) {
                     fetch_into(up, &mut sink, chunk)?;
                 }
@@ -374,17 +398,25 @@ pub fn fold(store: &Store, work: &Path, threads: usize) -> Result<Option<BlobMan
     Ok(Some(out))
 }
 
-/// Whether a tree entry's mode makes it a blob (git: anything but a directory or a
-/// gitlink, whatever the zero padding).
-fn is_blob_mode(mode: &[u8]) -> bool {
+/// The type of object a tree entry's mode names: a directory is a tree, a gitlink a
+/// commit (of another repository), anything else a blob, whatever the zero padding (as
+/// git reads modes). `None` if the mode is not octal.
+pub fn mode_kind(mode: &[u8]) -> Option<u8> {
+    if mode.is_empty() || mode.len() > 7 {
+        return None;
+    }
     let mut v = 0u32;
     for &c in mode {
         if !(b'0'..=b'7').contains(&c) {
-            return false;
+            return None;
         }
         v = v.wrapping_shl(3) | u32::from(c.wrapping_sub(b'0'));
     }
-    !matches!(v & 0o170_000, 0o040_000 | 0o160_000)
+    Some(match v & 0o170_000 {
+        0o040_000 => OBJ_TREE,
+        0o160_000 => crate::pack::OBJ_COMMIT,
+        _ => crate::pack::OBJ_BLOB,
+    })
 }
 
 /// Every blob id the trees of `slab` reference: sorted, distinct.
@@ -420,12 +452,15 @@ pub fn referenced_blobs(slab: &Slab, threads: usize) -> Result<Vec<Oid>> {
                                 crate::bail!("slot {slot} is not a tree");
                             }
                             let mut it = TreeIter::new(content);
+                            let mut bad = it.malformed;
                             for e in &mut it {
-                                if is_blob_mode(e.mode) {
-                                    out.push(e.oid);
+                                match mode_kind(e.mode) {
+                                    Some(crate::pack::OBJ_BLOB) => out.push(e.oid),
+                                    Some(_) => {}
+                                    None => bad = true,
                                 }
                             }
-                            if it.malformed {
+                            if bad || it.malformed {
                                 let oid = slab.rec(slot).map(|r| r.oid).unwrap_or(Oid::ZERO);
                                 crate::bail!("malformed tree {oid}");
                             }
@@ -498,7 +533,20 @@ mod tests {
             ]
         );
         assert!(plan(&[], 100).is_empty());
-        assert!(is_blob_mode(b"100644") && is_blob_mode(b"100755") && is_blob_mode(b"120000"));
-        assert!(!is_blob_mode(b"40000") && !is_blob_mode(b"040000") && !is_blob_mode(b"160000"));
+        use crate::pack::{OBJ_BLOB, OBJ_COMMIT};
+        for (mode, kind) in [
+            (&b"100644"[..], Some(OBJ_BLOB)),
+            (b"100755", Some(OBJ_BLOB)),
+            (b"120000", Some(OBJ_BLOB)),
+            (b"100664", Some(OBJ_BLOB)),
+            (b"40000", Some(OBJ_TREE)),
+            (b"040000", Some(OBJ_TREE)),
+            (b"160000", Some(OBJ_COMMIT)),
+            (b"", None),
+            (b"1006x4", None),
+            (b"12345678", None),
+        ] {
+            assert_eq!(mode_kind(mode), kind, "{mode:?}");
+        }
     }
 }

@@ -36,6 +36,7 @@ pub mod blobcopy;
 pub mod blobs;
 pub mod blobstream;
 pub mod manifest;
+pub mod mirror;
 pub mod store;
 
 pub mod cli;

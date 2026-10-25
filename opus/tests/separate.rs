@@ -348,3 +348,147 @@ fn separate_store_pipeline_copies_blobs_before_trees() {
     assert_eq!(store_blobs(&root, &store_dir).len(), stored.len());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Runs `gvfs-daemon mirror`; `Err` holds the log of a failure.
+fn mirror(root: &Path, store: &str, up: &Upstream, extra: &[&str]) -> Result<String, String> {
+    let work = root.join("mirror-work");
+    std::fs::create_dir_all(&work).unwrap();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-daemon"));
+    cmd.args(["mirror", "--store", store, "--upstream"])
+        .arg(&up.bare)
+        .args(["--work-dir", work.to_str().unwrap(), "--threads", "2"])
+        .args(["--jobs", "3", "--publish-secs", "0"])
+        .args(extra);
+    gvfs_daemon::upstream::hermetic_git_env(&mut cmd);
+    let out = cmd.output().unwrap();
+    let log = String::from_utf8_lossy(&out.stderr).into_owned();
+    if out.status.success() {
+        Ok(log)
+    } else {
+        Err(log)
+    }
+}
+
+/// Blob ids (with their paths) of every commit in `revs`, from git.
+fn commit_blobs(bare: &Path, revs: &[&str]) -> BTreeMap<String, String> {
+    let mut args = vec!["rev-list"];
+    args.extend_from_slice(revs);
+    let mut out = BTreeMap::new();
+    for c in git(bare, &args).lines() {
+        for l in git(bare, &["ls-tree", "-r", c]).lines() {
+            let (meta, path) = l.split_once('\t').unwrap();
+            let f: Vec<&str> = meta.split(' ').collect();
+            if f[1] == "blob" {
+                out.insert(f[2].to_string(), format!("{c}:{path}"));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn mirror_completes_every_commit_since_genesis_and_resumes() {
+    let root = tempdir("sep-mirror");
+    let up = Upstream::new(&root);
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    let file = |dir: &str, i: u32, v: u32| -> (String, Option<Vec<u8>>) {
+        let mut t = text(v * 1000 + i);
+        t.extend_from_slice(format!("{dir} file {i}\n").as_bytes());
+        (format!("{dir}/f{i}.txt"), Some(t))
+    };
+    let mut first: Vec<(String, Option<Vec<u8>>)> = Vec::new();
+    for dir in ["x", "y/deep", "z"] {
+        for i in 0..12 {
+            first.push(file(dir, i, 1));
+        }
+    }
+    first.push(("big/large.bin".into(), Some(large((16 << 20) + 1))));
+    first.push(("bin/noise.bin".into(), Some(noise(1_500_000, 3))));
+    let as_refs =
+        |v: &[(String, Option<Vec<u8>>)]| -> Vec<(String, Option<Vec<u8>>)> { v.to_vec() };
+    let commit = |msg: &str, files: Vec<(String, Option<Vec<u8>>)>| {
+        let refs: Vec<(&str, Option<Vec<u8>>)> =
+            files.iter().map(|(p, c)| (p.as_str(), c.clone())).collect();
+        commit_files(&up, msg, &refs)
+    };
+    let c1 = commit("c1", as_refs(&first));
+    commit("c2", (0..6).map(|i| file("x", i, 2)).collect());
+    let g = commit("c3", (0..4).map(|i| file("z", i, 3)).collect());
+    pipeline(&root, &store, &up, "15m", &["--blobs", "separate"]);
+
+    // After genesis: x/f0.txt is deleted, y/deep/f1.txt changes, a new file appears.
+    let t = commit(
+        "c4",
+        vec![
+            ("x/f0.txt".into(), None),
+            file("y/deep", 1, 4),
+            ("n/new.txt".into(), Some(b"new\n".to_vec())),
+        ],
+    );
+    pipeline(&root, &store, &up, "15m", &[]);
+    let s = Store::open(&store, "").unwrap();
+    assert!(!blobcopy::load(&s).unwrap().0.complete());
+
+    // In slices: two packs, then the rest.
+    let log = mirror(
+        &root,
+        &store,
+        &up,
+        &["--blob-pack-mib", "1", "--max-items", "2"],
+    )
+    .unwrap();
+    assert!(log.contains("stopped after 2"), "{log}");
+    let (bm, _) = blobcopy::load(&s).unwrap();
+    assert!(!bm.complete() && !bm.segments.is_empty());
+    let log = mirror(&root, &store, &up, &["--blob-pack-mib", "1"]).unwrap();
+    let (bm, _) = blobcopy::load(&s).unwrap();
+    assert!(bm.complete(), "{log}");
+    assert_eq!(bm.genesis.to_string(), g);
+
+    // Every blob of every commit since genesis, byte for byte: the genesis tree's (even
+    // the file deleted since) and the window's.
+    let stored = store_blobs(&root, &store_dir);
+    let since_genesis = commit_blobs(&up.bare, &["--ancestry-path", &format!("{g}..{t}")]);
+    let at_genesis = commit_blobs(&up.bare, &["-1", &g]);
+    for (id, at) in since_genesis.iter().chain(&at_genesis) {
+        let content = stored
+            .get(id)
+            .unwrap_or_else(|| panic!("{at} ({id}) missing\n{log}"));
+        assert!(*content == cat_blob(&up.bare, id), "{at} differs");
+    }
+    // Nothing was copied twice: one record per blob across all segments.
+    let records: usize = bm.segments.iter().map(|m| m.blobs as usize).sum();
+    assert_eq!(records, stored.len(), "a blob listed twice");
+    // Versions only commits before genesis reference were not copied.
+    let old_only: Vec<String> = commit_blobs(&up.bare, &["-1", &c1])
+        .into_keys()
+        .filter(|id| !at_genesis.contains_key(id))
+        .collect();
+    assert!(!old_only.is_empty() && old_only.iter().all(|id| !stored.contains_key(id)));
+
+    // Again: nothing to copy.
+    let log = mirror(&root, &store, &up, &[]).unwrap();
+    assert!(log.contains("to copy in 0 items"), "{log}");
+
+    // The whole history: every blob ever referenced.
+    let log = mirror(
+        &root,
+        &store,
+        &up,
+        &["--scope", "history", "--blob-pack-mib", "1"],
+    )
+    .unwrap();
+    let stored = store_blobs(&root, &store_dir);
+    for id in git_blobs(&up.bare, &["--all"]).keys() {
+        assert!(
+            stored.contains_key(id),
+            "{id} missing after --scope history\n{log}"
+        );
+    }
+    let (bm, _) = blobcopy::load(&s).unwrap();
+    assert!(bm.complete() && bm.since_ts == 1);
+    let records: usize = bm.segments.iter().map(|m| m.blobs as usize).sum();
+    assert_eq!(records, stored.len(), "a blob listed twice");
+    let _ = std::fs::remove_dir_all(&root);
+}
