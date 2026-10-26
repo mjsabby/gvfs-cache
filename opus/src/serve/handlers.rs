@@ -181,6 +181,10 @@ pub fn handle(
         Route::ObjectGet(oid) => {
             inc(&ctx.metrics.object_get);
             let view = ctx.view();
+            if let Some((pack, rec)) = stored_blob(&view, &oid) {
+                inc(&ctx.metrics.blobs_store);
+                return loose_blob(ctx, w, stream, pack, &rec, keep);
+            }
             match view.find(&oid) {
                 Some((k, slot)) => loose(ctx, w, stream, &view, k, slot, None, keep),
                 None => match find_blob(ctx, &view, &oid) {
@@ -261,14 +265,12 @@ enum Blob {
 /// client accepts both (the store's large-blob threshold).
 const LOOSE_BLOB_MAX: u64 = crate::blobcopy::LARGE_MIN;
 
-/// A blob's size from the store's blob packs or the sizes tables (0 if unknown).
-fn blob_size_of(view: &View, oid: &Oid) -> u64 {
-    view.blobs
-        .as_ref()
-        .and_then(|s| s.find(oid))
-        .map(|(_, r)| r.size)
-        .or_else(|| view.blob_size(oid))
-        .unwrap_or(0)
+/// Blob `oid` in the store's blob packs (`--blobs separate` stores). Looked up before the
+/// slabs: they hold only commits and trees in such a store, so a blob id would miss every
+/// slab's index first (each a probe of a large table) before reaching the one that has it.
+#[inline]
+fn stored_blob<'v>(view: &'v View, oid: &Oid) -> Option<(&'v Arc<BlobPack>, BlobRec)> {
+    view.blobs.as_ref()?.find(oid)
 }
 
 /// Counts and logs blobs that sealed trees name and a complete store lacks (cold path).
@@ -816,7 +818,13 @@ fn objects_post(
     // more) is sent as that pack file, which is the response already.
     if let [oid] = arena.oids.as_slice() {
         let oid = *oid;
-        match view.find(&oid) {
+        let stored = stored_blob(&view, &oid);
+        let in_slab = if stored.is_some() {
+            None
+        } else {
+            view.find(&oid)
+        };
+        match in_slab {
             Some((k, slot)) => {
                 let rec = view.all.get(usize::from(k)).and_then(|s| s.rec(slot));
                 let is_commit = rec.is_some_and(|r| r.kind == OBJ_COMMIT);
@@ -827,14 +835,21 @@ fn objects_post(
                 }
             }
             None => {
-                let large = blob_size_of(&view, &oid) >= LOOSE_BLOB_MAX;
+                let size = stored
+                    .map(|(_, r)| r.size)
+                    .or_else(|| view.blob_size(&oid))
+                    .unwrap_or(0);
+                let large = size >= LOOSE_BLOB_MAX;
                 if !accepts_loose || (accepts_pack && large) {
-                    if let Some((pack, rec)) = view.blobs.as_ref().and_then(|s| s.find(&oid)) {
+                    if let Some((pack, rec)) = stored {
                         if own_pack(pack, &rec) {
                             inc(&ctx.metrics.blobs_store);
                             return whole_pack(ctx, w, stream, pack, keep);
                         }
                     }
+                } else if let Some((pack, rec)) = stored {
+                    inc(&ctx.metrics.blobs_store);
+                    return loose_blob(ctx, w, stream, pack, &rec, keep);
                 } else {
                     match find_blob(ctx, &view, &oid) {
                         Blob::Found(pack, rec) => {
@@ -846,6 +861,16 @@ fn objects_post(
                 }
             }
         }
+    }
+    if let Err(miss) = take_stored_blobs(&view, arena) {
+        return match miss {
+            Miss::Capacity => {
+                respond_text(stream, 413, "request expands beyond the arena\n", keep)?;
+                Ok(keep)
+            }
+            Miss::NotFound => not_found(ctx, stream, keep),
+            Miss::Broken => unavailable(ctx, stream, keep),
+        };
     }
     match plan_objects(&view, arena, depth) {
         Ok(()) => {}
@@ -874,7 +899,9 @@ fn objects_post(
         return Ok(keep);
     };
     // Slab entries, then whole blob entries; the trailer is hashed as the bytes go out.
-    let count = count.saturating_add(crate::util::u32_of(arena.blobs.len()));
+    let count = count
+        .saturating_add(crate::util::u32_of(arena.blobs.len()))
+        .saturating_add(crate::util::u32_of(arena.proxied.len()));
     let header = pack_header(count);
     let body_len = arena
         .splice
@@ -882,6 +909,7 @@ fn objects_post(
         .iter()
         .map(Piece::len)
         .chain(arena.blobs.iter().map(|(_, r)| r.entry_len))
+        .chain(arena.proxied.iter().map(|(_, r)| r.entry_len))
         .fold(0u64, u64::saturating_add);
     let mut h = Sha1::new();
     h.update(header);
@@ -900,7 +928,15 @@ fn objects_post(
             Piece::Bytes { .. } => out.bytes(bytes)?,
         }
     }
-    for (pack, rec) in &arena.blobs {
+    for (seg, rec) in &arena.blobs {
+        let pack = view
+            .blobs
+            .as_ref()
+            .and_then(|s| s.pack(*seg, rec))
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        send_pack_range(&mut out, pack, rec.offset, rec.entry_len, Some(&mut h))?;
+    }
+    for (pack, rec) in &arena.proxied {
         send_pack_range(&mut out, pack, rec.offset, rec.entry_len, Some(&mut h))?;
     }
     let trailer: [u8; 20] = h.finalize().into();
@@ -921,15 +957,12 @@ enum Miss {
 
 /// Adds the requested objects to the arena's splice; commits bring `depth - 1` levels of
 /// parents and every tree reachable from each commit (the GVFS protocol's expansion).
+/// In a separate-blob store, leaves in `arena.oids` only the ids no slab has, for
+/// [`plan_blobs`].
 fn plan_objects(view: &View, arena: &mut Arena, depth: u64) -> Result<(), Miss> {
-    // Commit expansion can name hundreds of thousands of trees: let it grow the arena.
-    arena.grow = arena.oids.iter().any(|o| {
-        view.find(o)
-            .and_then(|(k, s)| view.all.get(usize::from(k)).and_then(|sl| sl.rec(s)))
-            .is_some_and(|r| r.kind == OBJ_COMMIT)
-    });
     let Arena {
         oids,
+        found,
         seen,
         visited,
         work,
@@ -940,12 +973,38 @@ fn plan_objects(view: &View, arena: &mut Arena, depth: u64) -> Result<(), Miss> 
         grow,
         ..
     } = arena;
+    // Commit expansion can name hundreds of thousands of trees: let it grow the arena. The
+    // lookups that tell are kept for the loop below (as many as `found` holds), and stop
+    // where they did before once a commit settles it.
+    found.clear();
+    *grow = false;
+    for (i, o) in oids.iter().enumerate() {
+        if *grow && i >= found.capacity() {
+            break;
+        }
+        let hit = view.find(o);
+        *grow |= hit
+            .and_then(|(k, s)| view.all.get(usize::from(k)).and_then(|sl| sl.rec(s)))
+            .is_some_and(|r| r.kind == OBJ_COMMIT);
+        if i < found.capacity() {
+            found.push(hit);
+        }
+    }
     let grow = *grow;
+    let mut rest = 0usize;
     for i in 0..oids.len() {
         let Some(&oid) = oids.get(i) else { break };
-        let Some((k, slot)) = view.find(&oid) else {
+        let hit = match found.get(i) {
+            Some(&hit) => hit,
+            None => view.find(&oid),
+        };
+        let Some((k, slot)) = hit else {
             // Blobs of a separate-blob store: see `plan_blobs`.
             if view.blobs.is_some() {
+                if let Some(o) = oids.get_mut(rest) {
+                    *o = oid;
+                }
+                rest = rest.saturating_add(1);
                 continue;
             }
             return Err(Miss::NotFound);
@@ -1037,44 +1096,84 @@ fn plan_objects(view: &View, arena: &mut Arena, depth: u64) -> Result<(), Miss> 
             std::mem::swap(commits, next_commits);
         }
     }
+    oids.truncate(rest);
     Ok(())
 }
 
-/// The requested ids that are not in the slabs, as blobs: from the store's blob packs,
-/// the proxy's cache, else from the upstream in one request (only for blobs the store's
-/// trees name; anything else is not found). Sealed trees' blobs a complete store lacks are
-/// counted as missing.
+/// Moves the requested blobs the store's blob packs hold (`--blobs separate` stores) to
+/// `arena.blobs`, one blob-pack lookup each (no slab has them), and leaves the other ids in
+/// `arena.oids`: commits and trees for [`plan_objects`], blobs only the upstream has for
+/// [`plan_blobs`] (which also drops repeated ids).
+fn take_stored_blobs(view: &View, arena: &mut Arena) -> Result<(), Miss> {
+    let Some(set) = view.blobs.as_ref() else {
+        return Ok(());
+    };
+    let Arena { oids, blobs, .. } = arena;
+    let mut rest = 0usize;
+    for i in 0..oids.len() {
+        let Some(&oid) = oids.get(i) else { break };
+        match set.locate(&oid) {
+            Some(found) => {
+                if !crate::arena::push(blobs, found, true) {
+                    return Err(Miss::Capacity);
+                }
+            }
+            None => {
+                if let Some(o) = oids.get_mut(rest) {
+                    *o = oid;
+                }
+                rest = rest.saturating_add(1);
+            }
+        }
+    }
+    oids.truncate(rest);
+    Ok(())
+}
+
+/// The requested blobs: the store's ([`take_stored_blobs`]), each once, then the ids no
+/// slab has ([`plan_objects`] leaves them in `arena.oids`) from the proxy's cache, else from
+/// the upstream in one request (only for blobs the store's trees name; anything else is not
+/// found). Sealed trees' blobs a complete store lacks are counted as missing.
 fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
     let Some(set) = view.blobs.as_ref() else {
         return Ok(());
     };
     let Arena {
-        oids, seen, blobs, ..
+        oids,
+        blobs,
+        proxied,
+        blob_seen,
+        ..
     } = arena;
-    let (mut unresolved, mut from_store, mut from_cache) = (0usize, 0u64, 0u64);
-    for oid in oids.iter() {
-        if view.find(oid).is_some() {
-            continue;
-        }
-        if !seen.insert_grow(oid, true).map_err(|_| Miss::Capacity)? {
-            continue;
-        }
-        let found = match set.find(oid) {
-            Some((pack, rec)) => {
-                from_store = from_store.saturating_add(1);
-                Some((Arc::clone(pack), rec))
-            }
-            None => {
-                let c = ctx.proxy.as_ref().and_then(|p| p.cached(oid));
-                if c.is_some() {
-                    from_cache = from_cache.saturating_add(1);
-                }
-                c
-            }
+    let mut kept = 0usize;
+    for i in 0..blobs.len() {
+        let Some(oid) = blobs.get(i).map(|b| b.1.oid) else {
+            break;
         };
-        match found {
+        if blob_seen
+            .insert_grow(&oid, true)
+            .map_err(|_| Miss::Capacity)?
+        {
+            if kept != i {
+                blobs.swap(kept, i);
+            }
+            kept = kept.saturating_add(1);
+        }
+    }
+    blobs.truncate(kept);
+    let from_store = u64_of(kept);
+    let (mut unresolved, mut from_cache) = (0usize, 0u64);
+    for oid in oids.iter() {
+        if !blob_seen
+            .insert_grow(oid, true)
+            .map_err(|_| Miss::Capacity)?
+        {
+            continue;
+        }
+        match ctx.proxy.as_ref().and_then(|p| p.cached(oid)) {
             Some(b) => {
-                if !crate::arena::push(blobs, b, true) {
+                from_cache = from_cache.saturating_add(1);
+                if !crate::arena::push(proxied, b, true) {
                     return Err(Miss::Capacity);
                 }
             }
@@ -1091,10 +1190,10 @@ fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
         return Ok(());
     }
     let _cold = gvfs_alloc_guard::cold_section();
-    let mut have: std::collections::HashSet<Oid> = blobs.iter().map(|b| b.1.oid).collect();
+    let mut have: std::collections::HashSet<Oid> = proxied.iter().map(|b| b.1.oid).collect();
     let mut need = Vec::with_capacity(unresolved);
     for oid in oids.iter() {
-        if view.find(oid).is_none() && have.insert(*oid) {
+        if have.insert(*oid) {
             if view.blob_size(oid).is_none() {
                 return Err(Miss::NotFound);
             }
@@ -1117,21 +1216,18 @@ fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
         .blobs_proxied
         .fetch_add(u64_of(got.len()), Ordering::Relaxed);
     for b in got {
-        if !crate::arena::push(blobs, b, true) {
+        if !crate::arena::push(proxied, b, true) {
             return Err(Miss::Capacity);
         }
     }
     Ok(())
 }
 
-/// The size of an object outside the slabs: a blob the trees name (sizes tables), in the
-/// blob packs, or known to the upstream.
+/// The size of an object no slab and no blob pack has: a blob the trees name (sizes
+/// tables), or known to the upstream.
 fn size_outside_slabs(ctx: &Ctx, view: &View, oid: &Oid) -> Option<u64> {
     if let Some(s) = view.blob_size(oid) {
         return Some(s);
-    }
-    if let Some((_, r)) = view.blobs.as_ref()?.find(oid) {
-        return Some(r.size);
     }
     let proxy = ctx.proxy.as_ref()?;
     if let Some((_, r)) = proxy.cached(oid) {
@@ -1162,16 +1258,19 @@ fn sizes(
     let mut ok = out.capacity() > 2;
     out.push(b'[');
     for (i, oid) in oids.iter().enumerate() {
-        let size = match view.find(oid) {
-            Some((k, slot)) => view
-                .all
-                .get(usize::from(k))
-                .and_then(|s| s.rec(slot))
-                .map(|r| r.size)
-                .unwrap_or(0),
-            None => match size_outside_slabs(ctx, &view, oid) {
-                Some(s) => s,
-                None => return not_found(ctx, stream, keep),
+        let size = match stored_blob(&view, oid) {
+            Some((_, r)) => r.size,
+            None => match view.find(oid) {
+                Some((k, slot)) => view
+                    .all
+                    .get(usize::from(k))
+                    .and_then(|s| s.rec(slot))
+                    .map(|r| r.size)
+                    .unwrap_or(0),
+                None => match size_outside_slabs(ctx, &view, oid) {
+                    Some(s) => s,
+                    None => return not_found(ctx, stream, keep),
+                },
             },
         };
         let hex = oid.to_hex();

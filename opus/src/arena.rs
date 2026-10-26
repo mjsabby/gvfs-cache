@@ -154,6 +154,8 @@ pub struct Arena {
     pub body: Vec<u8>,
     /// Object ids parsed from the request.
     pub oids: Vec<Oid>,
+    /// Where the first of them are (`View::find`), looked up once per request.
+    pub found: Vec<Option<(u16, u32)>>,
     /// Ids already planned (dedupe across requested objects and delta chains).
     pub seen: OidSet,
     /// Commits and trees already expanded.
@@ -168,11 +170,18 @@ pub struct Arena {
     /// Small response bodies built in place (sizes JSON, resolved loose objects).
     pub out: Vec<u8>,
     pub deflater: crate::zlib::Deflater,
-    /// Blobs of the request (`--blobs separate` stores): their packs and records.
-    pub blobs: Vec<(
+    /// Blobs of the request (`--blobs separate` stores) from the store's blob packs: the
+    /// segment of the view's blob set ([`crate::serve::blobs::BlobSet::locate`]) and record.
+    pub blobs: Vec<(u32, crate::blobs::BlobRec)>,
+    /// Blobs of the request from the proxy (the live tip's, not in the store yet).
+    pub proxied: Vec<(
         std::sync::Arc<crate::serve::blobs::BlobPack>,
         crate::blobs::BlobRec,
     )>,
+    /// The request's blobs already planned. Apart from `seen` (blobs and slab objects never
+    /// share an id) and sized for a blob batch, not the arena's whole object capacity, so
+    /// it stays in cache.
+    pub blob_seen: OidSet,
     /// Commit expansion may outgrow the arena: allow its structures to grow (counted as
     /// cold allocations) for this request; `reset` shrinks them back.
     pub grow: bool,
@@ -181,6 +190,10 @@ pub struct Arena {
 
 /// Blobs one request holds without growing (gvfs-helper asks for a few thousand at once).
 const BLOBS: usize = 1 << 13;
+/// Proxied blobs one request holds without growing.
+const PROXIED: usize = 1 << 8;
+/// Requested ids whose lookups a request keeps (a gvfs-helper batch is at most 4,000).
+const FOUND: usize = 1 << 13;
 
 impl Arena {
     /// `bytes` is split between the body, response and splice buffers; `objects` bounds
@@ -190,6 +203,7 @@ impl Arena {
         let mut a = Arena {
             body: Vec::with_capacity(quarter),
             oids: Vec::with_capacity(objects),
+            found: Vec::with_capacity(FOUND),
             seen: OidSet::with_capacity(objects),
             visited: OidSet::with_capacity(objects),
             work: Vec::with_capacity(objects),
@@ -200,6 +214,8 @@ impl Arena {
             out: Vec::with_capacity(quarter.saturating_mul(2)),
             deflater: crate::zlib::Deflater::new(1),
             blobs: Vec::with_capacity(BLOBS),
+            proxied: Vec::with_capacity(PROXIED),
+            blob_seen: OidSet::with_capacity(BLOBS),
             grow: false,
             objects,
         };
@@ -221,6 +237,7 @@ impl Arena {
         }
         self.body.clear();
         self.oids.clear();
+        self.found.clear();
         self.seen.clear();
         self.visited.clear();
         self.work.clear();
@@ -229,6 +246,10 @@ impl Arena {
         self.splice.clear();
         self.out.clear();
         self.blobs.clear();
+        self.proxied.clear();
+        self.blob_seen.clear();
+        self.blob_seen.shrink(BLOBS);
+        shrink(&mut self.proxied, PROXIED);
         if self.blobs.capacity() > BLOBS.saturating_mul(2) {
             let _cold = gvfs_alloc_guard::cold_section();
             self.blobs.shrink_to(BLOBS);
@@ -268,6 +289,9 @@ impl ArenaPool {
             .wait_timeout_while(guard, timeout, |f| f.is_empty())
             .ok()?;
         let mut arena = guard.pop()?;
+        // Reset outside the lock: clearing a large request's sets under it serialized every
+        // lease and return behind it.
+        drop(guard);
         arena.reset();
         Some(Lease {
             arena: Some(arena),

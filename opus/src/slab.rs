@@ -405,6 +405,8 @@ pub struct Slab {
     sorted: std::sync::OnceLock<Option<crate::idx::SortedSlab>>,
     /// The blob sizes its trees introduce (`--blobs separate` stores), once loaded.
     sizes: std::sync::OnceLock<Arc<crate::sizes::Sizes>>,
+    /// Its ids, checked before the index once built ([`Slab::prepare_filter`]).
+    filter: std::sync::OnceLock<crate::idfilter::IdFilter>,
 }
 
 impl Slab {
@@ -517,6 +519,7 @@ impl Slab {
             records_at,
             sorted: std::sync::OnceLock::new(),
             sizes: std::sync::OnceLock::new(),
+            filter: std::sync::OnceLock::new(),
         })
     }
 
@@ -587,6 +590,9 @@ impl Slab {
     /// The slot holding `oid`, if this slab has it.
     #[inline]
     pub fn find(&self, oid: &Oid) -> Option<u32> {
+        if self.filter.get().is_some_and(|f| !f.may_contain(oid)) {
+            return None;
+        }
         let slot = self.mphf().slot(oid)?;
         let rec = self.rec_bytes(slot)?;
         if rec.get(..20)? == oid.0 {
@@ -594,6 +600,22 @@ impl Slab {
         } else {
             None
         }
+    }
+
+    /// Builds the id filter [`Slab::find`] checks before the index (once; an edge does it
+    /// for every slab its lookups probe before another: see [`crate::idfilter`]).
+    pub fn prepare_filter(&self) {
+        self.filter
+            .get_or_init(|| crate::idfilter::IdFilter::new(us(u64::from(self.count)), self.ids()));
+    }
+
+    /// Every id, in slot order.
+    pub fn ids(&self) -> impl Iterator<Item = Oid> + '_ {
+        (0..self.count).filter_map(|s| {
+            self.rec_bytes(s)
+                .and_then(|r| r.get(..20))
+                .and_then(Oid::from_slice)
+        })
     }
 
     #[inline]

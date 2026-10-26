@@ -206,6 +206,31 @@ impl BlobSet {
         })
     }
 
+    /// Like [`BlobSet::find`], with the segment (for [`BlobSet::pack`]) in place of the pack:
+    /// a request can note thousands of blobs without touching their packs' reference counts,
+    /// which every core would otherwise contend for.
+    #[inline]
+    pub fn locate(&self, oid: &Oid) -> Option<(u32, BlobRec)> {
+        self.segments
+            .iter()
+            .enumerate()
+            .find_map(|(i, (s, packs))| {
+                let r = s.find(oid)?;
+                packs.get(us(u64::from(r.pack)))?.as_ref()?;
+                Some((u32::try_from(i).ok()?, r))
+            })
+    }
+
+    /// The pack of a record [`BlobSet::locate`] found in segment `seg`.
+    #[inline]
+    pub fn pack(&self, seg: u32, rec: &BlobRec) -> Option<&Arc<BlobPack>> {
+        self.segments
+            .get(us(u64::from(seg)))?
+            .1
+            .get(us(u64::from(rec.pack)))?
+            .as_ref()
+    }
+
     pub fn segments(&self) -> usize {
         self.segments.len()
     }

@@ -43,6 +43,9 @@ pub struct View {
     pub l0_len: usize,
     /// Index into `all` of the baseline.
     baseline: usize,
+    /// The ids of every slab before the baseline in `all`: a lookup it rules out goes
+    /// straight to the baseline (see [`crate::idfilter`]).
+    recent: crate::idfilter::IdFilter,
     /// What plans are made of: weekly deltas, pyramid, retained slabs and every L0 slab,
     /// sorted by `(start_ts, end_ts)`; `spans` are their bounds.
     warm: Vec<Arc<Slab>>,
@@ -100,6 +103,20 @@ impl View {
         all.extend(weekly.iter().rev().cloned());
         all.extend(sealed.first().cloned());
         let baseline = all.len().saturating_sub(1);
+        // Lookups try the slabs in this order. One filter over every slab before the
+        // baseline sends most of them (ids only the baseline has) straight there; each of
+        // those slabs also gets its own (built once per slab) for the ids that pass it.
+        let before = all.get(..baseline).unwrap_or(&[]);
+        for s in before {
+            s.prepare_filter();
+        }
+        let recent = crate::idfilter::IdFilter::new(
+            before
+                .iter()
+                .map(|s| crate::util::us(u64::from(s.count())))
+                .sum(),
+            before.iter().flat_map(|s| s.ids()),
+        );
 
         // L0 slabs first: the sort is stable and covers take the last of equal spans, so a
         // sealed slab wins over an L0 slab with the same bounds.
@@ -142,6 +159,7 @@ impl View {
             all,
             l0_len,
             baseline,
+            recent,
             warm,
             spans,
             starts,
@@ -173,7 +191,12 @@ impl View {
     /// Finds `oid` in the newest slab that has it.
     #[inline]
     pub fn find(&self, oid: &Oid) -> Option<(u16, u32)> {
-        self.all.iter().enumerate().find_map(|(i, s)| {
+        let from = if self.recent.may_contain(oid) {
+            0
+        } else {
+            self.baseline
+        };
+        self.all.iter().enumerate().skip(from).find_map(|(i, s)| {
             s.find(oid)
                 .map(|slot| (u16::try_from(i).unwrap_or(u16::MAX), slot))
         })

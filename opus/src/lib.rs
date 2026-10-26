@@ -44,6 +44,7 @@ pub mod fsutil;
 
 pub mod delta;
 pub mod hfs;
+pub mod idfilter;
 pub mod idx;
 pub mod ingest;
 pub mod inspect;
