@@ -538,6 +538,22 @@ fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
     let one = std::slice::from_ref(&text2);
     let (status, ct, _) = server.post("/gvfs/objects", json_ids(one, None).as_bytes(), CT_LOOSE);
     assert_eq!((status, ct.as_str()), (200, CT_LOOSE));
+    // A single large blob comes as a pack to a client that takes both (gvfs-helper): its
+    // maintenance keeps a pack entry as it is but must deflate a loose object again. A
+    // small one, or a client that takes only loose objects, still gets a loose object.
+    let both = "application/x-git-packfile, application/x-git-loose-object";
+    let large_id = rev(&up.bare, &format!("{g}:big/large.bin"));
+    let one = std::slice::from_ref(&large_id);
+    let (status, ct, pack) = server.post("/gvfs/objects", json_ids(one, None).as_bytes(), both);
+    assert_eq!((status, ct.as_str()), (200, CT_PACK));
+    let single = fresh_repo(&root, "single");
+    git_stdin(&single, &["index-pack", "--stdin", "--strict"], &pack);
+    assert_eq!(cat_batch(&single, one), cat_batch(&up.bare, one));
+    let (_, ct, _) = server.post("/gvfs/objects", json_ids(one, None).as_bytes(), CT_LOOSE);
+    assert_eq!(ct, CT_LOOSE);
+    let small = std::slice::from_ref(&text2);
+    let (_, ct, _) = server.post("/gvfs/objects", json_ids(small, None).as_bytes(), both);
+    assert_eq!(ct, CT_LOOSE);
 
     // Sizes of blobs (stored, old), trees and commits.
     let mut ids: Vec<String> = all_blobs.clone();

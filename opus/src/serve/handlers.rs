@@ -219,7 +219,15 @@ pub fn handle(
                 sizes(ctx, w, stream, arena, keep)
             } else {
                 inc(&ctx.metrics.object_post);
-                objects_post(ctx, w, stream, arena, req.accepts_loose, keep)
+                objects_post(
+                    ctx,
+                    w,
+                    stream,
+                    arena,
+                    req.accepts_loose,
+                    req.accepts_pack,
+                    keep,
+                )
             }
         }
         // An unread POST body would be parsed as the next request: close instead.
@@ -247,6 +255,20 @@ enum Blob {
     Unknown,
     /// Named by a tree, but the upstream could not supply it.
     Failed,
+}
+
+/// A single blob at least this large is answered with a pack, not a loose object, when the
+/// client accepts both (the store's large-blob threshold).
+const LOOSE_BLOB_MAX: u64 = crate::blobcopy::LARGE_MIN;
+
+/// A blob's size from the store's blob packs or the sizes tables (0 if unknown).
+fn blob_size_of(view: &View, oid: &Oid) -> u64 {
+    view.blobs
+        .as_ref()
+        .and_then(|s| s.find(oid))
+        .map(|(_, r)| r.size)
+        .or_else(|| view.blob_size(oid))
+        .unwrap_or(0)
 }
 
 /// Counts and logs blobs that sealed trees name and a complete store lacks (cold path).
@@ -745,6 +767,7 @@ fn objects_post(
     stream: &mut TcpStream,
     arena: &mut Arena,
     accepts_loose: bool,
+    accepts_pack: bool,
     keep: bool,
 ) -> std::io::Result<bool> {
     let depth = scan_number(&arena.body, b"\"commitDepth")
@@ -764,15 +787,18 @@ fn objects_post(
         let oid = *oid;
         match view.find(&oid) {
             Some((k, slot)) => {
-                let is_commit = view
-                    .all
-                    .get(usize::from(k))
-                    .and_then(|s| s.rec(slot))
-                    .is_some_and(|r| r.kind == OBJ_COMMIT);
-                if !is_commit {
+                let rec = view.all.get(usize::from(k)).and_then(|s| s.rec(slot));
+                let is_commit = rec.is_some_and(|r| r.kind == OBJ_COMMIT);
+                let large_blob =
+                    rec.is_some_and(|r| r.kind == OBJ_BLOB && r.size >= LOOSE_BLOB_MAX);
+                if !is_commit && !(accepts_pack && large_blob) {
                     return loose(ctx, w, stream, &view, k, slot, Some(arena), keep);
                 }
             }
+            // A large blob goes out as a pack when the client takes one: its maintenance
+            // then keeps the entry as it is, where a loose object must be inflated and
+            // deflated again (`git maintenance`'s loose-objects task: ~15 s per GiB).
+            None if accepts_pack && blob_size_of(&view, &oid) >= LOOSE_BLOB_MAX => {}
             None => match find_blob(ctx, &view, &oid) {
                 Blob::Found(pack, rec) => return loose_blob(ctx, w, stream, &pack, &rec, keep),
                 Blob::Failed => return unavailable(ctx, stream, keep),

@@ -34,8 +34,10 @@ pub struct Request {
     pub chunked: bool,
     pub keep_alive: bool,
     pub expect_continue: bool,
-    /// `Accept` names `application/x-git-loose-object`.
+    /// An `Accept` header names `application/x-git-loose-object`.
     pub accepts_loose: bool,
+    /// An `Accept` header names `application/x-git-packfile`.
+    pub accepts_pack: bool,
     /// `User-Agent: git/...`: git itself (gvfs-helper), which always indexes packs itself.
     pub git_agent: bool,
     /// `X-GVFS-Sizes: 1`: the client wants the blob sizes for a prefetch's trees (a `GSZ1`
@@ -204,6 +206,7 @@ fn parse_head(head: &[u8], head_len: usize) -> std::io::Result<Request> {
         keep_alive: version == b"HTTP/1.1",
         expect_continue: false,
         accepts_loose: false,
+        accepts_pack: false,
         git_agent: false,
         wants_sizes: false,
         head_len,
@@ -231,9 +234,13 @@ fn parse_head(head: &[u8], head_len: usize) -> std::io::Result<Request> {
         } else if name.eq_ignore_ascii_case(b"expect") {
             req.expect_continue = value.eq_ignore_ascii_case(b"100-continue");
         } else if name.eq_ignore_ascii_case(b"accept") {
-            req.accepts_loose = value
+            // gvfs-helper sends one `Accept` line per type.
+            req.accepts_loose |= value
                 .windows(24)
                 .any(|w| w.eq_ignore_ascii_case(b"application/x-git-loose-"));
+            req.accepts_pack |= value
+                .windows(26)
+                .any(|w| w.eq_ignore_ascii_case(b"application/x-git-packfile"));
         } else if name.eq_ignore_ascii_case(b"user-agent") {
             req.git_agent = value.starts_with(b"git/");
         } else if name.eq_ignore_ascii_case(b"x-gvfs-sizes") {
@@ -593,7 +600,14 @@ mod tests {
             ),
             (Some(12), true, true, true)
         );
-        assert!(!r.git_agent);
+        assert!(!r.git_agent && !r.accepts_pack);
+        // gvfs-helper: one Accept line per type.
+        let h = b"POST /gvfs/objects HTTP/1.1\r\nAccept: application/x-git-packfile\r\nAccept: application/x-git-loose-object\r\n\r\n";
+        let r = parse_head(h, h.len()).unwrap();
+        assert!(r.accepts_pack && r.accepts_loose);
+        let h = b"POST /gvfs/objects HTTP/1.1\r\nAccept: application/x-git-loose-object\r\nAccept: application/x-git-packfile\r\n\r\n";
+        let r = parse_head(h, h.len()).unwrap();
+        assert!(r.accepts_pack && r.accepts_loose);
         let h = b"GET /gvfs/config HTTP/1.0\r\nUser-Agent: git/2.45.2.vfs.0.0\r\n\r\n";
         let r = parse_head(h, h.len()).unwrap();
         assert!(!r.keep_alive && r.method == Method::Get && r.git_agent);
