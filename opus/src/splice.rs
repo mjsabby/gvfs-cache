@@ -68,8 +68,66 @@ pub struct PackPlan {
     /// repacked into one).
     pub sources: usize,
     trailer: OnceLock<[u8; 20]>,
-    idx: OnceLock<Option<Vec<u8>>>,
-    sizes: OnceLock<Vec<u8>>,
+    idx: OnceLock<Option<Shared>>,
+    sizes: OnceLock<Shared>,
+}
+
+/// Bytes a plan builds once and many responses send (its `.idx`, its `GSZ1` section): moved
+/// into a memfd and mapped, so a response sends them with `sendfile(2)` like the pack itself
+/// rather than copying them into the socket (where each byte also costs a socket buffer page
+/// the kernel zeroes first). Small sections, or no memfd, stay on the heap.
+pub struct Shared {
+    file: Option<std::fs::File>,
+    bytes: crate::slab::Region,
+}
+
+/// Sections at least this large go to a memfd.
+const SPILL_MIN: usize = 1 << 20;
+
+impl Shared {
+    pub fn new(v: Vec<u8>) -> Shared {
+        if v.len() < SPILL_MIN {
+            return Shared {
+                file: None,
+                bytes: crate::slab::Region::Heap(v),
+            };
+        }
+        match Shared::spill(&v) {
+            Ok((file, map)) => Shared {
+                file: Some(file),
+                bytes: crate::slab::Region::Map(map),
+            },
+            Err(_) => Shared {
+                file: None,
+                bytes: crate::slab::Region::Heap(v),
+            },
+        }
+    }
+
+    fn spill(v: &[u8]) -> std::io::Result<(std::fs::File, gvfs_mmap::Map)> {
+        use std::io::Write;
+        let fd = nix::sys::memfd::memfd_create(
+            c"gvfs-plan",
+            nix::sys::memfd::MemFdCreateFlag::MFD_CLOEXEC,
+        )
+        .map_err(std::io::Error::from)?;
+        let mut file = std::fs::File::from(fd);
+        file.write_all(v)?;
+        let map = gvfs_mmap::Map::open(&file, false)?;
+        if map.bytes() != v {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        Ok((file, map))
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        self.bytes.bytes()
+    }
+
+    /// The memfd holding [`Shared::bytes`], if they were moved to one.
+    pub fn file(&self) -> Option<&std::fs::File> {
+        self.file.as_ref()
+    }
 }
 
 impl PackPlan {
@@ -131,13 +189,22 @@ impl PackPlan {
     /// The pack's git `.idx` ([`crate::idx`]): built by the first caller, shared after.
     /// `None` if a slab's records do not cover its entries.
     pub fn idx(&self) -> Option<&[u8]> {
+        self.idx_shared().map(Shared::bytes)
+    }
+
+    /// The memfd holding [`PackPlan::idx`], if it is large enough to have one.
+    pub fn idx_file(&self) -> Option<&std::fs::File> {
+        self.idx_shared().and_then(Shared::file)
+    }
+
+    fn idx_shared(&self) -> Option<&Shared> {
         self.idx
             .get_or_init(|| {
                 let sha = self.trailer();
                 let _cold = gvfs_alloc_guard::cold_section();
-                crate::idx::build(self, &sha)
+                crate::idx::build(self, &sha).map(Shared::new)
             })
-            .as_deref()
+            .as_ref()
     }
 
     pub fn idx_ready(&self) -> bool {
@@ -147,6 +214,15 @@ impl PackPlan {
     /// The `GSZ1` section for this pack: the union of its slabs' sizes tables, built by
     /// the first caller and shared after.
     pub fn sizes_section(&self) -> &[u8] {
+        self.sizes_shared().bytes()
+    }
+
+    /// The memfd holding [`PackPlan::sizes_section`], if it is large enough to have one.
+    pub fn sizes_file(&self) -> Option<&std::fs::File> {
+        self.sizes_shared().file()
+    }
+
+    fn sizes_shared(&self) -> &Shared {
         self.sizes.get_or_init(|| {
             let _cold = gvfs_alloc_guard::cold_section();
             let tables: Vec<&crate::sizes::Sizes> = self
@@ -154,7 +230,7 @@ impl PackPlan {
                 .iter()
                 .filter_map(|s| s.sizes().map(|t| t.as_ref()))
                 .collect();
-            crate::sizes::wire_section(&tables)
+            Shared::new(crate::sizes::wire_section(&tables))
         })
     }
 

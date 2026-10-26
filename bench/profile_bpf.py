@@ -278,6 +278,8 @@ WORKLOADS = {
     "sizes_4000": (["--workload", "sizes", "--oids", "{oids}", "--batch", "4000"], 32),
     "prefetch_cold_sizes": (["--workload", "prefetch", "--ts", "0", "--header", "X-GVFS-Sizes: 1",
                              "--header", "User-Agent: git/2.53.0.vfs.0.0"], 8),
+    # VFS for Git (not a git user agent): the pack's .idx comes after it.
+    "prefetch_cold_idx": (["--workload", "prefetch", "--ts", "0", "--header", "User-Agent: GVFS/1.0"], 8),
 }
 # name: (store, blob ids)
 STORES = {

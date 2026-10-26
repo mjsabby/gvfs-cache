@@ -647,10 +647,13 @@ fn prefetch(
     // Computed once per plan; usually ready (warmed in the background) by now.
     let trailer = plan.trailer();
     out.bytes(&trailer)?;
+    // Mapped from a memfd when large: sent like the pack, not copied into the socket.
     if let Some(idx) = idx {
-        out.bytes(idx)?;
+        out.mapped(plan.idx_file(), idx, 0, u64_of(idx.len()))?;
     }
-    out.bytes(section)?;
+    if sizes {
+        out.mapped(plan.sizes_file(), section, 0, u64_of(section.len()))?;
+    }
     out.flush()?;
     ctx.metrics.bytes_out.fetch_add(out.sent, Ordering::Relaxed);
     ctx.metrics

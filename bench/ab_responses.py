@@ -51,6 +51,25 @@ def pack_objects(pack, scratch):
     return {line.split()[1] for line in out.splitlines()}
 
 
+def stream_digest(port, path, headers):
+    """Status, content type and SHA-256 of a (large) response body, streamed."""
+    import http.client
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=3600)
+    try:
+        c.request("GET", path, headers=headers)
+        r = c.getresponse()
+        h, n = hashlib.sha256(), 0
+        while True:
+            chunk = r.read(1 << 20)
+            if not chunk:
+                break
+            h.update(chunk)
+            n += len(chunk)
+        return r.status, r.getheader("Content-Type"), n, h.hexdigest()
+    finally:
+        c.close()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--store", required=True)
@@ -148,6 +167,20 @@ def main():
                 raw = zlib.decompress(resp.body)
                 assert hashlib.sha1(raw).hexdigest() == oid, oid
                 checked["gets"] += 1
+            if r == 0:
+                # Prefetch: cold with sizes (gvfs-helper), cold with the .idx (VFS for Git),
+                # and warm from a few boundaries.
+                for path, hdrs in (("/gvfs/prefetch?lastPackTimestamp=0",
+                                    {"User-Agent": "git/2.53.0.vfs.0.0", "X-GVFS-Sizes": "1"}),
+                                   ("/gvfs/prefetch?lastPackTimestamp=0", {"User-Agent": "GVFS/1.0"}),
+                                   ("/gvfs/prefetch?lastPackTimestamp=1792400000",
+                                    {"User-Agent": "git/2.53.0.vfs.0.0", "X-GVFS-Sizes": "1"}),
+                                   ("/gvfs/prefetch?lastPackTimestamp=1792440000", {"User-Agent": "GVFS/1.0"})):
+                    got = {t: stream_digest(port, path, hdrs) for t, (_, port) in servers.items()}
+                    assert got["base"] == got["new"], (path, hdrs, got)
+                    assert got["new"][0] == 200, got
+                    checked["prefetch"] = checked.get("prefetch", 0) + 1
+                    checked["prefetch_bytes"] = checked.get("prefetch_bytes", 0) + got["new"][2]
             print(f"round {r}: {checked}", flush=True)
         for t, (_, port) in servers.items():
             m = metrics(port)
