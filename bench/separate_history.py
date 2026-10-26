@@ -236,7 +236,7 @@ def check_store(store, want, index_pack_all=True, check_repo=None):
 def serve(store, cache, log, cpus=None):
     port = free_port()
     cmd = [BIN, "serve", "--store", f"fs:{store}", "--bind", f"127.0.0.1:{port}",
-           "--cache-dir", cache, "--alloc-guard", "strict", "--workers", "64"]
+           "--cache-dir", cache, "--alloc-guard", "strict"]
     if cpus:
         cmd = ["taskset", "-c", cpus] + cmd
     p = subprocess.Popen(cmd, env=clean_env(), stdout=subprocess.DEVNULL, stderr=open(log, "wb"))

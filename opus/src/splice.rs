@@ -255,6 +255,9 @@ pub struct ObjectSplice {
     pub bytes: Vec<u8>,
     /// Output offset of each emitted entry, parallel to `refs` after sorting.
     out_at: Vec<u64>,
+    /// A plan in steps ([`ObjectSplice::plan_step`]): the next ref and its output offset.
+    next: usize,
+    out: u64,
 }
 
 impl ObjectSplice {
@@ -264,6 +267,8 @@ impl ObjectSplice {
             pieces: Vec::with_capacity(entries),
             bytes: Vec::with_capacity(bytes),
             out_at: Vec::with_capacity(entries),
+            next: 0,
+            out: 0,
         }
     }
 
@@ -322,12 +327,35 @@ impl ObjectSplice {
     /// Lays out the pack: sorted entries, contiguous runs merged, OFS distances re-encoded
     /// where needed. Returns the entry count; `self.pieces` / `self.bytes` hold the body.
     pub fn plan(&mut self, slabs: &[Arc<Slab>], grow: bool) -> Result<u32> {
+        self.plan_begin();
+        loop {
+            if let Some(n) = self.plan_step(slabs, grow, usize::MAX)? {
+                return Ok(n);
+            }
+        }
+    }
+
+    /// [`ObjectSplice::plan`] in steps (a request that yields between them): sorts the
+    /// entries, then [`ObjectSplice::plan_step`] until it returns the entry count.
+    pub fn plan_begin(&mut self) {
         self.refs.sort_unstable();
         self.pieces.clear();
         self.bytes.clear();
         self.out_at.clear();
-        let mut out = u64_of(PACK_HEADER_LEN);
-        for i in 0..self.refs.len() {
+        self.next = 0;
+        self.out = u64_of(PACK_HEADER_LEN);
+    }
+
+    /// Lays out up to `max` more entries; the entry count once all are.
+    pub fn plan_step(
+        &mut self,
+        slabs: &[Arc<Slab>],
+        grow: bool,
+        max: usize,
+    ) -> Result<Option<u32>> {
+        let end = self.refs.len().min(self.next.saturating_add(max));
+        let mut out = self.out;
+        for i in self.next..end {
             let (k, offset, slot) = *self.refs.get(i).ctx("ref")?;
             let slab = slabs.get(usize::from(k)).ctx("slab out of range")?;
             let rec: Rec = slab.rec(slot).ctx("record")?;
@@ -403,7 +431,9 @@ impl ObjectSplice {
                 out = out.saturating_add(u64::from(rec.entry_len));
             }
         }
-        Ok(u32_of(self.refs.len()))
+        self.next = end;
+        self.out = out;
+        Ok((end == self.refs.len()).then(|| u32_of(self.refs.len())))
     }
 
     /// Appends a piece, merging it into the previous one when contiguous.

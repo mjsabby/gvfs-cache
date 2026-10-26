@@ -299,7 +299,7 @@ def main():
     edge_log = open(os.path.join(W, "edge.log"), "wb")
     edge = subprocess.Popen([BIN, "serve", "--store", f"fs:{store}", "--bind", f"127.0.0.1:{port}",
                              "--cache-dir", os.path.join(W, "edge-cache"), "--poll-ms", "100",
-                             "--alloc-guard", "strict", "--workers", "64"],
+                             "--alloc-guard", "strict"],
                             stderr=edge_log, stdout=subprocess.DEVNULL, env=clean_env())
     wait_http(port, "/healthz", timeout=600, proc=edge)
 

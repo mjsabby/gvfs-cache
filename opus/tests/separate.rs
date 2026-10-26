@@ -1648,3 +1648,103 @@ fn a_manifest_names_the_blobs_generation_its_trees_need() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The edge's async upstream client (`AsyncUpstream`, the blob proxy's) over each transport
+/// it meets: a local repository; smart HTTP with protocol v2 (blobs by id, `object-info`,
+/// as Azure DevOps allows them); and a GVFS upstream (another edge: `POST /gvfs/objects` and
+/// `POST /gvfs/sizes`). Every blob asked for arrives, verified by id as it streams in, and
+/// every size is git's.
+#[test]
+fn async_upstream_fetches_blobs_and_sizes_over_every_transport() {
+    use gvfs_daemon::serve::blobs::fetch_into;
+    use gvfs_daemon::upstream::{AsyncUpstream, Auth};
+    use std::collections::HashSet;
+
+    let root = tempdir("sep-async-up");
+    let up = Upstream::new(&root);
+    commit_files(
+        &up,
+        "c1",
+        &[
+            ("a/one.txt", Some(text(1))),
+            ("b/noise.bin", Some(noise(1 << 20, 3))),
+        ],
+    );
+    commit_files(
+        &up,
+        "c2",
+        &[
+            ("a/one.txt", Some(text(2))),
+            ("c/two.txt", Some(b"two\n".to_vec())),
+        ],
+    );
+    for (k, v) in [
+        ("uploadpack.allowAnySHA1InWant", "true"),
+        ("uploadpack.allowFilter", "true"),
+        ("transfer.advertiseObjectInfo", "true"),
+    ] {
+        git(&up.bare, &["config", k, v]);
+    }
+    let http = SmartHttp::start(&up.bare, "secret", true);
+    // A GVFS upstream: an edge whose store has every blob of the history.
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    pipeline(&root, &store, &up, "15m", &["--blobs", "separate"]);
+    mirror(&root, &store, &up, &[]).unwrap();
+    let cache = root.join("cache");
+    let edge = Server::start(&["--store", &store, "--cache-dir", cache.to_str().unwrap()]);
+
+    let blobs = git_blobs(&up.bare, &["--all"]);
+    let oids: Vec<Oid> = blobs
+        .keys()
+        .map(|id| Oid::from_hex(id.as_bytes()).unwrap())
+        .collect();
+    let sizes: Vec<Option<u64>> = blobs.values().map(|&s| Some(s)).collect();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let basic = Auth {
+        header: Some(gvfs_daemon::http::basic_auth("", "secret")),
+    };
+    let transports = [
+        (
+            "local",
+            up.bare.to_str().unwrap().to_string(),
+            Auth::default(),
+        ),
+        ("smart-http", http.url.clone(), basic),
+        ("gvfs", edge.url(), Auth::default()),
+    ];
+    for (label, spec, auth) in transports {
+        let mut a = AsyncUpstream::open(&spec, &auth).unwrap();
+        let path = root.join(format!("{label}.pack"));
+        let (_pack, recs) = rt
+            .block_on(fetch_into(&mut a, &oids, &path, label))
+            .unwrap();
+        let got: HashSet<Oid> = recs.iter().map(|r| r.oid).collect();
+        assert_eq!(got, oids.iter().copied().collect::<HashSet<_>>(), "{label}");
+        for r in &recs {
+            assert_eq!(
+                Some(r.size),
+                blobs.get(&r.oid.to_string()).copied(),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            rt.block_on(a.object_sizes(&oids)).unwrap(),
+            sizes,
+            "{label}"
+        );
+        // A second round on the same client: its connections are reused.
+        let one = std::slice::from_ref(&oids[0]);
+        assert_eq!(
+            rt.block_on(a.object_sizes(one)).unwrap(),
+            vec![sizes[0]],
+            "{label}"
+        );
+    }
+    assert!(http.v2_posts() > 0);
+    edge.assert_clean();
+    let _ = std::fs::remove_dir_all(&root);
+}

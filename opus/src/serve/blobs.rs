@@ -11,16 +11,21 @@
 //!   for a blob already being fetched wait for that fetch), verified by id as they stream
 //!   in, and kept in a local cache with a byte budget. Only blobs the store's trees name
 //!   are proxied ([`super::view::View::blob_size`]); anything else is a 404.
+//!
+//! Remote reads and the proxy's fetches are async: a request waiting on object storage or
+//! the upstream parks its task, not a thread.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use tokio::sync::Notify;
 
 use crate::blobs::{BlobManifest, BlobRec, Segment, pack_key};
 use crate::blobstream::{BlobSink, FileSpool};
 use crate::store::Store;
-use crate::upstream::{Auth, BATCH, Upstream};
+use crate::upstream::{AsyncUpstream, Auth, BATCH};
 use crate::util::{Context, Oid, Result, sub, us};
 
 /// One blob pack: mapped (local) or in object storage (remote).
@@ -84,14 +89,22 @@ impl BlobPack {
         self.local.as_ref().map(|(f, _)| f)
     }
 
-    /// `len` bytes at `at`, handed to `sink` in pieces (a remote pack: one ranged read).
-    pub fn read(&self, at: u64, len: u64, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    /// `len` bytes at `at`, handed to `sink` in pieces (a remote pack: ranged reads,
+    /// through the block cache when there is one).
+    pub async fn read(
+        &self,
+        at: u64,
+        len: u64,
+        sink: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
+    ) -> Result<()> {
         if let Some(b) = self.bytes() {
             return sink(sub(b, us(at), us(len)).ctx("blob pack range")?);
         }
         match &self.remote {
-            Some(Remote::Direct(store, key)) => store.read_range(key, at, len, sink),
-            Some(Remote::Cached(cache, id, key)) => cache.read(id, key, self.len, at, len, sink),
+            Some(Remote::Direct(store, key)) => store.read_range_async(key, at, len, sink).await,
+            Some(Remote::Cached(cache, id, key)) => {
+                cache.read(id, key, self.len, at, len, sink).await
+            }
             None => crate::bail!("blob pack {} has no bytes", self.id),
         }
     }
@@ -266,13 +279,34 @@ struct ProxyState {
 /// Read-through of blobs the store lacks (see the module docs).
 pub struct Proxy {
     upstream: String,
-    branch: String,
     auth: Auth,
     dir: PathBuf,
     budget: u64,
-    idle: Mutex<Vec<Upstream>>,
+    idle: Mutex<Vec<AsyncUpstream>>,
     state: Mutex<ProxyState>,
-    done: Condvar,
+    /// Woken when a fetch ends (blobs cached, or the fetch failed).
+    done: Notify,
+}
+
+/// Blobs a request is fetching: if the request is dropped before the fetch ends, they are
+/// no longer marked, and requests waiting for them are woken (one of them fetches them).
+struct Fetching<'a> {
+    proxy: &'a Proxy,
+    oids: &'a [Oid],
+    armed: bool,
+}
+
+impl Drop for Fetching<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            let mut st = lock(&self.proxy.state);
+            for o in self.oids {
+                st.fetching.remove(o);
+            }
+            drop(st);
+            self.proxy.done.notify_waiters();
+        }
+    }
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -284,18 +318,11 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Proxy {
     /// Fetched blobs are kept under `dir` (emptied now) up to `budget` bytes.
-    pub fn new(
-        upstream: &str,
-        branch: &str,
-        auth: &Auth,
-        dir: &Path,
-        budget: u64,
-    ) -> Result<Proxy> {
+    pub fn new(upstream: &str, auth: &Auth, dir: &Path, budget: u64) -> Result<Proxy> {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).ctx(&format!("creating {}", dir.display()))?;
         Ok(Proxy {
             upstream: upstream.to_string(),
-            branch: branch.to_string(),
             auth: auth.clone(),
             dir: dir.to_path_buf(),
             budget,
@@ -306,7 +333,7 @@ impl Proxy {
                 bytes: 0,
                 fetching: HashSet::new(),
             }),
-            done: Condvar::new(),
+            done: Notify::new(),
         })
     }
 
@@ -320,13 +347,16 @@ impl Proxy {
     /// for all of those not being fetched already (others wait for those fetches). Cold
     /// path. What the call has in hand it keeps (an `Arc` keeps a pack open, cached or
     /// not), so the cache evicting one pack for another never makes it start over.
-    pub fn fetch(&self, oids: &[Oid]) -> Result<Vec<(Arc<BlobPack>, BlobRec)>> {
-        let _cold = gvfs_alloc_guard::cold_section();
+    pub async fn fetch(&self, oids: &[Oid]) -> Result<Vec<(Arc<BlobPack>, BlobRec)>> {
         let mut found: HashMap<Oid, (Arc<BlobPack>, BlobRec)> = HashMap::with_capacity(oids.len());
         loop {
-            let mine: Vec<Oid> = {
-                let mut st = lock(&self.state);
-                loop {
+            let mine: Vec<Oid> = loop {
+                // Waiting is registered before the state is read: a fetch that ends in
+                // between still wakes this request.
+                let mut ended = std::pin::pin!(self.done.notified());
+                ended.as_mut().enable();
+                {
+                    let mut st = lock(&self.state);
                     for o in oids {
                         if !found.contains_key(o) {
                             if let Some(hit) = st.cache.get(o) {
@@ -353,13 +383,16 @@ impl Proxy {
                         st.fetching.extend(mine.iter().copied());
                         break mine;
                     }
-                    st = match self.done.wait(st) {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
                 }
+                ended.await;
             };
-            let got = self.fetch_now(&mine);
+            let mut guard = Fetching {
+                proxy: self,
+                oids: &mine,
+                armed: true,
+            };
+            let got = self.fetch_now(&mine).await;
+            guard.armed = false;
             let mut st = lock(&self.state);
             for o in &mine {
                 st.fetching.remove(o);
@@ -383,39 +416,25 @@ impl Proxy {
                     st.bytes = st.bytes.saturating_sub(old.len);
                 }
             }
-            self.done.notify_all();
             drop(st);
+            self.done.notify_waiters();
             got?;
         }
     }
 
-    fn connection(&self) -> Result<Upstream> {
+    fn connection(&self) -> Result<AsyncUpstream> {
         match lock(&self.idle).pop() {
             Some(u) => Ok(u),
-            None => Upstream::open(&self.upstream, &self.branch, &self.auth),
+            None => AsyncUpstream::open(&self.upstream, &self.auth),
         }
     }
 
-    fn fetch_now(&self, oids: &[Oid]) -> Result<(Arc<BlobPack>, Vec<BlobRec>)> {
+    async fn fetch_now(&self, oids: &[Oid]) -> Result<(Arc<BlobPack>, Vec<BlobRec>)> {
         let t0 = std::time::Instant::now();
         let mut up = self.connection()?;
         let id = crate::blobcopy::fresh_id(oids);
         let path = self.dir.join(format!("{id}.pack"));
-        let result = (|| -> Result<(BlobPack, Vec<BlobRec>)> {
-            let mut sink = BlobSink::new(FileSpool::create(&path)?, oids)?;
-            for chunk in oids.chunks(BATCH) {
-                if let Err(e) = up.fetch_objects(chunk, &mut sink) {
-                    return Err(sink.failure().unwrap_or(e));
-                }
-                sink.end_input()?;
-            }
-            let f = sink.finish()?;
-            f.out.close()?;
-            let mut pack = BlobPack::open(&path, &id)?;
-            pack.unlink = Some(path.clone());
-            Ok((pack, f.recs))
-        })();
-        match result {
+        match fetch_into(&mut up, oids, &path, &id).await {
             Ok((pack, recs)) => {
                 lock(&self.idle).push(up);
                 crate::log!(
@@ -434,12 +453,92 @@ impl Proxy {
     }
 
     /// Sizes the upstream knows (cold path).
-    pub fn sizes(&self, oids: &[Oid]) -> Result<Vec<Option<u64>>> {
-        let _cold = gvfs_alloc_guard::cold_section();
+    pub async fn sizes(&self, oids: &[Oid]) -> Result<Vec<Option<u64>>> {
         let mut up = self.connection()?;
-        let r = up.object_sizes(oids)?;
+        let r = up.object_sizes(oids).await?;
         lock(&self.idle).push(up);
         Ok(r)
+    }
+}
+
+/// What [`fetch_into`]'s network side hands its blocking side.
+enum Piece {
+    Data(bytes::Bytes),
+    /// One request's pack has ended (the sink checks it before the next).
+    EndPack,
+    /// Every pack has arrived.
+    Done,
+}
+
+/// Hands pack pieces to [`fetch_into`]'s blocking side (waiting while its queue is full).
+struct ToSink<'a>(&'a tokio::sync::mpsc::Sender<Piece>);
+
+impl crate::upstream::PackPieces for ToSink<'_> {
+    async fn put(&mut self, piece: bytes::Bytes) -> Result<()> {
+        self.0
+            .send(Piece::Data(piece))
+            .await
+            .map_err(|_| crate::err!("the blob sink stopped"))
+    }
+}
+
+/// Fetches the blobs `oids` from `up` into a blob pack at `path` (id `id`), each verified
+/// by id as it streams in. The network side is async (the request's task waits, not a
+/// thread); verifying (inflating, hashing, re-deflating deltas) and writing run on tokio's
+/// blocking pool, fed through a bounded queue, so the runtime's workers keep serving.
+pub async fn fetch_into(
+    up: &mut AsyncUpstream,
+    oids: &[Oid],
+    path: &Path,
+    id: &str,
+) -> Result<(BlobPack, Vec<BlobRec>)> {
+    use std::io::Write;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Piece>(16);
+    let (want, path, id) = (oids.to_vec(), path.to_path_buf(), id.to_string());
+    // `Err((true, e))`: the sink failed (which explains a failed send); `(false, _)`: the
+    // network side stopped first.
+    let sink = tokio::task::spawn_blocking(move || {
+        let spool = FileSpool::create(&path).map_err(|e| (true, e))?;
+        let mut sink = BlobSink::new(spool, &want).map_err(|e| (true, e))?;
+        loop {
+            match rx.blocking_recv() {
+                Some(Piece::Data(b)) => {
+                    if let Err(e) = sink.write_all(&b) {
+                        let e = sink.failure().unwrap_or_else(|| e.into());
+                        return Err((true, e));
+                    }
+                }
+                Some(Piece::EndPack) => sink.end_input().map_err(|e| (true, e))?,
+                Some(Piece::Done) => break,
+                None => return Err((false, crate::err!("the fetch stopped"))),
+            }
+        }
+        let f = sink.finish().map_err(|e| (true, e))?;
+        f.out.close().map_err(|e| (true, e))?;
+        let mut pack = BlobPack::open(&path, &id).map_err(|e| (true, e))?;
+        pack.unlink = Some(path);
+        Ok((pack, f.recs))
+    });
+    let sent: Result<()> = async {
+        for chunk in oids.chunks(BATCH) {
+            up.fetch_objects(chunk, &mut ToSink(&tx)).await?;
+            tx.send(Piece::EndPack)
+                .await
+                .map_err(|_| crate::err!("the blob sink stopped"))?;
+        }
+        tx.send(Piece::Done)
+            .await
+            .map_err(|_| crate::err!("the blob sink stopped"))
+    }
+    .await;
+    drop(tx);
+    let done = sink
+        .await
+        .map_err(|e| crate::err!("the blob sink failed: {e}"))?;
+    match (sent, done) {
+        (Ok(()), Ok(v)) => Ok(v),
+        (_, Err((true, e))) | (Err(e), Err((false, _))) => Err(e),
+        (Ok(()), Err((false, e))) | (Err(e), Ok(_)) => Err(e),
     }
 }
 
@@ -511,14 +610,17 @@ mod tests {
         let up = work.join(".git");
         let proxy = Proxy::new(
             up.to_str().unwrap(),
-            "main",
             &Auth::default(),
             &dir.join("proxy"),
             0,
         )
         .unwrap();
-        assert_eq!(proxy.fetch(&[a]).unwrap()[0].1.oid, a);
-        let both = proxy.fetch(&[a, b]).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert_eq!(rt.block_on(proxy.fetch(&[a])).unwrap()[0].1.oid, a);
+        let both = rt.block_on(proxy.fetch(&[a, b])).unwrap();
         assert_eq!(both.iter().map(|x| x.1.oid).collect::<Vec<_>>(), vec![a, b]);
         assert_eq!((both[0].1.size, both[1].1.size), (70_000, 90_000));
         let _ = std::fs::remove_dir_all(&dir);

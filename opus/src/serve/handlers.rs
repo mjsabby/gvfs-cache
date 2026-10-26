@@ -18,17 +18,23 @@
 //! trees introduce), and `X-GVFS-Sizes: 1` in the response says so.
 //!
 //! Any prefix before `/gvfs/` is accepted (`https://host/org/repo/gvfs/...`). Handlers use
-//! only the worker's buffers and a leased request arena: no heap allocation.
+//! only the connection's buffers and a leased request arena: no heap allocation. Loops
+//! that compute for long (batches of ids, commit expansion, hashing a pack) yield to the
+//! runtime's other tasks every [`super::budget::QUANTUM`]; plans built once run in
+//! [`blocking`] sections; fetches from the upstream or object storage are awaited ([`cold`]
+//! sections: their clients allocate).
 
 use std::io::Write;
-use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha1::{Digest, Sha1};
+use tokio::net::TcpStream;
 
 use super::Ctx;
 use super::blobs::BlobPack;
+use super::budget::{Budget, blocking, cold};
+use super::conn::Bufs;
 use super::httpd::{Method, Out, Request, read_body, respond_text, write_response};
 use super::view::{Prefetch, View};
 use crate::arena::{Arena, BlobSrc};
@@ -67,6 +73,10 @@ pub struct Metrics {
     /// mirror` repairs the store).
     pub blobs_missing: AtomicU64,
     pub unavailable: AtomicU64,
+    /// Connections closed for idling past `--idle-secs`, or for going idle while
+    /// `--max-idle-conns` others were.
+    pub idle_closed: AtomicU64,
+    pub idle_overflow: AtomicU64,
 }
 
 fn inc(c: &AtomicU64) {
@@ -130,25 +140,26 @@ fn query_number(query: &[u8], key: &[u8]) -> Option<u64> {
 }
 
 /// Handles one request. Returns whether the connection may be reused.
-pub fn handle(
+pub async fn handle(
     ctx: &Ctx,
-    w: &mut super::Worker,
-    stream: &mut TcpStream,
+    b: &mut Bufs,
+    stream: &TcpStream,
     req: &Request,
 ) -> std::io::Result<bool> {
     let route = route(
         req.method,
-        w.input.bytes(req.path),
-        w.input.bytes(req.query),
+        b.input.bytes(req.path),
+        b.input.bytes(req.query),
     );
     let keep = req.keep_alive;
     if req.method != Method::Post {
-        w.input.consume(req.head_len);
+        b.input.consume(req.head_len);
     }
     match route {
         Route::Config => {
             inc(&ctx.metrics.config);
-            write_response(stream, 200, CT_JSON, &ctx.config_json, keep)?;
+            let t = ctx.deadlines.write;
+            write_response(stream, 200, CT_JSON, &ctx.config_json, keep, t).await?;
             Ok(keep)
         }
         Route::Health => {
@@ -160,13 +171,18 @@ pub fn handle(
                 (true, false) => (503, "blobs incomplete (gvfs-daemon mirror running)\n"),
                 _ => (503, "starting\n"),
             };
-            respond_text(stream, status, text, keep)?;
+            respond(ctx, stream, status, text, keep).await?;
             Ok(keep)
         }
         Route::Metrics => {
+            let text = {
+                let _cold = gvfs_alloc_guard::cold_section();
+                super::metrics_text(ctx)
+            };
+            let sent = respond(ctx, stream, 200, &text, keep).await;
             let _cold = gvfs_alloc_guard::cold_section();
-            let text = super::metrics_text(ctx);
-            respond_text(stream, 200, &text, keep)?;
+            drop(text);
+            sent?;
             Ok(keep)
         }
         Route::Prefetch(since) => {
@@ -176,79 +192,83 @@ pub fn handle(
                 super::IdxPolicy::Always => true,
                 super::IdxPolicy::Never => false,
             };
-            prefetch(ctx, w, stream, since, idx, req.wants_sizes, keep)
+            prefetch(ctx, b, stream, since, idx, req.wants_sizes, keep).await
         }
         Route::ObjectGet(oid) => {
             inc(&ctx.metrics.object_get);
             let view = ctx.view();
             if let Some((pack, rec)) = stored_blob(&view, &oid) {
                 inc(&ctx.metrics.blobs_store);
-                return loose_blob(ctx, w, stream, pack, &rec, keep);
+                return loose_blob(ctx, b, stream, pack, &rec, keep).await;
             }
             match view.find(&oid) {
-                Some((k, slot)) => loose(ctx, w, stream, &view, k, slot, None, keep),
-                None => match find_blob(ctx, &view, &oid) {
-                    Blob::Found(pack, rec) => loose_blob(ctx, w, stream, &pack, &rec, keep),
-                    Blob::Unknown => not_found(ctx, stream, keep),
-                    Blob::Failed => unavailable(ctx, stream, keep),
+                Some((k, slot)) => loose(ctx, b, stream, &view, k, slot, None, keep).await,
+                None => match find_blob(ctx, &view, &oid).await {
+                    Blob::Found(pack, rec) => loose_blob(ctx, b, stream, &pack, &rec, keep).await,
+                    Blob::Unknown => not_found(ctx, stream, keep).await,
+                    Blob::Failed => unavailable(ctx, stream, keep).await,
                 },
             }
         }
         Route::BlobRange(oid, offset, length) => {
             inc(&ctx.metrics.object_get);
             let view = ctx.view();
-            match find_blob(ctx, &view, &oid) {
+            match find_blob(ctx, &view, &oid).await {
                 Blob::Found(pack, rec) => {
-                    blob_range(ctx, w, stream, &pack, &rec, offset, length, keep)
+                    blob_range(ctx, b, stream, &pack, &rec, offset, length, keep).await
                 }
-                Blob::Unknown => not_found(ctx, stream, keep),
-                Blob::Failed => unavailable(ctx, stream, keep),
+                Blob::Unknown => not_found(ctx, stream, keep).await,
+                Blob::Failed => unavailable(ctx, stream, keep).await,
             }
         }
         Route::ObjectsPost | Route::SizesPost => {
-            let Some(mut lease) = ctx.arenas.lease(ctx.arena_wait) else {
+            let Some(mut lease) = ctx.arenas.lease(ctx.arena_wait).await else {
                 inc(&ctx.metrics.busy);
-                respond_text(stream, 503, "busy\n", false)?;
+                respond(ctx, stream, 503, "busy\n", false).await?;
                 return Ok(false);
             };
             let Some(arena) = lease.arena() else {
                 return Ok(false);
             };
-            if !read_body(stream, &mut w.input, req, &mut arena.body)? {
-                respond_text(stream, 413, "request too large\n", false)?;
+            if !read_body(stream, &mut b.input, req, &mut arena.body, &ctx.deadlines).await? {
+                respond(ctx, stream, 413, "request too large\n", false).await?;
                 return Ok(false);
             }
             if route == Route::SizesPost {
                 inc(&ctx.metrics.sizes);
-                sizes(ctx, w, stream, arena, keep)
+                sizes(ctx, stream, arena, keep).await
             } else {
                 inc(&ctx.metrics.object_post);
-                objects_post(
-                    ctx,
-                    w,
-                    stream,
-                    arena,
-                    req.accepts_loose,
-                    req.accepts_pack,
-                    keep,
-                )
+                let (loose_ok, pack_ok) = (req.accepts_loose, req.accepts_pack);
+                objects_post(ctx, b, stream, arena, loose_ok, pack_ok, keep).await
             }
         }
         // An unread POST body would be parsed as the next request: close instead.
-        Route::NotFound => not_found(ctx, stream, keep && req.method != Method::Post),
+        Route::NotFound => not_found(ctx, stream, keep && req.method != Method::Post).await,
     }
 }
 
-fn not_found(ctx: &Ctx, stream: &mut TcpStream, keep: bool) -> std::io::Result<bool> {
+/// A small plain-text response.
+async fn respond(
+    ctx: &Ctx,
+    stream: &TcpStream,
+    status: u16,
+    text: &str,
+    keep: bool,
+) -> std::io::Result<()> {
+    respond_text(stream, status, text, keep, ctx.deadlines.write).await
+}
+
+async fn not_found(ctx: &Ctx, stream: &TcpStream, keep: bool) -> std::io::Result<bool> {
     inc(&ctx.metrics.not_found);
-    respond_text(stream, 404, "not found\n", keep)?;
+    respond(ctx, stream, 404, "not found\n", keep).await?;
     Ok(keep)
 }
 
 /// The upstream could not supply a blob the store lacks (clients retry a 503).
-fn unavailable(ctx: &Ctx, stream: &mut TcpStream, keep: bool) -> std::io::Result<bool> {
+async fn unavailable(ctx: &Ctx, stream: &TcpStream, keep: bool) -> std::io::Result<bool> {
     inc(&ctx.metrics.unavailable);
-    respond_text(stream, 503, "blob unavailable upstream, retry\n", keep)?;
+    respond(ctx, stream, 503, "blob unavailable upstream, retry\n", keep).await?;
     Ok(keep)
 }
 
@@ -286,7 +306,7 @@ fn missing(ctx: &Ctx, generation: u64, count: usize, first: &Oid) {
 }
 
 /// A blob from the store's packs, else (if the store's trees name it) through the proxy.
-fn find_blob(ctx: &Ctx, view: &View, oid: &Oid) -> Blob {
+async fn find_blob(ctx: &Ctx, view: &View, oid: &Oid) -> Blob {
     let Some(set) = view.blobs.as_ref() else {
         return Blob::Unknown;
     };
@@ -308,7 +328,7 @@ fn find_blob(ctx: &Ctx, view: &View, oid: &Oid) -> Blob {
     let Some(proxy) = ctx.proxy.as_ref() else {
         return Blob::Failed;
     };
-    match proxy.fetch(std::slice::from_ref(oid)) {
+    match cold(proxy.fetch(std::slice::from_ref(oid))).await {
         Ok(mut v) => match v.pop() {
             Some((pack, rec)) => {
                 inc(&ctx.metrics.blobs_proxied);
@@ -324,44 +344,80 @@ fn find_blob(ctx: &Ctx, view: &View, oid: &Oid) -> Blob {
     }
 }
 
+/// Bytes hashed between budget checks.
+const HASH_STEP: usize = 64 << 10;
+
+/// Hashes `bytes` into `h`, yielding as `budget` says (one unit per 4 KiB: ~1.4 µs).
+async fn hash_into(h: &mut Sha1, bytes: &[u8], budget: &mut Budget) {
+    for chunk in bytes.chunks(HASH_STEP) {
+        h.update(chunk);
+        if budget.spend(super::budget::byte_units(chunk.len())) {
+            budget.pause().await;
+        }
+    }
+}
+
+/// File ranges at least this long leave with `sendfile(2)` ([`Out::mapped`]).
+const SENDFILE_MIN: u64 = 16 << 10;
+
+/// A small range of a mapped blob pack, copied into the response buffer without an
+/// `.await` (see `Out::put`); false if it is large, remote, or does not fit.
+#[inline]
+fn put_mapped(out: &mut Out<'_>, pack: &BlobPack, at: u64, len: u64) -> bool {
+    len < SENDFILE_MIN
+        && pack
+            .bytes()
+            .and_then(|b| crate::util::sub(b, us(at), us(len)))
+            .is_some_and(|r| out.put(r))
+}
+
+/// Bytes of a remote blob pack read per step (through the block cache or the store).
+const REMOTE_STEP: u64 = 1 << 20;
+
 /// Sends `len` bytes of a blob pack at `at` (mapped: `sendfile(2)` when large; remote: a
-/// ranged read, cold path), hashing them into `hash` when given.
-fn send_pack_range(
+/// step at a time, each read in a [`blocking`] section), hashing them into `hash` when
+/// given.
+async fn send_pack_range(
     out: &mut Out<'_>,
     pack: &BlobPack,
     at: u64,
     len: u64,
     mut hash: Option<&mut Sha1>,
+    budget: &mut Budget,
 ) -> std::io::Result<()> {
     if let Some(bytes) = pack.bytes() {
         if let Some(h) = hash {
-            h.update(
-                crate::util::sub(bytes, us(at), us(len))
-                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?,
-            );
+            let range = crate::util::sub(bytes, us(at), us(len))
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+            hash_into(h, range, budget).await;
         }
-        return out.mapped(pack.file(), bytes, at, len);
+        return out.mapped(pack.file(), bytes, at, len).await;
+    }
+    let mut buf = {
+        let _cold = gvfs_alloc_guard::cold_section();
+        vec![0u8; us(len.min(REMOTE_STEP))]
+    };
+    let mut pos = at;
+    let end = at.saturating_add(len);
+    while pos < end {
+        let n = end.saturating_sub(pos).min(REMOTE_STEP);
+        let piece = buf.get_mut(..us(n)).unwrap_or(&mut []);
+        cold(read_pack(pack, pos, piece))
+            .await
+            .map_err(super::httpd::other)?;
+        if let Some(h) = hash.as_mut() {
+            hash_into(h, piece, budget).await;
+        }
+        out.bytes(piece).await?;
+        pos = pos.saturating_add(n);
     }
     let _cold = gvfs_alloc_guard::cold_section();
-    let mut failed: Option<std::io::Error> = None;
-    let read = pack.read(at, len, &mut |chunk| {
-        if let Some(h) = hash.as_mut() {
-            h.update(chunk);
-        }
-        out.bytes(chunk).map_err(|e| {
-            let msg = e.to_string();
-            failed = Some(e);
-            crate::util::Error::new(msg)
-        })
-    });
-    if let Some(e) = failed {
-        return Err(e);
-    }
-    read.map_err(|e| std::io::Error::other(e.to_string()))
+    drop(buf);
+    Ok(())
 }
 
 /// Exactly `buf.len()` bytes of a blob pack at `at` (cold path for remote packs).
-fn read_pack(pack: &BlobPack, at: u64, buf: &mut [u8]) -> crate::util::Result<()> {
+async fn read_pack(pack: &BlobPack, at: u64, buf: &mut [u8]) -> crate::util::Result<()> {
     let mut n = 0usize;
     pack.read(at, u64_of(buf.len()), &mut |chunk| {
         let end = n.saturating_add(chunk.len());
@@ -370,7 +426,8 @@ fn read_pack(pack: &BlobPack, at: u64, buf: &mut [u8]) -> crate::util::Result<()
             .copy_from_slice(chunk);
         n = end;
         Ok(())
-    })?;
+    })
+    .await?;
     if n != buf.len() {
         crate::bail!("short blob pack read");
     }
@@ -379,10 +436,10 @@ fn read_pack(pack: &BlobPack, at: u64, buf: &mut [u8]) -> crate::util::Result<()
 
 /// A blob as a loose object: its entry's deflate blocks spliced between a stored block
 /// and the combined Adler-32, never inflated (a remote entry: only its ends are read).
-fn loose_blob(
+async fn loose_blob(
     ctx: &Ctx,
-    w: &mut super::Worker,
-    stream: &mut TcpStream,
+    b: &mut Bufs,
+    stream: &TcpStream,
     pack: &BlobPack,
     rec: &BlobRec,
     keep: bool,
@@ -392,35 +449,38 @@ fn loose_blob(
         Some(b) => crate::util::sub(b, us(zat), us(zlen))
             .and_then(|z| LooseSplice::plan(OBJ_BLOB, rec.size, z).ok()),
         None => {
-            let _cold = gvfs_alloc_guard::cold_section();
-            let (mut head, mut tail) = ([0u8; 2], [0u8; 4]);
-            read_pack(pack, zat, &mut head)
-                .and_then(|()| {
-                    read_pack(pack, zat.saturating_add(zlen).saturating_sub(4), &mut tail)
-                })
-                .ok()
-                .and_then(|()| {
-                    LooseSplice::plan_ends(OBJ_BLOB, rec.size, us(zlen), head, tail).ok()
-                })
+            cold(async {
+                let (mut head, mut tail) = ([0u8; 2], [0u8; 4]);
+                read_pack(pack, zat, &mut head).await.ok()?;
+                let tail_at = zat.saturating_add(zlen).saturating_sub(4);
+                read_pack(pack, tail_at, &mut tail).await.ok()?;
+                LooseSplice::plan_ends(OBJ_BLOB, rec.size, us(zlen), head, tail).ok()
+            })
+            .await
         }
     };
     let Some(plan) = plan else {
         inc(&ctx.metrics.errors);
-        respond_text(stream, 500, "blob unreadable\n", false)?;
+        respond(ctx, stream, 500, "blob unreadable\n", false).await?;
         return Ok(false);
     };
-    let mut out = Out::new(stream, &mut w.out);
+    let mut budget = Budget::new();
+    let mut out = Out::new(stream, &mut b.out, ctx.deadlines.write);
     out.head(200, CT_LOOSE, u64_of(plan.total_len()), keep)?;
-    out.bytes(plan.prefix())?;
-    send_pack_range(
-        &mut out,
-        pack,
+    if !out.put(plan.prefix()) {
+        out.bytes(plan.prefix()).await?;
+    }
+    let (at, n) = (
         zat.saturating_add(u64_of(plan.body_start)),
         u64_of(plan.body_end.saturating_sub(plan.body_start)),
-        None,
-    )?;
-    out.bytes(&plan.trailer)?;
-    out.flush()?;
+    );
+    if !put_mapped(&mut out, pack, at, n) {
+        send_pack_range(&mut out, pack, at, n, None, &mut budget).await?;
+    }
+    if !out.put(&plan.trailer) {
+        out.bytes(&plan.trailer).await?;
+    }
+    out.flush().await?;
     ctx.metrics.bytes_out.fetch_add(out.sent, Ordering::Relaxed);
     inc(&ctx.metrics.objects_out);
     Ok(keep)
@@ -436,17 +496,18 @@ fn own_pack(pack: &BlobPack, rec: &BlobRec) -> bool {
 
 /// A blob's own pack file as a one-blob pack response: its header and trailer were written
 /// when it was copied, so nothing is hashed (mapped: `sendfile(2)`; remote: ranged reads).
-fn whole_pack(
+async fn whole_pack(
     ctx: &Ctx,
-    w: &mut super::Worker,
-    stream: &mut TcpStream,
+    b: &mut Bufs,
+    stream: &TcpStream,
     pack: &BlobPack,
     keep: bool,
 ) -> std::io::Result<bool> {
-    let mut out = Out::new(stream, &mut w.out);
+    let mut budget = Budget::new();
+    let mut out = Out::new(stream, &mut b.out, ctx.deadlines.write);
     out.head(200, CT_PACK, pack.len, keep)?;
-    send_pack_range(&mut out, pack, 0, pack.len, None)?;
-    out.flush()?;
+    send_pack_range(&mut out, pack, 0, pack.len, None, &mut budget).await?;
+    out.flush().await?;
     ctx.metrics.bytes_out.fetch_add(out.sent, Ordering::Relaxed);
     inc(&ctx.metrics.objects_out);
     Ok(keep)
@@ -456,10 +517,10 @@ fn whole_pack(
 /// Stored entries are read in place; compressed ones are inflated from their start (cold
 /// path). `X-GVFS-Blob-Size` gives the blob's size.
 #[allow(clippy::too_many_arguments)]
-fn blob_range(
+async fn blob_range(
     ctx: &Ctx,
-    w: &mut super::Worker,
-    stream: &mut TcpStream,
+    b: &mut Bufs,
+    stream: &TcpStream,
     pack: &BlobPack,
     rec: &BlobRec,
     offset: u64,
@@ -467,7 +528,7 @@ fn blob_range(
     keep: bool,
 ) -> std::io::Result<bool> {
     if offset > rec.size {
-        respond_text(stream, 416, "offset beyond the blob\n", keep)?;
+        respond(ctx, stream, 416, "offset beyond the blob\n", keep).await?;
         return Ok(keep);
     }
     let len = length
@@ -479,7 +540,8 @@ fn blob_range(
         let _ = write!(cur, "X-GVFS-Blob-Size: {}\r\n", rec.size);
         usize::try_from(cur.position()).unwrap_or(0)
     };
-    let mut out = Out::new(stream, &mut w.out);
+    let mut budget = Budget::new();
+    let mut out = Out::new(stream, &mut b.out, ctx.deadlines.write);
     out.head_with(
         200,
         CT_BYTES,
@@ -489,65 +551,84 @@ fn blob_range(
     )?;
     if rec.stored {
         for (at, n) in rec.stored_range_iter(offset, len) {
-            send_pack_range(&mut out, pack, at, n, None)?;
+            send_pack_range(&mut out, pack, at, n, None, &mut budget).await?;
         }
     } else {
-        let _cold = gvfs_alloc_guard::cold_section();
-        inflate_range(&mut out, pack, rec, offset, len)?;
+        // Rare (a compressed blob read by range): its state lives on the heap.
+        cold(inflate_range(&mut out, pack, rec, offset, len, &mut budget)).await?;
     }
-    out.flush()?;
+    out.flush().await?;
     ctx.metrics.bytes_out.fetch_add(out.sent, Ordering::Relaxed);
     Ok(keep)
 }
 
-/// Inflates a compressed blob entry from its start, sending content `[offset, offset+len)`.
-fn inflate_range(
+/// Inflates a compressed blob entry from its start, sending content `[offset, offset+len)`
+/// (cold path: its buffers are allocated per request).
+async fn inflate_range(
     out: &mut Out<'_>,
     pack: &BlobPack,
     rec: &BlobRec,
     offset: u64,
     len: u64,
+    budget: &mut Budget,
 ) -> std::io::Result<()> {
-    let bad = |m: &str| std::io::Error::other(m.to_string());
+    let bad = |m: &str| super::httpd::other(m);
     let (zat, zlen) = rec.zlib();
-    let mut z = zlib_rs::Inflate::new(true, 15);
-    let mut chunk = vec![0u8; 256 << 10];
+    let (mut z, mut chunk, mut input) = {
+        let _cold = gvfs_alloc_guard::cold_section();
+        let input = match pack.bytes() {
+            Some(_) => Vec::new(),
+            None => vec![0u8; us(zlen.min(REMOTE_STEP))],
+        };
+        (zlib_rs::Inflate::new(true, 15), vec![0u8; 64 << 10], input)
+    };
     let (mut produced, end) = (0u64, offset.saturating_add(len));
-    let mut done = false;
-    let mut failed: Option<std::io::Error> = None;
-    let read = pack.read(zat, zlen, &mut |mut input| {
-        while !input.is_empty() && !done {
+    let mut pos = zat;
+    let zend = zat.saturating_add(zlen);
+    'stream: while pos < zend {
+        // The next piece of the entry: in place when mapped, else read (a blocking section).
+        let piece: &[u8] = match pack.bytes() {
+            Some(b) => crate::util::sub(b, us(pos), us(zend.saturating_sub(pos)))
+                .ok_or_else(|| bad("blob entry range"))?,
+            None => {
+                let n = zend.saturating_sub(pos).min(REMOTE_STEP);
+                let buf = input.get_mut(..us(n)).unwrap_or(&mut []);
+                cold(read_pack(pack, pos, buf))
+                    .await
+                    .map_err(super::httpd::other)?;
+                buf
+            }
+        };
+        pos = pos.saturating_add(u64_of(piece.len()));
+        let mut rest = piece;
+        while !rest.is_empty() {
             let (in0, out0) = (z.total_in(), z.total_out());
             let status = z
-                .decompress(input, &mut chunk, zlib_rs::InflateFlush::NoFlush)
-                .map_err(|_| crate::err!("corrupt blob entry"))?;
+                .decompress(rest, &mut chunk, zlib_rs::InflateFlush::NoFlush)
+                .map_err(|_| bad("corrupt blob entry"))?;
             let used = us(z.total_in().saturating_sub(in0));
             let made = z.total_out().saturating_sub(out0);
             let (lo, hi) = (produced.max(offset), produced.saturating_add(made).min(end));
             if lo < hi {
-                let piece = chunk
+                let part = chunk
                     .get(us(lo.saturating_sub(produced))..us(hi.saturating_sub(produced)))
-                    .ok_or_else(|| crate::err!("inflate range"))?;
-                if let Err(e) = out.bytes(piece) {
-                    let msg = e.to_string();
-                    failed = Some(e);
-                    crate::bail!("{msg}");
-                }
+                    .ok_or_else(|| bad("inflate range"))?;
+                out.bytes(part).await?;
             }
             produced = produced.saturating_add(made);
-            input = input.get(used..).unwrap_or(&[]);
+            rest = rest.get(used..).unwrap_or(&[]);
             if status == zlib_rs::Status::StreamEnd || produced >= end {
-                done = true;
+                break 'stream;
             } else if used == 0 && made == 0 {
-                crate::bail!("blob entry stream is stuck");
+                return Err(bad("blob entry stream is stuck"));
+            }
+            if budget.spend(64) {
+                budget.pause().await;
             }
         }
-        Ok(())
-    });
-    if let Some(e) = failed {
-        return Err(e);
     }
-    read.map_err(|e| bad(&e.to_string()))?;
+    let _cold = gvfs_alloc_guard::cold_section();
+    drop((z, chunk, input));
     if produced < end {
         return Err(bad("blob entry ended early"));
     }
@@ -557,10 +638,10 @@ fn inflate_range(
 /// `GPRE` + version + count, then per pack: timestamp, pack length, index length (-1 for
 /// none), the pack, and its `.idx` when `want_idx` (built once per plan).
 #[allow(clippy::too_many_arguments)]
-fn prefetch(
+async fn prefetch(
     ctx: &Ctx,
-    w: &mut super::Worker,
-    stream: &mut TcpStream,
+    b: &mut Bufs,
+    stream: &TcpStream,
     since: u64,
     want_idx: bool,
     want_sizes: bool,
@@ -568,9 +649,14 @@ fn prefetch(
 ) -> std::io::Result<bool> {
     let view = ctx.view();
     let sizes = want_sizes && view.blobs.is_some();
-    let (plan, start) = match view.prefetch(since) {
+    // A plan not built yet (a new snapshot's, before the warmer got to it) takes a while.
+    let answer = match view.prefetch_ready(since) {
+        Some(a) => a,
+        None => blocking(|| view.prefetch(since)),
+    };
+    let (plan, start) = match answer {
         Prefetch::UpToDate if sizes => {
-            let mut out = Out::new(stream, &mut w.out);
+            let mut out = Out::new(stream, &mut b.out, ctx.deadlines.write);
             let body: &[u8] = b"GPRE \x01\x00\x00GSZ1\0\0\0\0\0\0\0\0";
             out.head_with(
                 200,
@@ -579,26 +665,36 @@ fn prefetch(
                 keep,
                 b"X-GVFS-Sizes: 1\r\n",
             )?;
-            out.bytes(body)?;
-            out.flush()?;
+            out.bytes(body).await?;
+            out.flush().await?;
             return Ok(keep);
         }
         Prefetch::UpToDate => {
-            write_response(stream, 200, CT_PREFETCH, b"GPRE \x01\x00\x00", keep)?;
+            let t = ctx.deadlines.write;
+            write_response(stream, 200, CT_PREFETCH, b"GPRE \x01\x00\x00", keep, t).await?;
             return Ok(keep);
         }
         Prefetch::Pack(plan, start) => (plan, start),
     };
+    // The sections are built once per plan, usually by the warmer before anyone asks.
     let section: &[u8] = if sizes {
         ctx.sizes_wanted.store(true, Ordering::Relaxed);
-        plan.sizes_section()
+        if plan.sizes_ready() {
+            plan.sizes_section()
+        } else {
+            blocking(|| plan.sizes_section())
+        }
     } else {
         &[]
     };
     inc(&ctx.metrics.prefetch_packs);
     let idx = if want_idx {
         ctx.idx_wanted.store(true, Ordering::Relaxed);
-        plan.idx()
+        if plan.idx_ready() {
+            plan.idx()
+        } else {
+            blocking(|| plan.idx())
+        }
     } else {
         None
     };
@@ -631,7 +727,7 @@ fn prefetch(
         );
         usize::try_from(cur.position()).unwrap_or(0)
     };
-    let mut out = Out::new(stream, &mut w.out);
+    let mut out = Out::new(stream, &mut b.out, ctx.deadlines.write);
     out.head_with(
         200,
         CT_PREFETCH,
@@ -639,22 +735,31 @@ fn prefetch(
         keep,
         extra.get(..extra_len).unwrap_or(&[]),
     )?;
-    out.bytes(&head)?;
-    out.bytes(&plan.header)?;
+    if !(out.put(&head) && out.put(&plan.header)) {
+        return Err(super::httpd::other(
+            "prefetch head does not fit the output buffer",
+        ));
+    }
     for (slab, start, len) in plan.bodies() {
-        out.slab(slab, start, len)?;
+        out.slab(slab, start, len).await?;
     }
     // Computed once per plan; usually ready (warmed in the background) by now.
-    let trailer = plan.trailer();
-    out.bytes(&trailer)?;
+    let trailer = if plan.trailer_ready() {
+        plan.trailer()
+    } else {
+        blocking(|| plan.trailer())
+    };
+    out.bytes(&trailer).await?;
     // Mapped from a memfd when large: sent like the pack, not copied into the socket.
     if let Some(idx) = idx {
-        out.mapped(plan.idx_file(), idx, 0, u64_of(idx.len()))?;
+        out.mapped(plan.idx_file(), idx, 0, u64_of(idx.len()))
+            .await?;
     }
     if sizes {
-        out.mapped(plan.sizes_file(), section, 0, u64_of(section.len()))?;
+        out.mapped(plan.sizes_file(), section, 0, u64_of(section.len()))
+            .await?;
     }
-    out.flush()?;
+    out.flush().await?;
     ctx.metrics.bytes_out.fetch_add(out.sent, Ordering::Relaxed);
     ctx.metrics
         .objects_out
@@ -665,10 +770,10 @@ fn prefetch(
 /// A loose object: `zlib("<type> <size>\0" ++ content)`. Whole entries are spliced
 /// (stored block + original deflate blocks + combined Adler-32); deltas are resolved.
 #[allow(clippy::too_many_arguments)]
-fn loose(
+async fn loose(
     ctx: &Ctx,
-    w: &mut super::Worker,
-    stream: &mut TcpStream,
+    b: &mut Bufs,
+    stream: &TcpStream,
     view: &Arc<View>,
     k: u16,
     slot: u32,
@@ -676,10 +781,10 @@ fn loose(
     keep: bool,
 ) -> std::io::Result<bool> {
     let Some(slab) = view.all.get(usize::from(k)) else {
-        return not_found(ctx, stream, keep);
+        return not_found(ctx, stream, keep).await;
     };
     let Some(rec) = slab.rec(slot) else {
-        return not_found(ctx, stream, keep);
+        return not_found(ctx, stream, keep).await;
     };
     let entry = slab.entry(&rec).unwrap_or(&[]);
     let hdr_len = parse_entry_header(entry).map(|h| h.header_len).unwrap_or(0);
@@ -687,16 +792,24 @@ fn loose(
         if let Ok(plan) = LooseSplice::plan(rec.kind, rec.size, entry.get(hdr_len..).unwrap_or(&[]))
         {
             let zlib_at = rec.offset.saturating_add(u64_of(hdr_len));
-            let mut out = Out::new(stream, &mut w.out);
+            let mut out = Out::new(stream, &mut b.out, ctx.deadlines.write);
             out.head(200, CT_LOOSE, u64_of(plan.total_len()), keep)?;
-            out.bytes(plan.prefix())?;
-            out.slab(
-                slab,
+            if !out.put(plan.prefix()) {
+                out.bytes(plan.prefix()).await?;
+            }
+            let (at, n) = (
                 zlib_at.saturating_add(u64_of(plan.body_start)),
                 u64_of(plan.body_end.saturating_sub(plan.body_start)),
-            )?;
-            out.bytes(&plan.trailer)?;
-            out.flush()?;
+            );
+            let small = n < SENDFILE_MIN
+                && crate::util::sub(slab.pack(), us(at), us(n)).is_some_and(|b| out.put(b));
+            if !small {
+                out.slab(slab, at, n).await?;
+            }
+            if !out.put(&plan.trailer) {
+                out.bytes(&plan.trailer).await?;
+            }
+            out.flush().await?;
             ctx.metrics.bytes_out.fetch_add(out.sent, Ordering::Relaxed);
             inc(&ctx.metrics.objects_out);
             return Ok(keep);
@@ -707,12 +820,12 @@ fn loose(
     let arena = match arena {
         Some(a) => a,
         None => {
-            lease = ctx.arenas.lease(ctx.arena_wait);
+            lease = ctx.arenas.lease(ctx.arena_wait).await;
             match lease.as_mut().and_then(|l| l.arena()) {
                 Some(a) => a,
                 None => {
                     inc(&ctx.metrics.busy);
-                    respond_text(stream, 503, "busy\n", false)?;
+                    respond(ctx, stream, 503, "busy\n", false).await?;
                     return Ok(false);
                 }
             }
@@ -724,29 +837,39 @@ fn loose(
         deflater,
         ..
     } = arena;
-    let Ok((kind, content)) = resolver.resolve(slab, slot) else {
-        inc(&ctx.metrics.errors);
-        respond_text(stream, 500, "object unreadable\n", false)?;
-        return Ok(false);
+    // A large object's chain takes milliseconds to resolve and deflate: off the worker.
+    let mut work = || -> Result<usize, &'static str> {
+        let (kind, content) = resolver
+            .resolve(slab, slot)
+            .map_err(|_| "object unreadable\n")?;
+        let hdr = ObjectHeader::new(kind, u64_of(content.len()));
+        let bound = crate::zlib::compress_bound(content.len().saturating_add(hdr.as_slice().len()));
+        if buf.capacity() < bound {
+            // A larger object than any before: grow the arena once (cold path).
+            let _cold = gvfs_alloc_guard::cold_section();
+            buf.reserve(bound.saturating_sub(buf.len()));
+        }
+        buf.clear();
+        buf.resize(bound, 0);
+        deflater
+            .deflate_parts(&[hdr.as_slice(), content], buf)
+            .map_err(|_| "compression failed\n")
     };
-    let hdr = ObjectHeader::new(kind, u64_of(content.len()));
-    let bound = crate::zlib::compress_bound(content.len().saturating_add(hdr.as_slice().len()));
-    if buf.capacity() < bound {
-        // A larger object than any before: grow the arena once (cold path).
-        let _cold = gvfs_alloc_guard::cold_section();
-        buf.reserve(bound.saturating_sub(buf.len()));
-    }
-    buf.clear();
-    buf.resize(bound, 0);
-    let n = match deflater.deflate_parts(&[hdr.as_slice(), content], buf) {
+    let made = if rec.size >= RESOLVE_INLINE_MAX {
+        blocking(work)
+    } else {
+        work()
+    };
+    let n = match made {
         Ok(n) => n,
-        Err(_) => {
+        Err(why) => {
             inc(&ctx.metrics.errors);
-            respond_text(stream, 500, "compression failed\n", false)?;
+            respond(ctx, stream, 500, why, false).await?;
             return Ok(false);
         }
     };
-    write_response(stream, 200, CT_LOOSE, buf.get(..n).unwrap_or(&[]), keep)?;
+    let t = ctx.deadlines.write;
+    write_response(stream, 200, CT_LOOSE, buf.get(..n).unwrap_or(&[]), keep, t).await?;
     ctx.metrics
         .bytes_out
         .fetch_add(u64_of(n), Ordering::Relaxed);
@@ -755,28 +878,79 @@ fn loose(
     Ok(keep)
 }
 
+/// Objects at least this large are resolved in a [`blocking`] section (a delta chain of a
+/// large blob: milliseconds of inflating, applying and deflating).
+const RESOLVE_INLINE_MAX: u64 = 256 << 10;
+
 /// Every quoted 40-hex-digit string in `body`, appended to `out` up to its capacity.
 /// Returns false if `out` overflowed.
 pub fn scan_oids(body: &[u8], out: &mut Vec<Oid>) -> bool {
-    let mut i = 0usize;
+    let mut at = 0usize;
+    loop {
+        match scan_oids_step(body, &mut at, out, usize::MAX) {
+            Scan::More => {}
+            Scan::Done => return true,
+            Scan::Full => return false,
+        }
+    }
+}
+
+/// Where [`scan_oids_step`] stopped.
+pub enum Scan {
+    Done,
+    /// `max` ids taken; more may follow.
+    More,
+    /// `out` is full.
+    Full,
+}
+
+/// [`scan_oids`] from byte `*at`, stopping after `max` ids (so that a caller can yield).
+pub fn scan_oids_step(body: &[u8], at: &mut usize, out: &mut Vec<Oid>, max: usize) -> Scan {
+    let mut i = *at;
+    let mut taken = 0usize;
     while let Some(q) = body
         .get(i..)
         .and_then(|b| b.iter().position(|&c| c == b'"'))
     {
+        if taken >= max {
+            *at = i;
+            return Scan::More;
+        }
         let start = i.saturating_add(q).saturating_add(1);
         let end = start.saturating_add(40);
         if body.get(end) == Some(&b'"') {
             if let Some(oid) = body.get(start..end).and_then(Oid::from_hex) {
                 if !crate::util::try_push(out, oid) {
-                    return false;
+                    return Scan::Full;
                 }
+                taken = taken.saturating_add(1);
                 i = end.saturating_add(1);
                 continue;
             }
         }
         i = start;
     }
-    true
+    *at = body.len();
+    Scan::Done
+}
+
+/// Ids parsed between budget checks (~10 µs).
+const SCAN_STEP: usize = 256;
+
+/// [`scan_oids`], yielding as `budget` says.
+async fn scan_ids(body: &[u8], out: &mut Vec<Oid>, budget: &mut Budget) -> bool {
+    let mut at = 0usize;
+    loop {
+        match scan_oids_step(body, &mut at, out, SCAN_STEP) {
+            Scan::Done => return true,
+            Scan::Full => return false,
+            Scan::More => {
+                if budget.spend(64) {
+                    budget.pause().await;
+                }
+            }
+        }
+    }
 }
 
 /// The integer after `"key"` and a colon.
@@ -792,24 +966,26 @@ pub fn scan_number(body: &[u8], key: &[u8]) -> Option<u64> {
     std::str::from_utf8(rest.get(..digits)?).ok()?.parse().ok()
 }
 
-fn objects_post(
+#[allow(clippy::too_many_arguments)]
+async fn objects_post(
     ctx: &Ctx,
-    w: &mut super::Worker,
-    stream: &mut TcpStream,
+    b: &mut Bufs,
+    stream: &TcpStream,
     arena: &mut Arena,
     accepts_loose: bool,
     accepts_pack: bool,
     keep: bool,
 ) -> std::io::Result<bool> {
+    let mut budget = Budget::new();
     let depth = scan_number(&arena.body, b"\"commitDepth")
         .unwrap_or(1)
         .clamp(1, 1000);
-    if !scan_oids(&arena.body, &mut arena.oids) {
-        respond_text(stream, 413, "too many objects\n", keep)?;
+    if !scan_ids(&arena.body, &mut arena.oids, &mut budget).await {
+        respond(ctx, stream, 413, "too many objects\n", keep).await?;
         return Ok(keep);
     }
     if arena.oids.is_empty() {
-        respond_text(stream, 400, "no objectIds\n", keep)?;
+        respond(ctx, stream, 400, "no objectIds\n", keep).await?;
         return Ok(keep);
     }
     let view = ctx.view();
@@ -834,7 +1010,7 @@ fn objects_post(
                 let large_blob =
                     rec.is_some_and(|r| r.kind == OBJ_BLOB && r.size >= LOOSE_BLOB_MAX);
                 if accepts_loose && !is_commit && !(accepts_pack && large_blob) {
-                    return loose(ctx, w, stream, &view, k, slot, Some(arena), keep);
+                    return loose(ctx, b, stream, &view, k, slot, Some(arena), keep).await;
                 }
             }
             None => {
@@ -847,59 +1023,62 @@ fn objects_post(
                     if let Some((pack, rec)) = stored {
                         if own_pack(pack, &rec) {
                             inc(&ctx.metrics.blobs_store);
-                            return whole_pack(ctx, w, stream, pack, keep);
+                            return whole_pack(ctx, b, stream, pack, keep).await;
                         }
                     }
                 } else if let Some((pack, rec)) = stored {
                     inc(&ctx.metrics.blobs_store);
-                    return loose_blob(ctx, w, stream, pack, &rec, keep);
+                    return loose_blob(ctx, b, stream, pack, &rec, keep).await;
                 } else {
-                    match find_blob(ctx, &view, &oid) {
+                    match find_blob(ctx, &view, &oid).await {
                         Blob::Found(pack, rec) => {
-                            return loose_blob(ctx, w, stream, &pack, &rec, keep);
+                            return loose_blob(ctx, b, stream, &pack, &rec, keep).await;
                         }
-                        Blob::Failed => return unavailable(ctx, stream, keep),
+                        Blob::Failed => return unavailable(ctx, stream, keep).await,
                         Blob::Unknown => {}
                     }
                 }
             }
         }
     }
-    if let Err(miss) = take_stored_blobs(&view, arena) {
+    if let Err(miss) = take_stored_blobs(&view, arena, &mut budget).await {
         return match miss {
             Miss::Capacity => {
-                respond_text(stream, 413, "request expands beyond the arena\n", keep)?;
+                respond(ctx, stream, 413, "request expands beyond the arena\n", keep).await?;
                 Ok(keep)
             }
-            Miss::NotFound => not_found(ctx, stream, keep),
-            Miss::Broken => unavailable(ctx, stream, keep),
+            Miss::NotFound => not_found(ctx, stream, keep).await,
+            Miss::Broken => unavailable(ctx, stream, keep).await,
         };
     }
-    match plan_objects(&view, arena, depth) {
+    match plan_objects(&view, arena, depth, &mut budget).await {
         Ok(()) => {}
-        Err(Miss::NotFound) => return not_found(ctx, stream, keep),
+        Err(Miss::NotFound) => return not_found(ctx, stream, keep).await,
         Err(Miss::Capacity) => {
-            respond_text(stream, 413, "request expands beyond the arena\n", keep)?;
+            respond(ctx, stream, 413, "request expands beyond the arena\n", keep).await?;
             return Ok(keep);
         }
         Err(Miss::Broken) => {
             inc(&ctx.metrics.errors);
-            respond_text(stream, 500, "object unreadable\n", false)?;
+            respond(ctx, stream, 500, "object unreadable\n", false).await?;
             return Ok(false);
         }
     }
-    match plan_blobs(ctx, &view, arena) {
+    match plan_blobs(ctx, &view, arena, &mut budget).await {
         Ok(()) => {}
-        Err(Miss::NotFound) => return not_found(ctx, stream, keep),
+        Err(Miss::NotFound) => return not_found(ctx, stream, keep).await,
         Err(Miss::Capacity) => {
-            respond_text(stream, 413, "request expands beyond the arena\n", keep)?;
+            respond(ctx, stream, 413, "request expands beyond the arena\n", keep).await?;
             return Ok(keep);
         }
-        Err(Miss::Broken) => return unavailable(ctx, stream, keep),
+        Err(Miss::Broken) => return unavailable(ctx, stream, keep).await,
     }
-    let Ok(count) = arena.splice.plan(&view.all, arena.grow) else {
-        respond_text(stream, 413, "request expands beyond the arena\n", keep)?;
-        return Ok(keep);
+    let count = match lay_out(&view, arena, &mut budget).await {
+        Some(n) => n,
+        None => {
+            respond(ctx, stream, 413, "request expands beyond the arena\n", keep).await?;
+            return Ok(keep);
+        }
     };
     // Slab entries, then whole blob entries; the trailer is hashed as the bytes go out.
     let count = count.saturating_add(crate::util::u32_of(arena.blobs.len()));
@@ -913,19 +1092,33 @@ fn objects_post(
         .fold(0u64, u64::saturating_add);
     let mut h = Sha1::new();
     h.update(header);
-    let mut out = Out::new(stream, &mut w.out);
+    let mut out = Out::new(stream, &mut b.out, ctx.deadlines.write);
     out.head(200, CT_PACK, body_len.saturating_add(32), keep)?;
-    out.bytes(&header)?;
+    if !out.put(&header) {
+        out.bytes(&header).await?;
+    }
+    // Small pieces are hashed and copied without an `.await` (see `Out::put`).
     for p in &arena.splice.pieces {
         let bytes = piece_bytes(p, &view.all, &arena.splice.bytes)
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
-        h.update(bytes);
+        if bytes.len() <= HASH_STEP {
+            h.update(bytes);
+            if budget.spend(super::budget::byte_units(bytes.len())) {
+                budget.pause().await;
+            }
+        } else {
+            hash_into(&mut h, bytes, &mut budget).await;
+        }
+        let small = u64_of(bytes.len()) < SENDFILE_MIN && out.put(bytes);
+        if small {
+            continue;
+        }
         match *p {
             Piece::Slab { slab, start, len } => match view.all.get(usize::from(slab)) {
-                Some(s) => out.slab(s, start, len)?,
+                Some(s) => out.slab(s, start, len).await?,
                 None => return Err(std::io::ErrorKind::InvalidData.into()),
             },
-            Piece::Bytes { .. } => out.bytes(bytes)?,
+            Piece::Bytes { .. } => out.bytes(bytes).await?,
         }
     }
     let pack_of = |src: BlobSrc, rec: &BlobRec| match src {
@@ -943,16 +1136,70 @@ fn objects_post(
         }
         let pack = pack_of(*src, rec)
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
-        send_pack_range(&mut out, pack, rec.offset, rec.entry_len, Some(&mut h))?;
+        let small = pack
+            .bytes()
+            .filter(|_| rec.entry_len < SENDFILE_MIN)
+            .and_then(|b| crate::util::sub(b, us(rec.offset), us(rec.entry_len)));
+        if let Some(entry) = small {
+            h.update(entry);
+            if !out.put(entry) {
+                out.bytes(entry).await?;
+            }
+            if budget.spend(super::budget::byte_units(entry.len())) {
+                budget.pause().await;
+            }
+            continue;
+        }
+        send_pack_range(
+            &mut out,
+            pack,
+            rec.offset,
+            rec.entry_len,
+            Some(&mut h),
+            &mut budget,
+        )
+        .await?;
     }
     let trailer: [u8; 20] = h.finalize().into();
-    out.bytes(&trailer)?;
-    out.flush()?;
+    if !out.put(&trailer) {
+        out.bytes(&trailer).await?;
+    }
+    out.flush().await?;
     ctx.metrics.bytes_out.fetch_add(out.sent, Ordering::Relaxed);
     ctx.metrics
         .objects_out
         .fetch_add(u64::from(count), Ordering::Relaxed);
     Ok(keep)
+}
+
+/// Entries laid out between budget checks.
+const LAYOUT_STEP: usize = 512;
+
+/// Sorts more entries than this in a [`blocking`] section (a commit's expansion: hundreds
+/// of thousands of trees).
+const SORT_INLINE_MAX: usize = 50_000;
+
+/// The splice's layout ([`crate::splice::ObjectSplice::plan`]) in steps; `None` if it
+/// outgrows the arena.
+async fn lay_out(view: &View, arena: &mut Arena, budget: &mut Budget) -> Option<u32> {
+    let grow = arena.grow;
+    let splice = &mut arena.splice;
+    if splice.refs.len() > SORT_INLINE_MAX {
+        blocking(|| splice.plan_begin());
+    } else {
+        splice.plan_begin();
+    }
+    loop {
+        match splice.plan_step(&view.all, grow, LAYOUT_STEP) {
+            Ok(Some(n)) => return Some(n),
+            Ok(None) => {
+                if budget.spend(64) {
+                    budget.pause().await;
+                }
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 enum Miss {
@@ -965,7 +1212,12 @@ enum Miss {
 /// parents and every tree reachable from each commit (the GVFS protocol's expansion).
 /// In a separate-blob store, leaves in `arena.oids` only the ids no slab has, for
 /// [`plan_blobs`].
-fn plan_objects(view: &View, arena: &mut Arena, depth: u64) -> Result<(), Miss> {
+async fn plan_objects(
+    view: &View,
+    arena: &mut Arena,
+    depth: u64,
+    budget: &mut Budget,
+) -> Result<(), Miss> {
     let Arena {
         oids,
         oid_at,
@@ -999,10 +1251,16 @@ fn plan_objects(view: &View, arena: &mut Arena, depth: u64) -> Result<(), Miss> 
         if i < found.capacity() {
             found.push(hit);
         }
+        if budget.due() {
+            budget.pause().await;
+        }
     }
     let grow = *grow;
     let mut rest = 0usize;
     for i in 0..oids.len() {
+        if budget.due() {
+            budget.pause().await;
+        }
         let Some(&oid) = oids.get(i) else { break };
         let hit = match found.get(i) {
             Some(&hit) => hit,
@@ -1042,6 +1300,9 @@ fn plan_objects(view: &View, arena: &mut Arena, depth: u64) -> Result<(), Miss> 
         for _level in 0..depth {
             next_commits.clear();
             for j in 0..commits.len() {
+                if budget.spend(8) {
+                    budget.pause().await;
+                }
                 let Some(&c) = commits.get(j) else { break };
                 if !visited.insert_grow(&c, grow).map_err(|_| Miss::Capacity)? {
                     continue;
@@ -1072,6 +1333,9 @@ fn plan_objects(view: &View, arena: &mut Arena, depth: u64) -> Result<(), Miss> 
             }
             // Every tree of this level's commits.
             while let Some(t) = work.pop() {
+                if budget.spend(8) {
+                    budget.pause().await;
+                }
                 if !visited.insert_grow(&t, grow).map_err(|_| Miss::Capacity)? {
                     continue;
                 }
@@ -1121,7 +1385,11 @@ fn plan_objects(view: &View, arena: &mut Arena, depth: u64) -> Result<(), Miss> 
 /// `arena.oids`, with their request positions in `arena.oid_at`: commits and trees for
 /// [`plan_objects`], blobs only the upstream has for [`plan_blobs`] (which also drops
 /// repeated ids).
-fn take_stored_blobs(view: &View, arena: &mut Arena) -> Result<(), Miss> {
+async fn take_stored_blobs(
+    view: &View,
+    arena: &mut Arena,
+    budget: &mut Budget,
+) -> Result<(), Miss> {
     let Some(set) = view.blobs.as_ref() else {
         return Ok(());
     };
@@ -1134,6 +1402,9 @@ fn take_stored_blobs(view: &View, arena: &mut Arena) -> Result<(), Miss> {
     oid_at.clear();
     let mut rest = 0usize;
     for i in 0..oids.len() {
+        if budget.due() {
+            budget.pause().await;
+        }
         let Some(&oid) = oids.get(i) else { break };
         // Ahead of `i`: not yet moved by the compaction (it writes at `rest <= i`).
         if let Some(next) = oids.get(i.saturating_add(AHEAD)) {
@@ -1166,7 +1437,12 @@ fn take_stored_blobs(view: &View, arena: &mut Arena) -> Result<(), Miss> {
 /// `arena.oids`); then, from the upstream in one request, the rest (only blobs the store's
 /// trees name; anything else is not found). Sealed trees' blobs a complete store lacks are
 /// counted as missing.
-fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
+async fn plan_blobs(
+    ctx: &Ctx,
+    view: &View,
+    arena: &mut Arena,
+    budget: &mut Budget,
+) -> Result<(), Miss> {
     let Some(set) = view.blobs.as_ref() else {
         return Ok(());
     };
@@ -1180,6 +1456,9 @@ fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
     } = arena;
     let mut kept = 0usize;
     for i in 0..blobs.len() {
+        if budget.due() {
+            budget.pause().await;
+        }
         let Some(oid) = blobs.get(i).map(|b| b.2.oid) else {
             break;
         };
@@ -1197,6 +1476,9 @@ fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
     let from_store = u64_of(kept);
     let (mut unresolved, mut from_cache) = (0usize, 0u64);
     for (j, oid) in oids.iter().enumerate() {
+        if budget.due() {
+            budget.pause().await;
+        }
         if !blob_seen
             .insert_grow(oid, true)
             .map_err(|_| Miss::Capacity)?
@@ -1231,7 +1513,24 @@ fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
     if unresolved == 0 {
         return Ok(());
     }
-    let _cold = gvfs_alloc_guard::cold_section();
+    // Blobs only the upstream has (the L0 overlay's, or a fault): a cold section.
+    cold(fetch_unresolved(
+        ctx, view, set, oids, blobs, proxied, unresolved,
+    ))
+    .await
+}
+
+/// The requested blobs neither the store nor the proxy cache had: from the upstream in one
+/// request (only blobs the store's trees name; anything else is not found).
+async fn fetch_unresolved(
+    ctx: &Ctx,
+    view: &View,
+    set: &super::blobs::BlobSet,
+    oids: &[Oid],
+    blobs: &mut Vec<(u32, BlobSrc, BlobRec)>,
+    proxied: &mut Vec<Arc<BlobPack>>,
+    unresolved: usize,
+) -> Result<(), Miss> {
     let mut have: std::collections::HashSet<Oid> = blobs.iter().map(|b| b.2.oid).collect();
     let mut need = Vec::with_capacity(unresolved);
     for oid in oids.iter() {
@@ -1250,7 +1549,7 @@ fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
     }
     // Named by trees but not in the store: only the upstream has them.
     let proxy = ctx.proxy.as_ref().ok_or(Miss::Broken)?;
-    let got = proxy.fetch(&need).map_err(|e| {
+    let got = proxy.fetch(&need).await.map_err(|e| {
         crate::log!("serve: proxying {} blobs failed: {e}", need.len());
         Miss::Broken
     })?;
@@ -1274,7 +1573,7 @@ const AHEAD: usize = 16;
 
 /// The size of an object no slab and no blob pack has: a blob the trees name (sizes
 /// tables), or known to the upstream.
-fn size_outside_slabs(ctx: &Ctx, view: &View, oid: &Oid) -> Option<u64> {
+async fn size_outside_slabs(ctx: &Ctx, view: &View, oid: &Oid) -> Option<u64> {
     if let Some(s) = view.blob_size(oid) {
         return Some(s);
     }
@@ -1282,23 +1581,23 @@ fn size_outside_slabs(ctx: &Ctx, view: &View, oid: &Oid) -> Option<u64> {
     if let Some((_, r)) = proxy.cached(oid) {
         return Some(r.size);
     }
-    proxy
-        .sizes(std::slice::from_ref(oid))
+    cold(proxy.sizes(std::slice::from_ref(oid)))
+        .await
         .ok()?
         .first()
         .copied()
         .flatten()
 }
 
-fn sizes(
+async fn sizes(
     ctx: &Ctx,
-    _w: &mut super::Worker,
-    stream: &mut TcpStream,
+    stream: &TcpStream,
     arena: &mut Arena,
     keep: bool,
 ) -> std::io::Result<bool> {
-    if !scan_oids(&arena.body, &mut arena.oids) {
-        respond_text(stream, 413, "too many objects\n", keep)?;
+    let mut budget = Budget::new();
+    if !scan_ids(&arena.body, &mut arena.oids, &mut budget).await {
+        respond(ctx, stream, 413, "too many objects\n", keep).await?;
         return Ok(keep);
     }
     let view = ctx.view();
@@ -1307,6 +1606,9 @@ fn sizes(
     let mut ok = out.capacity() > 2;
     out.push(b'[');
     for (i, oid) in oids.iter().enumerate() {
+        if budget.due() {
+            budget.pause().await;
+        }
         if let Some(next) = oids.get(i.saturating_add(AHEAD)) {
             match view.blobs.as_ref() {
                 Some(set) => set.preload(next),
@@ -1322,42 +1624,51 @@ fn sizes(
                     .and_then(|s| s.rec(slot))
                     .map(|r| r.size)
                     .unwrap_or(0),
-                None => match size_outside_slabs(ctx, &view, oid) {
+                None => match size_outside_slabs(ctx, &view, oid).await {
                     Some(s) => s,
-                    None => return not_found(ctx, stream, keep),
+                    None => return not_found(ctx, stream, keep).await,
                 },
             },
         };
-        let hex = oid.to_hex();
-        let mut digits = [0u8; 20];
-        let digits = crate::util::decimal(size, &mut digits);
-        // `,{"Id":"<40 hex>","Size":<digits>}` built on the stack with constant-length copies.
-        let mut item = [0u8; 80];
-        let mut n = 0usize;
-        let mut put = |src: &[u8]| {
-            let end = n.saturating_add(src.len());
-            if let Some(dst) = item.get_mut(n..end) {
-                dst.copy_from_slice(src);
-                n = end;
-            }
-        };
-        if i != 0 {
-            put(b",");
-        }
-        put(b"{\"Id\":\"");
-        put(&hex);
-        put(b"\",\"Size\":");
-        put(digits);
-        put(b"}");
-        ok &= crate::util::try_extend(out, item.get(..n).unwrap_or(&[]));
+        ok &= size_item(out, i == 0, oid, size);
     }
     ok &= crate::util::try_push(out, b']');
     if !ok {
-        respond_text(stream, 413, "response too large\n", keep)?;
+        respond(ctx, stream, 413, "response too large\n", keep).await?;
         return Ok(keep);
     }
-    write_response(stream, 200, CT_JSON, out, keep)?;
+    write_response(stream, 200, CT_JSON, out, keep, ctx.deadlines.write).await?;
     Ok(keep)
+}
+
+/// `,{"Id":"<40 hex>","Size":<digits>}` (no comma first) onto `out`; false if it does not
+/// fit. Every copy has a constant length (the digits' right-aligned 20-byte buffer goes in
+/// whole, first, and the fixed parts over its leading bytes): copies of a length known only
+/// at run time are `memmove` calls, five per id (17% of a 4,000-id request).
+fn size_item(out: &mut Vec<u8>, first: bool, oid: &Oid, size: u64) -> bool {
+    const HEAD: &[u8; 8] = b",{\"Id\":\"";
+    const MID: &[u8; 9] = b"\",\"Size\":";
+    let mut digits = [0u8; 20];
+    let d = crate::util::decimal(size, &mut digits).len();
+    let mut item = [0u8; 80];
+    let end = 57usize.saturating_add(d);
+    if let Some(dst) = item.get_mut(end.saturating_sub(20)..end) {
+        dst.copy_from_slice(&digits);
+    }
+    if let Some(dst) = item.get_mut(..8) {
+        dst.copy_from_slice(HEAD);
+    }
+    if let Some(dst) = item.get_mut(8..48) {
+        dst.copy_from_slice(&oid.to_hex());
+    }
+    if let Some(dst) = item.get_mut(48..57) {
+        dst.copy_from_slice(MID);
+    }
+    if let Some(b) = item.get_mut(end) {
+        *b = b'}';
+    }
+    let from = usize::from(first);
+    crate::util::try_extend(out, item.get(from..end.saturating_add(1)).unwrap_or(&[]))
 }
 
 #[cfg(test)]
@@ -1415,5 +1726,19 @@ mod tests {
         assert_eq!(scan_number(body.as_bytes(), b"\"commitDepth"), Some(3));
         let mut one = Vec::with_capacity(1);
         assert!(!scan_oids(body.as_bytes(), &mut one));
+        let mut out = Vec::with_capacity(256);
+        assert!(size_item(&mut out, true, &Oid([0xab; 20]), 0));
+        assert!(size_item(&mut out, false, &Oid([0x01; 20]), u64::MAX));
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!(
+                "{{\"Id\":\"{}\",\"Size\":0}},{{\"Id\":\"{}\",\"Size\":{}}}",
+                "ab".repeat(20),
+                "01".repeat(20),
+                u64::MAX
+            )
+        );
+        let mut tight = Vec::with_capacity(10);
+        assert!(!size_item(&mut tight, true, &Oid([0xab; 20]), 7));
     }
 }

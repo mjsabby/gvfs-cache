@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""The tokio spike (`opus/examples/spike_tokio.rs`) against today's thread-per-request edge
-(`gvfs-daemon serve`), on one store.
+"""The edge's connection layer, A/B: the thread-per-request edge (`threads`, before the port),
+the tokio edge (`tokio`), and the spike's variants (`opus/examples/spike_tokio.rs`: `own`,
+`hyper`, `own-blk`, `own-nice`, `own-yield`), on one store.
 
     python3 bench/spike_tokio.py check --dir ~/gvfs-bench/prof/sg7-sep
     python3 bench/spike_tokio.py bench --dir ~/gvfs-bench/prof/sg7-sep --rounds 3
+    python3 bench/spike_tokio.py bench --dir ~/gvfs-bench/prof/sg7-sep \
+        --variants threads,own,hyper,own-blk,own-nice,own-yield     # REPORT.md §14's spike
 
-`check`: each spike variant answers the same requests with the same status, content type,
-length and body as `gvfs-daemon serve`: config, blobs (GET), commits and trees (GET, whole
+`check`: the tokio edge and each spike variant answer the same requests with the same
+status, content type, length and body as the thread-per-request edge: config, blobs (GET), commits and trees (GET, whole
 entries), unknown ids, up-to-date prefetches, cold and warm prefetches with and without
 sizes and `.idx`, sizes batches.
 
@@ -39,8 +42,12 @@ from gvfslib import clean_env, free_port, metrics, request, wait_http  # noqa: E
 from profile_bpf import LOADGEN_CPUS, OUT, SERVER_CPUS, cpu_seconds, loadgen_starter, wait_load  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-THREADS_BIN = os.path.join(REPO, "opus/target/release/gvfs-daemon")
+# `threads`: the thread-per-request edge (before the tokio port, commit 5dada58); `tokio`: the
+# edge as built now. Both run `gvfs-daemon serve` (env THREADS_BIN / TOKIO_BIN).
+THREADS_BIN = os.environ.get("THREADS_BIN", os.path.expanduser("~/gvfs-bench/prof/bin/gvfs-daemon-threads"))
+TOKIO_BIN = os.environ.get("TOKIO_BIN", os.path.join(REPO, "opus/target/release/gvfs-daemon"))
 SPIKE_BIN = os.path.join(REPO, "opus/target/release/examples/spike_tokio")
+DAEMONS = {"threads": THREADS_BIN, "tokio": TOKIO_BIN}
 CLIENT_CPUS = os.environ.get("CLIENT_CPUS", "4-7,20-23")
 GIT_UA = "git/2.53.0.vfs.0.0"
 UP_TO_DATE = 9999999999
@@ -56,9 +63,13 @@ def cpus(spec):
 
 def command(variant, store, port, cache, idle):
     bind = f"127.0.0.1:{port}"
-    if variant == "threads":
-        return [THREADS_BIN, "serve", "--store", f"fs:{store}", "--bind", bind, "--cache-dir", cache,
-                "--alloc-guard", "count", "--idle-secs", str(idle)]
+    if variant in DAEMONS:
+        cmd = [DAEMONS[variant], "serve", "--store", f"fs:{store}", "--bind", bind, "--cache-dir", cache,
+               "--alloc-guard", "count", "--idle-secs", str(idle)]
+        # The runtime's threads: one per edge CPU (the thread-per-request edge keeps its 256);
+        # TOKIO_EXTRA: more flags (e.g. `--quantum-us 50`).
+        extra = ["--workers", str(len(cpus(SERVER_CPUS)))] + os.environ.get("TOKIO_EXTRA", "").split()
+        return cmd + (extra if variant == "tokio" else [])
     mode, _, heavy = variant.partition("-")
     cmd = [SPIKE_BIN, "--mode", mode, "--store", f"fs:{store}", "--bind", bind, "--cache-dir", cache,
            "--threads", str(len(cpus(SERVER_CPUS))), "--idle-secs", str(idle)]
@@ -111,7 +122,7 @@ def stream(port, path, headers):
 def check(a):
     store, up = os.path.join(a.dir, "store"), os.path.join(a.dir, "up.git")
     blobs = [x for x in open(os.path.join(a.dir, "blobs.txt")).read().split() if x]
-    variants = ("threads", "own", "hyper")
+    variants = ("threads", "tokio", "own", "hyper")
     servers = {v: start(v, store) for v in variants}
     rnd = random.Random(7)
     reqs = [("GET", "/gvfs/config", None, {}), ("GET", "/healthz", None, {})]
@@ -222,7 +233,18 @@ def workloads(blobs):
     w["cold_clone_8"] = [("cold", cold, 8)]
     w["sizes_4000_32"] = [("sizes", sizes, 32)]
     w["mixed_get64_sizes32"] = [("sizes", sizes, 32), ("get", get, 64)]
+    # POST /gvfs/objects (not in the spike: `gvfs-daemon serve` only).
+    post = ["--workload", "post-objects", "--oids", blobs, "--batch", "4000", "--bodies", "512"]
+    w["post_4000_32"] = [("post", post, 32)]
+    w["mixed_get64_post32"] = [("post", post, 32), ("get", get, 64)]
     return w
+
+
+def runs(variant, work):
+    """Whether `variant` serves workload `work`."""
+    if work.startswith(("post", "mixed_get64_post")):
+        return variant in DAEMONS
+    return "-" not in variant or "sizes" in work
 
 
 def slow_reader(port, stop_evt, started):
@@ -323,7 +345,7 @@ def bench(a):
             for n in names:
                 k = rnd % len(variants)
                 for v in variants[k:] + variants[:k]:
-                    if "-" in v and "sizes" not in n:
+                    if not runs(v, n):
                         continue
                     p, port = servers[v]
                     res = run_loads(port, p.pid, work[n], a.secs)
@@ -360,9 +382,10 @@ def summarize(results):
             o = x["loads"].get(main)
             return o.get(key) if o else 0
         extra = ""
-        if "sizes" in xs[0]["loads"] and main != "sizes":
-            extra = f"sizes {med(lambda x: x['loads']['sizes']['ok_rps'] if x['loads'].get('sizes') else 0):.0f}/s " \
-                    f"p99 {med(lambda x: x['loads']['sizes']['p99_us'] if x['loads'].get('sizes') else 0):.0f}us"
+        for heavy in ("sizes", "post"):
+            if heavy in xs[0]["loads"] and main != heavy:
+                extra = f"{heavy} {med(lambda x: x['loads'][heavy]['ok_rps'] if x['loads'].get(heavy) else 0):.0f}/s " \
+                        f"p99 {med(lambda x: x['loads'][heavy]['p99_us'] if x['loads'].get(heavy) else 0):.0f}us"
         if "kb_per_idle_conn" in xs[0]:
             extra = f"anon rss {med(lambda x: x['anon_before_mb']):.0f} -> {med(lambda x: x['anon_idle_mb']):.0f} MB, " \
                     f"{med(lambda x: x['kb_per_idle_conn']):.1f} KB/conn"
@@ -382,7 +405,7 @@ def main():
     c.add_argument("--dir", required=True)
     b = sub.add_parser("bench")
     b.add_argument("--dir", required=True)
-    b.add_argument("--variants", default="threads,own,hyper,own-blk,own-nice,own-yield")
+    b.add_argument("--variants", default="threads,tokio")
     b.add_argument("--rounds", type=int, default=3)
     b.add_argument("--secs", type=float, default=10)
     b.add_argument("--only", default=None)

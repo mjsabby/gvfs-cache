@@ -141,6 +141,21 @@ impl Store {
         }
     }
 
+    /// [`Store::read_range`] for the edge while it serves: object storage through the async
+    /// client (the task waits, not its thread); a directory store reads its file here.
+    pub async fn read_range_async(
+        &self,
+        key: &str,
+        offset: u64,
+        len: u64,
+        sink: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
+    ) -> Result<()> {
+        match self {
+            Store::Fs(_) => self.read_range(key, offset, len, &mut |b| sink(b)),
+            Store::Azure(a) => a.read_range_async(key, offset, len, sink).await,
+        }
+    }
+
     /// A streaming upload of an immutable object: it appears, whole, at
     /// [`StoreWriter::finish`] (never partially); dropped unfinished, it never appears.
     pub fn writer(&self, key: &str) -> Result<StoreWriter<'_>> {

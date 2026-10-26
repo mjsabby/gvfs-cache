@@ -1,19 +1,26 @@
-//! The server side of HTTP/1.1, in-house: just what the GVFS protocol needs.
+//! The server side of HTTP/1.1, in-house: just what the GVFS protocol needs, on tokio
+//! sockets.
 //!
-//! Request heads are parsed in a per-worker buffer into ranges (no allocation); bodies
-//! (Content-Length or chunked) are read into the request arena; response heads are
+//! Request heads are parsed in the connection's head buffer into ranges (no allocation);
+//! bodies (Content-Length or chunked) are read into the request arena; response heads are
 //! formatted on the stack. [`Out`] coalesces small pieces into one buffer and sends large
-//! file-backed slab ranges with `sendfile(2)` straight from the page cache.
+//! file-backed ranges with `sendfile(2)` straight from the page cache whenever the socket
+//! is writable: a slow reader parks its task, never a thread. Every wait has a deadline
+//! ([`Deadlines`]).
 
 use std::fs::File;
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::future::Future;
+use std::io::Write;
 use std::os::fd::AsFd;
+use std::time::Duration;
+
+use tokio::io::Interest;
+use tokio::net::TcpStream;
 
 use crate::slab::Slab;
 
 pub const HEAD_MAX: usize = 16 << 10;
-/// Slab ranges at least this long go out with sendfile.
+/// File ranges at least this long go out with sendfile.
 const SENDFILE_MIN: u64 = 16 << 10;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -24,7 +31,7 @@ pub enum Method {
     Other,
 }
 
-/// A parsed request head; byte ranges point into the worker's head buffer.
+/// A parsed request head; byte ranges point into the connection's head buffer.
 #[derive(Clone, Copy, Debug)]
 pub struct Request {
     pub method: Method,
@@ -46,21 +53,27 @@ pub struct Request {
     pub head_len: usize,
 }
 
-/// The worker's input buffer: a request head plus whatever followed it on the wire.
+/// How long a connection may wait for its client.
+#[derive(Clone, Copy, Debug)]
+pub struct Deadlines {
+    /// Between requests (`--idle-secs`).
+    pub idle: Duration,
+    /// For the rest of a request once it has begun (head or body).
+    pub patience: Duration,
+    /// For the client to take more of a response.
+    pub write: Duration,
+}
+
+/// A connection's head buffer: a request head plus whatever followed it on the wire.
 pub struct Input {
     pub buf: Vec<u8>,
     pub filled: usize,
-    /// How long a client may pause in the middle of a request (head or body). Between
-    /// requests the socket's read timeout is the much shorter linger (see `serve`).
-    pub patience: std::time::Duration,
-    /// The socket's read timeout is currently `patience` (a request is in progress).
-    pub patient: bool,
 }
 
 /// What [`read_head`] found on a connection.
 pub enum Head {
     Request(Request),
-    /// No request arrived within the read timeout and nothing is buffered.
+    /// Woken with nothing to read and nothing buffered (the connection is still idle).
     Idle,
     /// The client closed the connection between requests.
     Closed,
@@ -71,18 +84,7 @@ impl Input {
         Input {
             buf: vec![0u8; HEAD_MAX],
             filled: 0,
-            patience: std::time::Duration::from_secs(30),
-            patient: false,
         }
-    }
-
-    /// Switches the socket to the mid-request read timeout (once per request).
-    pub fn be_patient(&mut self, stream: &TcpStream) -> std::io::Result<()> {
-        if !self.patient {
-            stream.set_read_timeout(Some(self.patience))?;
-            self.patient = true;
-        }
-        Ok(())
     }
 
     pub fn bytes(&self, r: (usize, usize)) -> &[u8] {
@@ -103,48 +105,45 @@ impl Default for Input {
     }
 }
 
-/// Reads one request head: [`Head::Idle`] when no request arrives within the socket's read
-/// timeout, [`Head::Closed`] on a clean close between requests.
-pub fn read_head(stream: &mut TcpStream, input: &mut Input) -> std::io::Result<Head> {
+/// `f`, or `TimedOut` once `t` has passed.
+pub async fn within(
+    t: Duration,
+    f: impl Future<Output = std::io::Result<()>>,
+) -> std::io::Result<()> {
+    match tokio::time::timeout(t, f).await {
+        Ok(r) => r,
+        Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+    }
+}
+
+/// Reads one request head: [`Head::Idle`] if nothing is readable after all, [`Head::Closed`]
+/// on a clean close between requests. Once part of a head is here, the rest must follow
+/// within `patience`.
+pub async fn read_head(
+    stream: &TcpStream,
+    input: &mut Input,
+    patience: Duration,
+) -> std::io::Result<Head> {
     loop {
         if let Some(end) = find_head_end(input.buf.get(..input.filled).unwrap_or(&[])) {
             return parse_head(input.buf.get(..end).unwrap_or(&[]), end).map(Head::Request);
         }
         if input.filled >= input.buf.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "request head too large",
-            ));
+            return Err(bad("request head too large"));
         }
-        let n = match stream.read(input.buf.get_mut(input.filled..).unwrap_or(&mut [])) {
-            Ok(n) => n,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
+        match stream.try_read(input.buf.get_mut(input.filled..).unwrap_or(&mut [])) {
+            Ok(0) if input.filled == 0 => return Ok(Head::Closed),
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => input.filled = input.filled.saturating_add(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if input.filled == 0 {
                     return Ok(Head::Idle);
                 }
-                if input.patient {
-                    return Err(e);
-                }
-                // Part of a head is here: wait for the rest with the mid-request timeout.
-                input.be_patient(stream)?;
-                continue;
+                within(patience, stream.readable()).await?;
             }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
-        };
-        if n == 0 {
-            return if input.filled == 0 {
-                Ok(Head::Closed)
-            } else {
-                Err(std::io::ErrorKind::UnexpectedEof.into())
-            };
         }
-        input.filled = input.filled.saturating_add(n);
     }
 }
 
@@ -155,8 +154,17 @@ pub fn find_head_end(b: &[u8]) -> Option<usize> {
         .and_then(|p| p.checked_add(4))
 }
 
-fn bad(msg: &'static str) -> std::io::Error {
+/// An `InvalidData` error with `msg`, built in a cold section: a malformed request is no
+/// reason to fail the allocator's hot-path check (a strict-mode edge would abort).
+pub fn bad(msg: &'static str) -> std::io::Error {
+    let _cold = gvfs_alloc_guard::cold_section();
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
+}
+
+/// [`std::io::Error::other`] with `msg`, built in a cold section (see [`bad`]).
+pub fn other(msg: impl std::fmt::Display) -> std::io::Error {
+    let _cold = gvfs_alloc_guard::cold_section();
+    std::io::Error::other(msg.to_string())
 }
 
 /// Parses a whole request head (`head_len` bytes, as [`find_head_end`] measured).
@@ -254,22 +262,21 @@ pub fn parse_head(head: &[u8], head_len: usize) -> std::io::Result<Request> {
 
 /// Reads the request body into `body` (whose capacity bounds it). Returns false if the
 /// body does not fit (the caller answers 413 and closes).
-pub fn read_body(
-    stream: &mut TcpStream,
+pub async fn read_body(
+    stream: &TcpStream,
     input: &mut Input,
     req: &Request,
     body: &mut Vec<u8>,
+    d: &Deadlines,
 ) -> std::io::Result<bool> {
     body.clear();
     if req.expect_continue {
-        stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")?;
+        write_all(stream, b"HTTP/1.1 100 Continue\r\n\r\n", d.write).await?;
     }
     input.consume(req.head_len);
-    // A body may take a while to arrive (a large POST over a slow link).
-    input.be_patient(stream)?;
     if req.chunked {
         loop {
-            let n = line_len(stream, input)?;
+            let n = line_len(stream, input, d.patience).await?;
             let line = input.buf.get(..n).unwrap_or(&[]);
             let hex = line
                 .split(|&b| b == b';')
@@ -284,7 +291,7 @@ pub fn read_body(
             if size == 0 {
                 // Trailers, then the empty line.
                 loop {
-                    let t = line_len(stream, input)?;
+                    let t = line_len(stream, input, d.patience).await?;
                     input.consume(t.saturating_add(2));
                     if t == 0 {
                         return Ok(true);
@@ -294,8 +301,8 @@ pub fn read_body(
             if body.len().saturating_add(size) > body.capacity() {
                 return Ok(false);
             }
-            read_exact_into(stream, input, body, size)?;
-            if line_len(stream, input)? != 0 {
+            read_exact_into(stream, input, body, size, d.patience).await?;
+            if line_len(stream, input, d.patience).await? != 0 {
                 return Err(bad("missing chunk terminator"));
             }
             input.consume(2);
@@ -305,12 +312,16 @@ pub fn read_body(
     if len > body.capacity() {
         return Ok(false);
     }
-    read_exact_into(stream, input, body, len)?;
+    read_exact_into(stream, input, body, len, d.patience).await?;
     Ok(true)
 }
 
 /// Length of the CRLF-terminated line at the start of the input (reading more as needed).
-fn line_len(stream: &mut TcpStream, input: &mut Input) -> std::io::Result<usize> {
+async fn line_len(
+    stream: &TcpStream,
+    input: &mut Input,
+    patience: Duration,
+) -> std::io::Result<usize> {
     loop {
         if let Some(p) = input
             .buf
@@ -321,48 +332,104 @@ fn line_len(stream: &mut TcpStream, input: &mut Input) -> std::io::Result<usize>
         {
             return Ok(p);
         }
-        fill(stream, input)?;
+        if input.filled >= input.buf.len() {
+            return Err(bad("line too long"));
+        }
+        let n = read_some(
+            stream,
+            input.buf.get_mut(input.filled..).unwrap_or(&mut []),
+            patience,
+        )
+        .await?;
+        input.filled = input.filled.saturating_add(n);
     }
 }
 
-fn fill(stream: &mut TcpStream, input: &mut Input) -> std::io::Result<()> {
-    if input.filled >= input.buf.len() {
-        return Err(bad("line too long"));
+/// At least one byte into `buf` (waiting up to `patience` for it).
+async fn read_some(
+    stream: &TcpStream,
+    buf: &mut [u8],
+    patience: Duration,
+) -> std::io::Result<usize> {
+    loop {
+        match stream.try_read(buf) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                within(patience, stream.readable()).await?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
     }
-    let n = stream.read(input.buf.get_mut(input.filled..).unwrap_or(&mut []))?;
-    if n == 0 {
-        return Err(std::io::ErrorKind::UnexpectedEof.into());
-    }
-    input.filled = input.filled.saturating_add(n);
-    Ok(())
 }
 
 /// Moves `n` body bytes into `body`: buffered ones first, then straight from the socket.
-fn read_exact_into(
-    stream: &mut TcpStream,
+async fn read_exact_into(
+    stream: &TcpStream,
     input: &mut Input,
     body: &mut Vec<u8>,
     n: usize,
+    patience: Duration,
 ) -> std::io::Result<()> {
     let from_buf = n.min(input.filled);
     body.extend_from_slice(input.buf.get(..from_buf).unwrap_or(&[]));
     input.consume(from_buf);
-    let rest = n.saturating_sub(from_buf);
-    if rest > 0 {
-        let start = body.len();
-        body.resize(start.saturating_add(rest), 0);
-        stream.read_exact(body.get_mut(start..).unwrap_or(&mut []))?;
+    let mut at = body.len();
+    let end = at.saturating_add(n.saturating_sub(from_buf));
+    body.resize(end, 0);
+    while at < end {
+        let got = read_some(stream, body.get_mut(at..end).unwrap_or(&mut []), patience).await?;
+        at = at.saturating_add(got);
     }
     Ok(())
 }
 
+/// All of `b`, waiting up to `t` each time the socket is full.
+pub async fn write_all(stream: &TcpStream, mut b: &[u8], t: Duration) -> std::io::Result<()> {
+    while !b.is_empty() {
+        match stream.try_write(b) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => b = b.get(n..).unwrap_or(&[]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                within(t, stream.writable()).await?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// `a` then `b`, with as few syscalls as possible (one, unless the socket buffer fills).
+async fn write_all2(stream: &TcpStream, a: &[u8], b: &[u8], t: Duration) -> std::io::Result<()> {
+    let (mut a, mut b) = (a, b);
+    while !a.is_empty() {
+        match stream.try_write_vectored(&[std::io::IoSlice::new(a), std::io::IoSlice::new(b)]) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) if n < a.len() => a = a.get(n..).unwrap_or(&[]),
+            Ok(n) => {
+                b = b.get(n.saturating_sub(a.len())..).unwrap_or(&[]);
+                a = &[];
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                within(t, stream.writable()).await?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    write_all(stream, b, t).await
+}
+
 /// Writes a whole response, head and body, in one `writev` when the socket takes it.
-pub fn write_response(
-    stream: &mut TcpStream,
+pub async fn write_response(
+    stream: &TcpStream,
     status: u16,
     content_type: &str,
     body: &[u8],
     keep_alive: bool,
+    t: Duration,
 ) -> std::io::Result<()> {
     let mut buf = [0u8; 320];
     let n = format_head(
@@ -372,38 +439,7 @@ pub fn write_response(
         crate::util::u64_of(body.len()),
         keep_alive,
     );
-    write_all2(stream, buf.get(..n).unwrap_or(&[]), body)
-}
-
-/// `a` then `b`, with as few syscalls as possible (one, unless the socket buffer fills).
-fn write_all2(stream: &mut TcpStream, a: &[u8], b: &[u8]) -> std::io::Result<()> {
-    let (mut a, mut b) = (a, b);
-    while !a.is_empty() {
-        match stream.write_vectored(&[std::io::IoSlice::new(a), std::io::IoSlice::new(b)]) {
-            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
-            Ok(n) if n < a.len() => a = a.get(n..).unwrap_or(&[]),
-            Ok(n) => {
-                b = b.get(n.saturating_sub(a.len())..).unwrap_or(&[]);
-                a = &[];
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
-        }
-    }
-    stream.write_all(b)
-}
-
-/// Writes a response head (formatted on the stack).
-pub fn write_head(
-    stream: &mut TcpStream,
-    status: u16,
-    content_type: &str,
-    len: u64,
-    keep_alive: bool,
-) -> std::io::Result<()> {
-    let mut buf = [0u8; 320];
-    let n = format_head(&mut buf, status, content_type, len, keep_alive);
-    stream.write_all(buf.get(..n).unwrap_or(&[]))
+    write_all2(stream, buf.get(..n).unwrap_or(&[]), body, t).await
 }
 
 /// Formats a response head into `buf`; returns its length.
@@ -448,34 +484,38 @@ pub fn format_head_with(
 }
 
 /// A small plain-text response.
-pub fn respond_text(
-    stream: &mut TcpStream,
+pub async fn respond_text(
+    stream: &TcpStream,
     status: u16,
     text: &str,
     keep_alive: bool,
+    t: Duration,
 ) -> std::io::Result<()> {
-    write_response(stream, status, "text/plain", text.as_bytes(), keep_alive)
+    write_response(stream, status, "text/plain", text.as_bytes(), keep_alive, t).await
 }
 
-/// Response body writer: coalesces small writes, sendfiles large slab ranges.
+/// Response body writer: coalesces small writes, sendfiles large file ranges.
 pub struct Out<'a> {
-    stream: &'a mut TcpStream,
+    stream: &'a TcpStream,
     buf: &'a mut Vec<u8>,
+    write: Duration,
     pub sent: u64,
 }
 
 impl<'a> Out<'a> {
-    /// `buf` is the worker's preallocated output buffer (its capacity is the batch size).
-    pub fn new(stream: &'a mut TcpStream, buf: &'a mut Vec<u8>) -> Out<'a> {
+    /// `buf` is the connection's output buffer (its capacity is the batch size); `write`
+    /// bounds each wait for the client to take more.
+    pub fn new(stream: &'a TcpStream, buf: &'a mut Vec<u8>, write: Duration) -> Out<'a> {
         buf.clear();
         Out {
             stream,
             buf,
+            write,
             sent: 0,
         }
     }
 
-    /// The response head, into the same buffer as the start of the body: small responses
+    /// The response head, into the (empty) buffer as the start of the body: small responses
     /// leave in one write. Not counted in `sent` (body bytes only).
     pub fn head(
         &mut self,
@@ -498,20 +538,44 @@ impl<'a> Out<'a> {
     ) -> std::io::Result<()> {
         let mut h = [0u8; 320];
         let n = format_head_with(&mut h, status, content_type, len, keep_alive, extra);
-        let h = h.get(..n).unwrap_or(&[]);
-        if self.buf.len().saturating_add(h.len()) > self.buf.capacity() {
-            self.flush()?;
+        if self.put_raw(h.get(..n).unwrap_or(&[])) {
+            Ok(())
+        } else {
+            Err(other("response head does not fit the output buffer"))
         }
-        self.buf.extend_from_slice(h);
-        Ok(())
     }
 
-    pub fn bytes(&mut self, b: &[u8]) -> std::io::Result<()> {
-        if self.buf.len().saturating_add(b.len()) > self.buf.capacity() {
-            self.flush()?;
+    /// `b` into the buffer if it fits there (true); else nothing (then [`Out::bytes`]).
+    ///
+    /// Synchronous, for per-object loops: an `.await` per small piece stores its arguments
+    /// into the future and reads them back at once, a load that must wait for the store
+    /// buffer to drain (the previous piece's copy). That made a 4,000-blob batch 17% slower.
+    #[inline]
+    pub fn put(&mut self, b: &[u8]) -> bool {
+        if self.put_raw(b) {
+            self.sent = self.sent.saturating_add(crate::util::u64_of(b.len()));
+            true
+        } else {
+            false
         }
+    }
+
+    #[inline]
+    fn put_raw(&mut self, b: &[u8]) -> bool {
+        if self.buf.len().saturating_add(b.len()) > self.buf.capacity() {
+            return false;
+        }
+        self.buf.extend_from_slice(b);
+        true
+    }
+
+    pub async fn bytes(&mut self, b: &[u8]) -> std::io::Result<()> {
+        if self.put(b) {
+            return Ok(());
+        }
+        self.flush().await?;
         if b.len() > self.buf.capacity() {
-            self.stream.write_all(b)?;
+            write_all(self.stream, b, self.write).await?;
         } else {
             self.buf.extend_from_slice(b);
         }
@@ -520,15 +584,15 @@ impl<'a> Out<'a> {
     }
 
     /// `slab.pack()[start .. start + len]`.
-    pub fn slab(&mut self, slab: &Slab, start: u64, len: u64) -> std::io::Result<()> {
-        self.mapped(slab.pack_file(), slab.pack(), start, len)
+    pub async fn slab(&mut self, slab: &Slab, start: u64, len: u64) -> std::io::Result<()> {
+        self.mapped(slab.pack_file(), slab.pack(), start, len).await
     }
 
     /// `len` bytes at `start` of an immutable file mapped as `bytes` (`sendfile(2)` from
     /// `file` when large).
-    pub fn mapped(
+    pub async fn mapped(
         &mut self,
-        file: Option<&std::fs::File>,
+        file: Option<&File>,
         bytes: &[u8],
         start: u64,
         len: u64,
@@ -538,45 +602,53 @@ impl<'a> Out<'a> {
                 if crate::util::us(start.saturating_add(len)) > bytes.len() {
                     return Err(bad("file range"));
                 }
-                self.flush()?;
-                sendfile_all(self.stream, file, start, len)?;
+                self.flush().await?;
+                sendfile_all(self.stream, file, start, len, self.write).await?;
                 self.sent = self.sent.saturating_add(len);
                 Ok(())
             }
             _ => {
                 let range = crate::util::sub(bytes, crate::util::us(start), crate::util::us(len))
                     .ok_or_else(|| bad("file range"))?;
-                self.bytes(range)
+                self.bytes(range).await
             }
         }
     }
 
-    pub fn flush(&mut self) -> std::io::Result<()> {
+    pub async fn flush(&mut self) -> std::io::Result<()> {
         if !self.buf.is_empty() {
-            self.stream.write_all(self.buf)?;
+            write_all(self.stream, self.buf, self.write).await?;
             self.buf.clear();
         }
         Ok(())
     }
 }
 
-/// `sendfile(2)` until `len` bytes of `file` from `offset` are in the socket.
-pub fn sendfile_all(
-    stream: &mut TcpStream,
+/// `sendfile(2)` whenever the socket is writable (waiting up to `t` each time it is full)
+/// until `len` bytes of `file` from `offset` are in it.
+pub async fn sendfile_all(
+    stream: &TcpStream,
     file: &File,
     offset: u64,
     len: u64,
+    t: Duration,
 ) -> std::io::Result<()> {
     let mut off = i64::try_from(offset).map_err(|_| bad("offset"))?;
     let mut left = len;
     while left > 0 {
         let chunk = crate::util::us(left.min(1 << 30));
-        match nix::sys::sendfile::sendfile64(stream.as_fd(), file.as_fd(), Some(&mut off), chunk) {
+        let sent = stream.try_io(Interest::WRITABLE, || {
+            nix::sys::sendfile::sendfile64(stream.as_fd(), file.as_fd(), Some(&mut off), chunk)
+                .map_err(std::io::Error::from)
+        });
+        match sent {
             Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => left = left.saturating_sub(crate::util::u64_of(n)),
-            Err(nix::errno::Errno::EINTR) => {}
-            Err(nix::errno::Errno::EAGAIN) => return Err(std::io::ErrorKind::TimedOut.into()),
-            Err(e) => return Err(std::io::Error::from(e)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                within(t, stream.writable()).await?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
     Ok(())

@@ -2,11 +2,13 @@
 //!
 //! Every per-request structure (the request body, parsed ids, the dedupe set, the splice
 //! plan, resolver buffers, small response bodies) lives in an [`Arena`]. A request leases
-//! one from the [`ArenaPool`] (blocking briefly when all are busy: built-in backpressure)
+//! one from the [`ArenaPool`] (waiting briefly when all are busy: built-in backpressure)
 //! and returns it on drop, so steady-state serving performs no heap allocation.
 
-use std::sync::{Condvar, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
+
+use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::splice::{ObjectSplice, Resolver};
 use crate::util::{Oid, Result};
@@ -269,52 +271,57 @@ impl Arena {
     }
 }
 
-/// A fixed set of arenas leased by requests.
+/// A fixed set of arenas leased by requests. Each is boxed: a lease, held across a
+/// request's awaits, is then a pointer in the connection's task, not the arena itself.
 pub struct ArenaPool {
-    free: Mutex<Vec<Arena>>,
-    available: Condvar,
+    // Boxed on purpose: a lease moves its box out of the pool.
+    #[allow(clippy::vec_box)]
+    free: Mutex<Vec<Box<Arena>>>,
+    /// One permit per arena in `free`: a request waits for one without holding a thread.
+    permits: Semaphore,
 }
 
 /// A leased arena; returned to the pool on drop.
 pub struct Lease<'a> {
-    arena: Option<Arena>,
+    arena: Option<Box<Arena>>,
     pool: &'a ArenaPool,
+    /// Released after the arena is back in the pool (fields drop after [`Drop::drop`]).
+    _permit: SemaphorePermit<'a>,
 }
 
 impl ArenaPool {
     pub fn new(count: usize, bytes: usize, objects: usize) -> ArenaPool {
         let mut free = Vec::with_capacity(count);
         for _ in 0..count {
-            free.push(Arena::new(bytes, objects));
+            free.push(Box::new(Arena::new(bytes, objects)));
         }
         ArenaPool {
             free: Mutex::new(free),
-            available: Condvar::new(),
+            permits: Semaphore::new(count),
         }
     }
 
     /// Waits up to `timeout` for a free arena.
-    pub fn lease(&self, timeout: Duration) -> Option<Lease<'_>> {
-        let guard = self.free.lock().ok()?;
-        let (mut guard, _) = self
-            .available
-            .wait_timeout_while(guard, timeout, |f| f.is_empty())
+    pub async fn lease(&self, timeout: Duration) -> Option<Lease<'_>> {
+        let permit = tokio::time::timeout(timeout, self.permits.acquire())
+            .await
+            .ok()?
             .ok()?;
-        let mut arena = guard.pop()?;
+        let mut arena = self.free.lock().ok()?.pop()?;
         // Reset outside the lock: clearing a large request's sets under it serialized every
         // lease and return behind it.
-        drop(guard);
         arena.reset();
         Some(Lease {
             arena: Some(arena),
             pool: self,
+            _permit: permit,
         })
     }
 }
 
 impl Lease<'_> {
     pub fn arena(&mut self) -> Option<&mut Arena> {
-        self.arena.as_mut()
+        self.arena.as_deref_mut()
     }
 }
 
@@ -325,7 +332,6 @@ impl Drop for Lease<'_> {
                 // Capacity was reserved for every arena at startup: never reallocates.
                 free.push(a);
             }
-            self.pool.available.notify_one();
         }
     }
 }
@@ -353,10 +359,16 @@ mod tests {
 
     #[test]
     fn pool_leases_and_returns() {
-        let pool = ArenaPool::new(1, 4096, 16);
-        let l = pool.lease(Duration::from_millis(10)).unwrap();
-        assert!(pool.lease(Duration::from_millis(10)).is_none());
-        drop(l);
-        assert!(pool.lease(Duration::from_millis(10)).is_some());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let pool = ArenaPool::new(1, 4096, 16);
+            let l = pool.lease(Duration::from_millis(10)).await.unwrap();
+            assert!(pool.lease(Duration::from_millis(10)).await.is_none());
+            drop(l);
+            assert!(pool.lease(Duration::from_millis(10)).await.is_some());
+        });
     }
 }

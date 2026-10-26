@@ -1004,10 +1004,9 @@ fn smart_http_upstream_v2_and_v0() {
     }
 }
 
-/// More continuously busy keep-alive clients than worker threads: each client keeps being
-/// answered while the others stay busy (a worker that has held a connection for
-/// `--hold-ms` while no worker is free parks it between requests), and every response is
-/// the right one for its connection.
+/// More continuously busy keep-alive clients than runtime threads (`--workers 2`): each
+/// client keeps being answered while the others stay busy (a connection is a task, not a
+/// thread), and every response is the right one for its connection.
 #[test]
 fn busy_connections_beyond_the_workers_take_turns() {
     use gvfs_daemon::http::{Client, Url};
@@ -1074,4 +1073,93 @@ fn busy_connections_beyond_the_workers_take_turns() {
         "answers per client: {answered:?}"
     );
     server.assert_clean();
+}
+
+/// Malformed requests get a 400 and change nothing: the server keeps serving, and their
+/// errors allocate nothing on the hot path (`--alloc-guard strict` would abort the server).
+/// At the `--max-idle-conns` cap, a new connection is still answered; the one that then goes
+/// idle is closed.
+#[test]
+fn malformed_requests_and_the_idle_cap() {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let root = tempdir("malformed");
+    let mut up = Upstream::new(&root);
+    up.commit(2);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--cache-dir",
+        cache.to_str().unwrap(),
+        "--max-idle-conns",
+        "2",
+    ]);
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    };
+    let head_too_large = vec![b'a'; 17 << 10];
+    let malformed: [&[u8]; 3] = [
+        b"GET /gvfs/config HTTP/1.1\r\nContent-Length: abc\r\n\r\n",
+        b"\r\nGET /gvfs/config HTTP/1.1\r\n\r\n",
+        &head_too_large,
+    ];
+    for req in malformed {
+        let mut s = connect();
+        s.write_all(req).unwrap();
+        let mut resp = Vec::new();
+        let _ = s.read_to_end(&mut resp);
+        assert!(
+            resp.starts_with(b"HTTP/1.1 400 "),
+            "{:?}",
+            String::from_utf8_lossy(&resp[..resp.len().min(60)])
+        );
+    }
+    // One whole response on a keep-alive connection, which then stays open.
+    let ask = |s: &mut TcpStream| -> Vec<u8> {
+        s.write_all(b"GET /gvfs/config HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = s.read(&mut buf).unwrap();
+            assert!(n > 0, "closed before the response");
+            got.extend_from_slice(&buf[..n]);
+            if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&got[..end]).to_ascii_lowercase();
+                let len: usize = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                if got.len() >= end + 4 + len {
+                    return got;
+                }
+            }
+        }
+    };
+    let (mut a, mut b) = (connect(), connect());
+    assert!(ask(&mut a).starts_with(b"HTTP/1.1 200 OK"));
+    assert!(ask(&mut b).starts_with(b"HTTP/1.1 200 OK"));
+    let mut c = connect();
+    assert!(ask(&mut c).starts_with(b"HTTP/1.1 200 OK"));
+    let mut rest = Vec::new();
+    let _ = c.read_to_end(&mut rest);
+    assert!(rest.is_empty(), "the third idle connection is closed");
+    assert!(server.metric("gvfs_connections_idle_overflow_total") >= 1);
+    assert!(
+        ask(&mut a).starts_with(b"HTTP/1.1 200 OK"),
+        "the idle ones still serve"
+    );
+    server.assert_clean();
+    let _ = std::fs::remove_dir_all(&root);
 }

@@ -63,7 +63,8 @@ impl Url {
     }
 }
 
-fn tls_config() -> Result<Arc<rustls::ClientConfig>> {
+/// The TLS client configuration (webpki roots, ring), shared with [`crate::aclient`].
+pub(crate) fn tls_config() -> Result<Arc<rustls::ClientConfig>> {
     static CONFIG: OnceLock<std::result::Result<Arc<rustls::ClientConfig>, String>> =
         OnceLock::new();
     CONFIG

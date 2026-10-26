@@ -19,19 +19,26 @@ These are the rules of `gvfs-server/opus/DESIGN.md`, applied to this workspace:
    are read with `.get()` and slice patterns; arithmetic is checked, saturating, or
    wrapping where wrapping is the intent. (Tests may unwrap: `clippy.toml`.)
 3. **No heap allocation while serving.** Everything a request touches is allocated before
-   the server starts: per-worker I/O buffers and a pool of request arenas
+   the server starts: a pool of connection buffers and a pool of request arenas
    (`src/arena.rs`). The global allocator (`gvfs-alloc-guard`) is *sealed* after warmup and
-   counts every allocation made inside a request (`gvfs_alloc_hot_path_total`).
-   `--alloc-guard strict` aborts on one; the tests and benchmarks run in strict mode. A
-   few rare paths are explicitly marked `cold_section` and may allocate: building a new
-   prefetch plan and its `.idx` once per view, metrics text, and arena growth for commit
-   closures.
+   counts every allocation made inside a request (`gvfs_alloc_hot_path_total`): the
+   hot-path scope is entered for every poll of a connection's task. `--alloc-guard strict`
+   aborts on one; the tests and benchmarks run in strict mode. A few rare paths are
+   explicitly marked `cold_section` and may allocate: building a new prefetch plan and its
+   `.idx` once per view, metrics text, arena growth for commit closures, fetches from the
+   upstream or object storage, and tokio's own bookkeeping when a connection opens or
+   closes (never per request).
 4. **Few dependencies, in-house wire formats.** pkt-line, pack/idx/delta, the GVFS
    prefetch stream, HTTP/1.1 (client and server), JSON scanning, base64, the manifest, and
    the slab index are written here. Dependencies are only what would be unwise to rewrite:
    `zlib-rs` (SIMD inflate/deflate), `sha1` (SHA-NI), `ring` + `rustls` + `webpki-roots`
-   (TLS, HMAC), `nix` (`sendfile`), `memmap2`. There is no async runtime, no CLI framework,
-   and no serde.
+   (TLS, HMAC), `nix` (`sendfile`), `memmap2`, and `tokio` (the edge's runtime: sockets,
+   timers, its scheduler, child processes). There is no CLI framework and no serde. The
+   edge's HTTP/1.1 server stays in-house on tokio's sockets: hyper's server copies every
+   body (no `sendfile`) and allocates per request (REPORT.md §14). Its fetches while it
+   serves (object storage, the blob proxy's upstream) use hyper's client with
+   `tokio-rustls` (`src/aclient.rs`); the pipeline, the mirror and the live loop keep the
+   blocking in-house client on their own threads.
 
 Code style: plain structs, slices, and indices into arenas; explicit loops; no trait
 hierarchies or generic plumbing.
@@ -388,25 +395,35 @@ warmer prepares it for each new cold plan once any client has asked for one.
 
 Any path prefix before `/gvfs/` is accepted.
 
-**Threads and memory.** A fixed set of worker threads (`--workers`, 256) waits on one epoll
-set that holds the listening socket (backlog raised to `net.core.somaxconn`; std's 128
-overflows when a fleet connects at once) and every idle keep-alive connection
-(`src/serve/conns.rs`). A worker keeps serving a connection while its requests keep coming
-(it waits up to `--linger-ms`, 5, for the next one, so a client sending requests back to back
-pays no epoll round trip per request), then parks it: an idle client costs a table slot
-(`--max-idle-conns`, 65,536), not a thread, and is closed after `--idle-secs` (30) without a
-request. The linger is short because every sporadic request (an agent polling once a minute)
-holds its worker for the whole linger: at 100 ms, 256 workers absorb only ~2,500 such requests
-a second before they queue (8,000/s over 2,048 connections: p50 145 ms, p99 2.5 s; at 5 ms:
-16 µs and 23 µs). While
-every worker is busy, a worker also parks its connection between requests once it has held it
-for `--hold-ms` (5), so busy connections beyond the worker count take turns instead of waiting
-for others to go idle. A response in progress holds its worker until it is written (blocking
-writes, 120 s timeout each). Each worker has a 16 KiB input buffer and a 256 KiB output
-buffer. POST bodies and their working sets live in a leased arena (default: 2 ×
-cores arenas of 8 MiB and 2^18 ids). If all arenas are busy for 10 s, the request gets a
-503. A commit closure larger than its arena grows it in a `cold_section`; `reset` shrinks
-it back. The server speaks plain HTTP/1.1: put TLS and HTTP/2 on the load balancer in
+**Threads and memory.** The edge runs on a tokio runtime, one worker thread per CPU
+(`--workers`), one task per connection (`src/serve/conn.rs`); the listening socket's
+backlog is raised to `net.core.somaxconn` (std's 128 overflows when a fleet connects at
+once). Between requests a connection holds no buffer, only its parked task (about 3 KB) and
+a descriptor: when its next request's bytes arrive it takes a 16 KiB head buffer and a
+256 KiB output buffer from a pool, and gives them back once the response is out. A
+connection is closed after `--idle-secs` (30) without a request, or when it goes idle after a
+response while `--max-idle-conns` (65,536) others are (its client reconnects; a new
+connection is always served first). A request must arrive whole
+within `--idle-secs` once begun, and each wait for a client to take more of a response is
+bounded at 120 s. A response waiting on a slow client parks its task: the worker serves
+other connections meanwhile, and `sendfile` resumes when the socket drains (REPORT.md §14:
+400 slow clones beside 1.2M GETs a second; with one thread per request, 256 of them stopped
+the edge).
+
+Handlers that compute for long (batches of ids, commit expansion, hashing a pack) yield
+every 100 µs of work (`src/serve/budget.rs`, `--quantum-us`). tokio does not preempt:
+without the yields, a 4,000-id sizes request held up the GETs queued behind it on its worker
+(GET p50 59 µs → 1.3 ms). At 100 µs, heavy requests keep the thread-per-request edge's
+throughput beside GETs, whose p99 is 4× better; a shorter quantum favors GETs further, at
+the heavy requests' expense. Moving such work to tokio's blocking pool does not help much, even at a lower
+priority, because its threads share the CPUs with the workers. Work that blocks or computes
+for seconds (a plan built once per view, a large object's delta chain) runs in
+`block_in_place` sections, which hand the worker's other tasks to another thread. Fetches
+from object storage or the upstream are awaited: a request waiting on them parks its task. POST
+bodies and their working sets live in a leased arena (default: 2 × cores arenas of 8 MiB and
+2^18 ids), awaited without holding a thread; if all arenas are busy for 10 s, the request
+gets a 503. A commit closure larger than its arena grows it in a `cold_section`; `reset`
+shrinks it back. The server speaks plain HTTP/1.1: put TLS and HTTP/2 on the load balancer in
 front of an edge. The localhost proxy needs neither.
 
 ## Stores with real blobs (`--blobs separate`)
@@ -561,7 +578,8 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   of more than a quarter of the budget (one huge blob) streams straight from the store,
   32 MiB at a time, instead of evicting everything else. The mirror writes the tip's
   blobs first, in path order, so a checkout's blobs share blocks; a block being fetched is
-  fetched once.
+  fetched once (other readers' tasks wait for it). The ranged GETs go through the async
+  client, its connections pooled per account.
 * **The proxy** serves blobs the store does not have, only for ids a sizes table names (a
   404 otherwise, without touching the upstream): the L0 overlay's, copied when the
   pipeline seals their trees, and blobs requested before the mirror has finished. A blob a
@@ -570,7 +588,11 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   each blob once per edge (requests for a blob being fetched wait for that fetch),
   verifies it as it streams in, and keeps it on local disk up to `--proxy-cache-mib`. A
   request keeps the packs it already holds, so eviction never makes it start over. An
-  upstream failure is a 503, which clients retry; gvfs-helper treats a 404 as fatal.
+  upstream failure is a 503, which clients retry; gvfs-helper treats a 404 as fatal. Its
+  requests are async (`AsyncUpstream`: the async client for smart HTTP and GVFS
+  upstreams, `tokio::process` for a local `git upload-pack`); what arrives is verified
+  and written on tokio's blocking pool, fed through a bounded queue
+  (`serve::blobs::fetch_into`), so the runtime's workers keep serving meanwhile.
 * **Loose objects** are spliced from the entry's deflate blocks between a stored block
   and the combined Adler-32, so nothing is inflated, and for a remote entry only its
   first 2 and last 4 zlib bytes are read before streaming. **POST packs** append whole
@@ -597,7 +619,8 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   the sizes their trees introduce asked of the upstream.
 
 Store hits allocate nothing (the edge tests run `--alloc-guard strict`). Proxy fetches
-and remote reads are cold sections.
+and remote reads are cold sections (`budget::cold`: allocations while they are polled are
+not the hot path's).
 
 ### Limits and open questions
 
@@ -630,7 +653,7 @@ and remote reads are cold sections.
 | Edge range-reads slabs from S3/Blob (coalesced HTTP `Range`) | The edge hydrates slabs to local disk (`--cache-dir`) and maps them | Local reads cost microseconds: a deltified tree GET is 190 µs p50. The edge restarts from the store at any time. The cluster layout keeps range reads possible behind the same `Slab` type. |
 | Pack timestamps are creation times; warm clients get every slab newer than their cursor; rollups replace the slabs they fold | Timestamps are derived from commits; warm clients get the exact cover from their cursor (retained finer slabs, cascading rollups), repacked into one pack | An edge's L0 slab and the sealed slab that later ends at the same commit get the same stamp, so nothing is sent twice. Measured over 14 days of SearchGold, every client pattern gets within 2% of one upstream fetch of exactly what it lacks, against 2.2-2.5× before. |
 | Superset tombstoning: every rollup reaches clients whole, and a client hook unlinks the packs it subsumes | Only sealed days and weeks reach a client whole, once (`--superset-tier`); the response carries its interval for a hook, and stock `git multi-pack-index expire` does the unlinking | Stock clients (gvfs-helper, VFS for Git, Scalar) run no hook, but their maintenance expires packs that newer packs duplicate. Days and weeks suffice for daily maintenance; finer supersets would re-send each hour up to five times (fable: 1.9-5.3× the ideal). |
-| Tokio/Axum/Hyper, `DashMap` memtable for L0 | std threads, in-house HTTP/1.1, `sendfile`; L0 = heap slabs (one per push) in the same format as sealed slabs | Fewer dependencies (rule 4) and zero hot-path allocation (rule 3). One code path serves every slab. |
+| Tokio/Axum/Hyper, `DashMap` memtable for L0 | tokio with the in-house HTTP/1.1 and `sendfile` (no Axum or hyper); L0 = heap slabs (one per push) in the same format as sealed slabs | hyper cannot `sendfile`: a cold clone cost 20× the CPU per GB, plus 5-6 allocations per request (rule 3). tokio itself measured 24-38% less CPU per small request than thread-per-request, and slow clients hold no thread (REPORT.md §14). One code path serves every slab. |
 | Parse every `Git-hfs 1.0` pointer during ingest; optional `.hfs` sidecar (content id + real size) | Ingest does not parse pointers. `inspect slab` uses the zero-allocation parser to report pointer coverage | No GVFS endpoint consumes real content sizes (`/gvfs/sizes` returns git object sizes), so the sidecar would be unused work on the critical path. |
 
 ## Protocol facts the implementation relies on

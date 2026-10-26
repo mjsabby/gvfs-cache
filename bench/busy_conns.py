@@ -1,5 +1,6 @@
 """More busy keep-alive clients than workers: N clients send GETs back to back for DUR s against
-opus with --workers W; prints answers per client and when each got its first.
+opus with --workers W; prints answers per client and when each got its first. (Written for the
+thread-per-request edge; on tokio, W is the runtime's thread count and every client is a task.)
 
 usage: busy_conns.py <opus-binary> <workers> <clients>   (env DUR; SearchGold store sg/opus2)
 """

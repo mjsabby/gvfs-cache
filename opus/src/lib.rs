@@ -25,6 +25,7 @@
 
 pub mod util;
 
+pub mod aclient;
 pub mod b64;
 pub mod http;
 pub mod pktline;

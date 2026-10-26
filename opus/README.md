@@ -247,9 +247,12 @@ src/separate.rs            --blobs separate: what pipeline, mirror and edge shar
 src/blobs.rs, sizes.rs     blob packs, segments, blobs.bin; sizes tables and the GSZ1 section
 src/blobstream.rs, blobcopy.rs   streaming whole-blob packs from upstream fetches; copy items, publish
 src/manifest.rs, store.rs, azure.rs    manifest.bin (CAS) and the fs / Azure stores
-src/serve/                 the server: view (prefetch plans), httpd, handlers, live L0 loop,
-                           blobs (blob packs and the read-through proxy)
+src/serve/                 the server on tokio: view (prefetch plans), httpd, conn (a task per
+                           connection), handlers, budget (yields), live L0 loop, blobs (blob
+                           packs and the read-through proxy), blobcache
 src/upstream.rs, http.rs, pktline.rs   git protocol v2/v0 over smart HTTP or a local repo
+src/aclient.rs             the edge's async HTTP client (hyper, tokio-rustls) for its fetches
+                           while serving (Azure ranged reads, the blob proxy's upstream)
 src/pack.rs, zlib.rs, delta.rs, object.rs, hfs.rs   git formats (delta.rs: tree delta encoder)
 src/arena.rs               per-request arenas (no allocation while serving)
 crates/gvfs-alloc-guard    counting global allocator that enforces zero hot-path allocations

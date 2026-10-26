@@ -19,19 +19,28 @@ pub enum ErrorKind {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Runs `f` in a cold section: errors are built here, so that a failing request (a
+/// malformed body, an over-capacity batch) never counts as a hot-path allocation (or, under
+/// `--alloc-guard strict`, aborts the edge).
+#[inline]
+pub fn cold<R>(f: impl FnOnce() -> R) -> R {
+    let _cold = gvfs_alloc_guard::cold_section();
+    f()
+}
+
 impl Error {
     pub fn new(msg: impl Into<String>) -> Error {
-        Error {
+        cold(|| Error {
             msg: msg.into(),
             kind: ErrorKind::Other,
-        }
+        })
     }
 
     pub fn with_kind(kind: ErrorKind, msg: impl Into<String>) -> Error {
-        Error {
+        cold(|| Error {
             msg: msg.into(),
             kind,
-        }
+        })
     }
 
     pub fn is_conflict(&self) -> bool {
@@ -64,26 +73,26 @@ impl From<std::io::Error> for Error {
         } else {
             ErrorKind::Other
         };
-        Error::with_kind(kind, e.to_string())
+        cold(|| Error::with_kind(kind, e.to_string()))
     }
 }
 
 impl From<nix::Error> for Error {
     fn from(e: nix::Error) -> Error {
-        Error::new(e.to_string())
+        cold(|| Error::new(e.to_string()))
     }
 }
 
 /// `return Err(Error::new(format!(..)))`.
 #[macro_export]
 macro_rules! bail {
-    ($($t:tt)*) => { return Err($crate::util::Error::new(format!($($t)*))) };
+    ($($t:tt)*) => { return Err($crate::util::cold(|| $crate::util::Error::new(format!($($t)*)))) };
 }
 
 /// `Error::new(format!(..))`.
 #[macro_export]
 macro_rules! err {
-    ($($t:tt)*) => { $crate::util::Error::new(format!($($t)*)) };
+    ($($t:tt)*) => { $crate::util::cold(|| $crate::util::Error::new(format!($($t)*))) };
 }
 
 /// Prepends context to an error: `file.read(..).ctx("reading manifest")?`.
@@ -94,6 +103,7 @@ pub trait Context<T> {
 impl<T, E: Into<Error>> Context<T> for std::result::Result<T, E> {
     fn ctx(self, what: &str) -> Result<T> {
         self.map_err(|e| {
+            let _cold = gvfs_alloc_guard::cold_section();
             let e: Error = e.into();
             Error {
                 msg: format!("{what}: {}", e.msg),

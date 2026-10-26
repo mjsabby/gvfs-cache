@@ -281,8 +281,7 @@ class Replay:
         self.S = commits[self.g_idx][1] - commits[self.g_idx][1] % 900 + 900
         self.E = min(commits[-1][1] + 1, self.S + a.days * 86400)
         self.clock = impls.Clock(os.path.join(self.work, "faketime"), self.S - 300)
-        self.im = impls.ALL["opus"](self.work, clock=self.clock, extra_serve=["--workers", "64"],
-                                    extra_pipeline=["--threads", "16"])
+        self.im = impls.ALL["opus"](self.work, clock=self.clock, extra_pipeline=["--threads", "16"])
         self.up = os.path.join(self.work, "up.git")
         self.scratch = os.path.join(self.work, "scratch")
         os.makedirs(self.scratch, exist_ok=True)

@@ -7,7 +7,8 @@
 //!    `--cache-dir`, then map them;
 //! 3. with `--upstream`, rebuild the live tip: `ingest_git_delta(manifest.tip, HEAD)`,
 //!    repacked into the in-RAM L0 slab — before the port opens;
-//! 4. allocate every worker buffer and request arena, then seal the allocator and serve.
+//! 4. allocate the connection buffers and request arenas, start the runtime, then seal the
+//!    allocator and serve.
 //!
 //! A live thread then polls the manifest and the upstream every `--poll-ms`. The L0 slabs
 //! bridge the minutes since the last sealed 15m slab, one per move of the branch, and every
@@ -31,23 +32,26 @@
 //! proxy, but counted (`gvfs_blobs_missing_total`) and logged. L0 fetches are `blob:none`,
 //! with the sizes their trees introduce asked of the upstream.
 //!
-//! Requests are served by a fixed set of threads, each with its own buffers, all waiting on
-//! one epoll set that holds the listening socket and every idle keep-alive connection
-//! ([`conns`]): an idle client costs a table slot, not a thread. POSTs lease a request arena.
-//! Large slab ranges leave through `sendfile(2)`.
+//! Requests are served on a tokio runtime (`--workers` threads, one per CPU by default), one
+//! task per connection ([`conn`]): an idle client costs a parked task, not a thread, and a
+//! slow one holds no thread while its response drains. HTTP/1.1 is the edge's own
+//! ([`httpd`]); large slab ranges leave through `sendfile(2)`. POSTs lease a request arena.
+//! Handlers yield in their long loops ([`budget`]), so a heavy request does not hold up the
+//! small ones queued behind it.
 
 pub mod blobcache;
 pub mod blobs;
-pub mod conns;
+pub mod budget;
+pub mod conn;
 pub mod handlers;
 pub mod httpd;
 pub mod view;
 
 use std::collections::HashMap;
-use std::net::{TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Condvar, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::arena::ArenaPool;
@@ -60,7 +64,6 @@ use crate::store::Store;
 use crate::upstream::Upstream;
 use crate::util::{Context, Oid, Result};
 use handlers::Metrics;
-use httpd::Input;
 use view::{Prefetch, View};
 
 /// Which prefetch clients get the pack's `.idx`.
@@ -72,9 +75,17 @@ pub enum IdxPolicy {
     Never,
 }
 
-/// Shared by every worker.
+/// Shared by every connection.
 pub struct Ctx {
     view: RwLock<Arc<View>>,
+    /// Buffers of the connections with a request in progress.
+    pub bufs: conn::Pool,
+    pub deadlines: httpd::Deadlines,
+    /// Connections waiting for their next request (to within `idle_fold` per thread: see
+    /// [`conn`]), and how many may.
+    pub idle: AtomicI64,
+    pub idle_fold: u64,
+    pub max_idle: i64,
     pub arenas: ArenaPool,
     pub arena_wait: Duration,
     pub config_json: Vec<u8>,
@@ -108,12 +119,6 @@ impl Ctx {
     }
 }
 
-/// Per-worker buffers, allocated once.
-pub struct Worker {
-    pub input: Input,
-    pub out: Vec<u8>,
-}
-
 pub struct Options {
     pub store: Store,
     pub upstream: Option<Upstream>,
@@ -126,6 +131,7 @@ pub struct Options {
     pub bind: String,
     pub cache_dir: PathBuf,
     pub poll: Duration,
+    /// Runtime worker threads.
     pub workers: usize,
     pub arenas: usize,
     pub arena_bytes: usize,
@@ -134,15 +140,9 @@ pub struct Options {
     pub idle_timeout: Duration,
     pub write_timeout: Duration,
     pub prefetch_idx: IdxPolicy,
-    /// Idle keep-alive connections that can wait at once (beyond that, the oldest idle
-    /// clients must reconnect).
+    /// Idle keep-alive connections that can wait at once (beyond that, a connection that
+    /// goes idle is closed: its client reconnects).
     pub max_idle_conns: usize,
-    /// How long a worker waits on a keep-alive connection for its next request before
-    /// parking it.
-    pub linger: Duration,
-    /// While no worker is free, how long a worker keeps serving one connection before
-    /// parking it between requests, so busy connections beyond `workers` take turns.
-    pub hold: Duration,
     /// Sealed rollups of this tier and above (24h, or the weekly delta) are delivered whole
     /// to the warm clients inside them, once ([`view`]); `None`: exact covers only.
     pub supersets: Option<Tier>,
@@ -171,14 +171,17 @@ pub fn main(args: &[String]) -> Result<()> {
             "alloc-guard",
             "idle-secs",
             "max-idle-conns",
-            "linger-ms",
-            "hold-ms",
+            "quantum-us",
             "prefetch-idx",
             "superset-tier",
             "proxy-cache-mib",
             "blob-cache-mib",
         ],
     )?;
+    budget::set_quantum(Duration::from_micros(f.num(
+        "quantum-us",
+        u64::try_from(budget::QUANTUM.as_micros()).unwrap_or(20),
+    )?));
     match f.get("alloc-guard").unwrap_or("count") {
         "count" => gvfs_alloc_guard::set_mode(gvfs_alloc_guard::Mode::Count),
         "strict" => gvfs_alloc_guard::set_mode(gvfs_alloc_guard::Mode::Strict),
@@ -231,7 +234,7 @@ pub fn main(args: &[String]) -> Result<()> {
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::temp_dir().join("gvfs-daemon-cache")),
         poll: Duration::from_millis(f.num("poll-ms", 2000u64)?),
-        workers: f.num("workers", 256usize)?,
+        workers: f.num("workers", cores)?,
         arenas: f.num("arenas", cores.saturating_mul(2))?,
         arena_bytes: f.num("arena-mib", 8usize)?.saturating_mul(1 << 20),
         arena_objects: f.num("arena-objects", 1usize << 18)?,
@@ -240,8 +243,6 @@ pub fn main(args: &[String]) -> Result<()> {
         write_timeout: Duration::from_secs(120),
         prefetch_idx,
         max_idle_conns: f.num("max-idle-conns", 65536usize)?,
-        linger: Duration::from_millis(f.num("linger-ms", 5u64)?),
-        hold: Duration::from_millis(f.num("hold-ms", 5u64)?),
         supersets,
     };
     run(opts)
@@ -286,8 +287,6 @@ pub fn run(o: Options) -> Result<()> {
         write_timeout,
         prefetch_idx,
         max_idle_conns,
-        linger,
-        hold,
         supersets,
     } = o;
     let store = Arc::new(store);
@@ -337,17 +336,33 @@ pub fn run(o: Options) -> Result<()> {
     live.open_manifest(&manifest)?;
     let first = live.snapshot(manifest, etag);
     let proxy = match (&upstream_spec, separate) {
-        (Some((u, branch, auth)), true) => Some(blobs::Proxy::new(
+        (Some((u, _, auth)), true) => Some(blobs::Proxy::new(
             u,
-            branch,
             auth,
             &live.cache_dir.join("proxy"),
             proxy_cache_bytes,
         )?),
         _ => None,
     };
+    let workers = workers.max(1);
     let ctx = Arc::new(Ctx {
         view: RwLock::new(Arc::new(first)),
+        bufs: conn::Pool::new(workers, CONN_BUFS, OUT_BYTES),
+        deadlines: httpd::Deadlines {
+            idle: idle_timeout,
+            patience: idle_timeout,
+            write: write_timeout,
+        },
+        idle: AtomicI64::new(0),
+        // Exact for small caps; for the default, within 64 per thread.
+        idle_fold: u64::try_from(
+            max_idle_conns
+                .checked_div(workers.saturating_mul(64))
+                .unwrap_or(1),
+        )
+        .unwrap_or(1)
+        .clamp(1, 64),
+        max_idle: i64::try_from(max_idle_conns).unwrap_or(i64::MAX),
         arenas: ArenaPool::new(arenas.max(1), arena_bytes, arena_objects),
         arena_wait: Duration::from_secs(10),
         config_json: config_json(&cache_servers),
@@ -365,7 +380,7 @@ pub fn run(o: Options) -> Result<()> {
     let warmer = Arc::new(Warmer::default());
     warmer.offer(ctx.view());
 
-    // 4. Workers, then seal.
+    // 4. The runtime and its buffers, then seal.
     raise_fd_limit();
     let listener = TcpListener::bind(&bind).ctx(&format!("binding {bind}"))?;
     // std listens with a backlog of 128: a burst of new clients (a fleet starting at 09:00,
@@ -375,42 +390,18 @@ pub fn run(o: Options) -> Result<()> {
     if let Err(e) = nix::sys::socket::listen(&listener, nix::sys::socket::Backlog::MAXALLOWABLE) {
         crate::log!("serve: could not raise the listen backlog: {e}");
     }
-    let conns = Arc::new(conns::Conns::new(&listener, max_idle_conns)?);
-    let started = Arc::new(Barrier::new(workers.saturating_add(1)));
-    for i in 0..workers {
-        let listener = listener.try_clone()?;
-        let ctx = ctx.clone();
-        let conns = conns.clone();
-        let started = started.clone();
-        std::thread::Builder::new()
-            .name(format!("gvfs-w{i}"))
-            .stack_size(512 << 10)
-            .spawn(move || {
-                let mut w = Worker {
-                    input: Input::new(),
-                    out: Vec::with_capacity(256 << 10),
-                };
-                w.input.patience = idle_timeout;
-                started.wait();
-                let pace = Pace {
-                    linger,
-                    hold,
-                    write: write_timeout,
-                };
-                worker_loop(&listener, &conns, &ctx, &mut w, i, pace);
-            })?;
-    }
-    {
-        let conns = conns.clone();
-        std::thread::Builder::new()
-            .name("gvfs-reaper".into())
-            .spawn(move || {
-                loop {
-                    std::thread::sleep(Duration::from_secs(1));
-                    conns.reap(idle_timeout);
-                }
-            })?;
-    }
+    listener.set_nonblocking(true)?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .thread_name("gvfs-w")
+        .enable_all()
+        .build()
+        .ctx("starting the runtime")?;
+    let listener = {
+        let _guard = rt.enter();
+        tokio::net::TcpListener::from_std(listener).ctx("registering the listener")?
+    };
+    rt.spawn(accept_loop(Arc::clone(&ctx), listener));
     {
         let warmer = warmer.clone();
         let ctx = ctx.clone();
@@ -418,12 +409,21 @@ pub fn run(o: Options) -> Result<()> {
             .name("gvfs-warmer".into())
             .spawn(move || warmer.run(&ctx))?;
     }
-    started.wait();
+    // Every worker has started and run a task before the allocator is sealed.
+    rt.block_on(async {
+        let mut started = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            started.push(tokio::spawn(async { tokio::task::yield_now().await }));
+        }
+        for t in started {
+            let _ = t.await;
+        }
+    });
     gvfs_alloc_guard::seal();
     ctx.ready.store(true, Ordering::Relaxed);
     let v = ctx.view();
     crate::log!(
-        "serving on http://{bind}: {} slabs ({} in L0), tip {}, {}",
+        "serving on http://{bind}: {} slabs ({} in L0), tip {}, {}, {workers} workers",
         v.all.len(),
         v.l0_len,
         v.tip,
@@ -483,75 +483,28 @@ pub fn raise_fd_limit() {
     }
 }
 
-/// A worker's per-connection timeouts (see [`Options`]).
-#[derive(Clone, Copy)]
-struct Pace {
-    linger: Duration,
-    hold: Duration,
-    write: Duration,
-}
+/// Connection buffers made at startup (more are made while they run out).
+const CONN_BUFS: usize = 256;
+/// Bytes of each connection's output buffer (the batch a response coalesces).
+const OUT_BYTES: usize = 256 << 10;
 
-fn worker_loop(
-    listener: &TcpListener,
-    conns: &conns::Conns,
-    ctx: &Ctx,
-    w: &mut Worker,
-    index: usize,
-    pace: Pace,
-) {
+/// Accepts connections for the life of the process: one task each.
+async fn accept_loop(ctx: Arc<Ctx>, listener: tokio::net::TcpListener) {
+    let mut logged: Option<Instant> = None;
     loop {
-        let Some((mut stream, fresh)) = conns.next(listener) else {
-            continue;
-        };
-        if fresh {
-            let _ = stream.set_nodelay(true);
-            let _ = stream.set_read_timeout(Some(pace.linger));
-            let _ = stream.set_write_timeout(Some(pace.write));
-        }
-        w.input.filled = 0;
-        w.input.patient = false;
-        if serve_connection(ctx, conns, w, &mut stream, pace) {
-            conns.park(stream, !fresh, index);
-        }
-    }
-}
-
-/// Serves requests until the client closes, errs, or pauses for longer than `pace.linger`
-/// between requests, or — while no worker is free — until this worker has held the
-/// connection for `pace.hold`. Then `true`: the connection is parked between requests (it no
-/// longer holds this worker; the epoll set hands it to whichever worker is free when it
-/// speaks again, after the connections that were already waiting).
-fn serve_connection(
-    ctx: &Ctx,
-    conns: &conns::Conns,
-    w: &mut Worker,
-    stream: &mut TcpStream,
-    pace: Pace,
-) -> bool {
-    let picked = Instant::now();
-    loop {
-        if w.input.patient {
-            if stream.set_read_timeout(Some(pace.linger)).is_err() {
-                return false;
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                tokio::spawn(conn::HotPath::new(conn::serve(Arc::clone(&ctx), stream)));
             }
-            w.input.patient = false;
-        }
-        if w.input.filled == 0 && conns.all_busy() && picked.elapsed() >= pace.hold {
-            return true;
-        }
-        let req = match httpd::read_head(stream, &mut w.input) {
-            Ok(httpd::Head::Request(r)) => r,
-            Ok(httpd::Head::Idle) => return w.input.filled == 0,
-            Ok(httpd::Head::Closed) => return false,
-            Err(_) => {
-                let _ = httpd::respond_text(stream, 400, "bad request\n", false);
-                return false;
+            Err(e) => {
+                // Out of descriptors, or a connection reset before it was accepted: back off
+                // briefly instead of spinning, and say so at most once a second.
+                if logged.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
+                    crate::log!("serve: accept failed: {e}");
+                    logged = Some(Instant::now());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-        };
-        let _hot = gvfs_alloc_guard::hot_path();
-        match handlers::handle(ctx, w, stream, &req) {
-            Ok(true) => {}
-            Ok(false) | Err(_) => return false,
         }
     }
 }
@@ -1100,7 +1053,10 @@ pub fn metrics_text(ctx: &Ctx) -> String {
          gvfs_blob_cache_misses_total {}\n\
          gvfs_blob_cache_fetches_total {}\n\
          gvfs_blob_cache_bypass_total {}\n\
-         gvfs_blob_cache_bytes {}\n",
+         gvfs_blob_cache_bytes {}\n\
+         gvfs_connections_idle {}\n\
+         gvfs_connections_idle_closed_total {}\n\
+         gvfs_connections_idle_overflow_total {}\n",
         get(&m.prefetch),
         get(&m.object_get),
         get(&m.object_post),
@@ -1130,7 +1086,10 @@ pub fn metrics_text(ctx: &Ctx) -> String {
         ctx.blob_cache.as_ref().map_or(0, |c| get(&c.misses)),
         ctx.blob_cache.as_ref().map_or(0, |c| get(&c.fetches)),
         ctx.blob_cache.as_ref().map_or(0, |c| get(&c.bypassed)),
-        ctx.blob_cache.as_ref().map_or(0, |c| c.bytes())
+        ctx.blob_cache.as_ref().map_or(0, |c| c.bytes()),
+        ctx.idle.load(Ordering::Relaxed).max(0),
+        get(&m.idle_closed),
+        get(&m.idle_overflow)
     )
 }
 

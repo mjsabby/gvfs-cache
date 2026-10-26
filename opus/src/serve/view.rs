@@ -69,6 +69,14 @@ pub enum Prefetch {
     Pack(Arc<PackPlan>, u64),
 }
 
+/// Where [`View::prefetch`] finds (or builds) a client's plan.
+enum Slot<'a> {
+    UpToDate,
+    /// The plan for clients from boundary `.1` on.
+    Warm(&'a OnceLock<Option<Arc<PackPlan>>>, u64),
+    Cold,
+}
+
 impl View {
     /// `sealed` in manifest order ([`Manifest::slabs`]: baseline, weekly deltas, pyramid,
     /// retained); `l0` oldest first. Sealed slabs of tier `supersets` and above (24h or the
@@ -220,18 +228,9 @@ impl View {
 
     /// The (shared, lazily built) plan for a client whose newest pack is `client_ts`.
     pub fn prefetch(&self, client_ts: u64) -> Prefetch {
-        if client_ts != 0 && client_ts >= self.tip_ts {
-            return Prefetch::UpToDate;
-        }
-        let client_ts = crate::timeline::superset_start(&self.rollups, client_ts, self.tip_ts)
-            .unwrap_or(client_ts);
-        let key = self
-            .starts
-            .partition_point(|&s| s <= client_ts)
-            .checked_sub(1);
-        let warm = key.and_then(|i| Some((self.plans.get(i)?, *self.starts.get(i)?)));
-        match warm {
-            Some((cell, from)) if client_ts >= self.warm_floor => {
+        match self.slot(client_ts) {
+            Slot::UpToDate => Prefetch::UpToDate,
+            Slot::Warm(cell, from) => {
                 let plan = cell.get_or_init(|| {
                     let _cold = gvfs_alloc_guard::cold_section();
                     let (slabs, sources, _) = self.covered(from, &[]);
@@ -242,7 +241,7 @@ impl View {
                     None => Prefetch::UpToDate,
                 }
             }
-            _ => Prefetch::Pack(
+            Slot::Cold => Prefetch::Pack(
                 self.cold_plan
                     .get_or_init(|| {
                         let _cold = gvfs_alloc_guard::cold_section();
@@ -265,6 +264,37 @@ impl View {
                     .clone(),
                 0,
             ),
+        }
+    }
+
+    /// [`View::prefetch`]'s answer if it is ready, `None` if its plan is still to be built
+    /// (seconds of work, for a cover that must be repacked).
+    pub fn prefetch_ready(&self, client_ts: u64) -> Option<Prefetch> {
+        match self.slot(client_ts) {
+            Slot::UpToDate => Some(Prefetch::UpToDate),
+            Slot::Warm(cell, from) => Some(match cell.get()? {
+                Some(p) => Prefetch::Pack(p.clone(), from),
+                None => Prefetch::UpToDate,
+            }),
+            Slot::Cold => self.cold_plan.get().map(|p| Prefetch::Pack(p.clone(), 0)),
+        }
+    }
+
+    /// Where the plan for a client at `client_ts` lives.
+    fn slot(&self, client_ts: u64) -> Slot<'_> {
+        if client_ts != 0 && client_ts >= self.tip_ts {
+            return Slot::UpToDate;
+        }
+        let client_ts = crate::timeline::superset_start(&self.rollups, client_ts, self.tip_ts)
+            .unwrap_or(client_ts);
+        let key = self
+            .starts
+            .partition_point(|&s| s <= client_ts)
+            .checked_sub(1);
+        let warm = key.and_then(|i| Some((self.plans.get(i)?, *self.starts.get(i)?)));
+        match warm {
+            Some((cell, from)) if client_ts >= self.warm_floor => Slot::Warm(cell, from),
+            _ => Slot::Cold,
         }
     }
 

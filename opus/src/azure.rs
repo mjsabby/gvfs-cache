@@ -1,5 +1,6 @@
 //! Azure Blob Storage over its REST API (Shared Key or SAS auth), on the blocking
-//! [`crate::http`] client. No SDK.
+//! [`crate::http`] client; the edge's ranged reads while it serves use the async
+//! [`crate::aclient`]. No SDK.
 //!
 //! Large slab files are uploaded as 16 MiB blocks (8 in parallel) committed atomically
 //! with Put Block List, and downloaded as parallel 16 MiB ranged reads.
@@ -33,6 +34,11 @@ const PARALLEL: usize = 8;
 const ATTEMPTS: u32 = 4;
 const TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The wait before retry `attempt` (1, 2, ...): 400 ms, 800 ms, 1.6 s.
+fn backoff(attempt: u32) -> Duration {
+    Duration::from_millis(200u64.saturating_mul(1u64.wrapping_shl(attempt)))
+}
+
 #[derive(Clone)]
 enum Credential {
     Key(Vec<u8>),
@@ -46,6 +52,8 @@ pub struct AzureStore {
     container: String,
     /// Key prefix inside the container (empty or ending in `/`).
     prefix: String,
+    /// The edge's async client ([`AzureStore::read_range_async`]).
+    aclient: std::sync::OnceLock<Box<crate::aclient::AClient>>,
 }
 
 impl AzureStore {
@@ -109,6 +117,7 @@ impl AzureStore {
             endpoint,
             container,
             prefix,
+            aclient: std::sync::OnceLock::new(),
         })
     }
 
@@ -125,6 +134,48 @@ impl AzureStore {
             crate::bail!("invalid store key {key:?}");
         }
         Ok(format!("/{}/{}{key}", self.container, self.prefix))
+    }
+
+    /// The headers and query string of one signed request: SharedKey (an `Authorization`
+    /// header over the canonical request), or the SAS appended to the query.
+    fn signed<'h>(
+        &self,
+        method: &str,
+        path: &str,
+        query: &[(&str, String)],
+        extra: &[(&'h str, String)],
+        body_len: u64,
+    ) -> (Vec<(&'h str, String)>, String) {
+        let mut headers: Vec<(&str, String)> = vec![
+            ("x-ms-date", http_date(SystemTime::now())),
+            ("x-ms-version", API_VERSION.to_string()),
+        ];
+        headers.extend(extra.iter().cloned());
+        let mut parts: Vec<String> = query
+            .iter()
+            .map(|(k, v)| format!("{k}={}", encode_query_value(v)))
+            .collect();
+        match &self.credential {
+            Credential::Key(key) => {
+                // The canonicalized resource is the full URI path: a BlobEndpoint with a
+                // path (the Azurite emulator: `/devstoreaccount1`) is part of it.
+                let full_path = format!("{}{path}", self.endpoint.path);
+                let sts =
+                    string_to_sign(&self.account, method, &full_path, query, &headers, body_len);
+                let sig = crate::b64::encode(
+                    hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), sts.as_bytes()).as_ref(),
+                );
+                headers.push(("Authorization", format!("SharedKey {}:{sig}", self.account)));
+            }
+            // The SAS arrives URL-encoded in the connection string: append it verbatim.
+            Credential::Sas(sas) => parts.push(sas.clone()),
+        }
+        let query_string = if parts.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", parts.join("&"))
+        };
+        (headers, query_string)
     }
 
     /// Sends one signed request with retries on transient failures; returns the response
@@ -145,46 +196,10 @@ impl AzureStore {
         let mut last = None;
         for attempt in 0..ATTEMPTS {
             if attempt > 0 {
-                std::thread::sleep(Duration::from_millis(
-                    200u64.saturating_mul(1u64.wrapping_shl(attempt)),
-                ));
+                std::thread::sleep(backoff(attempt));
             }
-            let mut headers: Vec<(&str, String)> = vec![
-                ("x-ms-date", http_date(SystemTime::now())),
-                ("x-ms-version", API_VERSION.to_string()),
-            ];
-            headers.extend(extra.iter().cloned());
-            let mut parts: Vec<String> = query
-                .iter()
-                .map(|(k, v)| format!("{k}={}", encode_query_value(v)))
-                .collect();
-            match &self.credential {
-                Credential::Key(key) => {
-                    // The canonicalized resource is the full URI path: a BlobEndpoint with a
-                    // path (the Azurite emulator: `/devstoreaccount1`) is part of it.
-                    let full_path = format!("{}{path}", self.endpoint.path);
-                    let sts = string_to_sign(
-                        &self.account,
-                        method,
-                        &full_path,
-                        query,
-                        &headers,
-                        crate::util::u64_of(body.len()),
-                    );
-                    let sig = crate::b64::encode(
-                        hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), sts.as_bytes())
-                            .as_ref(),
-                    );
-                    headers.push(("Authorization", format!("SharedKey {}:{sig}", self.account)));
-                }
-                // The SAS arrives URL-encoded in the connection string: append it verbatim.
-                Credential::Sas(sas) => parts.push(sas.clone()),
-            }
-            let query_string = if parts.is_empty() {
-                String::new()
-            } else {
-                format!("?{}", parts.join("&"))
-            };
+            let (headers, query_string) =
+                self.signed(method, path, query, extra, crate::util::u64_of(body.len()));
             let hdrs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
             match client.request(method, &format!("{path}{query_string}"), &hdrs, body) {
                 Ok(resp) if resp.status >= 500 || resp.status == 408 || resp.status == 429 => {
@@ -196,6 +211,73 @@ impl AzureStore {
             }
         }
         Err(last.unwrap_or_else(|| crate::err!("{method} {path} failed")))
+    }
+
+    /// The edge's async client for this account (connections pooled; made on first use).
+    fn aclient(&self) -> &crate::aclient::AClient {
+        self.aclient
+            .get_or_init(|| Box::new(crate::aclient::AClient::new(self.endpoint.clone(), TIMEOUT)))
+    }
+
+    /// [`AzureStore::read_range`] on the async client: one ranged GET (retried on transient
+    /// failures before any byte reached `sink`), streamed to `sink`.
+    pub async fn read_range_async(
+        &self,
+        key: &str,
+        offset: u64,
+        len: u64,
+        sink: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let blob = self.blob_path(key)?;
+        let last = offset.saturating_add(len).saturating_sub(1);
+        let extra = [("x-ms-range", format!("bytes={offset}-{last}"))];
+        let mut failed = None;
+        for attempt in 0..ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(backoff(attempt)).await;
+            }
+            let (headers, query_string) = self.signed("GET", &blob, &[], &extra, 0);
+            let hdrs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let path = format!("{blob}{query_string}");
+            let resp = match self
+                .aclient()
+                .request("GET", &path, &hdrs, bytes::Bytes::new())
+                .await
+            {
+                Ok(r) if r.status >= 500 || r.status == 408 || r.status == 429 => {
+                    failed = Some(crate::err!("GET {blob}: HTTP {}", r.status));
+                    continue;
+                }
+                Ok(r) => r,
+                Err(e) => {
+                    failed = Some(e);
+                    continue;
+                }
+            };
+            let mut resp = resp.ensure_ok(&format!("ranged GET {key}")).await?;
+            let mut got = 0u64;
+            // The sink's work (a block written to the cache) is the worker's: yield as it
+            // goes, as the edge's handlers do.
+            let mut budget = crate::serve::budget::Budget::new();
+            while let Some(chunk) = resp.chunk().await.ctx(&format!("reading {key}"))? {
+                got = got.saturating_add(crate::util::u64_of(chunk.len()));
+                if got > len {
+                    crate::bail!("ranged GET {key}: more bytes than asked for");
+                }
+                sink(&chunk)?;
+                if budget.spend(crate::serve::budget::byte_units(chunk.len())) {
+                    budget.pause().await;
+                }
+            }
+            if got != len {
+                crate::bail!("ranged GET {key}: {got} of {len} bytes");
+            }
+            return Ok(());
+        }
+        Err(failed.unwrap_or_else(|| crate::err!("GET {blob} failed")))
     }
 
     pub fn get(&self, key: &str) -> Result<Option<(Vec<u8>, String)>> {
