@@ -39,7 +39,7 @@ without a single error, at the lowest memory after fable. Its warm-client traffi
 to git's own ideal of the five (§6). Correctness: it passes every conformance, cross-client,
 JSON, scale and replay check after the fixes below. A later CPU and wait analysis (§13) made
 it faster still on a store carrying a week of slabs, with byte-identical responses: blob batches
-1.6× (inline) to 3× (separate blobs), sizes 1.9× to 6.1×, and cold prefetches 31-41% cheaper.
+1.8× (inline) to 5.5× (separate blobs), sizes 3.2× to 11×, and cold prefetches 31-41% cheaper.
 
 **What was fixed/optimized in opus** (each A/B-measured and re-verified; details in §8):
 
@@ -864,6 +864,15 @@ End to end with the final build:
 | `5bb4df3` | Inline store: an id only the baseline has (most of them) paid an MPHF probe in each of 11 newer slabs; 63% of POST and 87% of sizes CPU in lookups | Blocked Bloom filters, one per view over all slabs before the baseline, one per such slab: no false negatives, same answers | Inline POST 2,112 → 3,155, sizes 6,049 → 11,190 (1.85×) |
 | `5bb4df3` | `plan_objects` looked every id up twice (commit check, then plan): 22% of inline POST CPU | The check's lookups kept for the plan (up to 8,192 ids) | Inline POST → 3,357 req/s (1.59×), 3.75 → 2.36 ms CPU, p99 39 → 18 ms |
 | `a4734cb` | A cold prefetch's `.idx` and `GSZ1` (165 MB and 93 MB on SearchGold) were copied into the socket: each byte also cost a socket buffer page zeroed by `init_on_alloc`. 4% of the bytes, 27% of the CPU | Sections of 1 MiB or more moved to a memfd once (mapped, no second copy) and sent with `sendfile` | Edge CPU per cold prefetch: with `.idx` 87.8 → 51.4 ms (27.0 → 34.9 req/s), with sizes 73.4 → 50.5 ms |
+| `75fd11e` | Batched lookups waited for one DRAM read at a time: each id's record sits at a random place in an index far larger than the caches (the blob set's 160 MB, the baseline's 9M records). One load was 68% of a sizes request | Each batch loop has the CPU start loading the record of the id 16 places ahead, and the POST send loop the blob entries ahead, so the misses overlap. `_mm_prefetch` needs one `unsafe` block, isolated in `crates/gvfs-prefetch`; plain loads in its place (safe) were 4-11% slower | POST 4,000 blobs 4,824 → 9,035 req/s (1.87×), sizes 10,593 → 20,487 (1.93×); inline 1.14× and 1.77× |
+
+All of it against the original build, interleaved (df4a1df → 75fd11e, 8 CPUs):
+
+| | separate blobs | inline |
+|---|---|---|
+| POST 4,000 blobs | 1,634 → 9,040 req/s (5.5×), CPU 4.86 → 0.86 ms, p99 47 → 9 ms | 2,011 → 3,655 (1.8×) |
+| sizes 4,000 | 1,805 → 20,588 (11.4×), CPU 4.40 → 0.38 ms | 5,770 → 18,381 (3.2×) |
+| blob GET | 961K → 1.00M (+4.5%) | 983K → 1.02M (+3.3%) |
 
 Blob GETs rose 7% (separate) and 4% (inline). Large-blob paths were already cheap and did not
 change: about 40 µs of CPU per 1 MiB range at 48K ranges/s, and whole large blobs leave
@@ -871,10 +880,18 @@ through `sendfile`.
 
 **What remains is mostly inherent:**
 
-* *Blob batches* (separate store, 1.6 ms of CPU per 4,000 blobs):
-  * the pack trailer's SHA-1, 29%. The `sha1` crate already runs at OpenSSL's speed with the
-    SHA extensions (2.9 GB/s; `ring` manages 0.8);
-  * memory latency of the segment lookups, ~23%, and of the entry copies, 14%.
+* *Blob batches* (separate store, 0.86 ms of CPU per 4,000 blobs):
+  * the pack trailer's SHA-1, 28%. It is the pure-Rust `sha1` crate on the CPU's SHA
+    instructions (no OpenSSL anywhere; `openssl speed` was only the yardstick: 2.94 GB/s per
+    core, the crate 2.91; `ring` 0.79). One stream cannot go faster: each 64-byte block needs
+    the previous block's result, a chain of dependent SHA instructions, and git checks the
+    trailer, so it cannot be skipped (a single large blob's own stored pack is sent without
+    hashing);
+  * the lookups, ~35%: computing each id's slot, then its record. The prefetches now mostly
+    wait for address translation (an L2 TLB miss every ~550 cycles, an estimated 7-15% of
+    the batch);
+  * parsing the ids from the JSON, 7%; the dedupe set, 7%; copying entries, 4%; the kernel
+    zeroing socket buffer pages, 3%.
 * *Small GETs* (1.07M req/s at 256 connections, all 8 CPUs busy):
   * the TCP stack takes about half the cycles and the scheduler 15-20%: one `recvfrom` and one
     `sendto` per request, and one context switch, since a worker blocks for the next request;
@@ -896,10 +913,11 @@ through `sendfile`.
   `sendfile` backpressure), for at most the scheduler's 15-20% of small-GET CPU.
 * A per-worker cached view would skip the `RwLock` and `Arc` atomics per request (≤3% of GET).
   It changes every handler's signature.
-* Software prefetch in batched lookups would overlap the misses (~23% of a blob batch). It
-  needs `_mm_prefetch` under `forbid(unsafe_code)`.
 * Hashing the output buffer in large chunks would hash 100-byte entries at 2.9 GB/s instead of
-  2.5 GB/s (~3% of a blob batch).
+  2.5 GB/s (~4% of a blob batch).
+* Index files mapped with 2 MiB pages would make most of the remaining page walks go away
+  (~7-15% of a blob batch, estimated). The page cache maps them in 4 KiB pages; huge pages
+  would mean copying the indexes into anonymous memory, at the RAM that costs.
 
 **Measurement pitfalls found on the way:**
 
