@@ -587,6 +587,19 @@ impl Slab {
         sub(self.index.bytes(), at, REC_LEN)
     }
 
+    /// Starts loading the record [`Slab::find`] would read for `oid`.
+    #[inline]
+    pub fn preload(&self, oid: &Oid) {
+        if let Some(slot) = self.mphf().slot(oid) {
+            let at = us(u64::from(slot))
+                .saturating_mul(REC_LEN)
+                .saturating_add(self.records_at);
+            let b = self.index.bytes();
+            crate::util::prefetch(b, at);
+            crate::util::prefetch(b, at.saturating_add(REC_LEN.saturating_sub(1)));
+        }
+    }
+
     /// The slot holding `oid`, if this slab has it.
     #[inline]
     pub fn find(&self, oid: &Oid) -> Option<u32> {

@@ -295,6 +295,14 @@ pub fn try_extend(v: &mut Vec<u8>, data: &[u8]) -> bool {
     true
 }
 
+/// Starts loading the cache line that holds `bytes[at]` (nothing if `at` is out of range).
+/// Batched lookups issue this for an id some way ahead of the one they are on, so that the
+/// cache misses of a batch overlap instead of following one another.
+#[inline(always)]
+pub fn prefetch(bytes: &[u8], at: usize) {
+    gvfs_prefetch::prefetch(bytes, at);
+}
+
 /// Pushes `item` only if it fits in the existing capacity (never reallocates).
 #[inline]
 pub fn try_push<T>(v: &mut Vec<T>, item: T) -> bool {

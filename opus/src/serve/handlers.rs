@@ -928,12 +928,21 @@ fn objects_post(
             Piece::Bytes { .. } => out.bytes(bytes)?,
         }
     }
-    for (_, src, rec) in &arena.blobs {
-        let pack = match *src {
-            BlobSrc::Store(seg) => view.blobs.as_ref().and_then(|s| s.pack(seg, rec)),
-            BlobSrc::Proxied(k) => arena.proxied.get(us(u64::from(k))),
+    let pack_of = |src: BlobSrc, rec: &BlobRec| match src {
+        BlobSrc::Store(seg) => view.blobs.as_ref().and_then(|s| s.pack(seg, rec)),
+        BlobSrc::Proxied(k) => arena.proxied.get(us(u64::from(k))),
+    };
+    for (i, (_, src, rec)) in arena.blobs.iter().enumerate() {
+        // The first two lines of an entry ahead (most are small; a large one's reads stream).
+        if let Some((_, s, r)) = arena.blobs.get(i.saturating_add(AHEAD)) {
+            if let Some(b) = pack_of(*s, r).and_then(|p| p.bytes()) {
+                let at = us(r.offset);
+                crate::util::prefetch(b, at);
+                crate::util::prefetch(b, at.saturating_add(64));
+            }
         }
-        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+        let pack = pack_of(*src, rec)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
         send_pack_range(&mut out, pack, rec.offset, rec.entry_len, Some(&mut h))?;
     }
     let trailer: [u8; 20] = h.finalize().into();
@@ -979,6 +988,9 @@ fn plan_objects(view: &View, arena: &mut Arena, depth: u64) -> Result<(), Miss> 
     for (i, o) in oids.iter().enumerate() {
         if *grow && i >= found.capacity() {
             break;
+        }
+        if let Some(next) = oids.get(i.saturating_add(AHEAD)) {
+            view.preload(next);
         }
         let hit = view.find(o);
         *grow |= hit
@@ -1123,6 +1135,10 @@ fn take_stored_blobs(view: &View, arena: &mut Arena) -> Result<(), Miss> {
     let mut rest = 0usize;
     for i in 0..oids.len() {
         let Some(&oid) = oids.get(i) else { break };
+        // Ahead of `i`: not yet moved by the compaction (it writes at `rest <= i`).
+        if let Some(next) = oids.get(i.saturating_add(AHEAD)) {
+            set.preload(next);
+        }
         let at = crate::util::u32_of(i);
         match set.locate(&oid) {
             Some((seg, rec)) => {
@@ -1253,6 +1269,9 @@ fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
     Ok(())
 }
 
+/// How far ahead of the id it is on a batched lookup starts loading another's record.
+const AHEAD: usize = 16;
+
 /// The size of an object no slab and no blob pack has: a blob the trees name (sizes
 /// tables), or known to the upstream.
 fn size_outside_slabs(ctx: &Ctx, view: &View, oid: &Oid) -> Option<u64> {
@@ -1288,6 +1307,12 @@ fn sizes(
     let mut ok = out.capacity() > 2;
     out.push(b'[');
     for (i, oid) in oids.iter().enumerate() {
+        if let Some(next) = oids.get(i.saturating_add(AHEAD)) {
+            match view.blobs.as_ref() {
+                Some(set) => set.preload(next),
+                None => view.preload(next),
+            }
+        }
         let size = match stored_blob(&view, oid) {
             Some((_, r)) => r.size,
             None => match view.find(oid) {

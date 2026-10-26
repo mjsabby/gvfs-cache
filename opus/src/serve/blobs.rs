@@ -221,6 +221,14 @@ impl BlobSet {
             })
     }
 
+    /// Starts loading what [`BlobSet::locate`] reads for `oid` in the biggest segment.
+    #[inline]
+    pub fn preload(&self, oid: &Oid) {
+        if let Some((s, _)) = self.segments.first() {
+            s.preload(oid);
+        }
+    }
+
     /// The pack of a record [`BlobSet::locate`] found in segment `seg`.
     #[inline]
     pub fn pack(&self, seg: u32, rec: &BlobRec) -> Option<&Arc<BlobPack>> {

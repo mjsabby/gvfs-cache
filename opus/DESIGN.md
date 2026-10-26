@@ -9,9 +9,11 @@ change). The README covers usage and benchmarks.
 These are the rules of `gvfs-server/opus/DESIGN.md`, applied to this workspace:
 
 1. **Safe Rust.** The main crate inherits `unsafe_code = "forbid"` from the workspace.
-   Two operations cannot be written safely: a `GlobalAlloc` implementation and `mmap(2)`.
-   Each lives in its own tiny crate (`crates/gvfs-alloc-guard`, `crates/gvfs-mmap`) with
-   `undocumented_unsafe_blocks` denied.
+   Three operations cannot be written safely: a `GlobalAlloc` implementation, `mmap(2)`,
+   and a cache prefetch hint (`_mm_prefetch` is a `#[target_feature(enable = "sse")]`
+   function, so calling it from code that does not itself list `sse` is `unsafe`, although
+   every x86-64 CPU has SSE). Each lives in its own tiny crate (`crates/gvfs-alloc-guard`,
+   `crates/gvfs-mmap`, `crates/gvfs-prefetch`) with `undocumented_unsafe_blocks` denied.
 2. **No panics.** `unwrap_used`, `expect_used`, `panic`, `indexing_slicing`,
    `arithmetic_side_effects`, `todo`, `unimplemented`, and `unreachable` are denied. Slices
    are read with `.get()` and slice patterns; arithmetic is checked, saturating, or
@@ -287,7 +289,11 @@ line per check): an id it rules out goes straight to the baseline. Each of those
 its own filter too, for the ids that pass. Filters have no false negatives, so lookups
 answer exactly as without them; they are built off the request path when a view is made
 (once per slab). On a week-old SearchGold store (12 live slabs) they took 4,000-id sizes
-requests from 6,049 to 11,190 a second and blob batches from 2,112 to 3,155.
+requests from 6,049 to 11,190 a second and blob batches from 2,112 to 3,155. Batched lookups
+(POST, sizes) also have the CPU start loading the record of the id 16 places ahead
+(`gvfs-prefetch`; a hint, so answers cannot change), so a batch's cache misses overlap
+instead of following one another: sizes 1.8-1.9× again, blob batches 1.1-1.9×. Plain loads
+in its place made them 4-11% slower: a load the core must wait for stalls it.
 
 **Prefetch plans.** Every response is one pack holding what the client lacks (and, once
 per sealed day and week, that rollup whole):

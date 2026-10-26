@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = [".", "crates/gvfs-alloc-guard", "crates/gvfs-mmap"]
+members = [".", "crates/gvfs-alloc-guard", "crates/gvfs-mmap", "crates/gvfs-prefetch"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,9 +10,10 @@ license = "MIT"
 publish = false
 
 # Invariant 1 (100% safe Rust) and invariant 2 (zero panics) hold for every crate that
-# opts into `[lints] workspace = true`. The two tiny crates that cannot (`gvfs-alloc-guard`:
-# `unsafe impl GlobalAlloc`; `gvfs-mmap`: one `mmap(2)` of an immutable file) re-declare the
-# same clippy denials and confine their `unsafe` to a single documented item each.
+# opts into `[lints] workspace = true`. The three tiny crates that cannot (`gvfs-alloc-guard`:
+# `unsafe impl GlobalAlloc`; `gvfs-mmap`: one `mmap(2)` of an immutable file; `gvfs-prefetch`:
+# one `_mm_prefetch` hint) re-declare the same clippy denials and confine their `unsafe` to a
+# single documented item each.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
@@ -49,6 +50,7 @@ workspace = true
 [dependencies]
 gvfs-alloc-guard = { path = "crates/gvfs-alloc-guard" }
 gvfs-mmap = { path = "crates/gvfs-mmap" }
+gvfs-prefetch = { path = "crates/gvfs-prefetch" }
 # zlib with SIMD inflate/deflate/adler32, used through its safe streaming API.
 zlib-rs = "0.6"
 # SHA-1 with runtime-detected SHA-NI.

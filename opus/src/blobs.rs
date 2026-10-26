@@ -549,6 +549,19 @@ impl Segment {
         decode_rec(sub(self.region.bytes(), at, SEG_REC_LEN)?)
     }
 
+    /// Starts loading the record [`Segment::find`] would read for `oid`.
+    #[inline]
+    pub fn preload(&self, oid: &Oid) {
+        if let Some(slot) = self.mphf().slot(oid) {
+            let at = us(u64::from(slot))
+                .saturating_mul(SEG_REC_LEN)
+                .saturating_add(self.records_at);
+            let b = self.region.bytes();
+            crate::util::prefetch(b, at);
+            crate::util::prefetch(b, at.saturating_add(SEG_REC_LEN.saturating_sub(1)));
+        }
+    }
+
     /// The record of `oid`, if this segment has it.
     #[inline]
     pub fn find(&self, oid: &Oid) -> Option<BlobRec> {

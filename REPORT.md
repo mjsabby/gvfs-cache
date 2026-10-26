@@ -147,7 +147,7 @@ judged only by **stock git** (`index-pack [--strict]`, `verify-pack`, `rev-list 
 
 | | clippy (deny unwrap/expect/panic/indexing/arithmetic) | own tests | `unsafe` |
 |---|---|---|---|
-| opus | 0 warnings | 49/49 as shipped (incl. a gvfs-helper e2e); 53/53 with the 4 added here (`cargo test --workspace`) | 2 tiny crates |
+| opus | 0 warnings | 49/49 as shipped (incl. a gvfs-helper e2e); 53/53 with the 4 added here (`cargo test --workspace`) | 2 tiny crates (3 after §13: a prefetch hint) |
 | fable | 0 | 40/40 | 2 tiny crates |
 | sol | 0 | 29/29 | 1 crate |
 | astra | 0 | 37/38 — two unit tests flaky (~50 %): an flock race in a multithreaded test, a mock-HTTP connection reset | 1 crate |

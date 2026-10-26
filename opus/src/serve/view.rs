@@ -202,6 +202,17 @@ impl View {
         })
     }
 
+    /// Starts loading what [`View::find`] reads for `oid` in the baseline (where an id the
+    /// newer slabs' filter rules out is).
+    #[inline]
+    pub fn preload(&self, oid: &Oid) {
+        if !self.recent.may_contain(oid) {
+            if let Some(b) = self.all.get(self.baseline) {
+                b.preload(oid);
+            }
+        }
+    }
+
     /// The live L0 slabs, oldest first.
     pub fn l0(&self) -> impl Iterator<Item = &Arc<Slab>> {
         self.all.get(..self.l0_len).unwrap_or(&[]).iter().rev()

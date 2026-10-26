@@ -253,7 +253,9 @@ src/upstream.rs, http.rs, pktline.rs   git protocol v2/v0 over smart HTTP or a l
 src/pack.rs, zlib.rs, delta.rs, object.rs, hfs.rs   git formats (delta.rs: tree delta encoder)
 src/arena.rs               per-request arenas (no allocation while serving)
 crates/gvfs-alloc-guard    counting global allocator that enforces zero hot-path allocations
-crates/gvfs-mmap           the one memory map (the only other `unsafe` in the workspace)
+crates/gvfs-mmap           the one memory map
+crates/gvfs-prefetch       the one cache prefetch hint (batched lookups); with the two above,
+                           the only `unsafe` in the workspace
 tests/                     end-to-end tests (pipeline, serve, HTTP v2/v0, gvfs-helper, Azure,
                            separate blobs)
 benches/load.sh            the load table above

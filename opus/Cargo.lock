@@ -111,6 +111,7 @@ version = "0.1.0"
 dependencies = [
  "gvfs-alloc-guard",
  "gvfs-mmap",
+ "gvfs-prefetch",
  "nix",
  "ring",
  "rustls",
@@ -125,6 +126,10 @@ version = "0.1.0"
 dependencies = [
  "memmap2",
 ]
+
+[[package]]
+name = "gvfs-prefetch"
+version = "0.1.0"
 
 [[package]]
 name = "libc"
