@@ -690,7 +690,7 @@ bitmaps), and a window needs no walk.
 * *Real content with history:* a synthetic repository (20,208 files: text, 1-8 MB binaries, 64-512
   MB incompressible files) and 30 commits of new versions before genesis: 26,871 blobs, 4.21 GB
   in main's history. The mirror, capped at 400 Mbps so that commits land while it runs, took
-  80.3 s (52.4 MB/s) at a 497 MiB peak RSS. Six 15-minute runs sealed commits during the mirror,
+  80.3 s (52.4 MB/s) at a 55 MiB peak RSS (the daemon's; the local git upstream's `pack-objects` peaked at 498 MiB). Six 15-minute runs sealed commits during the mirror,
   one restoring a pre-genesis version of a large file, one restoring a whole old directory against
   a bitmap upstream. Afterwards the store lists exactly git's 26,871 blobs, each once, in 4.02 GB
   of packs (the content's size); every pack passes `index-pack --strict`; an edge with no upstream
@@ -703,6 +703,79 @@ bitmaps), and a window needs no walk.
   Until the mirror is done, a window now copies only blobs no sizes table has. Re-run: each window
   copied its 100 new blobs in 0.1 s, and nothing was copied twice.
 * *Inline stores unchanged:* opus conformance re-run with this binary, 918 passed, 0 failed.
+
+**Client side: blob packs on stock clients** (`bench/blob_clients.py`,
+`bench/results/blob-clients.json`). Sixteen microsoft/git 2.56 clients with Scalar's GVFS settings
+(`core.gvfs`, `core.useGVFSHelper`, Scalar's recommended config, sparse cones) follow a separate-blob
+edge for 14 days of a synthetic repository (`bench/corpus_gen.py` at scale 0.05: 9.0 GB over 2,150
+commits, a 6.2 GB tip at genesis), the pipeline sealing every 15 minutes. Each sync is `gvfs-helper
+prefetch` then `checkout --detach <tip>`, which faults the missing blobs of the cone in (POSTs of up to
+4,000 ids, each a `vfs-<sha>.pack`; a single blob as a loose object). The developer also runs `log -p`
+and `cat-file` on old versions every weekday. Maintenance runs at 00:00 UTC under four regimes: none,
+Scalar's default (`incremental`: incremental-repack and loose-objects), VFS for Git's (2 GB batches),
+and `geometric`. All 16 clients ended complete (every blob of the cone at their tip present) and clean;
+0 failures; the edge made no hot-path allocation and missed no blob.
+
+| client (blob bytes fetched in 14 days) | packs, no maintenance | Scalar default: packs (peak), written | VFS for Git: packs, written | geometric: written; downloaded by maintenance |
+|---|---|---|---|---|
+| agent every 15 min, text cone (287 MB) | 743 | 84 (162), 1.1 GB (3.8×) | 73, 2.8 GB (9.8×) | 38.5 GB (134×); **7.3 GB** |
+| agent hourly, binary cone (2.6 GB) | 288 | 29 (59), 1.8 GB (0.7×) | 26, 1.9 GB (0.7×) | 38.5 GB (15×); **4.9 GB** |
+| developer, 3 syncs a weekday + history (592 MB) | 61 | 11 (19), 1.8 GB (3.1×) | 8, 5.4 GB (9.1×) | 24.7 GB (42×); **7.0 GB** |
+| full checkout, daily (7.9 GB) | 30 | 7 (9), 9.8 GB (1.2×) | 6, 11.2 GB (1.4×) | 23.9 GB (3.0×); 0 |
+
+* *Scalar's default works with blob packs.* Packs stay bounded (84 instead of 743 for the 15-minute
+  agent), at 0.7-3.8× the fetched bytes rewritten over two weeks; maintenance took 2-3 s a day for an
+  agent and 11 s a day for the full checkout. Packs of 2 GB or more are never rewritten (the batch size
+  is capped at 2 GB). VFS for Git's fixed batches rewrite more for the same bound.
+* *The `geometric` strategy must not be used in a GVFS enlistment.* Its `pack-objects --stdin-packs`
+  walks history for path hints, and every blob the walk touches that the client lacks is faulted in
+  through gvfs-helper (traced: `pack.usePathWalk` on or off): the 15-minute agent, whose cone needed
+  287 MB, had its maintenance download 7.3 GB and write 38 GB. That is the client, not the server: it
+  happens against ADO too. Scalar sets `incremental`; `git gc` and `repack -a` traverse history as well.
+* *A single large blob now comes as a pack* (`8ac4c46`). A checkout that needs one blob POSTs one id,
+  and gvfs-helper installs a loose answer as is; Scalar's loose-objects task then inflates and deflates
+  it into a pack: 14.9 s and another 1.07 GB written for a 1 GiB blob (SearchGold's largest file is
+  94 GB). A pack costs gvfs-helper one `index-pack` (3.1 s) and is never deflated again, so the edge
+  answers a single blob of 16 MiB or more with a pack when the client accepts both. GETs (gvfs-helper's
+  on-demand reads) stay loose, as gvfs-helper requires.
+* *Without maintenance* a 15-minute agent gains ~50 packs a day, mostly prefetch packs (§11).
+
+**Two weeks on a 170 GB repository** (`bench/corpus_gen.py` at scale 1.0, `bench/replay_separate.py`,
+`bench/results/replay-separate.json`). The corpus: 170.5 GB of real content in 32,553 blobs (SearchGold's
+size distribution: p50 12 KB, p99 49 MB, 20 blobs over 1 GB, the largest 4.6 GB, two over 4 GiB) and
+2,360 commits, a 124 GB tip at genesis, ~3 GB of new content a weekday; reproducible (41 blobs
+regenerated, up to 4.3 GiB, match) and `git fsck --full --strict` clean. Genesis took 1.8 s; the
+mirror copied the history (126.7 GiB, 29,406 blobs) in **150.7 s** (~900 MB/s with 16 jobs, from a
+local git upstream) at a 98.8 MiB peak RSS (git's `pack-objects` on the upstream side peaked at
+4.4 GiB). Then 14 days of pushes were replayed on the pipeline's cron, with a live edge (L0 one per
+push, its blobs read through) and the §6 clients, each with a sparse cone: every prefetch with
+`X-GVFS-Sizes: 1`, then the cone's missing blobs in POSTs of up to 4,000 ids, every entry inflated and
+hashed by the harness; CI cold clones every 2 hours fetch their cone (4 GB) from scratch.
+
+* *0 failures in 21,612 client events.* Every prefetch complete (as in §6), never a blob in it; every
+  GSZ1 size git's, and every file of every cone sized before its blob was fetched; every blob
+  response exactly the ids asked for, each git's. All 168 cold clones exact: 3.4 MB of commits and
+  trees in 0.01 s (median), then 5,610 blobs (4.0 GB) in 6.2 s (max 9.7 s); 686 GB to CI in all.
+* *Edge:* 948,114 blobs from the store, 548 through the proxy (L0, before the pipeline sealed them), 0
+  missing, 0 errors, 0 hot-path allocations; 1,406 L0 ingests.
+* *Pipeline:* 1,340 runs; 15-minute windows 0.10 s on average, 2.4 s at most (a window copying the
+  day's rebuilt binaries first).
+* *Clients over the two weeks:*
+
+  | client (cone) | requests | blob bytes | blob requests (max) | prefetch ÷ git's ideal |
+  |---|---|---|---|---|
+  | agent, every minute (src, 2 GB) | 20,102 | 0.16 GB | 128 (0.10 s) | 1.55× |
+  | agent, every 15 min (services, lib) | 1,340 | 0.68 GB | 222 (0.72 s) | 1.56× |
+  | agent, hourly (models, 27 GB) | 335 | 8.6 GB | 156 (1.9 s) | 1.62× |
+  | developer, hourly (web, sdk, tests) | 110 | 2.0 GB | 94 (4.0 s) | 1.48× |
+  | developer, 3× a day (bin, config) | 30 | 4.6 GB | 30 (1.0 s) | 1.57× |
+  | developer, mornings (everything) | 10 | 31.4 GB | 10 (8.3 s) | 1.35× |
+  | back after 6 days off | 2 | 5.5 GB | 1 (7.1 s) | 0.96× |
+  | stale (cold cursor) | 1 | 0.78 GB | 1 (1.5 s) | 1.66× |
+
+  Blob bytes equal the content's (text compressed, binaries stored). Prefetches carry megabytes over
+  the two weeks, 1.35-1.66× git's own `blob:none` pack for the same range (the day supersets of §11),
+  next to gigabytes of blobs.
 
 **Seeding real content** (`bench/separate_seed.py`): a synthetic corpus shaped like
 SearchGold (20,216 files, 5.99 GB of which 4.7 GB in 16 large incompressible files),
@@ -720,10 +793,10 @@ SHA-1s), so ADO's serving rate, not the daemon, will set the seed time.
   missing), and `gvfs-daemon mirror`, run again, repairs `blobs.bin`. A lost pack in Azure shows
   only when it is read (5xx for its blobs until the repair).
 
-* *ADO capabilities are assumed, not verified:* protocol v2 `filter blob:none` and `object-info`
-  for genesis, the 15-minute runs and L0. `/gvfs/objects` and `/gvfs/sizes` are used when
-  the upstream is GVFS. A short run against the real repository settles it; if the filter
-  is missing, a metadata-only fetch through `/gvfs/prefetch` is the substitute.
+* *ADO capabilities:* protocol v2 `filter blob:none`, `object-info` and fetching blobs by id (genesis,
+  the 15-minute runs, L0, the mirror) are supported by ADO (confirmed, not exercised here: every run
+  above used a local git upstream). `/gvfs/objects` and `/gvfs/sizes` are used when the upstream is
+  GVFS.
 * *Edges cache blob packs in object storage by 4 MiB blocks* (`--blob-cache-mib`): a read fetches
   each run of missing blocks with one ranged GET, so a checkout's blobs, which sit together in path
   order, cost a few requests. Repeat reads cost none (tested on Azurite). The cache starts cold
@@ -735,8 +808,5 @@ SHA-1s), so ADO's serving rate, not the daemon, will set the seed time.
   stores whole files, so the chunk-level dedup HFS had is gone: a small edit to a 10 GB file
   costs 10 GB again, upstream and here.
 * *Not done from the plan:*
-  * the 100–200 GB P0 corpus (the seed benchmark is 6 GB, the history validation 4.2 GB);
-  * the 7-day replay in separate mode, with its oracle extended to blobs;
-  * client-side lifecycles with blob packs (each gvfs-helper POST is a pack);
-  * a reference client for `GSZ1` and ranges;
+  * a reference client for `GSZ1` and ranges (the replay's harness plays that part);
   * reachability GC of blob packs.

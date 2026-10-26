@@ -67,6 +67,12 @@ def elapsed(text):
     return secs
 
 
+def daemon_rss_kib(text):
+    """The `peak RSS` the daemon logs for itself, in KiB."""
+    v, unit = re.search(r"peak RSS ([\d.]+) (\w+)", text).groups()
+    return int(float(v) * {"B": 1 / 1024, "KiB": 1, "MiB": 1024, "GiB": 1 << 20}[unit])
+
+
 def timed(cmd, log):
     """Runs `cmd` under GNU time; returns (seconds, peak RSS KiB, log text)."""
     t0 = time.time()
@@ -473,7 +479,8 @@ def run_synth(a):
     log = open(mlog, errors="replace").read()
     assert rc == 0, log[-4000:]
     t_mirror = elapsed(log)
-    rss_mirror = int(re.search(r"Maximum resident set size \(kbytes\): (\d+)", log).group(1))
+    # The daemon's own peak (its log); GNU time's includes the local git upstream's processes.
+    rss_mirror = daemon_rss_kib(log)
     skipped = [int(x) for x in re.findall(r"(\d+) items listed meanwhile, skipped", log)]
     pipeline("final")
     want = git_blobs(up)

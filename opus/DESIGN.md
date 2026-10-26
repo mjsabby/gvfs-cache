@@ -576,9 +576,9 @@ and remote reads are cold sections.
   pointers standing for 256 TiB, per `inspect slab`), once, before edges serve; the
   mirror is resumable, parallel and rate-capped, and ADO's serving rate decides how long
   it takes.
-* ADO support for protocol v2 `filter blob:none` and `object-info` is assumed, not
-  verified. GVFS endpoints are used where the upstream offers them (`/gvfs/objects`,
-  `/gvfs/sizes`); a metadata-only fetch through `/gvfs/prefetch` would replace the filter.
+* ADO supports protocol v2 `filter blob:none`, `object-info` and fetching blobs by id
+  (confirmed; every test here uses a local git upstream). GVFS endpoints are used where the
+  upstream offers them (`/gvfs/objects`, `/gvfs/sizes`).
 * The edge's block cache lives in memory and on local disk and starts empty after a
   restart. Hot small-blob packs are not prefetched whole.
 * A window run reads every segment index (48 B per blob) and the manifest's sizes tables:

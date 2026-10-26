@@ -18,12 +18,14 @@
   "mirror": {
     "s": 80.3,
     "MBps": 52.4,
-    "peak_rss_mib": 497,
+    "peak_rss_mib": 54.7,
     "jobs": 8,
     "blob_pack_mib": 256,
     "rate_mbps_cap": 400,
     "items_skipped_listed_meanwhile": 0,
-    "planned_s": 0.0
+    "planned_s": 0.0,
+    "peak_rss_with_upstream_children_mib": 497,
+    "peak_rss_note": "daemon's own (its log); GNU time's figure includes the local git upstream's pack-objects"
   },
   "windows_during_mirror": [
     {

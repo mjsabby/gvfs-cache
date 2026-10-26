@@ -325,9 +325,13 @@ class Replay:
         text = open(log, errors="replace").read()
         if p.returncode != 0:
             raise RuntimeError("mirror failed:\n" + text[-3000:])
+        # The daemon's own peak (its log); GNU time's includes the local git upstream's processes.
+        own = re.search(r"peak RSS ([\d.]+) (\w+)", text).groups()
+        rss_own_mib = float(own[0]) * {"KiB": 1 / 1024, "MiB": 1, "GiB": 1024}.get(own[1], 1)
         rss = int(re.search(r"Maximum resident set size \(kbytes\): (\d+)", text).group(1))
         planned = re.search(r"mirror: (\d+) blobs in the history \(([^)]+)\).*planned in ([\d.]+)s", text)
-        self.seeded = {"genesis_s": round(t_gen, 1), "mirror_s": round(t_mirror, 1), "mirror_peak_rss_mib": rss // 1024,
+        self.seeded = {"genesis_s": round(t_gen, 1), "mirror_s": round(t_mirror, 1),
+                       "mirror_peak_rss_mib": round(rss_own_mib, 1), "with_upstream_children_mib": rss // 1024,
                        "history_blobs": int(planned.group(1)), "history_bytes": planned.group(2),
                        "mirror_planned_s": float(planned.group(3)), "mirror_jobs": self.a.jobs}
         print(f"seed: {self.seeded}", flush=True)
