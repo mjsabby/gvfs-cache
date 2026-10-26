@@ -552,7 +552,12 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   and the combined Adler-32, so nothing is inflated, and for a remote entry only its
   first 2 and last 4 zlib bytes are read before streaming. **POST packs** append whole
   blob entries after the slab splice and hash the trailer as the bytes go out, so a
-  remote entry is read once.
+  remote entry is read once. A POST of a single blob gets a loose object when the client
+  accepts one, unless the blob is 16 MiB or more and the client also takes packs (as
+  gvfs-helper does): a client's maintenance must inflate and deflate a loose object again
+  (~15 s per GiB), never a pack entry. Such a blob was copied into a pack of its own, whose
+  header and trailer were written then, so that file goes out as it is: as cheap for the
+  edge as a loose object (0.01 s of CPU for 1 GiB; hashing a fresh trailer took 0.38 s).
 * **Sizes.** `POST /gvfs/sizes` answers blobs from the sizes tables. A prefetch that
   sends `X-GVFS-Sizes: 1` gets, after its packs, `"GSZ1" | count u64 | (id[20] | size
   u64)*`: the union of the tables of the slabs in that response (a cold clone: the

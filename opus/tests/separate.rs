@@ -544,11 +544,31 @@ fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
     let both = "application/x-git-packfile, application/x-git-loose-object";
     let large_id = rev(&up.bare, &format!("{g}:big/large.bin"));
     let one = std::slice::from_ref(&large_id);
+    let from_store = server.metric("gvfs_blobs_from_store_total");
     let (status, ct, pack) = server.post("/gvfs/objects", json_ids(one, None).as_bytes(), both);
     assert_eq!((status, ct.as_str()), (200, CT_PACK));
     let single = fresh_repo(&root, "single");
     git_stdin(&single, &["index-pack", "--stdin", "--strict"], &pack);
     assert_eq!(cat_batch(&single, one), cat_batch(&up.bare, one));
+    assert_eq!(server.metric("gvfs_blobs_from_store_total"), from_store + 1);
+    // It is the blob's own pack in the store, byte for byte (sent as it is, not re-hashed).
+    let s = Store::open(&store, "").unwrap();
+    let (bm, _) = blobcopy::load(&s).unwrap();
+    let large_oid = Oid::from_hex(large_id.as_bytes()).unwrap();
+    let own = bm
+        .segments
+        .iter()
+        .find_map(|m| {
+            let seg = blobcopy::open_segment(&s, &root, m).unwrap();
+            let rec = seg.find(&large_oid)?;
+            Some(seg.packs()[rec.pack as usize].id.clone())
+        })
+        .unwrap();
+    assert!(pack == std::fs::read(store_dir.join(gvfs_daemon::blobs::pack_key(&own))).unwrap());
+    // So does a client that takes only packs.
+    let (_, ct, only) = server.post("/gvfs/objects", json_ids(one, None).as_bytes(), CT_PACK);
+    assert_eq!(ct, CT_PACK);
+    assert!(only == pack);
     let (_, ct, _) = server.post("/gvfs/objects", json_ids(one, None).as_bytes(), CT_LOOSE);
     assert_eq!(ct, CT_LOOSE);
     let small = std::slice::from_ref(&text2);

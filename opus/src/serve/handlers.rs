@@ -424,6 +424,32 @@ fn loose_blob(
     Ok(keep)
 }
 
+/// Whether `rec` is the only entry of `pack`: header, the entry, trailer. Every blob of
+/// [`crate::blobcopy::LARGE_MIN`] or more is copied into a pack of its own.
+fn own_pack(pack: &BlobPack, rec: &BlobRec) -> bool {
+    let header = u64_of(crate::pack::PACK_HEADER_LEN);
+    let trailer = u64_of(crate::pack::PACK_TRAILER_LEN);
+    rec.offset == header && header.saturating_add(rec.entry_len).saturating_add(trailer) == pack.len
+}
+
+/// A blob's own pack file as a one-blob pack response: its header and trailer were written
+/// when it was copied, so nothing is hashed (mapped: `sendfile(2)`; remote: ranged reads).
+fn whole_pack(
+    ctx: &Ctx,
+    w: &mut super::Worker,
+    stream: &mut TcpStream,
+    pack: &BlobPack,
+    keep: bool,
+) -> std::io::Result<bool> {
+    let mut out = Out::new(stream, &mut w.out);
+    out.head(200, CT_PACK, pack.len, keep)?;
+    send_pack_range(&mut out, pack, 0, pack.len, None)?;
+    out.flush()?;
+    ctx.metrics.bytes_out.fetch_add(out.sent, Ordering::Relaxed);
+    inc(&ctx.metrics.objects_out);
+    Ok(keep)
+}
+
 /// Bytes `[offset, offset + length)` of a blob's content (to its end without `length`).
 /// Stored entries are read in place; compressed ones are inflated from their start (cold
 /// path). `X-GVFS-Blob-Size` gives the blob's size.
@@ -782,8 +808,13 @@ fn objects_post(
         return Ok(keep);
     }
     let view = ctx.view();
-    // One non-commit object: answer as a loose object when the client accepts it.
-    if let ([oid], true) = (arena.oids.as_slice(), accepts_loose) {
+    // One object: a loose object when the client accepts one (not a commit: those expand),
+    // except that a large blob goes out as a pack to a client that takes both: its
+    // maintenance then keeps the entry as it is, where a loose object must be inflated and
+    // deflated again (`git maintenance`'s loose-objects task: ~15 s per GiB). A blob that
+    // goes out as a pack and has a pack of its own in the store (every blob of 16 MiB or
+    // more) is sent as that pack file, which is the response already.
+    if let [oid] = arena.oids.as_slice() {
         let oid = *oid;
         match view.find(&oid) {
             Some((k, slot)) => {
@@ -791,19 +822,29 @@ fn objects_post(
                 let is_commit = rec.is_some_and(|r| r.kind == OBJ_COMMIT);
                 let large_blob =
                     rec.is_some_and(|r| r.kind == OBJ_BLOB && r.size >= LOOSE_BLOB_MAX);
-                if !is_commit && !(accepts_pack && large_blob) {
+                if accepts_loose && !is_commit && !(accepts_pack && large_blob) {
                     return loose(ctx, w, stream, &view, k, slot, Some(arena), keep);
                 }
             }
-            // A large blob goes out as a pack when the client takes one: its maintenance
-            // then keeps the entry as it is, where a loose object must be inflated and
-            // deflated again (`git maintenance`'s loose-objects task: ~15 s per GiB).
-            None if accepts_pack && blob_size_of(&view, &oid) >= LOOSE_BLOB_MAX => {}
-            None => match find_blob(ctx, &view, &oid) {
-                Blob::Found(pack, rec) => return loose_blob(ctx, w, stream, &pack, &rec, keep),
-                Blob::Failed => return unavailable(ctx, stream, keep),
-                Blob::Unknown => {}
-            },
+            None => {
+                let large = blob_size_of(&view, &oid) >= LOOSE_BLOB_MAX;
+                if !accepts_loose || (accepts_pack && large) {
+                    if let Some((pack, rec)) = view.blobs.as_ref().and_then(|s| s.find(&oid)) {
+                        if own_pack(pack, &rec) {
+                            inc(&ctx.metrics.blobs_store);
+                            return whole_pack(ctx, w, stream, pack, keep);
+                        }
+                    }
+                } else {
+                    match find_blob(ctx, &view, &oid) {
+                        Blob::Found(pack, rec) => {
+                            return loose_blob(ctx, w, stream, &pack, &rec, keep);
+                        }
+                        Blob::Failed => return unavailable(ctx, stream, keep),
+                        Blob::Unknown => {}
+                    }
+                }
+            }
         }
     }
     match plan_objects(&view, arena, depth) {

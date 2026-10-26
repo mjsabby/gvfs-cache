@@ -736,8 +736,11 @@ and `geometric`. All 16 clients ended complete (every blob of the cone at their 
   and gvfs-helper installs a loose answer as is; Scalar's loose-objects task then inflates and deflates
   it into a pack: 14.9 s and another 1.07 GB written for a 1 GiB blob (SearchGold's largest file is
   94 GB). A pack costs gvfs-helper one `index-pack` (3.1 s) and is never deflated again, so the edge
-  answers a single blob of 16 MiB or more with a pack when the client accepts both. GETs (gvfs-helper's
-  on-demand reads) stay loose, as gvfs-helper requires.
+  answers a single blob of 16 MiB or more with a pack when the client accepts both. "A pack" is only an
+  envelope here: the same stored bytes, 16 bytes more on the wire (a 12-byte header, a 20-byte trailer).
+  Every such blob already sits alone in a pack in the store, trailer included, so the edge sends that
+  file as it is (`sendfile`): 0.01 s of edge CPU for 1 GiB, as for a loose object (computing a fresh
+  trailer took 0.38 s). GETs (gvfs-helper's on-demand reads) stay loose, as gvfs-helper requires.
 * *Without maintenance* a 15-minute agent gains ~50 packs a day, mostly prefetch packs (§11).
 
 **Two weeks on a 170 GB repository** (`bench/corpus_gen.py` at scale 1.0, `bench/replay_separate.py`,
