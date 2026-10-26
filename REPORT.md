@@ -847,6 +847,15 @@ ones sent them in a different order than before: the same objects, a valid pack,
 byte-identical. Upstream mode reproduces it (21,000 entries, the first difference at entry
 41). The fix keeps one list in request order.
 
+End to end with the final build:
+* opus's tests (59 + 3 + 7 + 9);
+* conformance 918/0;
+* the 14-day `--blobs separate` replay on the synthetic corpus (`bench/replay_separate.py
+  --corpus corpus-s`, a live edge proxying the L0 overlay's blobs; results in
+  `bench/results/replay-separate-corpus-s.json`): 21,954 client requests with 0 failures,
+  168 of 168 cold clones exact, 56,631 blobs from the store and 766 proxied, 0 missing,
+  0 errors, 0 hot-path allocations.
+
 | Commit | Found | Change | Effect (8 CPUs; separate / inline store) |
 |---|---|---|---|
 | `5bb4df3` | Separate store: a blob id probed every slab's index first, three times per POST (commit check, plan, `plan_blobs`), and sizes binary-searched every slab's sizes table (50% of sizes CPU in `memcmp`) | Blob packs' segments first (slabs hold only commits and trees there) | POST 4,000 blobs 1,703 → 4,320 req/s; sizes 1,852 → 11,292 |
