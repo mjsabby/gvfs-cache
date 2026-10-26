@@ -1,0 +1,6080 @@
+{
+ "corpus": "/home/muks/gvfs-bench/corpus-s",
+ "days": 14,
+ "tip": "19591f2dab2cef4be343e37c52bac60a2263b4ad",
+ "failures": [],
+ "edge": {
+  "gvfs_alloc_hot_path_total": 0.0,
+  "gvfs_blobs_from_store_total": 42095.0,
+  "gvfs_blobs_proxied_total": 0.0,
+  "gvfs_blobs_missing_total": 0.0,
+  "gvfs_errors_total": 0.0
+ },
+ "elapsed_s": 761,
+ "clients": {
+  "agent-15m/stock": {
+   "pattern": "agent-15m",
+   "regime": "stock",
+   "verify": {
+    "ok": true,
+    "cone_files": 228,
+    "cone_blobs_missing": 0
+   },
+   "final": {
+    "packs": 742,
+    "vfs_packs": 99,
+    "prefetch_packs": 643,
+    "pack_bytes": 149314364,
+    "loose": 184,
+    "loose_bytes": 143726398
+   },
+   "maint_fetched_bytes": 0,
+   "syncs": 1344,
+   "sync_s": 30.219327938073548,
+   "max_sync_s": 0.7405461829912383,
+   "blob_pack_bytes": 143170267,
+   "blob_packs_created": 99,
+   "loose_created": 184,
+   "loose_bytes_created": 143726398,
+   "prefetch_bytes": 6144097,
+   "maint_runs": 0,
+   "maint_written": 0,
+   "maint_s": 0.0,
+   "max_maint_s": 0.0,
+   "history_ops": 0,
+   "errors": [],
+   "days": [
+    {
+     "day": "2026-10-09",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 111560109,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 111560109,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 111144662
+    },
+    {
+     "day": "2026-10-10",
+     "before": {
+      "packs": 23,
+      "vfs_packs": 1,
+      "prefetch_packs": 22,
+      "pack_bytes": 111640060,
+      "loose": 6,
+      "loose_bytes": 131803
+     },
+     "after": {
+      "packs": 23,
+      "vfs_packs": 1,
+      "prefetch_packs": 22,
+      "pack_bytes": 111640060,
+      "loose": 6,
+      "loose_bytes": 131803
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 111276465
+    },
+    {
+     "day": "2026-10-11",
+     "before": {
+      "packs": 47,
+      "vfs_packs": 1,
+      "prefetch_packs": 46,
+      "pack_bytes": 111759200,
+      "loose": 12,
+      "loose_bytes": 283888
+     },
+     "after": {
+      "packs": 47,
+      "vfs_packs": 1,
+      "prefetch_packs": 46,
+      "pack_bytes": 111759200,
+      "loose": 12,
+      "loose_bytes": 283888
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 111428550
+    },
+    {
+     "day": "2026-10-12",
+     "before": {
+      "packs": 116,
+      "vfs_packs": 14,
+      "prefetch_packs": 102,
+      "pack_bytes": 127219769,
+      "loose": 28,
+      "loose_bytes": 8622497
+     },
+     "after": {
+      "packs": 116,
+      "vfs_packs": 14,
+      "prefetch_packs": 102,
+      "pack_bytes": 127219769,
+      "loose": 28,
+      "loose_bytes": 8622497
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 134801042
+    },
+    {
+     "day": "2026-10-13",
+     "before": {
+      "packs": 179,
+      "vfs_packs": 21,
+      "prefetch_packs": 158,
+      "pack_bytes": 129176789,
+      "loose": 44,
+      "loose_bytes": 9966085
+     },
+     "after": {
+      "packs": 179,
+      "vfs_packs": 21,
+      "prefetch_packs": 158,
+      "pack_bytes": 129176789,
+      "loose": 44,
+      "loose_bytes": 9966085
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 137607916
+    },
+    {
+     "day": "2026-10-14",
+     "before": {
+      "packs": 246,
+      "vfs_packs": 32,
+      "prefetch_packs": 214,
+      "pack_bytes": 132583384,
+      "loose": 63,
+      "loose_bytes": 44347144
+     },
+     "after": {
+      "packs": 246,
+      "vfs_packs": 32,
+      "prefetch_packs": 214,
+      "pack_bytes": 132583384,
+      "loose": 63,
+      "loose_bytes": 44347144
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 174900394
+    },
+    {
+     "day": "2026-10-15",
+     "before": {
+      "packs": 310,
+      "vfs_packs": 38,
+      "prefetch_packs": 272,
+      "pack_bytes": 133697541,
+      "loose": 76,
+      "loose_bytes": 61213482
+     },
+     "after": {
+      "packs": 310,
+      "vfs_packs": 38,
+      "prefetch_packs": 272,
+      "pack_bytes": 133697541,
+      "loose": 76,
+      "loose_bytes": 61213482
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 192402069
+    },
+    {
+     "day": "2026-10-16",
+     "before": {
+      "packs": 380,
+      "vfs_packs": 50,
+      "prefetch_packs": 330,
+      "pack_bytes": 137684472,
+      "loose": 92,
+      "loose_bytes": 68356429
+     },
+     "after": {
+      "packs": 380,
+      "vfs_packs": 50,
+      "prefetch_packs": 330,
+      "pack_bytes": 137684472,
+      "loose": 92,
+      "loose_bytes": 68356429
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 203038890
+    },
+    {
+     "day": "2026-10-17",
+     "before": {
+      "packs": 401,
+      "vfs_packs": 50,
+      "prefetch_packs": 351,
+      "pack_bytes": 137889215,
+      "loose": 97,
+      "loose_bytes": 68412538
+     },
+     "after": {
+      "packs": 401,
+      "vfs_packs": 50,
+      "prefetch_packs": 351,
+      "pack_bytes": 137889215,
+      "loose": 97,
+      "loose_bytes": 68412538
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 203094999
+    },
+    {
+     "day": "2026-10-18",
+     "before": {
+      "packs": 421,
+      "vfs_packs": 51,
+      "prefetch_packs": 370,
+      "pack_bytes": 138434707,
+      "loose": 101,
+      "loose_bytes": 78812489
+     },
+     "after": {
+      "packs": 421,
+      "vfs_packs": 51,
+      "prefetch_packs": 370,
+      "pack_bytes": 138434707,
+      "loose": 101,
+      "loose_bytes": 78812489
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 213920050
+    },
+    {
+     "day": "2026-10-19",
+     "before": {
+      "packs": 480,
+      "vfs_packs": 60,
+      "prefetch_packs": 420,
+      "pack_bytes": 140559505,
+      "loose": 118,
+      "loose_bytes": 90633131
+     },
+     "after": {
+      "packs": 480,
+      "vfs_packs": 60,
+      "prefetch_packs": 420,
+      "pack_bytes": 140559505,
+      "loose": 118,
+      "loose_bytes": 90633131
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 227031307
+    },
+    {
+     "day": "2026-10-20",
+     "before": {
+      "packs": 542,
+      "vfs_packs": 70,
+      "prefetch_packs": 472,
+      "pack_bytes": 143313943,
+      "loose": 134,
+      "loose_bytes": 109387589
+     },
+     "after": {
+      "packs": 542,
+      "vfs_packs": 70,
+      "prefetch_packs": 472,
+      "pack_bytes": 143313943,
+      "loose": 134,
+      "loose_bytes": 109387589
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 248048738
+    },
+    {
+     "day": "2026-10-21",
+     "before": {
+      "packs": 609,
+      "vfs_packs": 82,
+      "prefetch_packs": 527,
+      "pack_bytes": 146564317,
+      "loose": 148,
+      "loose_bytes": 127230862
+     },
+     "after": {
+      "packs": 609,
+      "vfs_packs": 82,
+      "prefetch_packs": 527,
+      "pack_bytes": 146564317,
+      "loose": 148,
+      "loose_bytes": 127230862
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 268659555
+    },
+    {
+     "day": "2026-10-22",
+     "before": {
+      "packs": 673,
+      "vfs_packs": 90,
+      "prefetch_packs": 583,
+      "pack_bytes": 147672111,
+      "loose": 165,
+      "loose_bytes": 130794497
+     },
+     "after": {
+      "packs": 673,
+      "vfs_packs": 90,
+      "prefetch_packs": 583,
+      "pack_bytes": 147672111,
+      "loose": 165,
+      "loose_bytes": 130794497
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 272833266
+    },
+    {
+     "day": "end",
+     "before": {
+      "packs": 742,
+      "vfs_packs": 99,
+      "prefetch_packs": 643,
+      "pack_bytes": 149314364,
+      "loose": 184,
+      "loose_bytes": 143726398
+     },
+     "after": {
+      "packs": 742,
+      "vfs_packs": 99,
+      "prefetch_packs": 643,
+      "pack_bytes": 149314364,
+      "loose": 184,
+      "loose_bytes": 143726398
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 286896665
+    }
+   ]
+  },
+  "agent-15m/scalar": {
+   "pattern": "agent-15m",
+   "regime": "scalar",
+   "verify": {
+    "ok": true,
+    "cone_files": 228,
+    "cone_blobs_missing": 0
+   },
+   "final": {
+    "packs": 83,
+    "vfs_packs": 17,
+    "prefetch_packs": 61,
+    "pack_bytes": 404238678,
+    "loose": 19,
+    "loose_bytes": 12931901
+   },
+   "maint_fetched_bytes": 0,
+   "syncs": 1344,
+   "sync_s": 20.903638251678785,
+   "max_sync_s": 0.7616709720168728,
+   "blob_pack_bytes": 143170267,
+   "blob_packs_created": 99,
+   "loose_created": 184,
+   "loose_bytes_created": 143726398,
+   "prefetch_bytes": 6144097,
+   "maint_runs": 15,
+   "maint_written": 1120626791,
+   "maint_s": 24.2628298830532,
+   "max_maint_s": 8.026296111987904,
+   "history_ops": 0,
+   "errors": [],
+   "days": [
+    {
+     "day": "2026-10-09",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 111560109,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 111560109,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 168420,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 111144662
+    },
+    {
+     "day": "2026-10-10",
+     "before": {
+      "packs": 23,
+      "vfs_packs": 1,
+      "prefetch_packs": 22,
+      "pack_bytes": 111640060,
+      "loose": 6,
+      "loose_bytes": 131803
+     },
+     "after": {
+      "packs": 25,
+      "vfs_packs": 1,
+      "prefetch_packs": 22,
+      "pack_bytes": 112188775,
+      "loose": 6,
+      "loose_bytes": 131803
+     },
+     "maint_written": 911739,
+     "maint_fetched": 0,
+     "maint_s": 0.04,
+     "fetched_blob_bytes": 111276465
+    },
+    {
+     "day": "2026-10-11",
+     "before": {
+      "packs": 49,
+      "vfs_packs": 1,
+      "prefetch_packs": 46,
+      "pack_bytes": 112307915,
+      "loose": 12,
+      "loose_bytes": 283888
+     },
+     "after": {
+      "packs": 29,
+      "vfs_packs": 1,
+      "prefetch_packs": 24,
+      "pack_bytes": 112512233,
+      "loose": 6,
+      "loose_bytes": 152085
+     },
+     "maint_written": 1068720,
+     "maint_fetched": 0,
+     "maint_s": 0.05,
+     "fetched_blob_bytes": 111428550
+    },
+    {
+     "day": "2026-10-12",
+     "before": {
+      "packs": 98,
+      "vfs_packs": 14,
+      "prefetch_packs": 80,
+      "pack_bytes": 127972802,
+      "loose": 22,
+      "loose_bytes": 8490694
+     },
+     "after": {
+      "packs": 74,
+      "vfs_packs": 14,
+      "prefetch_packs": 56,
+      "pack_bytes": 147588258,
+      "loose": 16,
+      "loose_bytes": 8338609
+     },
+     "maint_written": 20700963,
+     "maint_fetched": 0,
+     "maint_s": 0.27,
+     "fetched_blob_bytes": 134801042
+    },
+    {
+     "day": "2026-10-13",
+     "before": {
+      "packs": 137,
+      "vfs_packs": 21,
+      "prefetch_packs": 112,
+      "pack_bytes": 149545278,
+      "loose": 32,
+      "loose_bytes": 9682197
+     },
+     "after": {
+      "packs": 80,
+      "vfs_packs": 20,
+      "prefetch_packs": 56,
+      "pack_bytes": 150749370,
+      "loose": 16,
+      "loose_bytes": 1343588
+     },
+     "maint_written": 13753913,
+     "maint_fetched": 0,
+     "maint_s": 0.43,
+     "fetched_blob_bytes": 137607916
+    },
+    {
+     "day": "2026-10-14",
+     "before": {
+      "packs": 147,
+      "vfs_packs": 31,
+      "prefetch_packs": 112,
+      "pack_bytes": 154155965,
+      "loose": 35,
+      "loose_bytes": 35724647
+     },
+     "after": {
+      "packs": 81,
+      "vfs_packs": 19,
+      "prefetch_packs": 57,
+      "pack_bytes": 188405893,
+      "loose": 19,
+      "loose_bytes": 34381059
+     },
+     "maint_written": 47334794,
+     "maint_fetched": 0,
+     "maint_s": 1.24,
+     "fetched_blob_bytes": 174900394
+    },
+    {
+     "day": "2026-10-15",
+     "before": {
+      "packs": 145,
+      "vfs_packs": 25,
+      "prefetch_packs": 115,
+      "pack_bytes": 189520050,
+      "loose": 32,
+      "loose_bytes": 51247397
+     },
+     "after": {
+      "packs": 89,
+      "vfs_packs": 24,
+      "prefetch_packs": 59,
+      "pack_bytes": 257499357,
+      "loose": 13,
+      "loose_bytes": 16866338
+     },
+     "maint_written": 81426946,
+     "maint_fetched": 0,
+     "maint_s": 2.37,
+     "fetched_blob_bytes": 192402069
+    },
+    {
+     "day": "2026-10-16",
+     "before": {
+      "packs": 159,
+      "vfs_packs": 36,
+      "prefetch_packs": 117,
+      "pack_bytes": 261486288,
+      "loose": 29,
+      "loose_bytes": 24009285
+     },
+     "after": {
+      "packs": 82,
+      "vfs_packs": 19,
+      "prefetch_packs": 59,
+      "pack_bytes": 285456720,
+      "loose": 16,
+      "loose_bytes": 7142947
+     },
+     "maint_written": 89364948,
+     "maint_fetched": 0,
+     "maint_s": 3.2,
+     "fetched_blob_bytes": 203038890
+    },
+    {
+     "day": "2026-10-17",
+     "before": {
+      "packs": 103,
+      "vfs_packs": 19,
+      "prefetch_packs": 80,
+      "pack_bytes": 285661463,
+      "loose": 21,
+      "loose_bytes": 7199056
+     },
+     "after": {
+      "packs": 39,
+      "vfs_packs": 13,
+      "prefetch_packs": 22,
+      "pack_bytes": 296008667,
+      "loose": 5,
+      "loose_bytes": 56109
+     },
+     "maint_written": 93004952,
+     "maint_fetched": 0,
+     "maint_s": 1.33,
+     "fetched_blob_bytes": 203094999
+    },
+    {
+     "day": "2026-10-18",
+     "before": {
+      "packs": 59,
+      "vfs_packs": 14,
+      "prefetch_packs": 41,
+      "pack_bytes": 296554159,
+      "loose": 9,
+      "loose_bytes": 10456060
+     },
+     "after": {
+      "packs": 26,
+      "vfs_packs": 2,
+      "prefetch_packs": 20,
+      "pack_bytes": 306959105,
+      "loose": 4,
+      "loose_bytes": 10399951
+     },
+     "maint_written": 103540431,
+     "maint_fetched": 0,
+     "maint_s": 0.45,
+     "fetched_blob_bytes": 213920050
+    },
+    {
+     "day": "2026-10-19",
+     "before": {
+      "packs": 85,
+      "vfs_packs": 11,
+      "prefetch_packs": 70,
+      "pack_bytes": 309083903,
+      "loose": 21,
+      "loose_bytes": 22220593
+     },
+     "after": {
+      "packs": 65,
+      "vfs_packs": 11,
+      "prefetch_packs": 50,
+      "pack_bytes": 332947107,
+      "loose": 17,
+      "loose_bytes": 11820642
+     },
+     "maint_written": 117227856,
+     "maint_fetched": 0,
+     "maint_s": 1.71,
+     "fetched_blob_bytes": 227031307
+    },
+    {
+     "day": "2026-10-20",
+     "before": {
+      "packs": 127,
+      "vfs_packs": 21,
+      "prefetch_packs": 102,
+      "pack_bytes": 335701545,
+      "loose": 33,
+      "loose_bytes": 30575100
+     },
+     "after": {
+      "packs": 67,
+      "vfs_packs": 11,
+      "prefetch_packs": 52,
+      "pack_bytes": 365211880,
+      "loose": 16,
+      "loose_bytes": 18754458
+     },
+     "maint_written": 135677764,
+     "maint_fetched": 0,
+     "maint_s": 3.47,
+     "fetched_blob_bytes": 248048738
+    },
+    {
+     "day": "2026-10-21",
+     "before": {
+      "packs": 134,
+      "vfs_packs": 23,
+      "prefetch_packs": 107,
+      "pack_bytes": 368462254,
+      "loose": 30,
+      "loose_bytes": 36597731
+     },
+     "after": {
+      "packs": 83,
+      "vfs_packs": 23,
+      "prefetch_packs": 56,
+      "pack_bytes": 380604415,
+      "loose": 14,
+      "loose_bytes": 17843273
+     },
+     "maint_written": 129424744,
+     "maint_fetched": 0,
+     "maint_s": 0.79,
+     "fetched_blob_bytes": 268659555
+    },
+    {
+     "day": "2026-10-22",
+     "before": {
+      "packs": 147,
+      "vfs_packs": 31,
+      "prefetch_packs": 112,
+      "pack_bytes": 381712209,
+      "loose": 31,
+      "loose_bytes": 21406908
+     },
+     "after": {
+      "packs": 93,
+      "vfs_packs": 30,
+      "prefetch_packs": 57,
+      "pack_bytes": 426289484,
+      "loose": 17,
+      "loose_bytes": 3563635
+     },
+     "maint_written": 156747102,
+     "maint_fetched": 0,
+     "maint_s": 8.03,
+     "fetched_blob_bytes": 272833266
+    },
+    {
+     "day": "end",
+     "before": {
+      "packs": 162,
+      "vfs_packs": 39,
+      "prefetch_packs": 117,
+      "pack_bytes": 427931737,
+      "loose": 36,
+      "loose_bytes": 16495536
+     },
+     "after": {
+      "packs": 83,
+      "vfs_packs": 17,
+      "prefetch_packs": 61,
+      "pack_bytes": 404238678,
+      "loose": 19,
+      "loose_bytes": 12931901
+     },
+     "maint_written": 130273499,
+     "maint_fetched": 0,
+     "maint_s": 0.85,
+     "fetched_blob_bytes": 286896665
+    }
+   ]
+  },
+  "agent-15m/geometric": {
+   "pattern": "agent-15m",
+   "regime": "geometric",
+   "verify": {
+    "ok": true,
+    "cone_files": 228,
+    "cone_blobs_missing": 0
+   },
+   "final": {
+    "packs": 3,
+    "vfs_packs": 0,
+    "prefetch_packs": 1,
+    "pack_bytes": 8590725525,
+    "loose": 254,
+    "loose_bytes": 175495797
+   },
+   "maint_fetched_bytes": 7260201270,
+   "syncs": 1344,
+   "sync_s": 23.565741618338507,
+   "max_sync_s": 0.7505001950194128,
+   "blob_pack_bytes": 143170267,
+   "blob_packs_created": 99,
+   "loose_created": 184,
+   "loose_bytes_created": 143726398,
+   "prefetch_bytes": 6144097,
+   "maint_runs": 15,
+   "maint_written": 38467301982,
+   "maint_s": 302.365249519964,
+   "max_maint_s": 107.40973268897505,
+   "history_ops": 0,
+   "errors": [],
+   "days": [
+    {
+     "day": "2026-10-09",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 111560109,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 111560109,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 168541,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 111144662
+    },
+    {
+     "day": "2026-10-10",
+     "before": {
+      "packs": 23,
+      "vfs_packs": 1,
+      "prefetch_packs": 22,
+      "pack_bytes": 111640060,
+      "loose": 6,
+      "loose_bytes": 131803
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 2,
+      "pack_bytes": 111737590,
+      "loose": 1477,
+      "loose_bytes": 6143667718
+     },
+     "maint_written": 6255177439,
+     "maint_fetched": 6143667718,
+     "maint_s": 11.67,
+     "fetched_blob_bytes": 111276465
+    },
+    {
+     "day": "2026-10-11",
+     "before": {
+      "packs": 27,
+      "vfs_packs": 0,
+      "prefetch_packs": 26,
+      "pack_bytes": 111856730,
+      "loose": 1483,
+      "loose_bytes": 6143819803
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 2,
+      "pack_bytes": 6256709921,
+      "loose": 50,
+      "loose_bytes": 43359456
+     },
+     "maint_written": 6299964582,
+     "maint_fetched": 43359456,
+     "maint_s": 107.41,
+     "fetched_blob_bytes": 111428550
+    },
+    {
+     "day": "2026-10-12",
+     "before": {
+      "packs": 72,
+      "vfs_packs": 13,
+      "prefetch_packs": 58,
+      "pack_bytes": 6272170490,
+      "loose": 66,
+      "loose_bytes": 51698065
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7318349751,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 7319127128,
+     "maint_fetched": 0,
+     "maint_s": 55.58,
+     "fetched_blob_bytes": 134801042
+    },
+    {
+     "day": "2026-10-13",
+     "before": {
+      "packs": 65,
+      "vfs_packs": 7,
+      "prefetch_packs": 57,
+      "pack_bytes": 7320306771,
+      "loose": 16,
+      "loose_bytes": 1343588
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7321282716,
+      "loose": 251,
+      "loose_bytes": 145759982
+     },
+     "maint_written": 149131360,
+     "maint_fetched": 145759982,
+     "maint_s": 0.53,
+     "fetched_blob_bytes": 137607916
+    },
+    {
+     "day": "2026-10-14",
+     "before": {
+      "packs": 70,
+      "vfs_packs": 11,
+      "prefetch_packs": 57,
+      "pack_bytes": 7324689311,
+      "loose": 270,
+      "loose_bytes": 180141041
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7504443745,
+      "loose": 251,
+      "loose_bytes": 133109785
+     },
+     "maint_written": 319725174,
+     "maint_fetched": 133109785,
+     "maint_s": 7.55,
+     "fetched_blob_bytes": 174900394
+    },
+    {
+     "day": "2026-10-15",
+     "before": {
+      "packs": 67,
+      "vfs_packs": 6,
+      "prefetch_packs": 59,
+      "pack_bytes": 7505557902,
+      "loose": 264,
+      "loose_bytes": 149976123
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7654664889,
+      "loose": 256,
+      "loose_bytes": 158455146
+     },
+     "maint_written": 495369378,
+     "maint_fetched": 158455146,
+     "maint_s": 7.65,
+     "fetched_blob_bytes": 192402069
+    },
+    {
+     "day": "2026-10-16",
+     "before": {
+      "packs": 73,
+      "vfs_packs": 12,
+      "prefetch_packs": 59,
+      "pack_bytes": 7658651820,
+      "loose": 272,
+      "loose_bytes": 165598093
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7997898834,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 7999074110,
+     "maint_fetched": 0,
+     "maint_s": 47.93,
+     "fetched_blob_bytes": 203038890
+    },
+    {
+     "day": "2026-10-17",
+     "before": {
+      "packs": 23,
+      "vfs_packs": 0,
+      "prefetch_packs": 22,
+      "pack_bytes": 7998103577,
+      "loose": 5,
+      "loose_bytes": 56109
+     },
+     "after": {
+      "packs": 4,
+      "vfs_packs": 0,
+      "prefetch_packs": 2,
+      "pack_bytes": 7998118760,
+      "loose": 51,
+      "loose_bytes": 26753323
+     },
+     "maint_written": 27424661,
+     "maint_fetched": 26753323,
+     "maint_s": 0.1,
+     "fetched_blob_bytes": 203094999
+    },
+    {
+     "day": "2026-10-18",
+     "before": {
+      "packs": 24,
+      "vfs_packs": 1,
+      "prefetch_packs": 21,
+      "pack_bytes": 7998664252,
+      "loose": 55,
+      "loose_bytes": 37153274
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8035606783,
+      "loose": 50,
+      "loose_bytes": 29072503
+     },
+     "maint_written": 67370274,
+     "maint_fetched": 29072503,
+     "maint_s": 1.11,
+     "fetched_blob_bytes": 213920050
+    },
+    {
+     "day": "2026-10-19",
+     "before": {
+      "packs": 62,
+      "vfs_packs": 9,
+      "prefetch_packs": 51,
+      "pack_bytes": 8037731581,
+      "loose": 67,
+      "loose_bytes": 40893145
+     },
+     "after": {
+      "packs": 4,
+      "vfs_packs": 0,
+      "prefetch_packs": 2,
+      "pack_bytes": 8078318205,
+      "loose": 246,
+      "loose_bytes": 40745554
+     },
+     "maint_written": 121341510,
+     "maint_fetched": 40745554,
+     "maint_s": 1.96,
+     "fetched_blob_bytes": 227031307
+    },
+    {
+     "day": "2026-10-20",
+     "before": {
+      "packs": 66,
+      "vfs_packs": 10,
+      "prefetch_packs": 54,
+      "pack_bytes": 8081072643,
+      "loose": 262,
+      "loose_bytes": 59500012
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8187931434,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 8189341800,
+     "maint_fetched": 0,
+     "maint_s": 32.71,
+     "fetched_blob_bytes": 248048738
+    },
+    {
+     "day": "2026-10-21",
+     "before": {
+      "packs": 69,
+      "vfs_packs": 12,
+      "prefetch_packs": 56,
+      "pack_bytes": 8191181808,
+      "loose": 14,
+      "loose_bytes": 17843273
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8208666396,
+      "loose": 246,
+      "loose_bytes": 233817865
+     },
+     "maint_written": 255286961,
+     "maint_fetched": 233817865,
+     "maint_s": 0.98,
+     "fetched_blob_bytes": 268659555
+    },
+    {
+     "day": "2026-10-22",
+     "before": {
+      "packs": 67,
+      "vfs_packs": 8,
+      "prefetch_packs": 57,
+      "pack_bytes": 8209774190,
+      "loose": 263,
+      "loose_bytes": 237381500
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8446770053,
+      "loose": 249,
+      "loose_bytes": 129964141
+     },
+     "maint_written": 389616209,
+     "maint_fetched": 129964141,
+     "maint_s": 11.12,
+     "fetched_blob_bytes": 272833266
+    },
+    {
+     "day": "end",
+     "before": {
+      "packs": 72,
+      "vfs_packs": 9,
+      "prefetch_packs": 61,
+      "pack_bytes": 8448412306,
+      "loose": 268,
+      "loose_bytes": 142896042
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8590725525,
+      "loose": 254,
+      "loose_bytes": 175495797
+     },
+     "maint_written": 579182855,
+     "maint_fetched": 175495797,
+     "maint_s": 16.02,
+     "fetched_blob_bytes": 286896665
+    }
+   ]
+  },
+  "agent-15m/vfs": {
+   "pattern": "agent-15m",
+   "regime": "vfs",
+   "verify": {
+    "ok": true,
+    "cone_files": 228,
+    "cone_blobs_missing": 0
+   },
+   "final": {
+    "packs": 73,
+    "vfs_packs": 9,
+    "prefetch_packs": 60,
+    "pack_bytes": 560920783,
+    "loose": 19,
+    "loose_bytes": 12931901
+   },
+   "maint_fetched_bytes": 0,
+   "syncs": 1344,
+   "sync_s": 20.71483972921851,
+   "max_sync_s": 0.7387721120030619,
+   "blob_pack_bytes": 143170267,
+   "blob_packs_created": 99,
+   "loose_created": 184,
+   "loose_bytes_created": 143726398,
+   "prefetch_bytes": 6144097,
+   "maint_runs": 15,
+   "maint_written": 2798909815,
+   "maint_s": 42.698405295057455,
+   "max_maint_s": 9.728561892989092,
+   "history_ops": 0,
+   "errors": [],
+   "days": [
+    {
+     "day": "2026-10-09",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 111560109,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 111560109,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 168420,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 111144662
+    },
+    {
+     "day": "2026-10-10",
+     "before": {
+      "packs": 23,
+      "vfs_packs": 1,
+      "prefetch_packs": 22,
+      "pack_bytes": 111640060,
+      "loose": 6,
+      "loose_bytes": 131803
+     },
+     "after": {
+      "packs": 25,
+      "vfs_packs": 1,
+      "prefetch_packs": 22,
+      "pack_bytes": 223377366,
+      "loose": 6,
+      "loose_bytes": 131803
+     },
+     "maint_written": 112113514,
+     "maint_fetched": 0,
+     "maint_s": 0.44,
+     "fetched_blob_bytes": 111276465
+    },
+    {
+     "day": "2026-10-11",
+     "before": {
+      "packs": 49,
+      "vfs_packs": 1,
+      "prefetch_packs": 46,
+      "pack_bytes": 223496506,
+      "loose": 12,
+      "loose_bytes": 283888
+     },
+     "after": {
+      "packs": 28,
+      "vfs_packs": 0,
+      "prefetch_packs": 24,
+      "pack_bytes": 223765500,
+      "loose": 6,
+      "loose_bytes": 152085
+     },
+     "maint_written": 112297562,
+     "maint_fetched": 0,
+     "maint_s": 0.33,
+     "fetched_blob_bytes": 111428550
+    },
+    {
+     "day": "2026-10-12",
+     "before": {
+      "packs": 97,
+      "vfs_packs": 13,
+      "prefetch_packs": 80,
+      "pack_bytes": 239226069,
+      "loose": 22,
+      "loose_bytes": 8490694
+     },
+     "after": {
+      "packs": 73,
+      "vfs_packs": 13,
+      "prefetch_packs": 56,
+      "pack_bytes": 262532090,
+      "loose": 16,
+      "loose_bytes": 8338609
+     },
+     "maint_written": 135617955,
+     "maint_fetched": 0,
+     "maint_s": 1.69,
+     "fetched_blob_bytes": 134801042
+    },
+    {
+     "day": "2026-10-13",
+     "before": {
+      "packs": 136,
+      "vfs_packs": 20,
+      "prefetch_packs": 112,
+      "pack_bytes": 264489110,
+      "loose": 32,
+      "loose_bytes": 9682197
+     },
+     "after": {
+      "packs": 67,
+      "vfs_packs": 7,
+      "prefetch_packs": 56,
+      "pack_bytes": 275018823,
+      "loose": 16,
+      "loose_bytes": 1343588
+     },
+     "maint_written": 138420772,
+     "maint_fetched": 0,
+     "maint_s": 1.71,
+     "fetched_blob_bytes": 137607916
+    },
+    {
+     "day": "2026-10-14",
+     "before": {
+      "packs": 134,
+      "vfs_packs": 18,
+      "prefetch_packs": 112,
+      "pack_bytes": 278425418,
+      "loose": 35,
+      "loose_bytes": 35724647
+     },
+     "after": {
+      "packs": 71,
+      "vfs_packs": 11,
+      "prefetch_packs": 56,
+      "pack_bytes": 316441620,
+      "loose": 19,
+      "loose_bytes": 34381059
+     },
+     "maint_written": 175722501,
+     "maint_fetched": 0,
+     "maint_s": 1.97,
+     "fetched_blob_bytes": 174900394
+    },
+    {
+     "day": "2026-10-15",
+     "before": {
+      "packs": 135,
+      "vfs_packs": 17,
+      "prefetch_packs": 114,
+      "pack_bytes": 317555777,
+      "loose": 32,
+      "loose_bytes": 51247397
+     },
+     "after": {
+      "packs": 68,
+      "vfs_packs": 6,
+      "prefetch_packs": 58,
+      "pack_bytes": 368971855,
+      "loose": 13,
+      "loose_bytes": 16866338
+     },
+     "maint_written": 193371365,
+     "maint_fetched": 0,
+     "maint_s": 4.95,
+     "fetched_blob_bytes": 192402069
+    },
+    {
+     "day": "2026-10-16",
+     "before": {
+      "packs": 138,
+      "vfs_packs": 18,
+      "prefetch_packs": 116,
+      "pack_bytes": 372958786,
+      "loose": 29,
+      "loose_bytes": 24009285
+     },
+     "after": {
+      "packs": 74,
+      "vfs_packs": 12,
+      "prefetch_packs": 58,
+      "pack_bytes": 400159417,
+      "loose": 16,
+      "loose_bytes": 7142947
+     },
+     "maint_written": 204165977,
+     "maint_fetched": 0,
+     "maint_s": 9.73,
+     "fetched_blob_bytes": 203038890
+    },
+    {
+     "day": "2026-10-17",
+     "before": {
+      "packs": 95,
+      "vfs_packs": 12,
+      "prefetch_packs": 79,
+      "pack_bytes": 400364160,
+      "loose": 21,
+      "loose_bytes": 7199056
+     },
+     "after": {
+      "packs": 25,
+      "vfs_packs": 0,
+      "prefetch_packs": 21,
+      "pack_bytes": 407155862,
+      "loose": 5,
+      "loose_bytes": 56109
+     },
+     "maint_written": 204226658,
+     "maint_fetched": 0,
+     "maint_s": 1.78,
+     "fetched_blob_bytes": 203094999
+    },
+    {
+     "day": "2026-10-18",
+     "before": {
+      "packs": 45,
+      "vfs_packs": 1,
+      "prefetch_packs": 40,
+      "pack_bytes": 407701354,
+      "loose": 9,
+      "loose_bytes": 10456060
+     },
+     "after": {
+      "packs": 24,
+      "vfs_packs": 1,
+      "prefetch_packs": 19,
+      "pack_bytes": 418393030,
+      "loose": 4,
+      "loose_bytes": 10399951
+     },
+     "maint_written": 215085044,
+     "maint_fetched": 0,
+     "maint_s": 0.8,
+     "fetched_blob_bytes": 213920050
+    },
+    {
+     "day": "2026-10-19",
+     "before": {
+      "packs": 83,
+      "vfs_packs": 10,
+      "prefetch_packs": 69,
+      "pack_bytes": 420517828,
+      "loose": 21,
+      "loose_bytes": 22220593
+     },
+     "after": {
+      "packs": 63,
+      "vfs_packs": 9,
+      "prefetch_packs": 50,
+      "pack_bytes": 443789243,
+      "loose": 17,
+      "loose_bytes": 11820642
+     },
+     "maint_written": 228120945,
+     "maint_fetched": 0,
+     "maint_s": 2.85,
+     "fetched_blob_bytes": 227031307
+    },
+    {
+     "day": "2026-10-20",
+     "before": {
+      "packs": 125,
+      "vfs_packs": 19,
+      "prefetch_packs": 102,
+      "pack_bytes": 446543681,
+      "loose": 33,
+      "loose_bytes": 30575100
+     },
+     "after": {
+      "packs": 66,
+      "vfs_packs": 10,
+      "prefetch_packs": 52,
+      "pack_bytes": 478078146,
+      "loose": 16,
+      "loose_bytes": 18754458
+     },
+     "maint_written": 248874947,
+     "maint_fetched": 0,
+     "maint_s": 5.49,
+     "fetched_blob_bytes": 248048738
+    },
+    {
+     "day": "2026-10-21",
+     "before": {
+      "packs": 133,
+      "vfs_packs": 22,
+      "prefetch_packs": 107,
+      "pack_bytes": 481328520,
+      "loose": 30,
+      "loose_bytes": 36597731
+     },
+     "after": {
+      "packs": 71,
+      "vfs_packs": 12,
+      "prefetch_packs": 55,
+      "pack_bytes": 519713394,
+      "loose": 14,
+      "loose_bytes": 17843273
+     },
+     "maint_written": 269388317,
+     "maint_fetched": 0,
+     "maint_s": 3.19,
+     "fetched_blob_bytes": 268659555
+    },
+    {
+     "day": "2026-10-22",
+     "before": {
+      "packs": 135,
+      "vfs_packs": 20,
+      "prefetch_packs": 111,
+      "pack_bytes": 520821188,
+      "loose": 31,
+      "loose_bytes": 21406908
+     },
+     "after": {
+      "packs": 68,
+      "vfs_packs": 8,
+      "prefetch_packs": 56,
+      "pack_bytes": 542285589,
+      "loose": 17,
+      "loose_bytes": 3563635
+     },
+     "maint_written": 273716374,
+     "maint_fetched": 0,
+     "maint_s": 6.03,
+     "fetched_blob_bytes": 272833266
+    },
+    {
+     "day": "end",
+     "before": {
+      "packs": 137,
+      "vfs_packs": 17,
+      "prefetch_packs": 116,
+      "pack_bytes": 543927842,
+      "loose": 36,
+      "loose_bytes": 16495536
+     },
+     "after": {
+      "packs": 73,
+      "vfs_packs": 9,
+      "prefetch_packs": 60,
+      "pack_bytes": 560920783,
+      "loose": 19,
+      "loose_bytes": 12931901
+     },
+     "maint_written": 287619464,
+     "maint_fetched": 0,
+     "maint_s": 1.74,
+     "fetched_blob_bytes": 286896665
+    }
+   ]
+  },
+  "agent-1h/stock": {
+   "pattern": "agent-1h",
+   "regime": "stock",
+   "verify": {
+    "ok": true,
+    "cone_files": 129,
+    "cone_blobs_missing": 0
+   },
+   "final": {
+    "packs": 287,
+    "vfs_packs": 48,
+    "prefetch_packs": 239,
+    "pack_bytes": 2427635126,
+    "loose": 67,
+    "loose_bytes": 185993591
+   },
+   "maint_fetched_bytes": 0,
+   "syncs": 337,
+   "sync_s": 22.33180777321104,
+   "max_sync_s": 12.476183435006533,
+   "blob_pack_bytes": 2422283959,
+   "blob_packs_created": 48,
+   "loose_created": 67,
+   "loose_bytes_created": 185993591,
+   "prefetch_bytes": 5351167,
+   "maint_runs": 0,
+   "maint_written": 0,
+   "maint_s": 0.0,
+   "max_maint_s": 0.0,
+   "history_ops": 0,
+   "errors": [],
+   "days": [
+    {
+     "day": "2026-10-09",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 2305555482,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 2305555482,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 2305140035
+    },
+    {
+     "day": "2026-10-10",
+     "before": {
+      "packs": 16,
+      "vfs_packs": 1,
+      "prefetch_packs": 15,
+      "pack_bytes": 2305630060,
+      "loose": 1,
+      "loose_bytes": 1934280
+     },
+     "after": {
+      "packs": 16,
+      "vfs_packs": 1,
+      "prefetch_packs": 15,
+      "pack_bytes": 2305630060,
+      "loose": 1,
+      "loose_bytes": 1934280
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 2307074315
+    },
+    {
+     "day": "2026-10-11",
+     "before": {
+      "packs": 32,
+      "vfs_packs": 3,
+      "prefetch_packs": 29,
+      "pack_bytes": 2305762361,
+      "loose": 5,
+      "loose_bytes": 1944325
+     },
+     "after": {
+      "packs": 32,
+      "vfs_packs": 3,
+      "prefetch_packs": 29,
+      "pack_bytes": 2305762361,
+      "loose": 5,
+      "loose_bytes": 1944325
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 2307107611
+    },
+    {
+     "day": "2026-10-12",
+     "before": {
+      "packs": 55,
+      "vfs_packs": 8,
+      "prefetch_packs": 47,
+      "pack_bytes": 2308270833,
+      "loose": 10,
+      "loose_bytes": 2052808
+     },
+     "after": {
+      "packs": 55,
+      "vfs_packs": 8,
+      "prefetch_packs": 47,
+      "pack_bytes": 2308270833,
+      "loose": 10,
+      "loose_bytes": 2052808
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 2309369186
+    },
+    {
+     "day": "2026-10-13",
+     "before": {
+      "packs": 78,
+      "vfs_packs": 13,
+      "prefetch_packs": 65,
+      "pack_bytes": 2308972469,
+      "loose": 16,
+      "loose_bytes": 10651362
+     },
+     "after": {
+      "packs": 78,
+      "vfs_packs": 13,
+      "prefetch_packs": 65,
+      "pack_bytes": 2308972469,
+      "loose": 16,
+      "loose_bytes": 10651362
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 2318258976
+    },
+    {
+     "day": "2026-10-14",
+     "before": {
+      "packs": 103,
+      "vfs_packs": 19,
+      "prefetch_packs": 84,
+      "pack_bytes": 2401319705,
+      "loose": 19,
+      "loose_bytes": 13295645
+     },
+     "after": {
+      "packs": 103,
+      "vfs_packs": 19,
+      "prefetch_packs": 84,
+      "pack_bytes": 2401319705,
+      "loose": 19,
+      "loose_bytes": 13295645
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 2412834135
+    },
+    {
+     "day": "2026-10-15",
+     "before": {
+      "packs": 125,
+      "vfs_packs": 22,
+      "prefetch_packs": 103,
+      "pack_bytes": 2402391648,
+      "loose": 26,
+      "loose_bytes": 29854041
+     },
+     "after": {
+      "packs": 125,
+      "vfs_packs": 22,
+      "prefetch_packs": 103,
+      "pack_bytes": 2402391648,
+      "loose": 26,
+      "loose_bytes": 29854041
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 2430057923
+    },
+    {
+     "day": "2026-10-16",
+     "before": {
+      "packs": 149,
+      "vfs_packs": 27,
+      "prefetch_packs": 122,
+      "pack_bytes": 2407477670,
+      "loose": 31,
+      "loose_bytes": 30235416
+     },
+     "after": {
+      "packs": 149,
+      "vfs_packs": 27,
+      "prefetch_packs": 122,
+      "pack_bytes": 2407477670,
+      "loose": 31,
+      "loose_bytes": 30235416
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 2435113409
+    },
+    {
+     "day": "2026-10-17",
+     "before": {
+      "packs": 161,
+      "vfs_packs": 28,
+      "prefetch_packs": 133,
+      "pack_bytes": 2409894477,
+      "loose": 34,
+      "loose_bytes": 44784636
+     },
+     "after": {
+      "packs": 161,
+      "vfs_packs": 28,
+      "prefetch_packs": 133,
+      "pack_bytes": 2409894477,
+      "loose": 34,
+      "loose_bytes": 44784636
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 2451883397
+    },
+    {
+     "day": "2026-10-18",
+     "before": {
+      "packs": 172,
+      "vfs_packs": 28,
+      "prefetch_packs": 144,
+      "pack_bytes": 2410007302,
+      "loose": 36,
+      "loose_bytes": 44803700
+     },
+     "after": {
+      "packs": 172,
+      "vfs_packs": 28,
+      "prefetch_packs": 144,
+      "pack_bytes": 2410007302,
+      "loose": 36,
+      "loose_bytes": 44803700
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 2451902461
+    },
+    {
+     "day": "2026-10-19",
+     "before": {
+      "packs": 196,
+      "vfs_packs": 33,
+      "prefetch_packs": 163,
+      "pack_bytes": 2412151550,
+      "loose": 39,
+      "loose_bytes": 44807922
+     },
+     "after": {
+      "packs": 196,
+      "vfs_packs": 33,
+      "prefetch_packs": 163,
+      "pack_bytes": 2412151550,
+      "loose": 39,
+      "loose_bytes": 44807922
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 2453290278
+    },
+    {
+     "day": "2026-10-20",
+     "before": {
+      "packs": 221,
+      "vfs_packs": 40,
+      "prefetch_packs": 181,
+      "pack_bytes": 2423305780,
+      "loose": 42,
+      "loose_bytes": 44843744
+     },
+     "after": {
+      "packs": 221,
+      "vfs_packs": 40,
+      "prefetch_packs": 181,
+      "pack_bytes": 2423305780,
+      "loose": 42,
+      "loose_bytes": 44843744
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 2464063668
+    },
+    {
+     "day": "2026-10-21",
+     "before": {
+      "packs": 245,
+      "vfs_packs": 43,
+      "prefetch_packs": 202,
+      "pack_bytes": 2424088439,
+      "loose": 52,
+      "loose_bytes": 145532141
+     },
+     "after": {
+      "packs": 245,
+      "vfs_packs": 43,
+      "prefetch_packs": 202,
+      "pack_bytes": 2424088439,
+      "loose": 52,
+      "loose_bytes": 145532141
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 2565116037
+    },
+    {
+     "day": "2026-10-22",
+     "before": {
+      "packs": 266,
+      "vfs_packs": 45,
+      "prefetch_packs": 221,
+      "pack_bytes": 2424530478,
+      "loose": 61,
+      "loose_bytes": 174574853
+     },
+     "after": {
+      "packs": 266,
+      "vfs_packs": 45,
+      "prefetch_packs": 221,
+      "pack_bytes": 2424530478,
+      "loose": 61,
+      "loose_bytes": 174574853
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 2594186429
+    },
+    {
+     "day": "end",
+     "before": {
+      "packs": 287,
+      "vfs_packs": 48,
+      "prefetch_packs": 239,
+      "pack_bytes": 2427635126,
+      "loose": 67,
+      "loose_bytes": 185993591
+     },
+     "after": {
+      "packs": 287,
+      "vfs_packs": 48,
+      "prefetch_packs": 239,
+      "pack_bytes": 2427635126,
+      "loose": 67,
+      "loose_bytes": 185993591
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 2608277550
+    }
+   ]
+  },
+  "agent-1h/scalar": {
+   "pattern": "agent-1h",
+   "regime": "scalar",
+   "verify": {
+    "ok": true,
+    "cone_files": 129,
+    "cone_blobs_missing": 0
+   },
+   "final": {
+    "packs": 29,
+    "vfs_packs": 6,
+    "prefetch_packs": 19,
+    "pack_bytes": 2870231713,
+    "loose": 6,
+    "loose_bytes": 11418738
+   },
+   "maint_fetched_bytes": 0,
+   "syncs": 337,
+   "sync_s": 19.443627064873,
+   "max_sync_s": 12.076226820994634,
+   "blob_pack_bytes": 2422283959,
+   "blob_packs_created": 48,
+   "loose_created": 67,
+   "loose_bytes_created": 185993591,
+   "prefetch_bytes": 5351167,
+   "maint_runs": 15,
+   "maint_written": 1791042639,
+   "maint_s": 25.50096410594415,
+   "max_maint_s": 9.446045713993954,
+   "history_ops": 0,
+   "errors": [],
+   "days": [
+    {
+     "day": "2026-10-09",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 2305555482,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 2305555482,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 166124,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 2305140035
+    },
+    {
+     "day": "2026-10-10",
+     "before": {
+      "packs": 16,
+      "vfs_packs": 1,
+      "prefetch_packs": 15,
+      "pack_bytes": 2305630060,
+      "loose": 1,
+      "loose_bytes": 1934280
+     },
+     "after": {
+      "packs": 18,
+      "vfs_packs": 1,
+      "prefetch_packs": 15,
+      "pack_bytes": 2307984511,
+      "loose": 1,
+      "loose_bytes": 1934280
+     },
+     "maint_written": 2714915,
+     "maint_fetched": 0,
+     "maint_s": 0.06,
+     "fetched_blob_bytes": 2307074315
+    },
+    {
+     "day": "2026-10-11",
+     "before": {
+      "packs": 34,
+      "vfs_packs": 3,
+      "prefetch_packs": 29,
+      "pack_bytes": 2308116812,
+      "loose": 5,
+      "loose_bytes": 1944325
+     },
+     "after": {
+      "packs": 21,
+      "vfs_packs": 3,
+      "prefetch_packs": 14,
+      "pack_bytes": 2309987504,
+      "loose": 4,
+      "loose_bytes": 10045
+     },
+     "maint_written": 2726621,
+     "maint_fetched": 0,
+     "maint_s": 0.05,
+     "fetched_blob_bytes": 2307107611
+    },
+    {
+     "day": "2026-10-12",
+     "before": {
+      "packs": 44,
+      "vfs_packs": 8,
+      "prefetch_packs": 32,
+      "pack_bytes": 2312495976,
+      "loose": 9,
+      "loose_bytes": 118528
+     },
+     "after": {
+      "packs": 30,
+      "vfs_packs": 8,
+      "prefetch_packs": 18,
+      "pack_bytes": 2312524814,
+      "loose": 5,
+      "loose_bytes": 108483
+     },
+     "maint_written": 2888523,
+     "maint_fetched": 0,
+     "maint_s": 0.03,
+     "fetched_blob_bytes": 2309369186
+    },
+    {
+     "day": "2026-10-13",
+     "before": {
+      "packs": 53,
+      "vfs_packs": 13,
+      "prefetch_packs": 36,
+      "pack_bytes": 2313226450,
+      "loose": 11,
+      "loose_bytes": 8707037
+     },
+     "after": {
+      "packs": 34,
+      "vfs_packs": 11,
+      "prefetch_packs": 19,
+      "pack_bytes": 2323860142,
+      "loose": 6,
+      "loose_bytes": 8598554
+     },
+     "maint_written": 13747657,
+     "maint_fetched": 0,
+     "maint_s": 0.29,
+     "fetched_blob_bytes": 2318258976
+    },
+    {
+     "day": "2026-10-14",
+     "before": {
+      "packs": 59,
+      "vfs_packs": 17,
+      "prefetch_packs": 38,
+      "pack_bytes": 2416207378,
+      "loose": 9,
+      "loose_bytes": 11242837
+     },
+     "after": {
+      "packs": 36,
+      "vfs_packs": 12,
+      "prefetch_packs": 20,
+      "pack_bytes": 2515261995,
+      "loose": 3,
+      "loose_bytes": 2644283
+     },
+     "maint_written": 104596959,
+     "maint_fetched": 0,
+     "maint_s": 1.41,
+     "fetched_blob_bytes": 2412834135
+    },
+    {
+     "day": "2026-10-15",
+     "before": {
+      "packs": 58,
+      "vfs_packs": 15,
+      "prefetch_packs": 39,
+      "pack_bytes": 2516333938,
+      "loose": 10,
+      "loose_bytes": 19202679
+     },
+     "after": {
+      "packs": 32,
+      "vfs_packs": 9,
+      "prefetch_packs": 19,
+      "pack_bytes": 2539058316,
+      "loose": 7,
+      "loose_bytes": 16558396
+     },
+     "maint_written": 125269279,
+     "maint_fetched": 0,
+     "maint_s": 1.88,
+     "fetched_blob_bytes": 2430057923
+    },
+    {
+     "day": "2026-10-16",
+     "before": {
+      "packs": 56,
+      "vfs_packs": 14,
+      "prefetch_packs": 38,
+      "pack_bytes": 2544144338,
+      "loose": 12,
+      "loose_bytes": 16939771
+     },
+     "after": {
+      "packs": 33,
+      "vfs_packs": 9,
+      "prefetch_packs": 20,
+      "pack_bytes": 2544951753,
+      "loose": 5,
+      "loose_bytes": 381375
+     },
+     "maint_written": 109871177,
+     "maint_fetched": 0,
+     "maint_s": 0.58,
+     "fetched_blob_bytes": 2435113409
+    },
+    {
+     "day": "2026-10-17",
+     "before": {
+      "packs": 45,
+      "vfs_packs": 10,
+      "prefetch_packs": 31,
+      "pack_bytes": 2547368560,
+      "loose": 8,
+      "loose_bytes": 14930595
+     },
+     "after": {
+      "packs": 24,
+      "vfs_packs": 7,
+      "prefetch_packs": 12,
+      "pack_bytes": 2582890760,
+      "loose": 3,
+      "loose_bytes": 14549220
+     },
+     "maint_written": 145409425,
+     "maint_fetched": 0,
+     "maint_s": 2.19,
+     "fetched_blob_bytes": 2451883397
+    },
+    {
+     "day": "2026-10-18",
+     "before": {
+      "packs": 35,
+      "vfs_packs": 7,
+      "prefetch_packs": 23,
+      "pack_bytes": 2583003585,
+      "loose": 5,
+      "loose_bytes": 14568284
+     },
+     "after": {
+      "packs": 19,
+      "vfs_packs": 2,
+      "prefetch_packs": 12,
+      "pack_bytes": 2600173465,
+      "loose": 2,
+      "loose_bytes": 19064
+     },
+     "maint_written": 148165582,
+     "maint_fetched": 0,
+     "maint_s": 2.06,
+     "fetched_blob_bytes": 2451902461
+    },
+    {
+     "day": "2026-10-19",
+     "before": {
+      "packs": 43,
+      "vfs_packs": 7,
+      "prefetch_packs": 31,
+      "pack_bytes": 2602317713,
+      "loose": 5,
+      "loose_bytes": 23286
+     },
+     "after": {
+      "packs": 29,
+      "vfs_packs": 6,
+      "prefetch_packs": 19,
+      "pack_bytes": 2603666724,
+      "loose": 3,
+      "loose_bytes": 4222
+     },
+     "maint_written": 149710787,
+     "maint_fetched": 0,
+     "maint_s": 0.76,
+     "fetched_blob_bytes": 2453290278
+    },
+    {
+     "day": "2026-10-20",
+     "before": {
+      "packs": 54,
+      "vfs_packs": 13,
+      "prefetch_packs": 37,
+      "pack_bytes": 2614820954,
+      "loose": 6,
+      "loose_bytes": 40044
+     },
+     "after": {
+      "packs": 30,
+      "vfs_packs": 8,
+      "prefetch_packs": 18,
+      "pack_bytes": 2624790364,
+      "loose": 3,
+      "loose_bytes": 35822
+     },
+     "maint_written": 160418676,
+     "maint_fetched": 0,
+     "maint_s": 2.85,
+     "fetched_blob_bytes": 2464063668
+    },
+    {
+     "day": "2026-10-21",
+     "before": {
+      "packs": 54,
+      "vfs_packs": 11,
+      "prefetch_packs": 39,
+      "pack_bytes": 2625573023,
+      "loose": 13,
+      "loose_bytes": 100724219
+     },
+     "after": {
+      "packs": 29,
+      "vfs_packs": 4,
+      "prefetch_packs": 21,
+      "pack_bytes": 2726220759,
+      "loose": 10,
+      "loose_bytes": 100688397
+     },
+     "maint_written": 261637453,
+     "maint_fetched": 0,
+     "maint_s": 2.97,
+     "fetched_blob_bytes": 2565116037
+    },
+    {
+     "day": "2026-10-22",
+     "before": {
+      "packs": 50,
+      "vfs_packs": 6,
+      "prefetch_packs": 40,
+      "pack_bytes": 2726662798,
+      "loose": 19,
+      "loose_bytes": 129731109
+     },
+     "after": {
+      "packs": 26,
+      "vfs_packs": 3,
+      "prefetch_packs": 19,
+      "pack_bytes": 2855986677,
+      "loose": 9,
+      "loose_bytes": 29042712
+     },
+     "maint_written": 290583702,
+     "maint_fetched": 0,
+     "maint_s": 9.45,
+     "fetched_blob_bytes": 2594186429
+    },
+    {
+     "day": "end",
+     "before": {
+      "packs": 47,
+      "vfs_packs": 6,
+      "prefetch_packs": 37,
+      "pack_bytes": 2859091325,
+      "loose": 15,
+      "loose_bytes": 40461450
+     },
+     "after": {
+      "packs": 29,
+      "vfs_packs": 6,
+      "prefetch_packs": 19,
+      "pack_bytes": 2870231713,
+      "loose": 6,
+      "loose_bytes": 11418738
+     },
+     "maint_written": 273135759,
+     "maint_fetched": 0,
+     "maint_s": 0.92,
+     "fetched_blob_bytes": 2608277550
+    }
+   ]
+  },
+  "agent-1h/geometric": {
+   "pattern": "agent-1h",
+   "regime": "geometric",
+   "verify": {
+    "ok": true,
+    "cone_files": 129,
+    "cone_blobs_missing": 0
+   },
+   "final": {
+    "packs": 3,
+    "vfs_packs": 0,
+    "prefetch_packs": 1,
+    "pack_bytes": 8590043104,
+    "loose": 270,
+    "loose_bytes": 174828120
+   },
+   "maint_fetched_bytes": 4901250927,
+   "syncs": 337,
+   "sync_s": 27.853239151125308,
+   "max_sync_s": 15.588579351984663,
+   "blob_pack_bytes": 2422283959,
+   "blob_packs_created": 48,
+   "loose_created": 67,
+   "loose_bytes_created": 185993591,
+   "prefetch_bytes": 5351167,
+   "maint_runs": 15,
+   "maint_written": 38464147350,
+   "maint_s": 282.5323198529659,
+   "max_maint_s": 86.3695684930135,
+   "history_ops": 0,
+   "errors": [],
+   "days": [
+    {
+     "day": "2026-10-09",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 2305555482,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 2305555482,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 166245,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 2305140035
+    },
+    {
+     "day": "2026-10-10",
+     "before": {
+      "packs": 16,
+      "vfs_packs": 1,
+      "prefetch_packs": 15,
+      "pack_bytes": 2305630060,
+      "loose": 1,
+      "loose_bytes": 1934280
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 2,
+      "pack_bytes": 2307535527,
+      "loose": 1564,
+      "loose_bytes": 3947870880
+     },
+     "maint_written": 6255173470,
+     "maint_fetched": 3947870880,
+     "maint_s": 11.79,
+     "fetched_blob_bytes": 2307074315
+    },
+    {
+     "day": "2026-10-11",
+     "before": {
+      "packs": 19,
+      "vfs_packs": 2,
+      "prefetch_packs": 16,
+      "pack_bytes": 2307667828,
+      "loose": 1568,
+      "loose_bytes": 3947880925
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 2,
+      "pack_bytes": 6256088340,
+      "loose": 49,
+      "loose_bytes": 43481124
+     },
+     "maint_written": 6299467813,
+     "maint_fetched": 43481124,
+     "maint_s": 86.37,
+     "fetched_blob_bytes": 2307107611
+    },
+    {
+     "day": "2026-10-12",
+     "before": {
+      "packs": 26,
+      "vfs_packs": 5,
+      "prefetch_packs": 20,
+      "pack_bytes": 6258596812,
+      "loose": 54,
+      "loose_bytes": 43589607
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7318106977,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 7318884354,
+     "maint_fetched": 0,
+     "maint_s": 58.09,
+     "fetched_blob_bytes": 2309369186
+    },
+    {
+     "day": "2026-10-13",
+     "before": {
+      "packs": 25,
+      "vfs_packs": 5,
+      "prefetch_packs": 19,
+      "pack_bytes": 7318808613,
+      "loose": 6,
+      "loose_bytes": 8598554
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7327123608,
+      "loose": 268,
+      "loose_bytes": 139677098
+     },
+     "maint_written": 149130670,
+     "maint_fetched": 139677098,
+     "maint_s": 0.61,
+     "fetched_blob_bytes": 2318258976
+    },
+    {
+     "day": "2026-10-14",
+     "before": {
+      "packs": 28,
+      "vfs_packs": 6,
+      "prefetch_packs": 20,
+      "pack_bytes": 7419470844,
+      "loose": 271,
+      "loose_bytes": 142321381
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7561469644,
+      "loose": 276,
+      "loose_bytes": 75720696
+     },
+     "maint_written": 319603198,
+     "maint_fetched": 75720696,
+     "maint_s": 4.8,
+     "fetched_blob_bytes": 2412834135
+    },
+    {
+     "day": "2026-10-15",
+     "before": {
+      "packs": 25,
+      "vfs_packs": 3,
+      "prefetch_packs": 20,
+      "pack_bytes": 7562541587,
+      "loose": 283,
+      "loose_bytes": 92279092
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7653840733,
+      "loose": 272,
+      "loose_bytes": 158839418
+     },
+     "maint_written": 495171308,
+     "maint_fetched": 158839418,
+     "maint_s": 9.55,
+     "fetched_blob_bytes": 2430057923
+    },
+    {
+     "day": "2026-10-16",
+     "before": {
+      "packs": 27,
+      "vfs_packs": 5,
+      "prefetch_packs": 20,
+      "pack_bytes": 7658926755,
+      "loose": 277,
+      "loose_bytes": 159220793
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7997174477,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 7998349737,
+     "maint_fetched": 0,
+     "maint_s": 48.07,
+     "fetched_blob_bytes": 2435113409
+    },
+    {
+     "day": "2026-10-17",
+     "before": {
+      "packs": 14,
+      "vfs_packs": 1,
+      "prefetch_packs": 12,
+      "pack_bytes": 7999591284,
+      "loose": 3,
+      "loose_bytes": 14549220
+     },
+     "after": {
+      "packs": 4,
+      "vfs_packs": 0,
+      "prefetch_packs": 2,
+      "pack_bytes": 8014109960,
+      "loose": 50,
+      "loose_bytes": 10033787
+     },
+     "maint_written": 27419910,
+     "maint_fetched": 10033787,
+     "maint_s": 0.3,
+     "fetched_blob_bytes": 2451883397
+    },
+    {
+     "day": "2026-10-18",
+     "before": {
+      "packs": 15,
+      "vfs_packs": 0,
+      "prefetch_packs": 13,
+      "pack_bytes": 8014222785,
+      "loose": 52,
+      "loose_bytes": 10052851
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8024067707,
+      "loose": 55,
+      "loose_bytes": 39884144
+     },
+     "maint_written": 67366888,
+     "maint_fetched": 39884144,
+     "maint_s": 0.47,
+     "fetched_blob_bytes": 2451902461
+    },
+    {
+     "day": "2026-10-19",
+     "before": {
+      "packs": 27,
+      "vfs_packs": 5,
+      "prefetch_packs": 20,
+      "pack_bytes": 8026211955,
+      "loose": 58,
+      "loose_bytes": 39888366
+     },
+     "after": {
+      "packs": 4,
+      "vfs_packs": 0,
+      "prefetch_packs": 2,
+      "pack_bytes": 8065866821,
+      "loose": 269,
+      "loose_bytes": 52471922
+     },
+     "maint_written": 121337858,
+     "maint_fetched": 52471922,
+     "maint_s": 1.83,
+     "fetched_blob_bytes": 2453290278
+    },
+    {
+     "day": "2026-10-20",
+     "before": {
+      "packs": 29,
+      "vfs_packs": 7,
+      "prefetch_packs": 20,
+      "pack_bytes": 8077021051,
+      "loose": 272,
+      "loose_bytes": 52507744
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8187205585,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 8188615935,
+     "maint_fetched": 0,
+     "maint_s": 32.59,
+     "fetched_blob_bytes": 2464063668
+    },
+    {
+     "day": "2026-10-21",
+     "before": {
+      "packs": 26,
+      "vfs_packs": 3,
+      "prefetch_packs": 22,
+      "pack_bytes": 8187988244,
+      "loose": 10,
+      "loose_bytes": 100688397
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8288400350,
+      "loose": 270,
+      "loose_bytes": 153376282
+     },
+     "maint_written": 255303733,
+     "maint_fetched": 153376282,
+     "maint_s": 2.04,
+     "fetched_blob_bytes": 2565116037
+    },
+    {
+     "day": "2026-10-22",
+     "before": {
+      "packs": 24,
+      "vfs_packs": 2,
+      "prefetch_packs": 20,
+      "pack_bytes": 8288842389,
+      "loose": 279,
+      "loose_bytes": 182418994
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8470935207,
+      "loose": 272,
+      "loose_bytes": 105067456
+     },
+     "maint_written": 389609139,
+     "maint_fetched": 105067456,
+     "maint_s": 12.98,
+     "fetched_blob_bytes": 2594186429
+    },
+    {
+     "day": "end",
+     "before": {
+      "packs": 24,
+      "vfs_packs": 3,
+      "prefetch_packs": 19,
+      "pack_bytes": 8474039855,
+      "loose": 278,
+      "loose_bytes": 116486194
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8590043104,
+      "loose": 270,
+      "loose_bytes": 174828120
+     },
+     "maint_written": 578547092,
+     "maint_fetched": 174828120,
+     "maint_s": 13.04,
+     "fetched_blob_bytes": 2608277550
+    }
+   ]
+  },
+  "agent-1h/vfs": {
+   "pattern": "agent-1h",
+   "regime": "vfs",
+   "verify": {
+    "ok": true,
+    "cone_files": 129,
+    "cone_blobs_missing": 0
+   },
+   "final": {
+    "packs": 26,
+    "vfs_packs": 4,
+    "prefetch_packs": 18,
+    "pack_bytes": 2902192196,
+    "loose": 6,
+    "loose_bytes": 11418738
+   },
+   "maint_fetched_bytes": 0,
+   "syncs": 337,
+   "sync_s": 19.92538073909236,
+   "max_sync_s": 12.473428441007854,
+   "blob_pack_bytes": 2422283959,
+   "blob_packs_created": 48,
+   "loose_created": 67,
+   "loose_bytes_created": 185993591,
+   "prefetch_bytes": 5351167,
+   "maint_runs": 15,
+   "maint_written": 1854538403,
+   "maint_s": 33.20258263897267,
+   "max_maint_s": 9.351102874992648,
+   "history_ops": 0,
+   "errors": [],
+   "days": [
+    {
+     "day": "2026-10-09",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 2305555482,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 2305555482,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 166124,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 2305140035
+    },
+    {
+     "day": "2026-10-10",
+     "before": {
+      "packs": 16,
+      "vfs_packs": 1,
+      "prefetch_packs": 15,
+      "pack_bytes": 2305630060,
+      "loose": 1,
+      "loose_bytes": 1934280
+     },
+     "after": {
+      "packs": 18,
+      "vfs_packs": 1,
+      "prefetch_packs": 15,
+      "pack_bytes": 2308025783,
+      "loose": 1,
+      "loose_bytes": 1934280
+     },
+     "maint_written": 2762523,
+     "maint_fetched": 0,
+     "maint_s": 0.07,
+     "fetched_blob_bytes": 2307074315
+    },
+    {
+     "day": "2026-10-11",
+     "before": {
+      "packs": 34,
+      "vfs_packs": 3,
+      "prefetch_packs": 29,
+      "pack_bytes": 2308158084,
+      "loose": 5,
+      "loose_bytes": 1944325
+     },
+     "after": {
+      "packs": 21,
+      "vfs_packs": 3,
+      "prefetch_packs": 14,
+      "pack_bytes": 2310117672,
+      "loose": 4,
+      "loose_bytes": 10045
+     },
+     "maint_written": 2828701,
+     "maint_fetched": 0,
+     "maint_s": 0.05,
+     "fetched_blob_bytes": 2307107611
+    },
+    {
+     "day": "2026-10-12",
+     "before": {
+      "packs": 44,
+      "vfs_packs": 8,
+      "prefetch_packs": 32,
+      "pack_bytes": 2312626144,
+      "loose": 9,
+      "loose_bytes": 118528
+     },
+     "after": {
+      "packs": 28,
+      "vfs_packs": 6,
+      "prefetch_packs": 18,
+      "pack_bytes": 2314913031,
+      "loose": 5,
+      "loose_bytes": 108483
+     },
+     "maint_written": 5257363,
+     "maint_fetched": 0,
+     "maint_s": 0.1,
+     "fetched_blob_bytes": 2309369186
+    },
+    {
+     "day": "2026-10-13",
+     "before": {
+      "packs": 51,
+      "vfs_packs": 11,
+      "prefetch_packs": 36,
+      "pack_bytes": 2315614667,
+      "loose": 11,
+      "loose_bytes": 8707037
+     },
+     "after": {
+      "packs": 28,
+      "vfs_packs": 6,
+      "prefetch_packs": 18,
+      "pack_bytes": 2324217945,
+      "loose": 6,
+      "loose_bytes": 8598554
+     },
+     "maint_written": 14068911,
+     "maint_fetched": 0,
+     "maint_s": 0.28,
+     "fetched_blob_bytes": 2318258976
+    },
+    {
+     "day": "2026-10-14",
+     "before": {
+      "packs": 53,
+      "vfs_packs": 12,
+      "prefetch_packs": 37,
+      "pack_bytes": 2416565181,
+      "loose": 9,
+      "loose_bytes": 11242837
+     },
+     "after": {
+      "packs": 30,
+      "vfs_packs": 7,
+      "prefetch_packs": 19,
+      "pack_bytes": 2519276594,
+      "loose": 3,
+      "loose_bytes": 2644283
+     },
+     "maint_written": 108799508,
+     "maint_fetched": 0,
+     "maint_s": 1.59,
+     "fetched_blob_bytes": 2412834135
+    },
+    {
+     "day": "2026-10-15",
+     "before": {
+      "packs": 52,
+      "vfs_packs": 10,
+      "prefetch_packs": 38,
+      "pack_bytes": 2520348537,
+      "loose": 10,
+      "loose_bytes": 19202679
+     },
+     "after": {
+      "packs": 27,
+      "vfs_packs": 4,
+      "prefetch_packs": 19,
+      "pack_bytes": 2539936759,
+      "loose": 7,
+      "loose_bytes": 16558396
+     },
+     "maint_written": 126129701,
+     "maint_fetched": 0,
+     "maint_s": 1.1,
+     "fetched_blob_bytes": 2430057923
+    },
+    {
+     "day": "2026-10-16",
+     "before": {
+      "packs": 51,
+      "vfs_packs": 9,
+      "prefetch_packs": 38,
+      "pack_bytes": 2545022781,
+      "loose": 12,
+      "loose_bytes": 16939771
+     },
+     "after": {
+      "packs": 29,
+      "vfs_packs": 6,
+      "prefetch_packs": 19,
+      "pack_bytes": 2566363084,
+      "loose": 5,
+      "loose_bytes": 381375
+     },
+     "maint_written": 131337790,
+     "maint_fetched": 0,
+     "maint_s": 3.76,
+     "fetched_blob_bytes": 2435113409
+    },
+    {
+     "day": "2026-10-17",
+     "before": {
+      "packs": 41,
+      "vfs_packs": 7,
+      "prefetch_packs": 30,
+      "pack_bytes": 2568779891,
+      "loose": 8,
+      "loose_bytes": 14930595
+     },
+     "after": {
+      "packs": 17,
+      "vfs_packs": 2,
+      "prefetch_packs": 11,
+      "pack_bytes": 2585615540,
+      "loose": 3,
+      "loose_bytes": 14549220
+     },
+     "maint_written": 147795300,
+     "maint_fetched": 0,
+     "maint_s": 1.03,
+     "fetched_blob_bytes": 2451883397
+    },
+    {
+     "day": "2026-10-18",
+     "before": {
+      "packs": 28,
+      "vfs_packs": 2,
+      "prefetch_packs": 22,
+      "pack_bytes": 2585728365,
+      "loose": 5,
+      "loose_bytes": 14568284
+     },
+     "after": {
+      "packs": 16,
+      "vfs_packs": 1,
+      "prefetch_packs": 11,
+      "pack_bytes": 2600126675,
+      "loose": 2,
+      "loose_bytes": 19064
+     },
+     "maint_written": 148177375,
+     "maint_fetched": 0,
+     "maint_s": 1.92,
+     "fetched_blob_bytes": 2451902461
+    },
+    {
+     "day": "2026-10-19",
+     "before": {
+      "packs": 40,
+      "vfs_packs": 6,
+      "prefetch_packs": 30,
+      "pack_bytes": 2602270923,
+      "loose": 5,
+      "loose_bytes": 23286
+     },
+     "after": {
+      "packs": 29,
+      "vfs_packs": 6,
+      "prefetch_packs": 19,
+      "pack_bytes": 2603659747,
+      "loose": 3,
+      "loose_bytes": 4222
+     },
+     "maint_written": 149704813,
+     "maint_fetched": 0,
+     "maint_s": 0.76,
+     "fetched_blob_bytes": 2453290278
+    },
+    {
+     "day": "2026-10-20",
+     "before": {
+      "packs": 54,
+      "vfs_packs": 13,
+      "prefetch_packs": 37,
+      "pack_bytes": 2614813977,
+      "loose": 6,
+      "loose_bytes": 40044
+     },
+     "after": {
+      "packs": 30,
+      "vfs_packs": 8,
+      "prefetch_packs": 18,
+      "pack_bytes": 2624776972,
+      "loose": 3,
+      "loose_bytes": 35822
+     },
+     "maint_written": 160411258,
+     "maint_fetched": 0,
+     "maint_s": 3.3,
+     "fetched_blob_bytes": 2464063668
+    },
+    {
+     "day": "2026-10-21",
+     "before": {
+      "packs": 54,
+      "vfs_packs": 11,
+      "prefetch_packs": 39,
+      "pack_bytes": 2625559631,
+      "loose": 13,
+      "loose_bytes": 100724219
+     },
+     "after": {
+      "packs": 29,
+      "vfs_packs": 4,
+      "prefetch_packs": 21,
+      "pack_bytes": 2726205311,
+      "loose": 10,
+      "loose_bytes": 100688397
+     },
+     "maint_written": 261629423,
+     "maint_fetched": 0,
+     "maint_s": 2.94,
+     "fetched_blob_bytes": 2565116037
+    },
+    {
+     "day": "2026-10-22",
+     "before": {
+      "packs": 50,
+      "vfs_packs": 6,
+      "prefetch_packs": 40,
+      "pack_bytes": 2726647350,
+      "loose": 19,
+      "loose_bytes": 129731109
+     },
+     "after": {
+      "packs": 26,
+      "vfs_packs": 3,
+      "prefetch_packs": 19,
+      "pack_bytes": 2856185794,
+      "loose": 9,
+      "loose_bytes": 29042712
+     },
+     "maint_written": 290855713,
+     "maint_fetched": 0,
+     "maint_s": 9.35,
+     "fetched_blob_bytes": 2594186429
+    },
+    {
+     "day": "end",
+     "before": {
+      "packs": 47,
+      "vfs_packs": 6,
+      "prefetch_packs": 37,
+      "pack_bytes": 2859290442,
+      "loose": 15,
+      "loose_bytes": 40461450
+     },
+     "after": {
+      "packs": 26,
+      "vfs_packs": 4,
+      "prefetch_packs": 18,
+      "pack_bytes": 2902192196,
+      "loose": 6,
+      "loose_bytes": 11418738
+     },
+     "maint_written": 304613900,
+     "maint_fetched": 0,
+     "maint_s": 6.96,
+     "fetched_blob_bytes": 2608277550
+    }
+   ]
+  },
+  "dev/stock": {
+   "pattern": "dev",
+   "regime": "stock",
+   "verify": {
+    "ok": true,
+    "cone_files": 326,
+    "cone_blobs_missing": 0
+   },
+   "final": {
+    "packs": 61,
+    "vfs_packs": 30,
+    "prefetch_packs": 31,
+    "pack_bytes": 594742328,
+    "loose": 2,
+    "loose_bytes": 32555
+   },
+   "maint_fetched_bytes": 0,
+   "syncs": 31,
+   "sync_s": 5.611402581096627,
+   "max_sync_s": 2.3236850560060702,
+   "blob_pack_bytes": 591582481,
+   "blob_packs_created": 30,
+   "loose_created": 2,
+   "loose_bytes_created": 32555,
+   "prefetch_bytes": 3159847,
+   "maint_runs": 0,
+   "maint_written": 0,
+   "maint_s": 0.0,
+   "max_maint_s": 0.0,
+   "history_ops": 10,
+   "errors": [],
+   "days": [
+    {
+     "day": "2026-10-09",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 341824190,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 341824190,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 341408743
+    },
+    {
+     "day": "2026-10-10",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 348306925,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 8,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 348306925,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 347840615
+    },
+    {
+     "day": "2026-10-11",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 348306925,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 8,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 348306925,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 347840615
+    },
+    {
+     "day": "2026-10-12",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 348306925,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 8,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 348306925,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 347840615
+    },
+    {
+     "day": "2026-10-13",
+     "before": {
+      "packs": 14,
+      "vfs_packs": 7,
+      "prefetch_packs": 7,
+      "pack_bytes": 405440626,
+      "loose": 1,
+      "loose_bytes": 32406
+     },
+     "after": {
+      "packs": 14,
+      "vfs_packs": 7,
+      "prefetch_packs": 7,
+      "pack_bytes": 405440626,
+      "loose": 1,
+      "loose_bytes": 32406
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 404713961
+    },
+    {
+     "day": "2026-10-14",
+     "before": {
+      "packs": 20,
+      "vfs_packs": 10,
+      "prefetch_packs": 10,
+      "pack_bytes": 408538560,
+      "loose": 1,
+      "loose_bytes": 32406
+     },
+     "after": {
+      "packs": 20,
+      "vfs_packs": 10,
+      "prefetch_packs": 10,
+      "pack_bytes": 408538560,
+      "loose": 1,
+      "loose_bytes": 32406
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 407556307
+    },
+    {
+     "day": "2026-10-15",
+     "before": {
+      "packs": 26,
+      "vfs_packs": 13,
+      "prefetch_packs": 13,
+      "pack_bytes": 487048929,
+      "loose": 1,
+      "loose_bytes": 32406
+     },
+     "after": {
+      "packs": 26,
+      "vfs_packs": 13,
+      "prefetch_packs": 13,
+      "pack_bytes": 487048929,
+      "loose": 1,
+      "loose_bytes": 32406
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 485816840
+    },
+    {
+     "day": "2026-10-16",
+     "before": {
+      "packs": 32,
+      "vfs_packs": 16,
+      "prefetch_packs": 16,
+      "pack_bytes": 517216718,
+      "loose": 1,
+      "loose_bytes": 32406
+     },
+     "after": {
+      "packs": 32,
+      "vfs_packs": 16,
+      "prefetch_packs": 16,
+      "pack_bytes": 517216718,
+      "loose": 1,
+      "loose_bytes": 32406
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 515720682
+    },
+    {
+     "day": "2026-10-17",
+     "before": {
+      "packs": 37,
+      "vfs_packs": 18,
+      "prefetch_packs": 19,
+      "pack_bytes": 518118361,
+      "loose": 2,
+      "loose_bytes": 32555
+     },
+     "after": {
+      "packs": 37,
+      "vfs_packs": 18,
+      "prefetch_packs": 19,
+      "pack_bytes": 518118361,
+      "loose": 2,
+      "loose_bytes": 32555
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 516448940
+    },
+    {
+     "day": "2026-10-18",
+     "before": {
+      "packs": 37,
+      "vfs_packs": 18,
+      "prefetch_packs": 19,
+      "pack_bytes": 518118361,
+      "loose": 2,
+      "loose_bytes": 32555
+     },
+     "after": {
+      "packs": 37,
+      "vfs_packs": 18,
+      "prefetch_packs": 19,
+      "pack_bytes": 518118361,
+      "loose": 2,
+      "loose_bytes": 32555
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 516448940
+    },
+    {
+     "day": "2026-10-19",
+     "before": {
+      "packs": 37,
+      "vfs_packs": 18,
+      "prefetch_packs": 19,
+      "pack_bytes": 518118361,
+      "loose": 2,
+      "loose_bytes": 32555
+     },
+     "after": {
+      "packs": 37,
+      "vfs_packs": 18,
+      "prefetch_packs": 19,
+      "pack_bytes": 518118361,
+      "loose": 2,
+      "loose_bytes": 32555
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 516448940
+    },
+    {
+     "day": "2026-10-20",
+     "before": {
+      "packs": 43,
+      "vfs_packs": 21,
+      "prefetch_packs": 22,
+      "pack_bytes": 522728106,
+      "loose": 2,
+      "loose_bytes": 32555
+     },
+     "after": {
+      "packs": 43,
+      "vfs_packs": 21,
+      "prefetch_packs": 22,
+      "pack_bytes": 522728106,
+      "loose": 2,
+      "loose_bytes": 32555
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 520377975
+    },
+    {
+     "day": "2026-10-21",
+     "before": {
+      "packs": 49,
+      "vfs_packs": 24,
+      "prefetch_packs": 25,
+      "pack_bytes": 534754102,
+      "loose": 2,
+      "loose_bytes": 32555
+     },
+     "after": {
+      "packs": 49,
+      "vfs_packs": 24,
+      "prefetch_packs": 25,
+      "pack_bytes": 534754102,
+      "loose": 2,
+      "loose_bytes": 32555
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 532146348
+    },
+    {
+     "day": "2026-10-22",
+     "before": {
+      "packs": 55,
+      "vfs_packs": 27,
+      "prefetch_packs": 28,
+      "pack_bytes": 557738985,
+      "loose": 2,
+      "loose_bytes": 32555
+     },
+     "after": {
+      "packs": 55,
+      "vfs_packs": 27,
+      "prefetch_packs": 28,
+      "pack_bytes": 557738985,
+      "loose": 2,
+      "loose_bytes": 32555
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 554870845
+    },
+    {
+     "day": "end",
+     "before": {
+      "packs": 61,
+      "vfs_packs": 30,
+      "prefetch_packs": 31,
+      "pack_bytes": 594742328,
+      "loose": 2,
+      "loose_bytes": 32555
+     },
+     "after": {
+      "packs": 61,
+      "vfs_packs": 30,
+      "prefetch_packs": 31,
+      "pack_bytes": 594742328,
+      "loose": 2,
+      "loose_bytes": 32555
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 591615036
+    }
+   ]
+  },
+  "dev/scalar": {
+   "pattern": "dev",
+   "regime": "scalar",
+   "verify": {
+    "ok": true,
+    "cone_files": 326,
+    "cone_blobs_missing": 0
+   },
+   "final": {
+    "packs": 11,
+    "vfs_packs": 6,
+    "prefetch_packs": 3,
+    "pack_bytes": 839910464,
+    "loose": 0,
+    "loose_bytes": 0
+   },
+   "maint_fetched_bytes": 0,
+   "syncs": 31,
+   "sync_s": 5.6176057259435765,
+   "max_sync_s": 2.323564794001868,
+   "blob_pack_bytes": 591582481,
+   "blob_packs_created": 30,
+   "loose_created": 2,
+   "loose_bytes_created": 32555,
+   "prefetch_bytes": 3159847,
+   "maint_runs": 15,
+   "maint_written": 1638074359,
+   "maint_s": 36.53526568401139,
+   "max_maint_s": 12.402309308992699,
+   "history_ops": 10,
+   "errors": [],
+   "days": [
+    {
+     "day": "2026-10-09",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 341824190,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 341824190,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 171276,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 341408743
+    },
+    {
+     "day": "2026-10-10",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 348306925,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 9,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 354077483,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 6134734,
+     "maint_fetched": 0,
+     "maint_s": 0.04,
+     "fetched_blob_bytes": 347840615
+    },
+    {
+     "day": "2026-10-11",
+     "before": {
+      "packs": 9,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 354077483,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 2,
+      "pack_bytes": 355130545,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 7192079,
+     "maint_fetched": 0,
+     "maint_s": 0.08,
+     "fetched_blob_bytes": 347840615
+    },
+    {
+     "day": "2026-10-12",
+     "before": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 2,
+      "pack_bytes": 355130545,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 348253391,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 176980,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 347840615
+    },
+    {
+     "day": "2026-10-13",
+     "before": {
+      "packs": 9,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 405387092,
+      "loose": 1,
+      "loose_bytes": 32406
+     },
+     "after": {
+      "packs": 10,
+      "vfs_packs": 4,
+      "prefetch_packs": 3,
+      "pack_bytes": 464802010,
+      "loose": 1,
+      "loose_bytes": 32406
+     },
+     "maint_written": 59679735,
+     "maint_fetched": 0,
+     "maint_s": 0.83,
+     "fetched_blob_bytes": 404713961
+    },
+    {
+     "day": "2026-10-14",
+     "before": {
+      "packs": 16,
+      "vfs_packs": 7,
+      "prefetch_packs": 6,
+      "pack_bytes": 467899944,
+      "loose": 1,
+      "loose_bytes": 32406
+     },
+     "after": {
+      "packs": 12,
+      "vfs_packs": 6,
+      "prefetch_packs": 3,
+      "pack_bytes": 472013853,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 64174772,
+     "maint_fetched": 0,
+     "maint_s": 0.9,
+     "fetched_blob_bytes": 407556307
+    },
+    {
+     "day": "2026-10-15",
+     "before": {
+      "packs": 18,
+      "vfs_packs": 9,
+      "prefetch_packs": 6,
+      "pack_bytes": 550524222,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 13,
+      "vfs_packs": 7,
+      "prefetch_packs": 4,
+      "pack_bytes": 629839351,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 143886415,
+     "maint_fetched": 0,
+     "maint_s": 4.65,
+     "fetched_blob_bytes": 485816840
+    },
+    {
+     "day": "2026-10-16",
+     "before": {
+      "packs": 19,
+      "vfs_packs": 10,
+      "prefetch_packs": 7,
+      "pack_bytes": 660007140,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 11,
+      "vfs_packs": 6,
+      "prefetch_packs": 3,
+      "pack_bytes": 687842503,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 172185367,
+     "maint_fetched": 0,
+     "maint_s": 12.4,
+     "fetched_blob_bytes": 515720682
+    },
+    {
+     "day": "2026-10-17",
+     "before": {
+      "packs": 16,
+      "vfs_packs": 8,
+      "prefetch_packs": 6,
+      "pack_bytes": 688744146,
+      "loose": 1,
+      "loose_bytes": 149
+     },
+     "after": {
+      "packs": 11,
+      "vfs_packs": 5,
+      "prefetch_packs": 3,
+      "pack_bytes": 692309803,
+      "loose": 1,
+      "loose_bytes": 149
+     },
+     "maint_written": 175964260,
+     "maint_fetched": 0,
+     "maint_s": 1.34,
+     "fetched_blob_bytes": 516448940
+    },
+    {
+     "day": "2026-10-18",
+     "before": {
+      "packs": 11,
+      "vfs_packs": 5,
+      "prefetch_packs": 3,
+      "pack_bytes": 692309803,
+      "loose": 1,
+      "loose_bytes": 149
+     },
+     "after": {
+      "packs": 7,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 691973137,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 175981668,
+     "maint_fetched": 0,
+     "maint_s": 0.42,
+     "fetched_blob_bytes": 516448940
+    },
+    {
+     "day": "2026-10-19",
+     "before": {
+      "packs": 7,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 691973137,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 516698283,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 342180,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 516448940
+    },
+    {
+     "day": "2026-10-20",
+     "before": {
+      "packs": 9,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 521308028,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 9,
+      "vfs_packs": 4,
+      "prefetch_packs": 3,
+      "pack_bytes": 700587862,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 180155334,
+     "maint_fetched": 0,
+     "maint_s": 0.9,
+     "fetched_blob_bytes": 520377975
+    },
+    {
+     "day": "2026-10-21",
+     "before": {
+      "packs": 15,
+      "vfs_packs": 7,
+      "prefetch_packs": 6,
+      "pack_bytes": 712613858,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 9,
+      "vfs_packs": 4,
+      "prefetch_packs": 3,
+      "pack_bytes": 722130279,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 190288558,
+     "maint_fetched": 0,
+     "maint_s": 2.0,
+     "fetched_blob_bytes": 532146348
+    },
+    {
+     "day": "2026-10-22",
+     "before": {
+      "packs": 15,
+      "vfs_packs": 7,
+      "prefetch_packs": 6,
+      "pack_bytes": 745115162,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 11,
+      "vfs_packs": 6,
+      "prefetch_packs": 3,
+      "pack_bytes": 767462611,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 213026211,
+     "maint_fetched": 0,
+     "maint_s": 5.3,
+     "fetched_blob_bytes": 554870845
+    },
+    {
+     "day": "end",
+     "before": {
+      "packs": 17,
+      "vfs_packs": 9,
+      "prefetch_packs": 6,
+      "pack_bytes": 804465954,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 11,
+      "vfs_packs": 6,
+      "prefetch_packs": 3,
+      "pack_bytes": 839910464,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 248714790,
+     "maint_fetched": 0,
+     "maint_s": 7.63,
+     "fetched_blob_bytes": 591615036
+    }
+   ]
+  },
+  "dev/geometric": {
+   "pattern": "dev",
+   "regime": "geometric",
+   "verify": {
+    "ok": true,
+    "cone_files": 326,
+    "cone_blobs_missing": 0
+   },
+   "final": {
+    "packs": 3,
+    "vfs_packs": 0,
+    "prefetch_packs": 1,
+    "pack_bytes": 8604228785,
+    "loose": 199,
+    "loose_bytes": 128442571
+   },
+   "maint_fetched_bytes": 6987960519,
+   "syncs": 31,
+   "sync_s": 5.8340592149761505,
+   "max_sync_s": 2.323218799981987,
+   "blob_pack_bytes": 591582481,
+   "blob_packs_created": 30,
+   "loose_created": 2,
+   "loose_bytes_created": 32555,
+   "prefetch_bytes": 3159847,
+   "maint_runs": 15,
+   "maint_written": 24695010511,
+   "maint_s": 275.6938819180068,
+   "max_maint_s": 147.66542716999538,
+   "history_ops": 10,
+   "errors": [],
+   "days": [
+    {
+     "day": "2026-10-09",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 341824190,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 341824190,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 171397,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 341408743
+    },
+    {
+     "day": "2026-10-10",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 348306925,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 1,
+      "prefetch_packs": 4,
+      "pack_bytes": 348259485,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 6563558,
+     "maint_fetched": 0,
+     "maint_s": 0.06,
+     "fetched_blob_bytes": 347840615
+    },
+    {
+     "day": "2026-10-11",
+     "before": {
+      "packs": 6,
+      "vfs_packs": 1,
+      "prefetch_packs": 4,
+      "pack_bytes": 348259485,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 1,
+      "prefetch_packs": 4,
+      "pack_bytes": 348259485,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 347840615
+    },
+    {
+     "day": "2026-10-12",
+     "before": {
+      "packs": 6,
+      "vfs_packs": 1,
+      "prefetch_packs": 4,
+      "pack_bytes": 348259485,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 1,
+      "prefetch_packs": 4,
+      "pack_bytes": 348259485,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 347840615
+    },
+    {
+     "day": "2026-10-13",
+     "before": {
+      "packs": 12,
+      "vfs_packs": 4,
+      "prefetch_packs": 7,
+      "pack_bytes": 405393186,
+      "loose": 1,
+      "loose_bytes": 32406
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 2,
+      "pack_bytes": 405340689,
+      "loose": 1804,
+      "loose_bytes": 6233162876
+     },
+     "maint_written": 6638355604,
+     "maint_fetched": 6233162876,
+     "maint_s": 14.47,
+     "fetched_blob_bytes": 404713961
+    },
+    {
+     "day": "2026-10-14",
+     "before": {
+      "packs": 9,
+      "vfs_packs": 3,
+      "prefetch_packs": 5,
+      "pack_bytes": 408438623,
+      "loose": 1804,
+      "loose_bytes": 6233162876
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7635820551,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 7636735154,
+     "maint_fetched": 0,
+     "maint_s": 147.67,
+     "fetched_blob_bytes": 407556307
+    },
+    {
+     "day": "2026-10-15",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 4,
+      "pack_bytes": 7714330920,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7714197101,
+      "loose": 156,
+      "loose_bytes": 91724061
+     },
+     "maint_written": 170621396,
+     "maint_fetched": 91724061,
+     "maint_s": 0.71,
+     "fetched_blob_bytes": 485816840
+    },
+    {
+     "day": "2026-10-16",
+     "before": {
+      "packs": 9,
+      "vfs_packs": 3,
+      "prefetch_packs": 4,
+      "pack_bytes": 7744364890,
+      "loose": 156,
+      "loose_bytes": 91724061
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7835907867,
+      "loose": 219,
+      "loose_bytes": 157080246
+     },
+     "maint_written": 357742525,
+     "maint_fetched": 157080246,
+     "maint_s": 17.78,
+     "fetched_blob_bytes": 515720682
+    },
+    {
+     "day": "2026-10-17",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 2,
+      "prefetch_packs": 4,
+      "pack_bytes": 7836809510,
+      "loose": 220,
+      "loose_bytes": 157080395
+     },
+     "after": {
+      "packs": 9,
+      "vfs_packs": 2,
+      "prefetch_packs": 4,
+      "pack_bytes": 7993813523,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 157552181,
+     "maint_fetched": 0,
+     "maint_s": 7.05,
+     "fetched_blob_bytes": 516448940
+    },
+    {
+     "day": "2026-10-18",
+     "before": {
+      "packs": 9,
+      "vfs_packs": 2,
+      "prefetch_packs": 4,
+      "pack_bytes": 7993813523,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7993608433,
+      "loose": 137,
+      "loose_bytes": 30280329
+     },
+     "maint_written": 388725481,
+     "maint_fetched": 30280329,
+     "maint_s": 3.45,
+     "fetched_blob_bytes": 516448940
+    },
+    {
+     "day": "2026-10-19",
+     "before": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7993608433,
+      "loose": 137,
+      "loose_bytes": 30280329
+     },
+     "after": {
+      "packs": 4,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8023692827,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 30633142,
+     "maint_fetched": 0,
+     "maint_s": 1.35,
+     "fetched_blob_bytes": 516448940
+    },
+    {
+     "day": "2026-10-20",
+     "before": {
+      "packs": 10,
+      "vfs_packs": 3,
+      "prefetch_packs": 4,
+      "pack_bytes": 8028302572,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8185776474,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 8187108878,
+     "maint_fetched": 0,
+     "maint_s": 55.78,
+     "fetched_blob_bytes": 520377975
+    },
+    {
+     "day": "2026-10-21",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 4,
+      "pack_bytes": 8197802470,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8197667949,
+      "loose": 167,
+      "loose_bytes": 177647917
+     },
+     "maint_written": 190262921,
+     "maint_fetched": 177647917,
+     "maint_s": 0.59,
+     "fetched_blob_bytes": 532146348
+    },
+    {
+     "day": "2026-10-22",
+     "before": {
+      "packs": 9,
+      "vfs_packs": 3,
+      "prefetch_packs": 4,
+      "pack_bytes": 8220652832,
+      "loose": 167,
+      "loose_bytes": 177647917
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8398138479,
+      "loose": 231,
+      "loose_bytes": 169622519
+     },
+     "maint_written": 382782144,
+     "maint_fetched": 169622519,
+     "maint_s": 12.14,
+     "fetched_blob_bytes": 554870845
+    },
+    {
+     "day": "end",
+     "before": {
+      "packs": 9,
+      "vfs_packs": 3,
+      "prefetch_packs": 4,
+      "pack_bytes": 8435141822,
+      "loose": 231,
+      "loose_bytes": 169622519
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8604228785,
+      "loose": 199,
+      "loose_bytes": 128442571
+     },
+     "maint_written": 547756130,
+     "maint_fetched": 128442571,
+     "maint_s": 14.63,
+     "fetched_blob_bytes": 591615036
+    }
+   ]
+  },
+  "dev/vfs": {
+   "pattern": "dev",
+   "regime": "vfs",
+   "verify": {
+    "ok": true,
+    "cone_files": 326,
+    "cone_blobs_missing": 0
+   },
+   "final": {
+    "packs": 8,
+    "vfs_packs": 3,
+    "prefetch_packs": 3,
+    "pack_bytes": 1183681520,
+    "loose": 0,
+    "loose_bytes": 0
+   },
+   "maint_fetched_bytes": 0,
+   "syncs": 31,
+   "sync_s": 5.604023501829943,
+   "max_sync_s": 2.323032788001001,
+   "blob_pack_bytes": 591582481,
+   "blob_packs_created": 30,
+   "loose_created": 2,
+   "loose_bytes_created": 32555,
+   "prefetch_bytes": 3159847,
+   "maint_runs": 15,
+   "maint_written": 5406329594,
+   "maint_s": 69.38979112688685,
+   "max_maint_s": 17.121639100980246,
+   "history_ops": 10,
+   "errors": [],
+   "days": [
+    {
+     "day": "2026-10-09",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 341824190,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 341824190,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 171276,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 341408743
+    },
+    {
+     "day": "2026-10-10",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 348306925,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 9,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 696589143,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 348659002,
+     "maint_fetched": 0,
+     "maint_s": 2.1,
+     "fetched_blob_bytes": 347840615
+    },
+    {
+     "day": "2026-10-11",
+     "before": {
+      "packs": 9,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 696589143,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 348301683,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 176932,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 347840615
+    },
+    {
+     "day": "2026-10-12",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 348301683,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 348301683,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 347840615
+    },
+    {
+     "day": "2026-10-13",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 4,
+      "pack_bytes": 405435384,
+      "loose": 1,
+      "loose_bytes": 32406
+     },
+     "after": {
+      "packs": 9,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 810749594,
+      "loose": 1,
+      "loose_bytes": 32406
+     },
+     "maint_written": 405846087,
+     "maint_fetched": 0,
+     "maint_s": 9.43,
+     "fetched_blob_bytes": 404713961
+    },
+    {
+     "day": "2026-10-14",
+     "before": {
+      "packs": 15,
+      "vfs_packs": 6,
+      "prefetch_packs": 6,
+      "pack_bytes": 813847528,
+      "loose": 1,
+      "loose_bytes": 32406
+     },
+     "after": {
+      "packs": 9,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 816691091,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 408836230,
+     "maint_fetched": 0,
+     "maint_s": 1.16,
+     "fetched_blob_bytes": 407556307
+    },
+    {
+     "day": "2026-10-15",
+     "before": {
+      "packs": 15,
+      "vfs_packs": 6,
+      "prefetch_packs": 6,
+      "pack_bytes": 895201460,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 973045875,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 486914092,
+     "maint_fetched": 0,
+     "maint_s": 9.89,
+     "fetched_blob_bytes": 485816840
+    },
+    {
+     "day": "2026-10-16",
+     "before": {
+      "packs": 14,
+      "vfs_packs": 6,
+      "prefetch_packs": 6,
+      "pack_bytes": 1003213664,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 1032642992,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 516901611,
+     "maint_fetched": 0,
+     "maint_s": 17.12,
+     "fetched_blob_bytes": 515720682
+    },
+    {
+     "day": "2026-10-17",
+     "before": {
+      "packs": 13,
+      "vfs_packs": 5,
+      "prefetch_packs": 6,
+      "pack_bytes": 1033544635,
+      "loose": 1,
+      "loose_bytes": 149
+     },
+     "after": {
+      "packs": 8,
+      "vfs_packs": 2,
+      "prefetch_packs": 3,
+      "pack_bytes": 1034076634,
+      "loose": 1,
+      "loose_bytes": 149
+     },
+     "maint_written": 517706748,
+     "maint_fetched": 0,
+     "maint_s": 1.6,
+     "fetched_blob_bytes": 516448940
+    },
+    {
+     "day": "2026-10-18",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 2,
+      "prefetch_packs": 3,
+      "pack_bytes": 1034076634,
+      "loose": 1,
+      "loose_bytes": 149
+     },
+     "after": {
+      "packs": 4,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 1033979528,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 517705440,
+     "maint_fetched": 0,
+     "maint_s": 1.11,
+     "fetched_blob_bytes": 516448940
+    },
+    {
+     "day": "2026-10-19",
+     "before": {
+      "packs": 4,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 1033979528,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 517003716,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 342132,
+     "maint_fetched": 0,
+     "maint_s": 0.03,
+     "fetched_blob_bytes": 516448940
+    },
+    {
+     "day": "2026-10-20",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 4,
+      "pack_bytes": 521613461,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 1041967033,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 521238784,
+     "maint_fetched": 0,
+     "maint_s": 1.66,
+     "fetched_blob_bytes": 520377975
+    },
+    {
+     "day": "2026-10-21",
+     "before": {
+      "packs": 14,
+      "vfs_packs": 6,
+      "prefetch_packs": 6,
+      "pack_bytes": 1053993029,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 1064602511,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 533117315,
+     "maint_fetched": 0,
+     "maint_s": 2.81,
+     "fetched_blob_bytes": 532146348
+    },
+    {
+     "day": "2026-10-22",
+     "before": {
+      "packs": 14,
+      "vfs_packs": 6,
+      "prefetch_packs": 6,
+      "pack_bytes": 1087587394,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 1110195932,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 556003270,
+     "maint_fetched": 0,
+     "maint_s": 9.37,
+     "fetched_blob_bytes": 554870845
+    },
+    {
+     "day": "end",
+     "before": {
+      "packs": 14,
+      "vfs_packs": 6,
+      "prefetch_packs": 6,
+      "pack_bytes": 1147199275,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 1183681520,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 592710675,
+     "maint_fetched": 0,
+     "maint_s": 13.07,
+     "fetched_blob_bytes": 591615036
+    }
+   ]
+  },
+  "full/stock": {
+   "pattern": "full",
+   "regime": "stock",
+   "verify": {
+    "ok": true,
+    "cone_files": 1763,
+    "cone_blobs_missing": 0
+   },
+   "final": {
+    "packs": 30,
+    "vfs_packs": 15,
+    "prefetch_packs": 15,
+    "pack_bytes": 7889139309,
+    "loose": 0,
+    "loose_bytes": 0
+   },
+   "maint_fetched_bytes": 0,
+   "syncs": 15,
+   "sync_s": 59.38185899602831,
+   "max_sync_s": 47.346137334010564,
+   "blob_pack_bytes": 7886826886,
+   "blob_packs_created": 15,
+   "loose_created": 0,
+   "loose_bytes_created": 0,
+   "prefetch_bytes": 2312423,
+   "maint_runs": 0,
+   "maint_written": 0,
+   "maint_s": 0.0,
+   "max_maint_s": 0.0,
+   "history_ops": 0,
+   "errors": [],
+   "days": [
+    {
+     "day": "2026-10-09",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 6249931071,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 6249931071,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 6249515624
+    },
+    {
+     "day": "2026-10-10",
+     "before": {
+      "packs": 4,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 6258554370,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 4,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 6258554370,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 6258127382
+    },
+    {
+     "day": "2026-10-11",
+     "before": {
+      "packs": 6,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 6268484578,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 6268484578,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 6268010451
+    },
+    {
+     "day": "2026-10-12",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 6476801176,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 8,
+      "vfs_packs": 4,
+      "prefetch_packs": 4,
+      "pack_bytes": 6476801176,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 6476243152
+    },
+    {
+     "day": "2026-10-13",
+     "before": {
+      "packs": 10,
+      "vfs_packs": 5,
+      "prefetch_packs": 5,
+      "pack_bytes": 6628844010,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 10,
+      "vfs_packs": 5,
+      "prefetch_packs": 5,
+      "pack_bytes": 6628844010,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 6628145206
+    },
+    {
+     "day": "2026-10-14",
+     "before": {
+      "packs": 12,
+      "vfs_packs": 6,
+      "prefetch_packs": 6,
+      "pack_bytes": 6795707901,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 12,
+      "vfs_packs": 6,
+      "prefetch_packs": 6,
+      "pack_bytes": 6795707901,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 6794867955
+    },
+    {
+     "day": "2026-10-15",
+     "before": {
+      "packs": 14,
+      "vfs_packs": 7,
+      "prefetch_packs": 7,
+      "pack_bytes": 6972999139,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 14,
+      "vfs_packs": 7,
+      "prefetch_packs": 7,
+      "pack_bytes": 6972999139,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 6972022990
+    },
+    {
+     "day": "2026-10-16",
+     "before": {
+      "packs": 16,
+      "vfs_packs": 8,
+      "prefetch_packs": 8,
+      "pack_bytes": 7150965688,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 16,
+      "vfs_packs": 8,
+      "prefetch_packs": 8,
+      "pack_bytes": 7150965688,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 7149852244
+    },
+    {
+     "day": "2026-10-17",
+     "before": {
+      "packs": 18,
+      "vfs_packs": 9,
+      "prefetch_packs": 9,
+      "pack_bytes": 7167043431,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 18,
+      "vfs_packs": 9,
+      "prefetch_packs": 9,
+      "pack_bytes": 7167043431,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 7165806524
+    },
+    {
+     "day": "2026-10-18",
+     "before": {
+      "packs": 20,
+      "vfs_packs": 10,
+      "prefetch_packs": 10,
+      "pack_bytes": 7227571490,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 20,
+      "vfs_packs": 10,
+      "prefetch_packs": 10,
+      "pack_bytes": 7227571490,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 7226288362
+    },
+    {
+     "day": "2026-10-19",
+     "before": {
+      "packs": 22,
+      "vfs_packs": 11,
+      "prefetch_packs": 11,
+      "pack_bytes": 7269822505,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 22,
+      "vfs_packs": 11,
+      "prefetch_packs": 11,
+      "pack_bytes": 7269822505,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 7268057259
+    },
+    {
+     "day": "2026-10-20",
+     "before": {
+      "packs": 24,
+      "vfs_packs": 12,
+      "prefetch_packs": 12,
+      "pack_bytes": 7320081678,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 24,
+      "vfs_packs": 12,
+      "prefetch_packs": 12,
+      "pack_bytes": 7320081678,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 7318176565
+    },
+    {
+     "day": "2026-10-21",
+     "before": {
+      "packs": 26,
+      "vfs_packs": 13,
+      "prefetch_packs": 13,
+      "pack_bytes": 7530576806,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 26,
+      "vfs_packs": 13,
+      "prefetch_packs": 13,
+      "pack_bytes": 7530576806,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 7528531855
+    },
+    {
+     "day": "2026-10-22",
+     "before": {
+      "packs": 28,
+      "vfs_packs": 14,
+      "prefetch_packs": 14,
+      "pack_bytes": 7719905892,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 28,
+      "vfs_packs": 14,
+      "prefetch_packs": 14,
+      "pack_bytes": 7719905892,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 7717732873
+    },
+    {
+     "day": "end",
+     "before": {
+      "packs": 30,
+      "vfs_packs": 15,
+      "prefetch_packs": 15,
+      "pack_bytes": 7889139309,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 30,
+      "vfs_packs": 15,
+      "prefetch_packs": 15,
+      "pack_bytes": 7889139309,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 0,
+     "maint_fetched": 0,
+     "maint_s": 0.0,
+     "fetched_blob_bytes": 7886826886
+    }
+   ]
+  },
+  "full/scalar": {
+   "pattern": "full",
+   "regime": "scalar",
+   "verify": {
+    "ok": true,
+    "cone_files": 1763,
+    "cone_blobs_missing": 0
+   },
+   "final": {
+    "packs": 7,
+    "vfs_packs": 3,
+    "prefetch_packs": 2,
+    "pack_bytes": 9344695930,
+    "loose": 0,
+    "loose_bytes": 0
+   },
+   "maint_fetched_bytes": 0,
+   "syncs": 15,
+   "sync_s": 56.75842278805794,
+   "max_sync_s": 44.66317067001364,
+   "blob_pack_bytes": 7886826886,
+   "blob_packs_created": 15,
+   "loose_created": 0,
+   "loose_bytes_created": 0,
+   "prefetch_bytes": 2312423,
+   "maint_runs": 15,
+   "maint_written": 9787861177,
+   "maint_s": 162.17472713298048,
+   "max_maint_s": 33.2528630910092,
+   "history_ops": 0,
+   "errors": [],
+   "days": [
+    {
+     "day": "2026-10-09",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 6249931071,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 6249931071,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 212484,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 6249515624
+    },
+    {
+     "day": "2026-10-10",
+     "before": {
+      "packs": 4,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 6258554370,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 5,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 6267582542,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 9427984,
+     "maint_fetched": 0,
+     "maint_s": 0.04,
+     "fetched_blob_bytes": 6258127382
+    },
+    {
+     "day": "2026-10-11",
+     "before": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 6277512750,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 5,
+      "vfs_packs": 2,
+      "prefetch_packs": 1,
+      "pack_bytes": 6287385278,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 19320882,
+     "maint_fetched": 0,
+     "maint_s": 0.32,
+     "fetched_blob_bytes": 6268010451
+    },
+    {
+     "day": "2026-10-12",
+     "before": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 2,
+      "pack_bytes": 6495701876,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 5,
+      "vfs_packs": 2,
+      "prefetch_packs": 1,
+      "pack_bytes": 6703732359,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 227414667,
+     "maint_fetched": 0,
+     "maint_s": 1.94,
+     "fetched_blob_bytes": 6476243152
+    },
+    {
+     "day": "2026-10-13",
+     "before": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 2,
+      "pack_bytes": 6855775193,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 6855680811,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 227528157,
+     "maint_fetched": 0,
+     "maint_s": 0.83,
+     "fetched_blob_bytes": 6628145206
+    },
+    {
+     "day": "2026-10-14",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 7022544702,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 2,
+      "pack_bytes": 7174521492,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 379606962,
+     "maint_fetched": 0,
+     "maint_s": 26.94,
+     "fetched_blob_bytes": 6794867955
+    },
+    {
+     "day": "2026-10-15",
+     "before": {
+      "packs": 9,
+      "vfs_packs": 4,
+      "prefetch_packs": 3,
+      "pack_bytes": 7351812730,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 2,
+      "pack_bytes": 7518587146,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 546502143,
+     "maint_fetched": 0,
+     "maint_s": 12.06,
+     "fetched_blob_bytes": 6972022990
+    },
+    {
+     "day": "2026-10-16",
+     "before": {
+      "packs": 9,
+      "vfs_packs": 4,
+      "prefetch_packs": 3,
+      "pack_bytes": 7696553695,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 2,
+      "pack_bytes": 7873138173,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 723211459,
+     "maint_fetched": 0,
+     "maint_s": 33.25,
+     "fetched_blob_bytes": 7149852244
+    },
+    {
+     "day": "2026-10-17",
+     "before": {
+      "packs": 9,
+      "vfs_packs": 4,
+      "prefetch_packs": 3,
+      "pack_bytes": 7889215916,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 2,
+      "pack_bytes": 8065889182,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 900615071,
+     "maint_fetched": 0,
+     "maint_s": 12.19,
+     "fetched_blob_bytes": 7165806524
+    },
+    {
+     "day": "2026-10-18",
+     "before": {
+      "packs": 9,
+      "vfs_packs": 4,
+      "prefetch_packs": 3,
+      "pack_bytes": 8126417241,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 2,
+      "pack_bytes": 8141338027,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 916216998,
+     "maint_fetched": 0,
+     "maint_s": 2.53,
+     "fetched_blob_bytes": 7226288362
+    },
+    {
+     "day": "2026-10-19",
+     "before": {
+      "packs": 9,
+      "vfs_packs": 4,
+      "prefetch_packs": 3,
+      "pack_bytes": 8183589042,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 3,
+      "prefetch_packs": 1,
+      "pack_bytes": 8283178864,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 1016229905,
+     "maint_fetched": 0,
+     "maint_s": 12.64,
+     "fetched_blob_bytes": 7268057259
+    },
+    {
+     "day": "2026-10-20",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 4,
+      "prefetch_packs": 2,
+      "pack_bytes": 8333438037,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 8331808004,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 1016908308,
+     "maint_fetched": 0,
+     "maint_s": 2.45,
+     "fetched_blob_bytes": 7318176565
+    },
+    {
+     "day": "2026-10-21",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 8542303132,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 2,
+      "pack_bytes": 8591158771,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 1065862106,
+     "maint_fetched": 0,
+     "maint_s": 9.86,
+     "fetched_blob_bytes": 7528531855
+    },
+    {
+     "day": "2026-10-22",
+     "before": {
+      "packs": 9,
+      "vfs_packs": 4,
+      "prefetch_packs": 3,
+      "pack_bytes": 8780487857,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 2,
+      "pack_bytes": 8988430831,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 1275261507,
+     "maint_fetched": 0,
+     "maint_s": 24.82,
+     "fetched_blob_bytes": 7717732873
+    },
+    {
+     "day": "end",
+     "before": {
+      "packs": 9,
+      "vfs_packs": 4,
+      "prefetch_packs": 3,
+      "pack_bytes": 9157664248,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 2,
+      "pack_bytes": 9344695930,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 1463542544,
+     "maint_fetched": 0,
+     "maint_s": 22.3,
+     "fetched_blob_bytes": 7886826886
+    }
+   ]
+  },
+  "full/geometric": {
+   "pattern": "full",
+   "regime": "geometric",
+   "verify": {
+    "ok": true,
+    "cone_files": 1763,
+    "cone_blobs_missing": 0
+   },
+   "final": {
+    "packs": 6,
+    "vfs_packs": 1,
+    "prefetch_packs": 2,
+    "pack_bytes": 8724541058,
+    "loose": 0,
+    "loose_bytes": 0
+   },
+   "maint_fetched_bytes": 11699682,
+   "syncs": 15,
+   "sync_s": 56.809338037099224,
+   "max_sync_s": 44.66254108201247,
+   "blob_pack_bytes": 7886826886,
+   "blob_packs_created": 15,
+   "loose_created": 0,
+   "loose_bytes_created": 0,
+   "prefetch_bytes": 2312423,
+   "maint_runs": 15,
+   "maint_written": 23909050335,
+   "maint_s": 160.34110291698016,
+   "max_maint_s": 61.47131160800927,
+   "history_ops": 0,
+   "errors": [],
+   "days": [
+    {
+     "day": "2026-10-09",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 6249931071,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 6249931071,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 212605,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 6249515624
+    },
+    {
+     "day": "2026-10-10",
+     "before": {
+      "packs": 4,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 6258554370,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 4,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 6258554370,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 214013,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 6258127382
+    },
+    {
+     "day": "2026-10-11",
+     "before": {
+      "packs": 6,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 6268484578,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 4,
+      "vfs_packs": 1,
+      "prefetch_packs": 2,
+      "pack_bytes": 6268473005,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 18720037,
+     "maint_fetched": 0,
+     "maint_s": 0.31,
+     "fetched_blob_bytes": 6268010451
+    },
+    {
+     "day": "2026-10-12",
+     "before": {
+      "packs": 6,
+      "vfs_packs": 2,
+      "prefetch_packs": 3,
+      "pack_bytes": 6476789603,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 4,
+      "vfs_packs": 1,
+      "prefetch_packs": 2,
+      "pack_bytes": 6476742432,
+      "loose": 1,
+      "loose_bytes": 5972
+     },
+     "maint_written": 226974874,
+     "maint_fetched": 5972,
+     "maint_s": 0.45,
+     "fetched_blob_bytes": 6476243152
+    },
+    {
+     "day": "2026-10-13",
+     "before": {
+      "packs": 6,
+      "vfs_packs": 2,
+      "prefetch_packs": 3,
+      "pack_bytes": 6628785266,
+      "loose": 1,
+      "loose_bytes": 5972
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 2,
+      "pack_bytes": 6628639297,
+      "loose": 1,
+      "loose_bytes": 2273
+     },
+     "maint_written": 6628444985,
+     "maint_fetched": 2273,
+     "maint_s": 21.99,
+     "fetched_blob_bytes": 6628145206
+    },
+    {
+     "day": "2026-10-14",
+     "before": {
+      "packs": 5,
+      "vfs_packs": 1,
+      "prefetch_packs": 3,
+      "pack_bytes": 6795503188,
+      "loose": 1,
+      "loose_bytes": 2273
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7620294591,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 7621001287,
+     "maint_fetched": 0,
+     "maint_s": 61.47,
+     "fetched_blob_bytes": 6794867955
+    },
+    {
+     "day": "2026-10-15",
+     "before": {
+      "packs": 4,
+      "vfs_packs": 1,
+      "prefetch_packs": 2,
+      "pack_bytes": 7797585829,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 4,
+      "vfs_packs": 1,
+      "prefetch_packs": 2,
+      "pack_bytes": 7797585829,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 456510,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 6972022990
+    },
+    {
+     "day": "2026-10-16",
+     "before": {
+      "packs": 6,
+      "vfs_packs": 2,
+      "prefetch_packs": 3,
+      "pack_bytes": 7975552378,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 7975473535,
+      "loose": 18,
+      "loose_bytes": 1720211
+     },
+     "maint_written": 357481465,
+     "maint_fetched": 1720211,
+     "maint_s": 19.33,
+     "fetched_blob_bytes": 7149852244
+    },
+    {
+     "day": "2026-10-17",
+     "before": {
+      "packs": 5,
+      "vfs_packs": 1,
+      "prefetch_packs": 2,
+      "pack_bytes": 7991551278,
+      "loose": 18,
+      "loose_bytes": 1720211
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 1,
+      "prefetch_packs": 2,
+      "pack_bytes": 7993271542,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 2244984,
+     "maint_fetched": 0,
+     "maint_s": 0.07,
+     "fetched_blob_bytes": 7165806524
+    },
+    {
+     "day": "2026-10-18",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 2,
+      "prefetch_packs": 3,
+      "pack_bytes": 8053799601,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8053703632,
+      "loose": 37,
+      "loose_bytes": 8362382
+     },
+     "maint_written": 442557307,
+     "maint_fetched": 8362382,
+     "maint_s": 4.2,
+     "fetched_blob_bytes": 7226288362
+    },
+    {
+     "day": "2026-10-19",
+     "before": {
+      "packs": 5,
+      "vfs_packs": 1,
+      "prefetch_packs": 2,
+      "pack_bytes": 8095954647,
+      "loose": 37,
+      "loose_bytes": 8362382
+     },
+     "after": {
+      "packs": 4,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8104085365,
+      "loose": 1,
+      "loose_bytes": 270
+     },
+     "maint_written": 50497670,
+     "maint_fetched": 270,
+     "maint_s": 1.01,
+     "fetched_blob_bytes": 7268057259
+    },
+    {
+     "day": "2026-10-20",
+     "before": {
+      "packs": 6,
+      "vfs_packs": 1,
+      "prefetch_packs": 2,
+      "pack_bytes": 8154344538,
+      "loose": 1,
+      "loose_bytes": 270
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8153957277,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 8155099472,
+     "maint_fetched": 0,
+     "maint_s": 44.95,
+     "fetched_blob_bytes": 7318176565
+    },
+    {
+     "day": "2026-10-21",
+     "before": {
+      "packs": 4,
+      "vfs_packs": 1,
+      "prefetch_packs": 2,
+      "pack_bytes": 8364452405,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 4,
+      "vfs_packs": 1,
+      "prefetch_packs": 2,
+      "pack_bytes": 8364452405,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 661474,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 7528531855
+    },
+    {
+     "day": "2026-10-22",
+     "before": {
+      "packs": 6,
+      "vfs_packs": 2,
+      "prefetch_packs": 3,
+      "pack_bytes": 8553781491,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 3,
+      "vfs_packs": 0,
+      "prefetch_packs": 1,
+      "pack_bytes": 8553699276,
+      "loose": 19,
+      "loose_bytes": 1608574
+     },
+     "maint_written": 402139411,
+     "maint_fetched": 1608574,
+     "maint_s": 6.4,
+     "fetched_blob_bytes": 7717732873
+    },
+    {
+     "day": "end",
+     "before": {
+      "packs": 5,
+      "vfs_packs": 1,
+      "prefetch_packs": 2,
+      "pack_bytes": 8722932693,
+      "loose": 19,
+      "loose_bytes": 1608574
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 1,
+      "prefetch_packs": 2,
+      "pack_bytes": 8724541058,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 2344241,
+     "maint_fetched": 0,
+     "maint_s": 0.13,
+     "fetched_blob_bytes": 7886826886
+    }
+   ]
+  },
+  "full/vfs": {
+   "pattern": "full",
+   "regime": "vfs",
+   "verify": {
+    "ok": true,
+    "cone_files": 1763,
+    "cone_blobs_missing": 0
+   },
+   "final": {
+    "packs": 6,
+    "vfs_packs": 2,
+    "prefetch_packs": 2,
+    "pack_bytes": 9511707057,
+    "loose": 0,
+    "loose_bytes": 0
+   },
+   "maint_fetched_bytes": 0,
+   "syncs": 15,
+   "sync_s": 56.35358035101672,
+   "max_sync_s": 44.03587280999636,
+   "blob_pack_bytes": 7886826886,
+   "blob_packs_created": 15,
+   "loose_created": 0,
+   "loose_bytes_created": 0,
+   "prefetch_bytes": 2312423,
+   "maint_runs": 15,
+   "maint_written": 11149279022,
+   "maint_s": 187.2235144560109,
+   "max_maint_s": 33.633456559007755,
+   "history_ops": 0,
+   "errors": [],
+   "days": [
+    {
+     "day": "2026-10-09",
+     "before": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 6249931071,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 2,
+      "vfs_packs": 1,
+      "prefetch_packs": 1,
+      "pack_bytes": 6249931071,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 212484,
+     "maint_fetched": 0,
+     "maint_s": 0.01,
+     "fetched_blob_bytes": 6249515624
+    },
+    {
+     "day": "2026-10-10",
+     "before": {
+      "packs": 4,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 6258554370,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 5,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 6267582542,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 9427984,
+     "maint_fetched": 0,
+     "maint_s": 0.04,
+     "fetched_blob_bytes": 6258127382
+    },
+    {
+     "day": "2026-10-11",
+     "before": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 6277512750,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 5,
+      "vfs_packs": 2,
+      "prefetch_packs": 1,
+      "pack_bytes": 6287385278,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 19320882,
+     "maint_fetched": 0,
+     "maint_s": 0.32,
+     "fetched_blob_bytes": 6268010451
+    },
+    {
+     "day": "2026-10-12",
+     "before": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 2,
+      "pack_bytes": 6495701876,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 5,
+      "vfs_packs": 2,
+      "prefetch_packs": 1,
+      "pack_bytes": 6703732359,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 227179971,
+     "maint_fetched": 0,
+     "maint_s": 1.94,
+     "fetched_blob_bytes": 6476243152
+    },
+    {
+     "day": "2026-10-13",
+     "before": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 2,
+      "pack_bytes": 6855775193,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 7007483265,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 379339891,
+     "maint_fetched": 0,
+     "maint_s": 11.3,
+     "fetched_blob_bytes": 6628145206
+    },
+    {
+     "day": "2026-10-14",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 7174347156,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 7340839921,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 546033195,
+     "maint_fetched": 0,
+     "maint_s": 28.59,
+     "fetched_blob_bytes": 6794867955
+    },
+    {
+     "day": "2026-10-15",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 7518131159,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 7694808705,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 723036818,
+     "maint_fetched": 0,
+     "maint_s": 16.5,
+     "fetched_blob_bytes": 6972022990
+    },
+    {
+     "day": "2026-10-16",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 7872775254,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 8049614145,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 900324615,
+     "maint_fetched": 0,
+     "maint_s": 33.63,
+     "fetched_blob_bytes": 7149852244
+    },
+    {
+     "day": "2026-10-17",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 8065691888,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 8080638642,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 916096013,
+     "maint_fetched": 0,
+     "maint_s": 2.74,
+     "fetched_blob_bytes": 7165806524
+    },
+    {
+     "day": "2026-10-18",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 8141166701,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 8201042070,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 976402979,
+     "maint_fetched": 0,
+     "maint_s": 7.33,
+     "fetched_blob_bytes": 7226288362
+    },
+    {
+     "day": "2026-10-19",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 8243293085,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 5,
+      "vfs_packs": 2,
+      "prefetch_packs": 1,
+      "pack_bytes": 8282896401,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 1016244895,
+     "maint_fetched": 0,
+     "maint_s": 8.33,
+     "fetched_blob_bytes": 7268057259
+    },
+    {
+     "day": "2026-10-20",
+     "before": {
+      "packs": 7,
+      "vfs_packs": 3,
+      "prefetch_packs": 2,
+      "pack_bytes": 8333155574,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 8380534096,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 1065628098,
+     "maint_fetched": 0,
+     "maint_s": 12.96,
+     "fetched_blob_bytes": 7318176565
+    },
+    {
+     "day": "2026-10-21",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 8591029224,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 8798878226,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 1274998177,
+     "maint_fetched": 0,
+     "maint_s": 22.18,
+     "fetched_blob_bytes": 7528531855
+    },
+    {
+     "day": "2026-10-22",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 8988207312,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 9175270244,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 1463336291,
+     "maint_fetched": 0,
+     "maint_s": 25.65,
+     "fetched_blob_bytes": 7717732873
+    },
+    {
+     "day": "end",
+     "before": {
+      "packs": 8,
+      "vfs_packs": 3,
+      "prefetch_packs": 3,
+      "pack_bytes": 9344503661,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "after": {
+      "packs": 6,
+      "vfs_packs": 2,
+      "prefetch_packs": 2,
+      "pack_bytes": 9511707057,
+      "loose": 0,
+      "loose_bytes": 0
+     },
+     "maint_written": 1631696729,
+     "maint_fetched": 0,
+     "maint_s": 15.7,
+     "fetched_blob_bytes": 7886826886
+    }
+   ]
+  }
+ }
+}
