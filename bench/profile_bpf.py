@@ -280,6 +280,11 @@ WORKLOADS = {
                              "--header", "User-Agent: git/2.53.0.vfs.0.0"], 8),
     # VFS for Git (not a git user agent): the pack's .idx comes after it.
     "prefetch_cold_idx": (["--workload", "prefetch", "--ts", "0", "--header", "User-Agent: GVFS/1.0"], 8),
+    # Large blobs (a store whose id list is its blobs of 16 MiB or more): whole, as loose
+    # objects; one per POST (a pack: the blob's own pack file); 1 MiB ranges.
+    "get_large": (["--workload", "get-object", "--oids", "{oids}"], 16),
+    "post_large_1": (["--workload", "post-objects", "--oids", "{oids}", "--batch", "1"], 16),
+    "range_1m": (["--workload", "get-paths", "--paths", "{ranges}"], 32),
 }
 # name: (store, blob ids)
 STORES = {
@@ -288,12 +293,15 @@ STORES = {
     # SearchGold after a week of pipeline runs (bench/build_store.py): the live pyramid.
     "sg7-sep": (os.path.join(BENCH, "prof/sg7-sep/store"), f"{BENCH}/prof/sg7-sep/blobs.txt"),
     "sg7-inl": (os.path.join(BENCH, "prof/sg7-inl/store"), f"{BENCH}/prof/sg7-inl/blobs.txt"),
+    # The synthetic corpus' large blobs (bench/corpus_gen.py, scale 0.05).
+    "cs-sep": (os.path.join(BENCH, "prof/cs-sep/store"), f"{BENCH}/prof/cs-sep/large.txt"),
 }
 
 
 def args_for(work, store):
     args, conns = WORKLOADS[work]
-    return [a.replace("{oids}", STORES[store][1]) for a in args], conns
+    ranges = os.path.join(os.path.dirname(STORES[store][1]), "ranges.txt")
+    return [a.replace("{oids}", STORES[store][1]).replace("{ranges}", ranges) for a in args], conns
 
 
 def cpu_seconds(pid):

@@ -37,7 +37,9 @@ POSTs, sizes, cold clones (`sendfile`, ~10× less CPU than sol/fable), commit cl
 — it is the fastest, by 1.05× (genesis vs fable) to 2.3× (sizes vs sol) over the runner-up,
 without a single error, at the lowest memory after fable. Its warm-client traffic is the closest
 to git's own ideal of the five (§6). Correctness: it passes every conformance, cross-client,
-JSON, scale and replay check after the fixes below.
+JSON, scale and replay check after the fixes below. A later CPU and wait analysis (§13) made
+it faster still on a store carrying a week of slabs, with byte-identical responses: blob batches
+1.6× (inline) to 3× (separate blobs), sizes 1.9× to 6.1×, and cold prefetches 31-41% cheaper.
 
 **What was fixed/optimized in opus** (each A/B-measured and re-verified; details in §8):
 
@@ -813,3 +815,93 @@ SHA-1s), so ADO's serving rate, not the daemon, will set the seed time.
 * *Not done from the plan:*
   * a reference client for `GSZ1` and ranges (the replay's harness plays that part);
   * reachability GC of blob packs.
+
+## 13. CPU and wait analysis (BPF, perf)
+
+**Method** (`bench/profile_bpf.py`). The edge runs a frame-pointer build pinned to 8 CPUs (4 cores
+and their SMT siblings; loadgen on the other CCD). Each workload is profiled several ways:
+
+* on-CPU with bpftrace (kernel and user stacks), and NMI `perf record -e cycles` for exact
+  attribution;
+* off-CPU with bcc `offcputime`;
+* run-queue latency from bpftrace on the sched tracepoints;
+* syscalls per request, and uprobes on arena lease and hold.
+
+The stores are SearchGold after a week of pipeline runs on the replay's cron
+(`bench/build_store.py`: 12 live slabs, as in production; the one-slab store first profiled hid
+most lookup costs), separate and inline, plus the synthetic corpus' large blobs. `ab` mode
+interleaves two builds on the same CPUs (3 rounds, medians); `bench/ab_responses.py` requires
+their responses to be byte-identical:
+
+* 960 requests per store: batches of 1 to 20,000 ids with repeats, trees, commits and
+  recent-slab objects;
+* prefetches compared by SHA-256: cold with sizes, cold with `.idx`, warm (4.8 and 5.5 GB);
+* a sample also judged by git (`index-pack`, sizes against `cat-file`);
+* `--upstream`: both edges also serve a live tip 5 days ahead of a store (an upstream with
+  `pack.threads=1`, so both edges' L0 slabs and proxy caches are the same). Its 1,869 new
+  blobs are mixed in, fetched the first time and cached after, interleaved with the store's:
+  1,032 responses, 4,312 proxied blobs, all byte-identical.
+
+A code review of the first version found that a batch mixing store blobs with proxy-cached
+ones sent them in a different order than before: the same objects, a valid pack, but not
+byte-identical. Upstream mode reproduces it (21,000 entries, the first difference at entry
+41). The fix keeps one list in request order.
+
+| Commit | Found | Change | Effect (8 CPUs; separate / inline store) |
+|---|---|---|---|
+| `5bb4df3` | Separate store: a blob id probed every slab's index first, three times per POST (commit check, plan, `plan_blobs`), and sizes binary-searched every slab's sizes table (50% of sizes CPU in `memcmp`) | Blob packs' segments first (slabs hold only commits and trees there) | POST 4,000 blobs 1,703 → 4,320 req/s; sizes 1,852 → 11,292 |
+| `5bb4df3` | `lock incq` on one `Arc<BlobPack>` count per blob, from every core: 25% of POST cycles. Dedupe in the arena's 10 MB `seen` table: a cache miss per insert, 11% | Blobs noted by segment index; a dedupe set sized for a batch | POST → 5,037 req/s (2.96×), 4.7 → 1.6 ms CPU, p99 45 → 15 ms |
+| `5bb4df3` | `ArenaPool::lease` reset the arena (clearing a 4,000-id set) under the pool lock: 22% of POST off-CPU time in futex waits | Reset after unlocking | (part of the above) |
+| `5bb4df3` | Inline store: an id only the baseline has (most of them) paid an MPHF probe in each of 11 newer slabs; 63% of POST and 87% of sizes CPU in lookups | Blocked Bloom filters, one per view over all slabs before the baseline, one per such slab: no false negatives, same answers | Inline POST 2,112 → 3,155, sizes 6,049 → 11,190 (1.85×) |
+| `5bb4df3` | `plan_objects` looked every id up twice (commit check, then plan): 22% of inline POST CPU | The check's lookups kept for the plan (up to 8,192 ids) | Inline POST → 3,357 req/s (1.59×), 3.75 → 2.36 ms CPU, p99 39 → 18 ms |
+| `a4734cb` | A cold prefetch's `.idx` and `GSZ1` (165 MB and 93 MB on SearchGold) were copied into the socket: each byte also cost a socket buffer page zeroed by `init_on_alloc`. 4% of the bytes, 27% of the CPU | Sections of 1 MiB or more moved to a memfd once (mapped, no second copy) and sent with `sendfile` | Edge CPU per cold prefetch: with `.idx` 87.8 → 51.4 ms (27.0 → 34.9 req/s), with sizes 73.4 → 50.5 ms |
+
+Blob GETs rose 7% (separate) and 4% (inline). Large-blob paths were already cheap and did not
+change: about 40 µs of CPU per 1 MiB range at 48K ranges/s, and whole large blobs leave
+through `sendfile`.
+
+**What remains is mostly inherent:**
+
+* *Blob batches* (separate store, 1.6 ms of CPU per 4,000 blobs):
+  * the pack trailer's SHA-1, 29%. The `sha1` crate already runs at OpenSSL's speed with the
+    SHA extensions (2.9 GB/s; `ring` manages 0.8);
+  * memory latency of the segment lookups, ~23%, and of the entry copies, 14%.
+* *Small GETs* (1.07M req/s at 256 connections, all 8 CPUs busy):
+  * the TCP stack takes about half the cycles and the scheduler 15-20%: one `recvfrom` and one
+    `sendto` per request, and one context switch, since a worker blocks for the next request;
+  * user code is ~10%;
+  * PSI accounting is 2.3% (`psi=0` on the kernel command line removes it);
+  * the receive timeout that implements the linger arms and cancels a timer per wait (~1.5%).
+* *Cold prefetch:* page cache reads and socket buffers. `init_on_alloc`'s page zeroing is 14%
+  of it, part of the hardening kept on this host.
+* *Pipeline:* a 15-minute window takes 60 ms (max 114 ms) and a daily rollup 164 ms on
+  SearchGold. Separate stores spend 44% of that verifying sizes tables' SHA-256 (the
+  baseline's is 93 MB).
+* *Mirror:* 85% of the CPU is the local git upstream (`pack-objects`), 8% the daemon (SHA-1 of
+  what arrives).
+
+**Not done (trade-offs):**
+
+* An event-loop serving model would avoid the context switch per request, but only at
+  saturation. It is a rewrite of the connection model (non-blocking sockets, partial writes,
+  `sendfile` backpressure), for at most the scheduler's 15-20% of small-GET CPU.
+* A per-worker cached view would skip the `RwLock` and `Arc` atomics per request (≤3% of GET).
+  It changes every handler's signature.
+* Software prefetch in batched lookups would overlap the misses (~23% of a blob batch). It
+  needs `_mm_prefetch` under `forbid(unsafe_code)`.
+* Hashing the output buffer in large chunks would hash 100-byte entries at 2.9 GB/s instead of
+  2.5 GB/s (~3% of a blob batch).
+
+**Measurement pitfalls found on the way:**
+
+* loadgen builds its 4,096 request bodies (4,000 ids each, ~4.5 s) before it sends anything, so
+  a CPU window opened after a fixed delay measured an idle edge. That looked like a server
+  stalling at half its CPUs. The harness now waits until the edge is busy.
+* bpftrace's `profile:hz` (cpu-clock, an hrtimer) puts ~50% of small-GET samples in
+  `finish_task_switch`: samples due while interrupts were off during a switch land when they
+  come back on. NMI `cycles` sampling does not.
+* bcc's `runqlat` does not compile on kernel 7.3, and `runqlen` overlays an outdated `cfs_rq`
+  and always reads 0. The sched tracepoints in bpftrace work.
+* `rev-list --filter=object:type=blob` still prints the commit it was given (unless
+  `--filter-provided-objects`). In a POST mix, that one commit (which expands to every tree)
+  took 20-30% of the CPU.

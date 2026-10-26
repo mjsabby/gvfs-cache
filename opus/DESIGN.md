@@ -280,7 +280,14 @@ since the last one, with one heap slab per move of the branch. The live loop run
 
 Every change publishes a new immutable `View`; requests hold an `Arc` to the view they
 started with. Object lookups go through the live L0 slabs, the pyramid, the weekly deltas
-and the baseline, newest first; retained slabs hold nothing those do not.
+and the baseline, newest first; retained slabs hold nothing those do not. Most ids clients
+ask for are only in the baseline, which comes last, so each view carries a blocked Bloom
+filter of the ids of every slab before it (`src/idfilter.rs`, 16 bits per id, one cache
+line per check): an id it rules out goes straight to the baseline. Each of those slabs has
+its own filter too, for the ids that pass. Filters have no false negatives, so lookups
+answer exactly as without them; they are built off the request path when a view is made
+(once per slab). On a week-old SearchGold store (12 live slabs) they took 4,000-id sizes
+requests from 6,049 to 11,190 a second and blob batches from 2,112 to 3,155.
 
 **Prefetch plans.** Every response is one pack holding what the client lacks (and, once
 per sealed day and week, that rollup whole):
@@ -347,7 +354,10 @@ changes got there from 2.2-2.5×:
 (`gvfs.trust-pack-indexes`, default true) instead of running `index-pack`. gvfs-helper
 always indexes packs itself. So with `--prefetch-idx auto` (the default) every client
 except `User-Agent: git/...` gets the pack's `.idx` (v2). It is built once per plan and
-shared, like the trailer:
+shared, like the trailer, and moved into a memfd (as is a plan's `GSZ1` section) so that
+responses send it with `sendfile(2)` like the pack: copied into the socket, each byte cost a
+socket buffer page the kernel zeroes first plus the copy, ~9× a sendfile'd byte (a cold
+prefetch's edge CPU: 87.8 ms with the `.idx`, 51.4 ms now). Building it:
 
 * each slab sorts its ids and computes its entries' CRC-32s once (`SortedSlab`, kept with
   the open slab; 74 MB for SearchGold's baseline);
@@ -527,8 +537,15 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
 
 ### Serving (`src/serve/blobs.rs`)
 
-* **Where a blob comes from.** A request id not in the slabs is looked up in the
-  segments of the loaded `blobs.bin` (biggest first). Packs of a directory store are
+* **Where a blob comes from.** A request id is looked up in the segments of the loaded
+  `blobs.bin` (biggest first) before the slabs, which hold only commits and trees: a blob
+  id would otherwise probe every slab's index first (three times per POST). A POST notes
+  each blob by segment, not by cloning its pack's `Arc` (every core incremented the same
+  count, a quarter of a blob batch's cycles), and dedupes them in a set sized for a batch.
+  Blobs go out in request order (the store's and the proxy's cached ones interleaved),
+  then those fetched from the upstream for the request.
+  A 4,000-blob POST went from 4.7 to 1.6 ms of CPU, a 4,000-id sizes request from 4.3 to
+  0.7 ms (`bench/profile_bpf.py`). Packs of a directory store are
   mapped and leave through `sendfile(2)`. Packs in Azure stay there. The edge holds
   their segment indexes and reads the packs in 4 MiB blocks into a local cache
   (`src/serve/blobcache.rs`), at most 8 blocks per read at a time: a read fetches the
@@ -558,7 +575,8 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   (~15 s per GiB), never a pack entry. Such a blob was copied into a pack of its own, whose
   header and trailer were written then, so that file goes out as it is: as cheap for the
   edge as a loose object (0.01 s of CPU for 1 GiB; hashing a fresh trailer took 0.38 s).
-* **Sizes.** `POST /gvfs/sizes` answers blobs from the sizes tables. A prefetch that
+* **Sizes.** `POST /gvfs/sizes` answers blobs from their segment records (the sizes
+  tables for blobs the store lacks). A prefetch that
   sends `X-GVFS-Sizes: 1` gets, after its packs, `"GSZ1" | count u64 | (id[20] | size
   u64)*`: the union of the tables of the slabs in that response (a cold clone: the
   history's; a warm prefetch: what its window introduced). The section is built once per

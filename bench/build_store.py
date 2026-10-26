@@ -33,6 +33,8 @@ def main():
     ap.add_argument("--blobs", choices=["inline", "separate"], default="separate")
     ap.add_argument("--days", type=float, default=14)
     ap.add_argument("--bin", default=None, help="gvfs-daemon binary (default: the release build)")
+    ap.add_argument("--perf", default=None,
+                    help="perf.data path: record every CPU (frame pointers) during the window runs")
     a = ap.parse_args()
     if a.history:
         h = json.load(open(a.history))
@@ -68,7 +70,14 @@ def main():
         im.run([im.bin, "mirror", "--store", f"fs:{im.store}", "--upstream", up, "--jobs", "16",
                 "--threads", "16", "--work-dir", os.path.join(a.work, "mw")])
         out["mirror_s"] = round(time.time() - t0, 1)
+    perf = None
+    if a.perf:
+        import signal
+        perf = subprocess.Popen(["sudo", "perf", "record", "-F", "999", "-a", "-g", "--call-graph", "fp",
+                                 "-o", a.perf], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2)
     k, runs, t_runs, tip = 0, 0, 0.0, genesis
+    per_run = []
     for t in range(S + 900, E, 900):
         while k < len(pushes) and pushes[k][1] <= t:
             k += 1
@@ -77,14 +86,27 @@ def main():
             set_tip(tip)
         t0 = time.perf_counter()
         im.run(im.pipeline_cmd(up, cron_tier(t), t))
-        t_runs += time.perf_counter() - t0
+        dt = time.perf_counter() - t0
+        t_runs += dt
+        per_run.append((cron_tier(t), round(dt, 4)))
         runs += 1
+    if perf:
+        subprocess.run(["sudo", "kill", "-INT", str(perf.pid)])
+        perf.wait()
+        subprocess.run(["sudo", "chown", str(os.getuid()), a.perf])
     blobs = subprocess.run(["git", "--git-dir", up, "rev-list", "--objects", "--no-object-names",
                             "--filter=object:type=blob", "--filter-provided-objects", tip],
                            capture_output=True, text=True, check=True, env=clean_env()).stdout.split()
     random.Random(1).shuffle(blobs)
     open(os.path.join(a.work, "blobs.txt"), "w").write("\n".join(blobs) + "\n")
     slabs = sorted(f for f in os.listdir(os.path.join(im.store, "slabs")) if f.endswith(".mphf"))
+    by_tier = {}
+    for tier, dt in per_run:
+        b = by_tier.setdefault(tier, [0, 0.0, 0.0])
+        b[0] += 1
+        b[1] += dt
+        b[2] = max(b[2], dt)
+    out["by_tier"] = {t: {"runs": n, "mean_s": round(s / n, 3), "max_s": round(m, 3)} for t, (n, s, m) in by_tier.items()}
     out.update(blobs=a.blobs, days=a.days, runs=runs, runs_s=round(t_runs, 1), tip=tip,
                tip_blobs=len(blobs), slabs=len(slabs), slab_names=slabs, store=im.store)
     json.dump(out, open(os.path.join(a.work, "build.json"), "w"), indent=1)

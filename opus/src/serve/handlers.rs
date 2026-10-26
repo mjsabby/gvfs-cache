@@ -31,7 +31,7 @@ use super::Ctx;
 use super::blobs::BlobPack;
 use super::httpd::{Method, Out, Request, read_body, respond_text, write_response};
 use super::view::{Prefetch, View};
-use crate::arena::Arena;
+use crate::arena::{Arena, BlobSrc};
 use crate::blobs::BlobRec;
 use crate::pack::{OBJ_BLOB, OBJ_COMMIT, OBJ_TREE, ObjectHeader, pack_header, parse_entry_header};
 use crate::splice::{ObjRef, Piece, piece_bytes};
@@ -902,17 +902,14 @@ fn objects_post(
         return Ok(keep);
     };
     // Slab entries, then whole blob entries; the trailer is hashed as the bytes go out.
-    let count = count
-        .saturating_add(crate::util::u32_of(arena.blobs.len()))
-        .saturating_add(crate::util::u32_of(arena.proxied.len()));
+    let count = count.saturating_add(crate::util::u32_of(arena.blobs.len()));
     let header = pack_header(count);
     let body_len = arena
         .splice
         .pieces
         .iter()
         .map(Piece::len)
-        .chain(arena.blobs.iter().map(|(_, r)| r.entry_len))
-        .chain(arena.proxied.iter().map(|(_, r)| r.entry_len))
+        .chain(arena.blobs.iter().map(|(_, _, r)| r.entry_len))
         .fold(0u64, u64::saturating_add);
     let mut h = Sha1::new();
     h.update(header);
@@ -931,15 +928,12 @@ fn objects_post(
             Piece::Bytes { .. } => out.bytes(bytes)?,
         }
     }
-    for (seg, rec) in &arena.blobs {
-        let pack = view
-            .blobs
-            .as_ref()
-            .and_then(|s| s.pack(*seg, rec))
-            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
-        send_pack_range(&mut out, pack, rec.offset, rec.entry_len, Some(&mut h))?;
-    }
-    for (pack, rec) in &arena.proxied {
+    for (_, src, rec) in &arena.blobs {
+        let pack = match *src {
+            BlobSrc::Store(seg) => view.blobs.as_ref().and_then(|s| s.pack(seg, rec)),
+            BlobSrc::Proxied(k) => arena.proxied.get(us(u64::from(k))),
+        }
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
         send_pack_range(&mut out, pack, rec.offset, rec.entry_len, Some(&mut h))?;
     }
     let trailer: [u8; 20] = h.finalize().into();
@@ -965,6 +959,7 @@ enum Miss {
 fn plan_objects(view: &View, arena: &mut Arena, depth: u64) -> Result<(), Miss> {
     let Arena {
         oids,
+        oid_at,
         found,
         seen,
         visited,
@@ -1006,6 +1001,11 @@ fn plan_objects(view: &View, arena: &mut Arena, depth: u64) -> Result<(), Miss> 
             if view.blobs.is_some() {
                 if let Some(o) = oids.get_mut(rest) {
                     *o = oid;
+                }
+                if let Some(at) = oid_at.get(i).copied() {
+                    if let Some(a) = oid_at.get_mut(rest) {
+                        *a = at;
+                    }
                 }
                 rest = rest.saturating_add(1);
                 continue;
@@ -1100,30 +1100,42 @@ fn plan_objects(view: &View, arena: &mut Arena, depth: u64) -> Result<(), Miss> 
         }
     }
     oids.truncate(rest);
+    oid_at.truncate(rest);
     Ok(())
 }
 
 /// Moves the requested blobs the store's blob packs hold (`--blobs separate` stores) to
 /// `arena.blobs`, one blob-pack lookup each (no slab has them), and leaves the other ids in
-/// `arena.oids`: commits and trees for [`plan_objects`], blobs only the upstream has for
-/// [`plan_blobs`] (which also drops repeated ids).
+/// `arena.oids`, with their request positions in `arena.oid_at`: commits and trees for
+/// [`plan_objects`], blobs only the upstream has for [`plan_blobs`] (which also drops
+/// repeated ids).
 fn take_stored_blobs(view: &View, arena: &mut Arena) -> Result<(), Miss> {
     let Some(set) = view.blobs.as_ref() else {
         return Ok(());
     };
-    let Arena { oids, blobs, .. } = arena;
+    let Arena {
+        oids,
+        oid_at,
+        blobs,
+        ..
+    } = arena;
+    oid_at.clear();
     let mut rest = 0usize;
     for i in 0..oids.len() {
         let Some(&oid) = oids.get(i) else { break };
+        let at = crate::util::u32_of(i);
         match set.locate(&oid) {
-            Some(found) => {
-                if !crate::arena::push(blobs, found, true) {
+            Some((seg, rec)) => {
+                if !crate::arena::push(blobs, (at, BlobSrc::Store(seg), rec), true) {
                     return Err(Miss::Capacity);
                 }
             }
             None => {
                 if let Some(o) = oids.get_mut(rest) {
                     *o = oid;
+                }
+                if !crate::arena::push(oid_at, at, true) {
+                    return Err(Miss::Capacity);
                 }
                 rest = rest.saturating_add(1);
             }
@@ -1133,16 +1145,18 @@ fn take_stored_blobs(view: &View, arena: &mut Arena) -> Result<(), Miss> {
     Ok(())
 }
 
-/// The requested blobs: the store's ([`take_stored_blobs`]), each once, then the ids no
-/// slab has ([`plan_objects`] leaves them in `arena.oids`) from the proxy's cache, else from
-/// the upstream in one request (only for blobs the store's trees name; anything else is not
-/// found). Sealed trees' blobs a complete store lacks are counted as missing.
+/// The requested blobs, each once, in request order: the store's ([`take_stored_blobs`])
+/// and the proxy's cached ones among the ids no slab has ([`plan_objects`] leaves them in
+/// `arena.oids`); then, from the upstream in one request, the rest (only blobs the store's
+/// trees name; anything else is not found). Sealed trees' blobs a complete store lacks are
+/// counted as missing.
 fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
     let Some(set) = view.blobs.as_ref() else {
         return Ok(());
     };
     let Arena {
         oids,
+        oid_at,
         blobs,
         proxied,
         blob_seen,
@@ -1150,7 +1164,7 @@ fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
     } = arena;
     let mut kept = 0usize;
     for i in 0..blobs.len() {
-        let Some(oid) = blobs.get(i).map(|b| b.1.oid) else {
+        let Some(oid) = blobs.get(i).map(|b| b.2.oid) else {
             break;
         };
         if blob_seen
@@ -1166,7 +1180,7 @@ fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
     blobs.truncate(kept);
     let from_store = u64_of(kept);
     let (mut unresolved, mut from_cache) = (0usize, 0u64);
-    for oid in oids.iter() {
+    for (j, oid) in oids.iter().enumerate() {
         if !blob_seen
             .insert_grow(oid, true)
             .map_err(|_| Miss::Capacity)?
@@ -1174,14 +1188,23 @@ fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
             continue;
         }
         match ctx.proxy.as_ref().and_then(|p| p.cached(oid)) {
-            Some(b) => {
+            Some((pack, rec)) => {
                 from_cache = from_cache.saturating_add(1);
-                if !crate::arena::push(proxied, b, true) {
+                let at = oid_at.get(j).copied().unwrap_or(u32::MAX);
+                let src = BlobSrc::Proxied(crate::util::u32_of(proxied.len()));
+                if !crate::arena::push(proxied, pack, true)
+                    || !crate::arena::push(blobs, (at, src, rec), true)
+                {
                     return Err(Miss::Capacity);
                 }
             }
             None => unresolved = unresolved.saturating_add(1),
         }
+    }
+    // The store's blobs and the cached ones, each list in request order: one list (an
+    // in-place sort, positions are distinct).
+    if from_cache > 0 {
+        blobs.sort_unstable_by_key(|b| b.0);
     }
     ctx.metrics
         .blobs_store
@@ -1193,7 +1216,7 @@ fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
         return Ok(());
     }
     let _cold = gvfs_alloc_guard::cold_section();
-    let mut have: std::collections::HashSet<Oid> = proxied.iter().map(|b| b.1.oid).collect();
+    let mut have: std::collections::HashSet<Oid> = blobs.iter().map(|b| b.2.oid).collect();
     let mut need = Vec::with_capacity(unresolved);
     for oid in oids.iter() {
         if have.insert(*oid) {
@@ -1218,8 +1241,12 @@ fn plan_blobs(ctx: &Ctx, view: &View, arena: &mut Arena) -> Result<(), Miss> {
     ctx.metrics
         .blobs_proxied
         .fetch_add(u64_of(got.len()), Ordering::Relaxed);
-    for b in got {
-        if !crate::arena::push(proxied, b, true) {
+    // After the others, in the order the upstream's answer has them (as they always went).
+    for (pack, rec) in got {
+        let src = BlobSrc::Proxied(crate::util::u32_of(proxied.len()));
+        if !crate::arena::push(proxied, pack, true)
+            || !crate::arena::push(blobs, (u32::MAX, src, rec), true)
+        {
             return Err(Miss::Capacity);
         }
     }

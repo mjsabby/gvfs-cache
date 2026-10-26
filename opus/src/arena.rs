@@ -154,6 +154,9 @@ pub struct Arena {
     pub body: Vec<u8>,
     /// Object ids parsed from the request.
     pub oids: Vec<Oid>,
+    /// The request position of each of `oids` once the store's blobs have been taken out
+    /// of them (`--blobs separate` stores), so that blobs go out in request order.
+    pub oid_at: Vec<u32>,
     /// Where the first of them are (`View::find`), looked up once per request.
     pub found: Vec<Option<(u16, u32)>>,
     /// Ids already planned (dedupe across requested objects and delta chains).
@@ -170,14 +173,11 @@ pub struct Arena {
     /// Small response bodies built in place (sizes JSON, resolved loose objects).
     pub out: Vec<u8>,
     pub deflater: crate::zlib::Deflater,
-    /// Blobs of the request (`--blobs separate` stores) from the store's blob packs: the
-    /// segment of the view's blob set ([`crate::serve::blobs::BlobSet::locate`]) and record.
-    pub blobs: Vec<(u32, crate::blobs::BlobRec)>,
-    /// Blobs of the request from the proxy (the live tip's, not in the store yet).
-    pub proxied: Vec<(
-        std::sync::Arc<crate::serve::blobs::BlobPack>,
-        crate::blobs::BlobRec,
-    )>,
+    /// Blobs of the request (`--blobs separate` stores), in the order they go out: request
+    /// position, where the entry is, and its record.
+    pub blobs: Vec<(u32, BlobSrc, crate::blobs::BlobRec)>,
+    /// The packs of the proxied ones (the live tip's blobs, not in the store yet).
+    pub proxied: Vec<std::sync::Arc<crate::serve::blobs::BlobPack>>,
     /// The request's blobs already planned. Apart from `seen` (blobs and slab objects never
     /// share an id) and sized for a blob batch, not the arena's whole object capacity, so
     /// it stays in cache.
@@ -186,6 +186,16 @@ pub struct Arena {
     /// cold allocations) for this request; `reset` shrinks them back.
     pub grow: bool,
     objects: usize,
+}
+
+/// Where a blob entry of a response is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobSrc {
+    /// In a segment of the view's blob set ([`crate::serve::blobs::BlobSet::locate`]): no
+    /// reference count is taken per blob, which every core would contend for.
+    Store(u32),
+    /// In [`Arena::proxied`] at this index.
+    Proxied(u32),
 }
 
 /// Blobs one request holds without growing (gvfs-helper asks for a few thousand at once).
@@ -203,6 +213,7 @@ impl Arena {
         let mut a = Arena {
             body: Vec::with_capacity(quarter),
             oids: Vec::with_capacity(objects),
+            oid_at: Vec::with_capacity(objects),
             found: Vec::with_capacity(FOUND),
             seen: OidSet::with_capacity(objects),
             visited: OidSet::with_capacity(objects),
@@ -237,6 +248,7 @@ impl Arena {
         }
         self.body.clear();
         self.oids.clear();
+        self.oid_at.clear();
         self.found.clear();
         self.seen.clear();
         self.visited.clear();
