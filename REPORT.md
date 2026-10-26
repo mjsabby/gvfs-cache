@@ -40,6 +40,9 @@ to git's own ideal of the five (§6). Correctness: it passes every conformance, 
 JSON, scale and replay check after the fixes below. A later CPU and wait analysis (§13) made
 it faster still on a store carrying a week of slabs, with byte-identical responses: blob batches
 1.8× (inline) to 5.5× (separate blobs), sizes 3.2× to 11×, and cold prefetches 31-41% cheaper.
+A spike of its connection layer on tokio (§14) serves small requests with 24-38% less CPU and
+keeps serving beside slow downloaders, which stall today's 256 worker threads; hyper's server
+side was ruled out (20× the CPU per cloned GB, without `sendfile`).
 
 **What was fixed/optimized in opus** (each A/B-measured and re-verified; details in §8):
 
@@ -456,6 +459,10 @@ cargo run --release --example clients -- --repo ~/SearchGold --from 2026-10-10 -
 python3 separate_seed.py --jobs 8                        # real-content seed, ~/gvfs-bench/sep-seed
 gvfs-daemon pipeline --store fs:<dir> --upstream ~/SearchGold --branch main --tier 15m \
   --blobs separate                                       # SearchGold metadata in separate mode
+# §14: the connection layer on tokio (first, in opus/: cargo build --release --bin gvfs-daemon
+# --example spike_tokio; the store: build_store.py)
+python3 spike_tokio.py check --dir ~/gvfs-bench/prof/sg7-sep   # spike responses = serve's
+python3 spike_tokio.py bench --dir ~/gvfs-bench/prof/sg7-sep   # ~1 h; prof/out/spike.json
 ```
 Scratch data lives under `~/gvfs-bench` (SearchGold stores ~16 GB); `/tmp` is a tmpfs here.
 The shell's injected `GIT_CONFIG_*` is stripped by `gvfslib.clean_env`.
@@ -910,7 +917,8 @@ through `sendfile`.
 
 * An event-loop serving model would avoid the context switch per request, but only at
   saturation. It is a rewrite of the connection model (non-blocking sockets, partial writes,
-  `sendfile` backpressure), for at most the scheduler's 15-20% of small-GET CPU.
+  `sendfile` backpressure), for at most the scheduler's 15-20% of small-GET CPU. §14 measures
+  it on tokio: more than that, and slow clients stop holding threads.
 * A per-worker cached view would skip the `RwLock` and `Arc` atomics per request (≤3% of GET).
   It changes every handler's signature.
 * Hashing the output buffer in large chunks would hash 100-byte entries at 2.9 GB/s instead of
@@ -932,3 +940,113 @@ through `sendfile`.
 * `rev-list --filter=object:type=blob` still prints the commit it was given (unless
   `--filter-provided-objects`). In a POST mix, that one commit (which expands to every tree)
   took 20-30% of the CPU.
+
+## 14. Connection layer: std threads vs tokio (spike)
+
+**Question.** Today the edge runs one request per thread: 256 workers, with idle keep-alive
+connections parked in an epoll set until their next request. Would an async runtime serve
+better, and if so with hyper or with the edge's own HTTP/1 framing?
+
+**Method.** `opus/examples/spike_tokio.rs` serves the same store on tokio 1.54 (8 workers) with
+the edge's own building blocks: request parser and router, view lookups, loose-object splice
+plans, prefetch plans, the sizes loop. It runs in one of two modes:
+
+* *own*: tokio sockets with the edge's HTTP/1 framing. A connection takes buffers from a pool
+  only while it has a request in progress. File ranges go out with `sendfile` whenever the
+  socket is writable.
+* *hyper*: hyper 1.12's HTTP/1 server. Bodies are `Bytes`: small pieces are copied, slab ranges
+  are sliced from mmap-backed `Bytes` made once per slab.
+
+Endpoints: config, GET of an object (blobs and whole slab entries), prefetch (up to date, cold,
+warm, with sizes, with `.idx`) and POST sizes. Not covered: POST `/gvfs/objects`, deltas as
+loose objects, blob ranges, the proxy and the live tip.
+
+`bench/spike_tokio.py check` found every response identical to `gvfs-daemon serve`'s (status,
+content type, body):
+
+* 4,318 GETs;
+* 9 sizes POSTs;
+* 7 prefetch streams: cold (2.27 to 2.44 GB, with and without sizes and `.idx`) and warm.
+
+`bench/spike_tokio.py bench` ran on the week-old SearchGold store with separate blobs, the
+edge on 8 CPUs and loadgen on 16. It took medians of 3 interleaved rounds (round-to-round spread
+within 2%), plus 2 rounds of the slow-client and idle-connection tests. Results are in
+`bench/results/spike-tokio.json`.
+
+Small requests (req/s · p99 µs · edge CPU µs per request):
+
+| | threads (today) | tokio + own HTTP/1 | tokio + hyper |
+|---|---|---|---|
+| config, 64 connections | 1.08M · 298 · 4.59 | **1.29M · 142 · 3.31** | 1.22M · 176 · 3.70 |
+| config, 256 | 1.14M · 920 · 4.82 | **1.54M · 332 · 3.06** | 1.44M · 353 · 3.45 |
+| config, 1,024 | 1.15M · 15,647 · 4.79 | **1.75M · 1,165 · 2.97** | 1.59M · 1,299 · 3.37 |
+| GET blob, 64 | 1.00M · 320 · 4.99 | **1.21M · 133 · 3.80** | 1.15M · 145 · 4.17 |
+| GET blob, 256 | 1.07M · 983 · 5.25 | **1.40M · 379 · 3.58** | 1.32M · 393 · 3.91 |
+| GET blob, 1,024 | 1.08M · 15,703 · 5.20 | **1.55M · 1,365 · 3.49** | 1.45M · 1,369 · 3.87 |
+| prefetch up to date, 64 | 1.06M · 299 · 4.66 | **1.27M** · 178 · **3.42** | 1.21M · 123 · 3.80 |
+| prefetch up to date, 256 | 1.12M · 930 · 4.93 | **1.51M · 343 · 3.17** | 1.41M · 358 · 3.55 |
+| prefetch up to date, 1,024 | 1.13M · 15,671 · 4.89 | **1.71M · 1,217 · 3.07** | 1.56M · 1,291 · 3.49 |
+| allocations per request | 0 | 0 | 5-6 |
+
+Large and CPU-heavy requests:
+
+| | threads (today) | tokio + own HTTP/1 | tokio + hyper |
+|---|---|---|---|
+| Cold clones, 8 at a time (2.36 GB each): edge CPU per GB · MB/s | 23 ms · 77,401 | 24 ms · 81,617 | 461 ms · 14,840 |
+| Sizes of 4,000 ids, 32 connections: req/s · p99 · CPU per request | 20.6K · 3.95 ms · 376 µs | 20.4K · 2.68 ms · 380 µs | 20.5K · 2.89 ms · 379 µs |
+
+GETs beside other load (GET req/s · p50 · p99 in µs):
+
+| | threads (today) | own, sizes inline | own, sizes yield every 256 ids | own, sizes on `spawn_blocking` | same, those threads at nice 10 | hyper, sizes inline |
+|---|---|---|---|---|---|---|
+| 64 GET connections beside 32 sizes connections | 462K · 59 · 1,018 | 50K · 1,267 · 2,595 | **814K · 74 · 156** | 129K · 428 · 1,445 | 149K · 374 · 1,265 | 48K · 1,316 · 2,915 |
+| … the sizes requests: req/s · p99 | 13.7K · 8.6 ms | 19.9K · 2.9 ms | 11.5K · 4.5 ms | 18.9K · 6.0 ms | 18.8K · 6.9 ms | 19.8K · 3.1 ms |
+
+| | threads (today) | tokio + own HTTP/1 | tokio + hyper |
+|---|---|---|---|
+| 64 GET connections beside 400 cold clones read at 80 KB/s each: GET req/s · p99; clones progressing | **0** (every worker in `sendfile`); 256 of 400 | 1.19M · 234 µs; 400 | 1.15M · 135 µs; 400 |
+| 64 GET connections beside 30,000 idle keep-alive connections: GET req/s · p99; resident memory per idle connection | 1.01M · 318 µs; ~0 KB | 1.21M · 154 µs; 2.2 KB | 1.17M · 112 µs; 7-12 KB |
+
+**Findings:**
+
+1. **tokio with our own HTTP/1 is cheaper per small request at every concurrency: 24-38% less
+   CPU.** The context switch per request goes away, because a worker runs ready connections back
+   to back. Its tail stays bounded at 1,024 connections: p99 1.2-1.4 ms against today's 15.7 ms.
+   Today 1,024 connections share 256 workers, and a parked connection waits for one.
+2. **hyper's server is out.** On small requests it costs 9-14% more CPU than our own framing
+   and makes 5-6 allocations per request. It holds 3-5× the memory per idle connection, because
+   it keeps a read buffer. The decisive cost is that it has no `sendfile`: every byte of a clone
+   is copied into the socket, and the kernel first zeroes each socket buffer page
+   (`init_on_alloc`). A cold clone costs 20× the CPU (461 vs 24 ms per GB) and runs at a fifth
+   of the throughput. The edge's main job is streaming gigabytes of packs.
+3. **CPU-heavy requests have to yield.**
+   * Inline, a 380 µs sizes request holds its worker, and the GETs queued behind it wait: p50
+     59 → 1,267 µs.
+   * tokio's blocking pool helps little, because its threads share the CPUs with the workers as
+     equals.
+   * Lowering those threads' priority (nice 10, checked with `ps`) helps little more: a woken
+     worker still waits out the running thread's time slice.
+   * Yielding to other tasks every 256 ids (~20 µs of work) bounds the wait: GET p99 156 µs
+     (6.5× better than today) at 1.76× today's GET throughput. Sizes requests get 16% less
+     throughput than today (11.5K vs 13.7K/s) with half of today's p99. Every CPU-heavy loop
+     in a port needs such yield points: blob-batch planning, the pack's SHA-1, delta
+     resolution.
+4. **Slow clients stall today's edge.** 256 slow downloads take every worker, and the edge
+   serves nothing else: 0 GETs in 10 s, while 144 more downloads wait for a worker. On tokio a
+   slow client parks only its own task, and GETs are unaffected.
+5. **Idle connections:** today's epoll parking is the cheapest, at ~0 KB each. tokio's 2.2 KB
+   is a parked task (its future and timer, no buffers): 220 MB per 100,000 idle clients.
+
+**What a port takes (not done):**
+
+* tokio, with our own HTTP/1 on its sockets: the spike's `read_head`, `Out`, and `sendfile`
+  once the socket is writable.
+* Async handlers, whose CPU-heavy loops yield every ~20 µs of work.
+* Request arenas behind an async semaphore: today's `ArenaPool::lease` blocks its thread.
+* Azure reads, the blob cache, and upstream and proxy fetches made async, on hyper's client with
+  tokio-rustls (cold paths: its allocations do not matter there).
+* The live loop, pipeline and mirror keep their threads, calling those clients with
+  `block_on`.
+* The allocation guard's hot-path scope cannot be held across an `.await`. It would be entered
+  per poll, by a wrapper future around each connection.
+* Removed: `conns.rs`, the 256 workers, the linger/hold pacing, the reaper.

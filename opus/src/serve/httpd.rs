@@ -148,7 +148,8 @@ pub fn read_head(stream: &mut TcpStream, input: &mut Input) -> std::io::Result<H
     }
 }
 
-fn find_head_end(b: &[u8]) -> Option<usize> {
+/// The length of the request head at the start of `b` (through its blank line), if whole.
+pub fn find_head_end(b: &[u8]) -> Option<usize> {
     b.windows(4)
         .position(|w| w == b"\r\n\r\n")
         .and_then(|p| p.checked_add(4))
@@ -158,7 +159,8 @@ fn bad(msg: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
 }
 
-fn parse_head(head: &[u8], head_len: usize) -> std::io::Result<Request> {
+/// Parses a whole request head (`head_len` bytes, as [`find_head_end`] measured).
+pub fn parse_head(head: &[u8], head_len: usize) -> std::io::Result<Request> {
     let line_end = head
         .iter()
         .position(|&b| b == b'\r' || b == b'\n')

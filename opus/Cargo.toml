@@ -62,6 +62,16 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 webpki-roots = "1"
 ring = "0.17"
 
+# Only `examples/spike_tokio.rs` (the connection-layer experiment) uses these; the
+# `gvfs-daemon` binary does not depend on them.
+[dev-dependencies]
+tokio = { version = "1.54", features = ["rt-multi-thread", "net", "time", "io-util", "macros"] }
+hyper = { version = "1.12", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+http-body = "1.1"
+http-body-util = "0.1.5"
+bytes = "1.12"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

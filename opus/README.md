@@ -261,4 +261,6 @@ tests/                     end-to-end tests (pipeline, serve, HTTP v2/v0, gvfs-h
 benches/load.sh            the load table above
 benches/rollup.sh          the rollup table above (any repository, any week)
 examples/clients.rs        the client traffic table above (simulated clock, any window)
+examples/spike_tokio.rs    the connection layer on tokio, with its own HTTP/1 or hyper's
+                           (REPORT.md §14; its dev-dependencies are not in the binary)
 ```

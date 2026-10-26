@@ -439,8 +439,42 @@ pub fn run(o: Options) -> Result<()> {
     }
 }
 
+/// The store's current manifest as a [`View`], as `serve` boots it without an upstream
+/// (experiments that drive the handlers' building blocks themselves).
+#[doc(hidden)]
+pub fn load_view(store: Store, cache_dir: PathBuf) -> Result<Arc<View>> {
+    let mut live = Live {
+        store: Arc::new(store),
+        blob_cache: None,
+        upstream: None,
+        tip: LiveTip::default(),
+        cache_dir,
+        opened: HashMap::new(),
+        sealed: Vec::new(),
+        l0: Vec::new(),
+        last_head: Oid::ZERO,
+        generation: 0,
+        supersets: Some(Tier::H24),
+        blobs: None,
+        waiting_for: 0,
+    };
+    let (manifest, etag) = live.wait_for_manifest()?;
+    if manifest.separate_blobs() {
+        live.load_blobs()?;
+        if live.blobs_generation() < manifest.blobs_generation {
+            crate::bail!(
+                "blobs.bin is at generation {}, the manifest needs {}",
+                live.blobs_generation(),
+                manifest.blobs_generation
+            );
+        }
+    }
+    live.open_manifest(&manifest)?;
+    Ok(Arc::new(live.snapshot(manifest, etag)))
+}
+
 /// Raises the soft open-file limit to the hard limit: every idle client holds a descriptor.
-fn raise_fd_limit() {
+pub fn raise_fd_limit() {
     use nix::sys::resource::{Resource, getrlimit, setrlimit};
     if let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) {
         if soft < hard {
