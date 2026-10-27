@@ -53,8 +53,9 @@ gvfs-mmap = { path = "crates/gvfs-mmap" }
 gvfs-prefetch = { path = "crates/gvfs-prefetch" }
 # zlib with SIMD inflate/deflate/adler32, used through its safe streaming API.
 zlib-rs = "0.6"
-# SHA-1 with runtime-detected SHA-NI.
-sha1 = "0.10"
+# SHA-1 on the CPU's SHA instructions, detected at run time: SHA-NI on x86-64, the ARMv8
+# SHA extension on ARM64.
+sha1 = { version = "0.11", default-features = false }
 # Safe wrappers for sendfile(2).
 nix = { version = "0.29", default-features = false, features = ["fs", "zerocopy", "socket", "event", "resource"] }
 # HTTPS to the upstream and to Azure Blob; ring also provides HMAC-SHA256 / SHA-256.
