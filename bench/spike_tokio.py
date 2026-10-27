@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The edge's connection layer, A/B: the thread-per-request edge (`threads`, before the port),
-the tokio edge (`tokio`), and the spike's variants (`opus/examples/spike_tokio.rs`: `own`,
+the tokio edge (`tokio`), and the spike's variants (`examples/spike_tokio.rs`: `own`,
 `hyper`, `own-blk`, `own-nice`, `own-yield`), on one store.
 
     python3 bench/spike_tokio.py check --dir ~/gvfs-bench/prof/sg7-sep
@@ -45,8 +45,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # `threads`: the thread-per-request edge (before the tokio port, commit 5dada58); `tokio`: the
 # edge as built now. Both run `gvfs-daemon serve` (env THREADS_BIN / TOKIO_BIN).
 THREADS_BIN = os.environ.get("THREADS_BIN", os.path.expanduser("~/gvfs-bench/prof/bin/gvfs-daemon-threads"))
-TOKIO_BIN = os.environ.get("TOKIO_BIN", os.path.join(REPO, "opus/target/release/gvfs-daemon"))
-SPIKE_BIN = os.path.join(REPO, "opus/target/release/examples/spike_tokio")
+TOKIO_BIN = os.environ.get("TOKIO_BIN", os.path.join(REPO, "target/release/gvfs-daemon"))
+SPIKE_BIN = os.path.join(REPO, "target/release/examples/spike_tokio")
 DAEMONS = {"threads": THREADS_BIN, "tokio": TOKIO_BIN}
 CLIENT_CPUS = os.environ.get("CLIENT_CPUS", "4-7,20-23")
 GIT_UA = "git/2.53.0.vfs.0.0"

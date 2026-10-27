@@ -20,7 +20,6 @@ from gvfslib import clean_env, git, git_out, init_bare, missing_objects, request
 
 BASE = os.environ.get("BENCH_SCRATCH", "/home/muks/gvfs-bench/cross")
 MSGIT = os.environ.get("GVFS_TEST_MSGIT", os.path.expanduser("~/git/bin-wrappers/git"))
-ROOT = impls.ROOT
 
 
 def run(cmd, cwd=None, input=b"", env=None, timeout=300):
@@ -74,7 +73,7 @@ class FableHook(Client):
         self.packdir = os.path.join(self.gitdir, "objects", "pack")
 
     def prefetch(self):
-        return run([os.path.join(ROOT, "fable/target/release/gvfs-daemon"), "client-prefetch",
+        return run([impls.binary_path("fable"), "client-prefetch",
                     "--server", self.url + "/org/repo", "--repo", self.gitdir, "--midx"])
 
     def objects_repo(self):
@@ -90,7 +89,7 @@ class AstraSync(Client):
         self.packdir = os.path.join(self.gitdir, "objects", "pack")
 
     def prefetch(self):
-        return run([os.path.join(ROOT, "astra/target/release/gvfs-daemon"), "sync",
+        return run([impls.binary_path("astra"), "sync",
                     "--server", self.url + "/org/repo", "--cache-dir", self.gitdir])
 
     def objects_repo(self):

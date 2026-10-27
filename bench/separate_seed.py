@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from gvfslib import clean_env  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(ROOT, "opus/target/release/gvfs-daemon")
+BIN = os.path.join(ROOT, "target/release/gvfs-daemon")
 
 
 def run(cmd, **kw):

@@ -1,4 +1,5 @@
-"""Adapters: one uniform interface over the five gvfs-daemon CLIs.
+"""Adapters: one uniform interface over the gvfs-daemon CLIs: opus (this repository) and
+the other implementations kept in `alt_clients/` for cross-testing.
 
 Standard tiers: 15m 1h 6h 12h 24h 168h.  `step(tier)` performs one scheduled pipeline run
 "ingest new commits, then roll up everything up to `tier`" in whatever way the
@@ -13,6 +14,13 @@ from gvfslib import clean_env, free_port, wait_http, metrics
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TIERS = ["15m", "1h", "6h", "12h", "24h", "168h"]
+
+
+def binary_path(name):
+    """The release build of implementation `name`: opus at the repository root, the others
+    in `alt_clients/<name>/`."""
+    base = ROOT if name == "opus" else os.path.join(ROOT, "alt_clients", name)
+    return os.path.join(base, "target", "release", "gvfs-daemon")
 
 
 class Server:
@@ -77,7 +85,7 @@ class Impl:
     def __init__(self, work, binary=None, extra_serve=(), extra_pipeline=(), env=None, clock=None):
         self.work = work
         os.makedirs(work, exist_ok=True)
-        self.bin = binary or os.path.join(ROOT, self.name, "target", "release", "gvfs-daemon")
+        self.bin = binary or binary_path(self.name)
         self.store = os.path.join(work, "store")
         self.extra_serve = list(extra_serve)
         self.extra_pipeline = list(extra_pipeline)
@@ -243,19 +251,4 @@ class Astra(Impl):
         return c
 
 
-class Argon(Impl):
-    name = "argon"
-    clock = "wall"
-    poll_unit = "ms"
-
-    def pipeline_cmd(self, upstream, tier, now):
-        return [self.bin, "pipeline", "--tier", tier, "--store", f"fs:{self.store}",
-                "--upstream", upstream, "--branch", "main"] + self.extra_pipeline
-
-    def serve_cmd(self, upstream, port, poll_s, live):
-        return [self.bin, "serve", "--bind", f"127.0.0.1:{port}", "--store", f"fs:{self.store}",
-                "--upstream", upstream, "--branch", "main",
-                "--poll-ms", str(int(poll_s * 1000) if live else 0)]
-
-
-ALL = {c.name: c for c in (Opus, Fable, Sol, Astra, Argon)}
+ALL = {c.name: c for c in (Opus, Fable, Sol, Astra)}

@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = [".", "crates/gvfs-alloc-guard", "crates/gvfs-mmap", "crates/gvfs-prefetch"]
+# Other implementations kept for cross-testing, each its own workspace.
+exclude = ["alt_clients"]
 
 [workspace.package]
 version = "0.1.0"
