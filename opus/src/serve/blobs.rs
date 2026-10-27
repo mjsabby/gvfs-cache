@@ -285,6 +285,44 @@ struct ProxyState {
     fetching: HashSet<Oid>,
 }
 
+impl ProxyState {
+    /// Caches the blobs of `pack`, just fetched, then evicts the oldest packs beyond
+    /// `budget` and returns them (the caller drops them outside the lock: the last
+    /// reference to one unlinks its file). The pack just fetched always stays, since the
+    /// requests that waited for its blobs look for them here when they wake: the cache can
+    /// exceed its budget by one fetch. An id a newer pack holds too keeps that entry.
+    fn keep(&mut self, pack: &Arc<BlobPack>, recs: &[BlobRec], budget: u64) -> Vec<Arc<BlobPack>> {
+        for r in recs {
+            self.cache.insert(r.oid, (Arc::clone(pack), *r));
+        }
+        self.bytes = self.bytes.saturating_add(pack.len);
+        self.order
+            .push_back((Arc::clone(pack), recs.iter().map(|r| r.oid).collect()));
+        let mut evicted = Vec::new();
+        while self.bytes > budget && self.order.len() > 1 {
+            let Some((old, ids)) = self.order.pop_front() else {
+                break;
+            };
+            for id in &ids {
+                if self
+                    .cache
+                    .get(id)
+                    .is_some_and(|(p, _)| Arc::ptr_eq(p, &old))
+                {
+                    self.cache.remove(id);
+                }
+            }
+            self.bytes = self.bytes.saturating_sub(old.len);
+            evicted.push(old);
+        }
+        evicted
+    }
+}
+
+/// Upstream connections the proxy keeps for its next fetches (a burst opens more, which
+/// go once used).
+const PROXY_IDLE_MAX: usize = 8;
+
 /// Read-through of blobs the store lacks (see the module docs).
 pub struct Proxy {
     upstream: String,
@@ -406,26 +444,15 @@ impl Proxy {
             for o in &mine {
                 st.fetching.remove(o);
             }
+            let mut evicted = Vec::new();
             if let Ok((pack, recs)) = &got {
                 for r in recs {
-                    st.cache.insert(r.oid, (Arc::clone(pack), *r));
                     found.insert(r.oid, (Arc::clone(pack), *r));
                 }
-                st.bytes = st.bytes.saturating_add(pack.len);
-                st.order
-                    .push_back((Arc::clone(pack), recs.iter().map(|r| r.oid).collect()));
-                // Oldest packs go first; the one just fetched always stays.
-                while st.bytes > self.budget && st.order.len() > 1 {
-                    let Some((old, ids)) = st.order.pop_front() else {
-                        break;
-                    };
-                    for id in &ids {
-                        st.cache.remove(id);
-                    }
-                    st.bytes = st.bytes.saturating_sub(old.len);
-                }
+                evicted = st.keep(pack, recs, self.budget);
             }
             drop(st);
+            drop(evicted);
             self.done.notify_waiters();
             got?;
         }
@@ -438,6 +465,14 @@ impl Proxy {
         }
     }
 
+    /// A connection back for the next fetch, unless enough are kept already.
+    fn reuse(&self, up: AsyncUpstream) {
+        let mut idle = lock(&self.idle);
+        if idle.len() < PROXY_IDLE_MAX {
+            idle.push(up);
+        }
+    }
+
     async fn fetch_now(&self, oids: &[Oid]) -> Result<(Arc<BlobPack>, Vec<BlobRec>)> {
         let t0 = std::time::Instant::now();
         let mut up = self.connection()?;
@@ -445,7 +480,7 @@ impl Proxy {
         let path = self.dir.join(format!("{id}.pack"));
         match fetch_into(&mut up, oids, &path, &id).await {
             Ok((pack, recs)) => {
-                lock(&self.idle).push(up);
+                self.reuse(up);
                 crate::log!(
                     "serve: proxied {} blobs ({}) from the upstream in {:.2}s",
                     recs.len(),
@@ -552,6 +587,85 @@ pub async fn fetch_into(
 mod tests {
     use super::*;
     use std::process::{Command, Stdio};
+
+    /// A proxied pack of `len` bytes holding `ids`, its file unlinked with its last user.
+    fn proxied(dir: &Path, name: &str, len: usize, ids: &[u8]) -> (Arc<BlobPack>, Vec<BlobRec>) {
+        let path = dir.join(format!("{name}.pack"));
+        std::fs::write(&path, vec![0u8; len]).unwrap();
+        let mut pack = BlobPack::open(&path, name).unwrap();
+        pack.unlink = Some(path);
+        let recs = ids
+            .iter()
+            .map(|&i| BlobRec {
+                oid: Oid([i; 20]),
+                pack: 0,
+                offset: 0,
+                entry_len: 1,
+                size: 1,
+                hdr_len: 0,
+                stored: false,
+            })
+            .collect();
+        (Arc::new(pack), recs)
+    }
+
+    /// Evicting a pack leaves the entries of its ids that a newer pack holds; an evicted
+    /// pack's file goes with its last user; the newest pack stays, whatever its size.
+    #[test]
+    fn proxy_eviction_keeps_newer_entries() {
+        let dir = std::env::temp_dir().join(format!("gvd-proxy-evict-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut st = ProxyState {
+            cache: HashMap::new(),
+            order: VecDeque::new(),
+            bytes: 0,
+            fetching: HashSet::new(),
+        };
+        let (p1, r1) = proxied(&dir, "p1", 100, &[1, 2]);
+        let (p2, r2) = proxied(&dir, "p2", 100, &[2, 3]);
+        assert!(st.keep(&p1, &r1, 150).is_empty());
+        let evicted = st.keep(&p2, &r2, 150);
+        assert_eq!(evicted.len(), 1);
+        assert!(Arc::ptr_eq(&evicted[0], &p1));
+        let at = |st: &ProxyState, i: u8| st.cache.get(&Oid([i; 20])).map(|(p, _)| p.id.clone());
+        assert_eq!(at(&st, 1), None);
+        assert_eq!(
+            at(&st, 2).as_deref(),
+            Some("p2"),
+            "the newer pack's entry stays"
+        );
+        assert_eq!(at(&st, 3).as_deref(), Some("p2"));
+        assert_eq!(st.bytes, 100);
+        let p1_file = dir.join("p1.pack");
+        drop((evicted, p1, r1));
+        assert!(!p1_file.exists(), "unlinked with its last user");
+        // Larger than the whole budget: it stays until a newer one arrives.
+        let (p3, r3) = proxied(&dir, "p3", 400, &[4]);
+        assert_eq!(st.keep(&p3, &r3, 150).len(), 1);
+        assert_eq!(at(&st, 4).as_deref(), Some("p3"));
+        assert_eq!((st.order.len(), st.bytes), (1, 400));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The proxy keeps a few upstream connections for its next fetches, not every one a
+    /// burst opened.
+    #[test]
+    fn proxy_keeps_a_few_idle_connections() {
+        let dir = std::env::temp_dir().join(format!("gvd-proxy-idle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let spec = dir.to_str().unwrap();
+        let proxy = Proxy::new(spec, &Auth::default(), &dir.join("cache"), 1 << 20).unwrap();
+        let ups: Vec<AsyncUpstream> = (0..3 * PROXY_IDLE_MAX)
+            .map(|_| AsyncUpstream::open(spec, &Auth::default()).unwrap())
+            .collect();
+        for up in ups {
+            proxy.reuse(up);
+        }
+        assert_eq!(lock(&proxy.idle).len(), PROXY_IDLE_MAX);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn git(dir: &Path, args: &[&str]) -> String {
         let mut cmd = Command::new("git");

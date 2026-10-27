@@ -421,6 +421,13 @@ impl Lease<'_> {
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
         if let Some(mut a) = self.arena.take() {
+            // The request's proxied packs go now, not when the arena is next leased: the
+            // last reference to one the proxy evicted unlinks and unmaps its file, which is
+            // no later request's work (a cold section), and an idle arena must not keep it.
+            if !a.proxied.is_empty() {
+                let _cold = gvfs_alloc_guard::cold_section();
+                a.proxied.clear();
+            }
             // Grown memory goes before its charge does: what grown arenas hold stays within
             // the budget.
             a.shrink();
@@ -470,6 +477,33 @@ mod tests {
             drop(l);
             assert!(pool.lease(Duration::from_millis(10)).await.is_some());
         });
+    }
+
+    /// A request's proxied packs are released when its lease ends, not when the arena is
+    /// next leased (the last reference to an evicted pack unlinks its file).
+    #[test]
+    fn a_lease_releases_its_proxied_packs() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let path = std::env::temp_dir().join(format!("gvd-lease-pack-{}", std::process::id()));
+        std::fs::write(&path, b"pack").unwrap();
+        let pack = std::sync::Arc::new(crate::serve::blobs::BlobPack::open(&path, "p").unwrap());
+        rt.block_on(async {
+            let wait = Duration::from_millis(10);
+            let pool = ArenaPool::new(1, 4096, 16, 0, 16);
+            let mut lease = pool.lease(wait).await.unwrap();
+            lease
+                .arena()
+                .unwrap()
+                .proxied
+                .push(std::sync::Arc::clone(&pack));
+            assert_eq!(std::sync::Arc::strong_count(&pack), 2);
+            drop(lease);
+            assert_eq!(std::sync::Arc::strong_count(&pack), 1);
+        });
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Commit expansions grow arenas within a shared budget, each up to its own cap; a
