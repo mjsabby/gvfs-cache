@@ -130,6 +130,28 @@ pub async fn until(
     }
 }
 
+/// When a request must have arrived whole: `patience` after it first waits for bytes. The
+/// clock is read only then: most requests arrive in one read, and a clock read per request
+/// was 1% of a small GET's CPU.
+pub struct Deadline {
+    patience: Duration,
+    at: Option<Instant>,
+}
+
+impl Deadline {
+    pub fn after(patience: Duration) -> Deadline {
+        Deadline { patience, at: None }
+    }
+
+    /// The deadline, fixed by the first call.
+    pub fn at(&mut self) -> Instant {
+        *self.at.get_or_insert_with(|| {
+            let now = Instant::now();
+            now.checked_add(self.patience).unwrap_or(now)
+        })
+    }
+}
+
 /// Bytes that connection output buffers may hold beyond their pooled size, all together:
 /// bodies and answers larger than one buffer grow it from here, as their bytes arrive, so
 /// that many large requests at once take a bounded amount of memory.
@@ -219,7 +241,7 @@ pub enum Body {
 pub async fn read_head(
     stream: &TcpStream,
     input: &mut Input,
-    deadline: Instant,
+    deadline: &mut Deadline,
 ) -> std::io::Result<Head> {
     loop {
         if let Some(end) = find_head_end(input.buf.get(..input.filled).unwrap_or(&[])) {
@@ -236,7 +258,7 @@ pub async fn read_head(
                 if input.filled == 0 {
                     return Ok(Head::Idle);
                 }
-                until(deadline, stream.readable()).await?;
+                until(deadline.at(), stream.readable()).await?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
@@ -246,9 +268,14 @@ pub async fn read_head(
 
 /// The length of the request head at the start of `b` (through its blank line), if whole.
 pub fn find_head_end(b: &[u8]) -> Option<usize> {
-    b.windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .and_then(|p| p.checked_add(4))
+    let mut from = 0usize;
+    loop {
+        let at = from.checked_add(b.get(from..)?.iter().position(|&c| c == b'\r')?)?;
+        if b.get(at..at.checked_add(4)?) == Some(b"\r\n\r\n") {
+            return at.checked_add(4);
+        }
+        from = at.checked_add(1)?;
+    }
 }
 
 /// An `InvalidData` error with `msg`, built in a cold section: a malformed request is no
@@ -266,7 +293,9 @@ pub fn other(msg: impl std::fmt::Display) -> std::io::Error {
 
 /// `tchar` (RFC 9110 §5.6.2): what a method or a field name is made of.
 fn is_tchar(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)
+    matches!(c, b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z'
+        | b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_'
+        | b'`' | b'|' | b'~')
 }
 
 /// `v` without leading and trailing spaces and tabs (RFC 9110 `OWS`).
@@ -296,23 +325,24 @@ pub fn decimal_u64(v: &[u8]) -> Option<u64> {
     })
 }
 
-/// The CRLF-terminated lines of a head before its blank line. A bare CR or LF inside a line
-/// is an error: some parsers end lines at a bare LF, and two parsers that split a head
-/// differently frame the message differently.
+/// The CRLF-terminated lines of a head before its blank line. A bare CR is an error here; a
+/// bare LF stays in its line, which [`parse_head`] refuses (no part of a line may hold one):
+/// some parsers end lines at a bare LF, and two parsers that split a head differently frame
+/// the message differently.
 fn head_lines(head: &[u8]) -> impl Iterator<Item = std::io::Result<&[u8]>> {
     let mut rest = head;
     std::iter::from_fn(move || {
-        let end = rest.windows(2).position(|w| w == b"\r\n")?;
+        let end = rest.iter().position(|&c| c == b'\r')?;
         let line = rest.get(..end)?;
+        if rest.get(end.saturating_add(1)) != Some(&b'\n') {
+            rest = &[];
+            return Some(Err(bad("bare CR in the request head")));
+        }
         rest = rest.get(end.saturating_add(2)..)?;
         if line.is_empty() {
             return None;
         }
-        Some(if line.iter().any(|&c| c == b'\r' || c == b'\n') {
-            Err(bad("bare CR or LF in the request head"))
-        } else {
-            Ok(line)
-        })
+        Some(Ok(line))
     })
 }
 
@@ -447,7 +477,7 @@ pub async fn read_body(
     input: &mut Input,
     req: &Request,
     body: &mut Grow<'_>,
-    deadline: Instant,
+    deadline: &mut Deadline,
     write: Duration,
 ) -> std::io::Result<Body> {
     body.buf.clear();
@@ -525,7 +555,7 @@ fn chunk_size(line: &[u8]) -> Option<usize> {
 async fn line_len(
     stream: &TcpStream,
     input: &mut Input,
-    deadline: Instant,
+    deadline: &mut Deadline,
 ) -> std::io::Result<usize> {
     loop {
         if let Some(p) = input
@@ -554,14 +584,14 @@ async fn line_len(
 async fn read_some(
     stream: &TcpStream,
     buf: &mut [u8],
-    deadline: Instant,
+    deadline: &mut Deadline,
 ) -> std::io::Result<usize> {
     loop {
         match stream.try_read(buf) {
             Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => return Ok(n),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                until(deadline, stream.readable()).await?;
+                until(deadline.at(), stream.readable()).await?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
@@ -569,15 +599,16 @@ async fn read_some(
     }
 }
 
-/// Appends `n` body bytes to `body`: buffered ones first, then straight from the socket.
-/// The buffer grows only as far as the bytes that arrived need ([`Body::Busy`] if it cannot),
-/// and each byte of it is zeroed once before the socket fills it.
+/// Appends `n` body bytes to `body`: buffered ones first, then straight from the socket,
+/// into the buffer's spare capacity (never zeroed first: a 4,000-id body was a 172 KB
+/// `memset` per request). The buffer grows only as far as the bytes that arrived need
+/// ([`Body::Busy`] if it cannot), and no byte past the body is read.
 async fn read_exact_into(
     stream: &TcpStream,
     input: &mut Input,
     body: &mut Grow<'_>,
     n: usize,
-    deadline: Instant,
+    deadline: &mut Deadline,
 ) -> std::io::Result<Body> {
     let start = body.buf.len();
     let end = start.saturating_add(n);
@@ -588,23 +619,34 @@ async fn read_exact_into(
     body.buf
         .extend_from_slice(input.buf.get(..from_buf).unwrap_or(&[]));
     input.consume(from_buf);
-    // `body.buf.len()` marks what is zeroed (and read into, up to `filled`).
-    let mut filled = body.buf.len();
-    while filled < end {
-        if filled == body.buf.len() {
-            if body.buf.len() == body.buf.capacity() && !body.more(end) {
-                body.buf.truncate(filled);
-                return Ok(Body::Busy);
-            }
-            let upto = end.min(body.buf.capacity());
-            body.buf.resize(upto, 0);
+    while body.buf.len() < end {
+        if body.buf.len() == body.buf.capacity() && !body.more(end) {
+            return Ok(Body::Busy);
         }
-        let into = body.buf.get_mut(filled..).unwrap_or(&mut []);
-        let got = read_some(stream, into, deadline).await?;
-        filled = filled.saturating_add(got);
+        let want = end.saturating_sub(body.buf.len());
+        let mut rest = bytes::BufMut::limit(&mut *body.buf, want);
+        read_some_buf(stream, &mut rest, deadline).await?;
     }
-    body.buf.truncate(filled);
     Ok(Body::Read)
+}
+
+/// [`read_some`] into a buffer's spare capacity (as much as it offers; at least a byte).
+async fn read_some_buf<B: bytes::BufMut>(
+    stream: &TcpStream,
+    buf: &mut B,
+    deadline: &mut Deadline,
+) -> std::io::Result<usize> {
+    loop {
+        match stream.try_read_buf(buf) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => return Ok(n),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                until(deadline.at(), stream.readable()).await?;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// All of `b`, waiting up to `t` each time the socket is full.
@@ -989,6 +1031,8 @@ mod tests {
             b"POST /gvfs/sizes HTTP/1.1\r\nX: a\nContent-Length: 5\r\n\r\n",
             b"POST /gvfs/sizes HTTP/1.1\r\nX: a\rContent-Length: 5\r\n\r\n",
             b"GET /gvfs/config HTTP/1.1\nHost: a\r\n\r\n",
+            b"GET /gvfs/con\nfig HTTP/1.1\r\n\r\n",
+            b"GET /gvfs/config HTTP/1.1\r\nX\n-Y: a\r\n\r\n",
             b"GET /gvfs/config HTTP/1.1\r\nHost: a\x00b\r\n\r\n",
             // The request line: extra spaces, no version, another version, a bad method.
             b"GET  /gvfs/config HTTP/1.1\r\n\r\n",

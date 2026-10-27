@@ -244,9 +244,8 @@ async fn connection(ctx: &Ctx, stream: &TcpStream) {
 async fn request(ctx: &Ctx, stream: &TcpStream, b: &mut Bufs) -> Next {
     // All of the request, head and body, must arrive by then: a client that trickles bytes
     // cannot hold its buffers (or, for a POST, wait in line for an arena) for longer.
-    let now = tokio::time::Instant::now();
-    let deadline = now.checked_add(ctx.deadlines.patience).unwrap_or(now);
-    let req = match httpd::read_head(stream, &mut b.input, deadline).await {
+    let mut deadline = httpd::Deadline::after(ctx.deadlines.patience);
+    let req = match httpd::read_head(stream, &mut b.input, &mut deadline).await {
         Ok(Head::Request(r)) => r,
         Ok(Head::Idle) => return Next::Idle,
         Ok(Head::Closed) => return Next::Close,
@@ -255,7 +254,7 @@ async fn request(ctx: &Ctx, stream: &TcpStream, b: &mut Bufs) -> Next {
             return Next::Close;
         }
     };
-    match super::handlers::handle(ctx, b, stream, &req, deadline).await {
+    match super::handlers::handle(ctx, b, stream, &req, &mut deadline).await {
         Ok(true) => Next::Again,
         Ok(false) | Err(_) => Next::Close,
     }

@@ -161,7 +161,7 @@ pub async fn handle(
     b: &mut Bufs,
     stream: &TcpStream,
     req: &Request,
-    deadline: tokio::time::Instant,
+    deadline: &mut super::httpd::Deadline,
 ) -> std::io::Result<bool> {
     // HEAD asks what GET would answer.
     let method = match req.method {
@@ -1943,9 +1943,12 @@ async fn sizes(
                 },
             },
         };
-        // Room for one more item, growing the buffer if the answer outgrows it.
-        ok = ok && out.room(out.buf.len().saturating_add(ITEM_MAX));
-        ok = ok && size_item(out.buf, i == 0, oid, size);
+        // An item that does not fit is not written: grow the buffer (cold), then again.
+        if !size_item(out.buf, i == 0, oid, size) {
+            ok = ok
+                && out.room(out.buf.len().saturating_add(ITEM_MAX))
+                && size_item(out.buf, i == 0, oid, size);
+        }
     }
     ok = ok && out.room(out.buf.len().saturating_add(1)) && crate::util::try_push(out.buf, b']');
     if !ok {
