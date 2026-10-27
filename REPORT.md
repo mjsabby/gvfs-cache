@@ -1683,7 +1683,8 @@ as a server (§1), and nothing used it. The harness finds every build through
 * Load against `8af8de8`, the last build measured (§15, batch 4), on the week-old SearchGold
   store with separate blobs: medians of 3 interleaved rounds, then again with the builds'
   slots swapped (the slow-downloader and idle-connection tests ran once). Cold clones, which
-  vary most, had 5 rounds in each order.
+  vary most, had 5 rounds in each order. Every round of every run in this section, the hex
+  experiments' included, is in `bench/results/ab-load-f100038.json`.
 
 | Workload | Run 1: `8af8de8` → `f100038` | Run 2, slots swapped | Mean |
 |---|---|---|---|
@@ -1702,10 +1703,10 @@ less CPU per request. Cold clones vary more from round to round (74–87 GB/s fo
 than between the builds.
 
 The README's load table was measured again on this build (`benches/load.sh`, the inline
-week-old store), with the edge pinned to 8 CPUs as everywhere in this report; the earlier
-table let the edge and loadgen share all 32. The script also sampled ids with `shuf
---random-source=<(yes)`, the biased recipe of §9; it now seeds a uniform source. GET tree and
-POST of 4,000 ids agree with §7 (181K req/s against 182K; 369 POSTs a second at 11.2 MB each
-against 352 at 11.0 MB), and GETs, up-to-date prefetches and sizes show the gains of §13 and
-§14.
+week-old store; raw: `bench/results/readme-load-f100038.json`), with the edge pinned to 8
+CPUs as everywhere in this report; the earlier table let the edge and loadgen share all 32.
+The script also sampled ids with `shuf --random-source=<(yes)`, the biased recipe of §9; it
+now seeds a uniform source. GET tree and POST of 4,000 ids agree with §7 (181K req/s against
+182K; 369 POSTs a second at 11.2 MB each against 352 at 11.0 MB), and GETs, up-to-date
+prefetches and sizes show the gains of §13 and §14.
 

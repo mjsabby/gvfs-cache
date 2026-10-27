@@ -1,0 +1,4625 @@
+{
+ "store": "~/gvfs-bench/prof/sg7-sep (SearchGold, a week of pipeline runs, --blobs separate)",
+ "how": "bench/ab_load.py; edge on CPUs 0-3,16-19, loadgen 8-15,24-31; per round each build in turn",
+ "builds": {
+  "8af8de8": "batch 4 (REPORT section 15)",
+  "94416d6": "dead code, before the hex fix",
+  "f100038": "hex codec back to chunks_exact",
+  "oldhex": "94416d6 with both old hex loops",
+  "oldenc": "94416d6 with the old encoder loop only"
+ },
+ "runs": [
+  {
+   "name": "8af8de8 vs 94416d6",
+   "base": "8af8de8",
+   "new": "94416d6",
+   "rounds": [
+    {
+     "work": "config_64",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3170.9,
+     "anon_mb": 505.0,
+     "loads": {
+      "config": {
+       "ok_rps": 1187400.7,
+       "MBps": 61.7,
+       "p50_us": 47,
+       "p99_us": 269,
+       "statuses": {
+        "200": 16624796
+       }
+      }
+     },
+     "edge_cpus": 3.81,
+     "cpu_us_per_req": 3.21,
+     "cpu_ms_per_gb": 61749.2,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3171.4,
+     "anon_mb": 505.0,
+     "loads": {
+      "config": {
+       "ok_rps": 1227450.1,
+       "MBps": 63.8,
+       "p50_us": 46,
+       "p99_us": 235,
+       "statuses": {
+        "200": 17185536
+       }
+      }
+     },
+     "edge_cpus": 3.85,
+     "cpu_us_per_req": 3.14,
+     "cpu_ms_per_gb": 60422.0,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3489.5,
+     "anon_mb": 505.3,
+     "loads": {
+      "get": {
+       "ok_rps": 1194375.2,
+       "MBps": 131.7,
+       "p50_us": 50,
+       "p99_us": 187,
+       "statuses": {
+        "200": 16722444
+       }
+      }
+     },
+     "edge_cpus": 4.46,
+     "cpu_us_per_req": 3.73,
+     "cpu_ms_per_gb": 33841.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3490.0,
+     "anon_mb": 505.3,
+     "loads": {
+      "get": {
+       "ok_rps": 1176074.5,
+       "MBps": 129.7,
+       "p50_us": 50,
+       "p99_us": 254,
+       "statuses": {
+        "200": 16466219
+       }
+      }
+     },
+     "edge_cpus": 4.36,
+     "cpu_us_per_req": 3.7,
+     "cpu_ms_per_gb": 33592.3,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3493.2,
+     "anon_mb": 509.0,
+     "loads": {
+      "get": {
+       "ok_rps": 1579178.0,
+       "MBps": 174.5,
+       "p50_us": 613,
+       "p99_us": 1233,
+       "statuses": {
+        "200": 22110073
+       }
+      }
+     },
+     "edge_cpus": 5.4,
+     "cpu_us_per_req": 3.42,
+     "cpu_ms_per_gb": 30962.1,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3493.4,
+     "anon_mb": 508.6,
+     "loads": {
+      "get": {
+       "ok_rps": 1601786.4,
+       "MBps": 177.0,
+       "p50_us": 603,
+       "p99_us": 1227,
+       "statuses": {
+        "200": 22426655
+       }
+      }
+     },
+     "edge_cpus": 5.44,
+     "cpu_us_per_req": 3.39,
+     "cpu_ms_per_gb": 30716.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3582.6,
+     "anon_mb": 509.1,
+     "loads": {
+      "cold": {
+       "ok_rps": 35.5,
+       "MBps": 83809.2,
+       "p50_us": 210559,
+       "p99_us": 343807,
+       "statuses": {
+        "200": 497
+       }
+      }
+     },
+     "edge_cpus": 2.16,
+     "cpu_us_per_req": 60759.11,
+     "cpu_ms_per_gb": 25.7,
+     "allocs_per_req": 0.13
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3582.7,
+     "anon_mb": 508.8,
+     "loads": {
+      "cold": {
+       "ok_rps": 31.9,
+       "MBps": 75210.5,
+       "p50_us": 238591,
+       "p99_us": 363775,
+       "statuses": {
+        "200": 446
+       }
+      }
+     },
+     "edge_cpus": 1.95,
+     "cpu_us_per_req": 61220.97,
+     "cpu_ms_per_gb": 26.0,
+     "allocs_per_req": 0.14
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3642.0,
+     "anon_mb": 568.6,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19708.3,
+       "MBps": 4733.4,
+       "p50_us": 1579,
+       "p99_us": 2481,
+       "statuses": {
+        "200": 275936
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 393.88,
+     "cpu_ms_per_gb": 1640.0,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3642.2,
+     "anon_mb": 568.2,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19520.5,
+       "MBps": 4688.3,
+       "p50_us": 1594,
+       "p99_us": 2505,
+       "statuses": {
+        "200": 273308
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 398.29,
+     "cpu_ms_per_gb": 1658.3,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3652.9,
+     "anon_mb": 579.4,
+     "loads": {
+      "post": {
+       "ok_rps": 8570.7,
+       "MBps": 3394.2,
+       "p50_us": 3691,
+       "p99_us": 4995,
+       "statuses": {
+        "200": 119998
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 912.62,
+     "cpu_ms_per_gb": 2304.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3652.9,
+     "anon_mb": 579.0,
+     "loads": {
+      "post": {
+       "ok_rps": 8546.1,
+       "MBps": 3384.5,
+       "p50_us": 3701,
+       "p99_us": 5011,
+       "statuses": {
+        "200": 119654
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 915.6,
+     "cpu_ms_per_gb": 2312.0,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3653.2,
+     "anon_mb": 579.7,
+     "loads": {
+      "post": {
+       "ok_rps": 6651.8,
+       "MBps": 2634.3,
+       "p50_us": 4903,
+       "p99_us": 7031,
+       "statuses": {
+        "200": 133042
+       }
+      },
+      "get": {
+       "ok_rps": 415820.4,
+       "MBps": 45.9,
+       "p50_us": 152,
+       "p99_us": 295,
+       "statuses": {
+        "200": 5821900
+       }
+      }
+     },
+     "edge_cpus": 7.09,
+     "cpu_us_per_req": 16.78,
+     "cpu_ms_per_gb": 2644.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3653.2,
+     "anon_mb": 579.2,
+     "loads": {
+      "post": {
+       "ok_rps": 6758.9,
+       "MBps": 2676.7,
+       "p50_us": 4835,
+       "p99_us": 6699,
+       "statuses": {
+        "200": 135184
+       }
+      },
+      "get": {
+       "ok_rps": 417497.9,
+       "MBps": 46.1,
+       "p50_us": 152,
+       "p99_us": 295,
+       "statuses": {
+        "200": 5845388
+       }
+      }
+     },
+     "edge_cpus": 7.1,
+     "cpu_us_per_req": 16.73,
+     "cpu_ms_per_gb": 2606.4,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3653.2,
+     "anon_mb": 579.2,
+     "loads": {
+      "config": {
+       "ok_rps": 1313583.6,
+       "MBps": 68.3,
+       "p50_us": 46,
+       "p99_us": 89,
+       "statuses": {
+        "200": 18391514
+       }
+      }
+     },
+     "edge_cpus": 4.26,
+     "cpu_us_per_req": 3.25,
+     "cpu_ms_per_gb": 62443.8,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3653.2,
+     "anon_mb": 579.7,
+     "loads": {
+      "config": {
+       "ok_rps": 1300394.4,
+       "MBps": 67.6,
+       "p50_us": 46,
+       "p99_us": 100,
+       "statuses": {
+        "200": 18206819
+       }
+      }
+     },
+     "edge_cpus": 4.26,
+     "cpu_us_per_req": 3.27,
+     "cpu_ms_per_gb": 62987.0,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3653.2,
+     "anon_mb": 579.2,
+     "loads": {
+      "get": {
+       "ok_rps": 1230975.5,
+       "MBps": 135.8,
+       "p50_us": 50,
+       "p99_us": 92,
+       "statuses": {
+        "200": 17234855
+       }
+      }
+     },
+     "edge_cpus": 4.57,
+     "cpu_us_per_req": 3.71,
+     "cpu_ms_per_gb": 33673.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3653.2,
+     "anon_mb": 579.7,
+     "loads": {
+      "get": {
+       "ok_rps": 1216019.4,
+       "MBps": 134.1,
+       "p50_us": 50,
+       "p99_us": 99,
+       "statuses": {
+        "200": 17025484
+       }
+      }
+     },
+     "edge_cpus": 4.56,
+     "cpu_us_per_req": 3.75,
+     "cpu_ms_per_gb": 33981.4,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3656.5,
+     "anon_mb": 582.5,
+     "loads": {
+      "get": {
+       "ok_rps": 1613179.5,
+       "MBps": 178.2,
+       "p50_us": 599,
+       "p99_us": 1212,
+       "statuses": {
+        "200": 22586133
+       }
+      }
+     },
+     "edge_cpus": 5.45,
+     "cpu_us_per_req": 3.38,
+     "cpu_ms_per_gb": 30577.3,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3656.8,
+     "anon_mb": 583.3,
+     "loads": {
+      "get": {
+       "ok_rps": 1581144.5,
+       "MBps": 174.7,
+       "p50_us": 613,
+       "p99_us": 1233,
+       "statuses": {
+        "200": 22137598
+       }
+      }
+     },
+     "edge_cpus": 5.4,
+     "cpu_us_per_req": 3.42,
+     "cpu_ms_per_gb": 30932.4,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3656.5,
+     "anon_mb": 582.5,
+     "loads": {
+      "cold": {
+       "ok_rps": 32.9,
+       "MBps": 77738.4,
+       "p50_us": 227583,
+       "p99_us": 363007,
+       "statuses": {
+        "200": 461
+       }
+      }
+     },
+     "edge_cpus": 1.92,
+     "cpu_us_per_req": 58387.77,
+     "cpu_ms_per_gb": 24.7,
+     "allocs_per_req": 0.14
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3656.8,
+     "anon_mb": 583.3,
+     "loads": {
+      "cold": {
+       "ok_rps": 36.4,
+       "MBps": 86001.4,
+       "p50_us": 204543,
+       "p99_us": 326143,
+       "statuses": {
+        "200": 510
+       }
+      }
+     },
+     "edge_cpus": 2.23,
+     "cpu_us_per_req": 61344.7,
+     "cpu_ms_per_gb": 26.0,
+     "allocs_per_req": 0.12
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3656.5,
+     "anon_mb": 582.5,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19447.9,
+       "MBps": 4670.9,
+       "p50_us": 1601,
+       "p99_us": 2521,
+       "statuses": {
+        "200": 272290
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 399.73,
+     "cpu_ms_per_gb": 1664.3,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3656.8,
+     "anon_mb": 583.3,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19813.5,
+       "MBps": 4758.7,
+       "p50_us": 1571,
+       "p99_us": 2463,
+       "statuses": {
+        "200": 277409
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 391.95,
+     "cpu_ms_per_gb": 1631.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3656.5,
+     "anon_mb": 582.5,
+     "loads": {
+      "post": {
+       "ok_rps": 8666.5,
+       "MBps": 3432.2,
+       "p50_us": 3655,
+       "p99_us": 4887,
+       "statuses": {
+        "200": 121339
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 902.76,
+     "cpu_ms_per_gb": 2279.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3656.8,
+     "anon_mb": 583.3,
+     "loads": {
+      "post": {
+       "ok_rps": 8662.4,
+       "MBps": 3430.5,
+       "p50_us": 3659,
+       "p99_us": 4871,
+       "statuses": {
+        "200": 121282
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 902.96,
+     "cpu_ms_per_gb": 2280.1,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3656.6,
+     "anon_mb": 582.6,
+     "loads": {
+      "post": {
+       "ok_rps": 6918.7,
+       "MBps": 2740.0,
+       "p50_us": 4687,
+       "p99_us": 6459,
+       "statuses": {
+        "200": 138381
+       }
+      },
+      "get": {
+       "ok_rps": 418311.0,
+       "MBps": 46.2,
+       "p50_us": 151,
+       "p99_us": 294,
+       "statuses": {
+        "200": 5856744
+       }
+      }
+     },
+     "edge_cpus": 7.11,
+     "cpu_us_per_req": 16.72,
+     "cpu_ms_per_gb": 2552.2,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3656.9,
+     "anon_mb": 583.4,
+     "loads": {
+      "post": {
+       "ok_rps": 6787.9,
+       "MBps": 2688.2,
+       "p50_us": 4807,
+       "p99_us": 6599,
+       "statuses": {
+        "200": 135765
+       }
+      },
+      "get": {
+       "ok_rps": 418139.5,
+       "MBps": 46.2,
+       "p50_us": 151,
+       "p99_us": 295,
+       "statuses": {
+        "200": 5854377
+       }
+      }
+     },
+     "edge_cpus": 7.09,
+     "cpu_us_per_req": 16.68,
+     "cpu_ms_per_gb": 2592.8,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3656.9,
+     "anon_mb": 583.4,
+     "loads": {
+      "config": {
+       "ok_rps": 1281220.1,
+       "MBps": 66.6,
+       "p50_us": 47,
+       "p99_us": 182,
+       "statuses": {
+        "200": 17938365
+       }
+      }
+     },
+     "edge_cpus": 4.21,
+     "cpu_us_per_req": 3.29,
+     "cpu_ms_per_gb": 63211.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3656.6,
+     "anon_mb": 582.6,
+     "loads": {
+      "config": {
+       "ok_rps": 1269749.5,
+       "MBps": 66.0,
+       "p50_us": 47,
+       "p99_us": 217,
+       "statuses": {
+        "200": 17777760
+       }
+      }
+     },
+     "edge_cpus": 4.08,
+     "cpu_us_per_req": 3.22,
+     "cpu_ms_per_gb": 61892.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3656.9,
+     "anon_mb": 583.4,
+     "loads": {
+      "get": {
+       "ok_rps": 1214075.3,
+       "MBps": 133.9,
+       "p50_us": 50,
+       "p99_us": 114,
+       "statuses": {
+        "200": 16998272
+       }
+      }
+     },
+     "edge_cpus": 4.55,
+     "cpu_us_per_req": 3.75,
+     "cpu_ms_per_gb": 33994.8,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3656.6,
+     "anon_mb": 582.6,
+     "loads": {
+      "get": {
+       "ok_rps": 1232552.0,
+       "MBps": 135.9,
+       "p50_us": 49,
+       "p99_us": 94,
+       "statuses": {
+        "200": 17256949
+       }
+      }
+     },
+     "edge_cpus": 4.56,
+     "cpu_us_per_req": 3.7,
+     "cpu_ms_per_gb": 33546.0,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3659.6,
+     "anon_mb": 586.1,
+     "loads": {
+      "get": {
+       "ok_rps": 1576801.0,
+       "MBps": 174.2,
+       "p50_us": 615,
+       "p99_us": 1238,
+       "statuses": {
+        "200": 22076709
+       }
+      }
+     },
+     "edge_cpus": 5.4,
+     "cpu_us_per_req": 3.43,
+     "cpu_ms_per_gb": 31004.0,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3657.7,
+     "anon_mb": 583.7,
+     "loads": {
+      "get": {
+       "ok_rps": 1612189.2,
+       "MBps": 178.1,
+       "p50_us": 600,
+       "p99_us": 1212,
+       "statuses": {
+        "200": 22572277
+       }
+      }
+     },
+     "edge_cpus": 5.45,
+     "cpu_us_per_req": 3.38,
+     "cpu_ms_per_gb": 30594.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3659.6,
+     "anon_mb": 586.1,
+     "loads": {
+      "cold": {
+       "ok_rps": 34.9,
+       "MBps": 82460.1,
+       "p50_us": 216703,
+       "p99_us": 339711,
+       "statuses": {
+        "200": 489
+       }
+      }
+     },
+     "edge_cpus": 2.13,
+     "cpu_us_per_req": 61144.71,
+     "cpu_ms_per_gb": 25.9,
+     "allocs_per_req": 0.13
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3657.7,
+     "anon_mb": 583.7,
+     "loads": {
+      "cold": {
+       "ok_rps": 34.4,
+       "MBps": 81111.2,
+       "p50_us": 228223,
+       "p99_us": 324607,
+       "statuses": {
+        "200": 481
+       }
+      }
+     },
+     "edge_cpus": 2.12,
+     "cpu_us_per_req": 61510.21,
+     "cpu_ms_per_gb": 26.1,
+     "allocs_per_req": 0.13
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3659.6,
+     "anon_mb": 586.1,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19719.1,
+       "MBps": 4736.0,
+       "p50_us": 1579,
+       "p99_us": 2475,
+       "statuses": {
+        "200": 276087
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 393.77,
+     "cpu_ms_per_gb": 1639.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3657.7,
+     "anon_mb": 583.7,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19445.5,
+       "MBps": 4670.3,
+       "p50_us": 1601,
+       "p99_us": 2517,
+       "statuses": {
+        "200": 272256
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 399.72,
+     "cpu_ms_per_gb": 1664.3,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3659.6,
+     "anon_mb": 586.1,
+     "loads": {
+      "post": {
+       "ok_rps": 8674.0,
+       "MBps": 3435.2,
+       "p50_us": 3651,
+       "p99_us": 4879,
+       "statuses": {
+        "200": 121445
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 901.87,
+     "cpu_ms_per_gb": 2277.3,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3657.7,
+     "anon_mb": 583.7,
+     "loads": {
+      "post": {
+       "ok_rps": 8679.2,
+       "MBps": 3437.2,
+       "p50_us": 3653,
+       "p99_us": 4875,
+       "statuses": {
+        "200": 121518
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 901.33,
+     "cpu_ms_per_gb": 2275.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3659.6,
+     "anon_mb": 586.1,
+     "loads": {
+      "post": {
+       "ok_rps": 6801.6,
+       "MBps": 2693.6,
+       "p50_us": 4795,
+       "p99_us": 6571,
+       "statuses": {
+        "200": 136040
+       }
+      },
+      "get": {
+       "ok_rps": 416514.6,
+       "MBps": 46.0,
+       "p50_us": 152,
+       "p99_us": 296,
+       "statuses": {
+        "200": 5831621
+       }
+      }
+     },
+     "edge_cpus": 7.08,
+     "cpu_us_per_req": 16.73,
+     "cpu_ms_per_gb": 2585.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3657.8,
+     "anon_mb": 583.8,
+     "loads": {
+      "post": {
+       "ok_rps": 6814.5,
+       "MBps": 2698.7,
+       "p50_us": 4791,
+       "p99_us": 6547,
+       "statuses": {
+        "200": 136297
+       }
+      },
+      "get": {
+       "ok_rps": 421414.4,
+       "MBps": 46.6,
+       "p50_us": 150,
+       "p99_us": 294,
+       "statuses": {
+        "200": 5900198
+       }
+      }
+     },
+     "edge_cpus": 7.1,
+     "cpu_us_per_req": 16.59,
+     "cpu_ms_per_gb": 2587.6,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "slow400_get64",
+     "variant": "base",
+     "round": 0,
+     "loads": {
+      "get": {
+       "ok_rps": 1183715.8,
+       "MBps": 130.5,
+       "p50_us": 50,
+       "p99_us": 200,
+       "statuses": {
+        "200": 16573206
+       }
+      }
+     },
+     "edge_cpus": 4.46,
+     "cpu_us_per_req": 3.77,
+     "cpu_ms_per_gb": 34214.0,
+     "allocs_per_req": 0.0,
+     "slow_receiving": 400
+    },
+    {
+     "work": "idle30000_get64",
+     "variant": "base",
+     "round": 0,
+     "loads": {
+      "get": {
+       "ok_rps": 1212465.6,
+       "MBps": 133.7,
+       "p50_us": 50,
+       "p99_us": 112,
+       "statuses": {
+        "200": 16975734
+       }
+      }
+     },
+     "edge_cpus": 4.55,
+     "cpu_us_per_req": 3.75,
+     "cpu_ms_per_gb": 34008.3,
+     "allocs_per_req": 0.0,
+     "idle_conns": 30000,
+     "rss_before_mb": 3660.6,
+     "rss_idle_mb": 3776.0,
+     "anon_before_mb": 587.1,
+     "anon_idle_mb": 702.5,
+     "kb_per_idle_conn": 3.94
+    },
+    {
+     "work": "slow400_get64",
+     "variant": "new",
+     "round": 0,
+     "loads": {
+      "get": {
+       "ok_rps": 1208313.4,
+       "MBps": 133.2,
+       "p50_us": 49,
+       "p99_us": 176,
+       "statuses": {
+        "200": 16917599
+       }
+      }
+     },
+     "edge_cpus": 4.51,
+     "cpu_us_per_req": 3.74,
+     "cpu_ms_per_gb": 33888.3,
+     "allocs_per_req": 0.0,
+     "slow_receiving": 400
+    },
+    {
+     "work": "idle30000_get64",
+     "variant": "new",
+     "round": 0,
+     "loads": {
+      "get": {
+       "ok_rps": 1234550.5,
+       "MBps": 136.2,
+       "p50_us": 49,
+       "p99_us": 94,
+       "statuses": {
+        "200": 17284940
+       }
+      }
+     },
+     "edge_cpus": 4.56,
+     "cpu_us_per_req": 3.69,
+     "cpu_ms_per_gb": 33464.9,
+     "allocs_per_req": 0.0,
+     "idle_conns": 30000,
+     "rss_before_mb": 3659.4,
+     "rss_idle_mb": 3764.2,
+     "anon_before_mb": 585.5,
+     "anon_idle_mb": 690.3,
+     "kb_per_idle_conn": 3.58
+    },
+    {
+     "work": "slow400_get64",
+     "variant": "base",
+     "round": 1,
+     "loads": {
+      "get": {
+       "ok_rps": 1204181.3,
+       "MBps": 132.8,
+       "p50_us": 50,
+       "p99_us": 147,
+       "statuses": {
+        "200": 16859721
+       }
+      }
+     },
+     "edge_cpus": 4.48,
+     "cpu_us_per_req": 3.72,
+     "cpu_ms_per_gb": 33764.4,
+     "allocs_per_req": 0.0,
+     "slow_receiving": 400
+    },
+    {
+     "work": "idle30000_get64",
+     "variant": "base",
+     "round": 1,
+     "loads": {
+      "get": {
+       "ok_rps": 1217718.7,
+       "MBps": 134.3,
+       "p50_us": 50,
+       "p99_us": 98,
+       "statuses": {
+        "200": 17049265
+       }
+      }
+     },
+     "edge_cpus": 4.54,
+     "cpu_us_per_req": 3.73,
+     "cpu_ms_per_gb": 33804.3,
+     "allocs_per_req": 0.0,
+     "idle_conns": 30000,
+     "rss_before_mb": 3776.1,
+     "rss_idle_mb": 3849.7,
+     "anon_before_mb": 702.6,
+     "anon_idle_mb": 776.2,
+     "kb_per_idle_conn": 2.51
+    },
+    {
+     "work": "slow400_get64",
+     "variant": "new",
+     "round": 1,
+     "loads": {
+      "get": {
+       "ok_rps": 1213966.4,
+       "MBps": 133.9,
+       "p50_us": 49,
+       "p99_us": 158,
+       "statuses": {
+        "200": 16996747
+       }
+      }
+     },
+     "edge_cpus": 4.49,
+     "cpu_us_per_req": 3.7,
+     "cpu_ms_per_gb": 33546.8,
+     "allocs_per_req": 0.0,
+     "slow_receiving": 400
+    },
+    {
+     "work": "idle30000_get64",
+     "variant": "new",
+     "round": 1,
+     "loads": {
+      "get": {
+       "ok_rps": 1228425.1,
+       "MBps": 135.5,
+       "p50_us": 50,
+       "p99_us": 96,
+       "statuses": {
+        "200": 17199177
+       }
+      }
+     },
+     "edge_cpus": 4.55,
+     "cpu_us_per_req": 3.7,
+     "cpu_ms_per_gb": 33563.9,
+     "allocs_per_req": 0.0,
+     "idle_conns": 30000,
+     "rss_before_mb": 3764.5,
+     "rss_idle_mb": 3857.4,
+     "anon_before_mb": 690.5,
+     "anon_idle_mb": 783.4,
+     "kb_per_idle_conn": 3.17
+    }
+   ]
+  },
+  {
+   "name": "8af8de8 vs 94416d6, slots swapped",
+   "base": "94416d6",
+   "new": "8af8de8",
+   "rounds": [
+    {
+     "work": "config_64",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3170.6,
+     "anon_mb": 505.0,
+     "loads": {
+      "config": {
+       "ok_rps": 1254134.3,
+       "MBps": 65.2,
+       "p50_us": 46,
+       "p99_us": 225,
+       "statuses": {
+        "200": 17559132
+       }
+      }
+     },
+     "edge_cpus": 3.98,
+     "cpu_us_per_req": 3.17,
+     "cpu_ms_per_gb": 61057.1,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3171.5,
+     "anon_mb": 505.0,
+     "loads": {
+      "config": {
+       "ok_rps": 1266047.1,
+       "MBps": 65.8,
+       "p50_us": 47,
+       "p99_us": 218,
+       "statuses": {
+        "200": 17725922
+       }
+      }
+     },
+     "edge_cpus": 4.06,
+     "cpu_us_per_req": 3.21,
+     "cpu_ms_per_gb": 61777.1,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3489.2,
+     "anon_mb": 505.2,
+     "loads": {
+      "get": {
+       "ok_rps": 1226259.0,
+       "MBps": 135.2,
+       "p50_us": 50,
+       "p99_us": 99,
+       "statuses": {
+        "200": 17168849
+       }
+      }
+     },
+     "edge_cpus": 4.56,
+     "cpu_us_per_req": 3.72,
+     "cpu_ms_per_gb": 33764.3,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3490.1,
+     "anon_mb": 505.3,
+     "loads": {
+      "get": {
+       "ok_rps": 1217229.9,
+       "MBps": 134.3,
+       "p50_us": 50,
+       "p99_us": 97,
+       "statuses": {
+        "200": 17042429
+       }
+      }
+     },
+     "edge_cpus": 4.55,
+     "cpu_us_per_req": 3.74,
+     "cpu_ms_per_gb": 33871.4,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3548.6,
+     "anon_mb": 564.6,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19410.3,
+       "MBps": 4661.8,
+       "p50_us": 1604,
+       "p99_us": 2515,
+       "statuses": {
+        "200": 271763
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 400.35,
+     "cpu_ms_per_gb": 1666.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3549.5,
+     "anon_mb": 564.7,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19848.5,
+       "MBps": 4767.1,
+       "p50_us": 1568,
+       "p99_us": 2459,
+       "statuses": {
+        "200": 277900
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 391.46,
+     "cpu_ms_per_gb": 1629.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3559.2,
+     "anon_mb": 575.3,
+     "loads": {
+      "post": {
+       "ok_rps": 8686.8,
+       "MBps": 3440.2,
+       "p50_us": 3645,
+       "p99_us": 4879,
+       "statuses": {
+        "200": 121624
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 900.54,
+     "cpu_ms_per_gb": 2274.0,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3560.2,
+     "anon_mb": 575.4,
+     "loads": {
+      "post": {
+       "ok_rps": 8691.3,
+       "MBps": 3442.0,
+       "p50_us": 3647,
+       "p99_us": 4863,
+       "statuses": {
+        "200": 121686
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 900.31,
+     "cpu_ms_per_gb": 2273.3,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3560.2,
+     "anon_mb": 575.5,
+     "loads": {
+      "config": {
+       "ok_rps": 1308953.7,
+       "MBps": 68.1,
+       "p50_us": 46,
+       "p99_us": 91,
+       "statuses": {
+        "200": 18326657
+       }
+      }
+     },
+     "edge_cpus": 4.25,
+     "cpu_us_per_req": 3.25,
+     "cpu_ms_per_gb": 62465.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3559.4,
+     "anon_mb": 575.4,
+     "loads": {
+      "config": {
+       "ok_rps": 1313933.9,
+       "MBps": 68.3,
+       "p50_us": 46,
+       "p99_us": 89,
+       "statuses": {
+        "200": 18396387
+       }
+      }
+     },
+     "edge_cpus": 4.27,
+     "cpu_us_per_req": 3.25,
+     "cpu_ms_per_gb": 62546.3,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3560.2,
+     "anon_mb": 575.5,
+     "loads": {
+      "get": {
+       "ok_rps": 1218350.6,
+       "MBps": 134.4,
+       "p50_us": 50,
+       "p99_us": 96,
+       "statuses": {
+        "200": 17058137
+       }
+      }
+     },
+     "edge_cpus": 4.56,
+     "cpu_us_per_req": 3.74,
+     "cpu_ms_per_gb": 33905.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3559.5,
+     "anon_mb": 575.5,
+     "loads": {
+      "get": {
+       "ok_rps": 1222721.6,
+       "MBps": 134.9,
+       "p50_us": 50,
+       "p99_us": 106,
+       "statuses": {
+        "200": 17119326
+       }
+      }
+     },
+     "edge_cpus": 4.55,
+     "cpu_us_per_req": 3.73,
+     "cpu_ms_per_gb": 33765.1,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3560.2,
+     "anon_mb": 575.5,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19840.2,
+       "MBps": 4765.1,
+       "p50_us": 1571,
+       "p99_us": 2453,
+       "statuses": {
+        "200": 277784
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 391.62,
+     "cpu_ms_per_gb": 1630.6,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3559.5,
+     "anon_mb": 575.5,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19418.3,
+       "MBps": 4663.8,
+       "p50_us": 1602,
+       "p99_us": 2523,
+       "statuses": {
+        "200": 271875
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 400.33,
+     "cpu_ms_per_gb": 1666.8,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3560.3,
+     "anon_mb": 575.5,
+     "loads": {
+      "post": {
+       "ok_rps": 8679.9,
+       "MBps": 3437.5,
+       "p50_us": 3649,
+       "p99_us": 4875,
+       "statuses": {
+        "200": 121527
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 901.49,
+     "cpu_ms_per_gb": 2276.3,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3559.5,
+     "anon_mb": 575.5,
+     "loads": {
+      "post": {
+       "ok_rps": 8683.1,
+       "MBps": 3438.8,
+       "p50_us": 3649,
+       "p99_us": 4867,
+       "statuses": {
+        "200": 121573
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 900.93,
+     "cpu_ms_per_gb": 2274.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3559.5,
+     "anon_mb": 575.5,
+     "loads": {
+      "config": {
+       "ok_rps": 1319185.6,
+       "MBps": 68.6,
+       "p50_us": 46,
+       "p99_us": 87,
+       "statuses": {
+        "200": 18469924
+       }
+      }
+     },
+     "edge_cpus": 4.28,
+     "cpu_us_per_req": 3.24,
+     "cpu_ms_per_gb": 62345.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3560.3,
+     "anon_mb": 575.5,
+     "loads": {
+      "config": {
+       "ok_rps": 1302423.0,
+       "MBps": 67.7,
+       "p50_us": 46,
+       "p99_us": 95,
+       "statuses": {
+        "200": 18235223
+       }
+      }
+     },
+     "edge_cpus": 4.25,
+     "cpu_us_per_req": 3.27,
+     "cpu_ms_per_gb": 62820.0,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3559.5,
+     "anon_mb": 575.5,
+     "loads": {
+      "get": {
+       "ok_rps": 1226517.5,
+       "MBps": 135.3,
+       "p50_us": 50,
+       "p99_us": 96,
+       "statuses": {
+        "200": 17172432
+       }
+      }
+     },
+     "edge_cpus": 4.56,
+     "cpu_us_per_req": 3.71,
+     "cpu_ms_per_gb": 33672.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3560.4,
+     "anon_mb": 575.6,
+     "loads": {
+      "get": {
+       "ok_rps": 1216653.3,
+       "MBps": 134.1,
+       "p50_us": 50,
+       "p99_us": 105,
+       "statuses": {
+        "200": 17034368
+       }
+      }
+     },
+     "edge_cpus": 4.56,
+     "cpu_us_per_req": 3.75,
+     "cpu_ms_per_gb": 33989.0,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3559.5,
+     "anon_mb": 575.5,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19360.0,
+       "MBps": 4649.8,
+       "p50_us": 1608,
+       "p99_us": 2529,
+       "statuses": {
+        "200": 271060
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 401.28,
+     "cpu_ms_per_gb": 1670.8,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3560.4,
+     "anon_mb": 575.6,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19734.6,
+       "MBps": 4739.7,
+       "p50_us": 1578,
+       "p99_us": 2469,
+       "statuses": {
+        "200": 276306
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 393.46,
+     "cpu_ms_per_gb": 1638.3,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3559.5,
+     "anon_mb": 575.5,
+     "loads": {
+      "post": {
+       "ok_rps": 8673.1,
+       "MBps": 3434.8,
+       "p50_us": 3655,
+       "p99_us": 4863,
+       "statuses": {
+        "200": 121432
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 902.19,
+     "cpu_ms_per_gb": 2278.1,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3560.4,
+     "anon_mb": 575.6,
+     "loads": {
+      "post": {
+       "ok_rps": 8688.7,
+       "MBps": 3440.9,
+       "p50_us": 3645,
+       "p99_us": 4867,
+       "statuses": {
+        "200": 121649
+       }
+      }
+     },
+     "edge_cpus": 7.83,
+     "cpu_us_per_req": 900.92,
+     "cpu_ms_per_gb": 2274.9,
+     "allocs_per_req": 0.0
+    }
+   ]
+  },
+  {
+   "name": "hex: as_chunks vs old loops",
+   "base": "94416d6",
+   "new": "oldhex",
+   "rounds": [
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3230.7,
+     "anon_mb": 564.3,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19542.6,
+       "MBps": 4693.6,
+       "p50_us": 1593,
+       "p99_us": 2501,
+       "statuses": {
+        "200": 273616
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 397.58,
+     "cpu_ms_per_gb": 1655.4,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3230.6,
+     "anon_mb": 564.3,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20150.0,
+       "MBps": 4839.5,
+       "p50_us": 1545,
+       "p99_us": 2421,
+       "statuses": {
+        "200": 282120
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 384.95,
+     "cpu_ms_per_gb": 1602.8,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3230.7,
+     "anon_mb": 564.4,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20154.9,
+       "MBps": 4840.7,
+       "p50_us": 1545,
+       "p99_us": 2423,
+       "statuses": {
+        "200": 282188
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 385.11,
+     "cpu_ms_per_gb": 1603.4,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3230.8,
+     "anon_mb": 564.4,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19528.4,
+       "MBps": 4690.2,
+       "p50_us": 1593,
+       "p99_us": 2511,
+       "statuses": {
+        "200": 273418
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 397.98,
+     "cpu_ms_per_gb": 1657.0,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3230.9,
+     "anon_mb": 564.5,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19428.5,
+       "MBps": 4666.2,
+       "p50_us": 1602,
+       "p99_us": 2525,
+       "statuses": {
+        "200": 272021
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 399.87,
+     "cpu_ms_per_gb": 1664.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3230.8,
+     "anon_mb": 564.5,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20206.8,
+       "MBps": 4853.2,
+       "p50_us": 1540,
+       "p99_us": 2413,
+       "statuses": {
+        "200": 282916
+       }
+      }
+     },
+     "edge_cpus": 7.75,
+     "cpu_us_per_req": 383.77,
+     "cpu_ms_per_gb": 1597.9,
+     "allocs_per_req": 0.0
+    }
+   ]
+  },
+  {
+   "name": "hex: as_chunks vs old loops, slots swapped",
+   "base": "oldhex",
+   "new": "94416d6",
+   "rounds": [
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3230.9,
+     "anon_mb": 564.3,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20142.9,
+       "MBps": 4837.8,
+       "p50_us": 1545,
+       "p99_us": 2419,
+       "statuses": {
+        "200": 282021
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 385.14,
+     "cpu_ms_per_gb": 1603.6,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3230.2,
+     "anon_mb": 564.3,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19521.1,
+       "MBps": 4688.5,
+       "p50_us": 1594,
+       "p99_us": 2509,
+       "statuses": {
+        "200": 273314
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 398.18,
+     "cpu_ms_per_gb": 1657.8,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3230.3,
+     "anon_mb": 564.4,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19458.5,
+       "MBps": 4673.4,
+       "p50_us": 1599,
+       "p99_us": 2519,
+       "statuses": {
+        "200": 272440
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 399.2,
+     "cpu_ms_per_gb": 1662.1,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3231.0,
+     "anon_mb": 564.4,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20074.5,
+       "MBps": 4821.4,
+       "p50_us": 1551,
+       "p99_us": 2433,
+       "statuses": {
+        "200": 281064
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 386.5,
+     "cpu_ms_per_gb": 1609.2,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3231.0,
+     "anon_mb": 564.4,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20125.0,
+       "MBps": 4833.5,
+       "p50_us": 1547,
+       "p99_us": 2421,
+       "statuses": {
+        "200": 281770
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 385.43,
+     "cpu_ms_per_gb": 1604.8,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3230.4,
+     "anon_mb": 564.4,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19452.5,
+       "MBps": 4672.0,
+       "p50_us": 1600,
+       "p99_us": 2519,
+       "statuses": {
+        "200": 272355
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 399.27,
+     "cpu_ms_per_gb": 1662.4,
+     "allocs_per_req": 0.0
+    }
+   ]
+  },
+  {
+   "name": "hex: both old loops vs old encoder only",
+   "base": "oldhex",
+   "new": "oldenc",
+   "rounds": [
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3230.4,
+     "anon_mb": 564.3,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20227.3,
+       "MBps": 4858.1,
+       "p50_us": 1539,
+       "p99_us": 2409,
+       "statuses": {
+        "200": 283202
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 383.53,
+     "cpu_ms_per_gb": 1596.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3230.6,
+     "anon_mb": 564.3,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20179.1,
+       "MBps": 4846.5,
+       "p50_us": 1542,
+       "p99_us": 2427,
+       "statuses": {
+        "200": 282527
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 384.55,
+     "cpu_ms_per_gb": 1601.1,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3230.7,
+     "anon_mb": 564.4,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20148.5,
+       "MBps": 4839.1,
+       "p50_us": 1546,
+       "p99_us": 2419,
+       "statuses": {
+        "200": 282099
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 384.93,
+     "cpu_ms_per_gb": 1602.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3230.5,
+     "anon_mb": 564.4,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20232.3,
+       "MBps": 4859.3,
+       "p50_us": 1539,
+       "p99_us": 2407,
+       "statuses": {
+        "200": 283273
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 383.49,
+     "cpu_ms_per_gb": 1596.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3230.6,
+     "anon_mb": 564.5,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20109.2,
+       "MBps": 4829.7,
+       "p50_us": 1548,
+       "p99_us": 2429,
+       "statuses": {
+        "200": 281549
+       }
+      }
+     },
+     "edge_cpus": 7.75,
+     "cpu_us_per_req": 385.63,
+     "cpu_ms_per_gb": 1605.6,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3230.8,
+     "anon_mb": 564.4,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20109.2,
+       "MBps": 4829.7,
+       "p50_us": 1548,
+       "p99_us": 2421,
+       "statuses": {
+        "200": 281549
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 385.68,
+     "cpu_ms_per_gb": 1605.9,
+     "allocs_per_req": 0.0
+    }
+   ]
+  },
+  {
+   "name": "hex: both old loops vs old encoder only, slots swapped",
+   "base": "oldenc",
+   "new": "oldhex",
+   "rounds": [
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3230.9,
+     "anon_mb": 564.3,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20121.7,
+       "MBps": 4832.7,
+       "p50_us": 1547,
+       "p99_us": 2427,
+       "statuses": {
+        "200": 281723
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 385.49,
+     "cpu_ms_per_gb": 1605.1,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3230.4,
+     "anon_mb": 564.3,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20116.7,
+       "MBps": 4831.5,
+       "p50_us": 1548,
+       "p99_us": 2423,
+       "statuses": {
+        "200": 281654
+       }
+      }
+     },
+     "edge_cpus": 7.75,
+     "cpu_us_per_req": 385.29,
+     "cpu_ms_per_gb": 1604.2,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3230.5,
+     "anon_mb": 564.3,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20212.8,
+       "MBps": 4854.6,
+       "p50_us": 1540,
+       "p99_us": 2419,
+       "statuses": {
+        "200": 283000
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 383.96,
+     "cpu_ms_per_gb": 1598.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3231.0,
+     "anon_mb": 564.4,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20117.6,
+       "MBps": 4831.7,
+       "p50_us": 1547,
+       "p99_us": 2425,
+       "statuses": {
+        "200": 281666
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 385.57,
+     "cpu_ms_per_gb": 1605.4,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3231.1,
+     "anon_mb": 564.5,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20096.2,
+       "MBps": 4826.6,
+       "p50_us": 1549,
+       "p99_us": 2427,
+       "statuses": {
+        "200": 281367
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 386.08,
+     "cpu_ms_per_gb": 1607.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3230.6,
+     "anon_mb": 564.4,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20198.8,
+       "MBps": 4851.2,
+       "p50_us": 1541,
+       "p99_us": 2417,
+       "statuses": {
+        "200": 282803
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 384.12,
+     "cpu_ms_per_gb": 1599.4,
+     "allocs_per_req": 0.0
+    }
+   ]
+  },
+  {
+   "name": "8af8de8 vs f100038",
+   "base": "8af8de8",
+   "new": "f100038",
+   "rounds": [
+    {
+     "work": "config_64",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3171.2,
+     "anon_mb": 505.0,
+     "loads": {
+      "config": {
+       "ok_rps": 1200136.2,
+       "MBps": 62.4,
+       "p50_us": 47,
+       "p99_us": 266,
+       "statuses": {
+        "200": 16803104
+       }
+      }
+     },
+     "edge_cpus": 3.93,
+     "cpu_us_per_req": 3.27,
+     "cpu_ms_per_gb": 62915.6,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3171.2,
+     "anon_mb": 505.0,
+     "loads": {
+      "config": {
+       "ok_rps": 1257606.8,
+       "MBps": 65.4,
+       "p50_us": 46,
+       "p99_us": 224,
+       "statuses": {
+        "200": 17607735
+       }
+      }
+     },
+     "edge_cpus": 4.02,
+     "cpu_us_per_req": 3.19,
+     "cpu_ms_per_gb": 61405.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3489.9,
+     "anon_mb": 505.3,
+     "loads": {
+      "get": {
+       "ok_rps": 1113273.9,
+       "MBps": 122.8,
+       "p50_us": 50,
+       "p99_us": 284,
+       "statuses": {
+        "200": 15586843
+       }
+      }
+     },
+     "edge_cpus": 4.25,
+     "cpu_us_per_req": 3.81,
+     "cpu_ms_per_gb": 34584.2,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3489.7,
+     "anon_mb": 505.2,
+     "loads": {
+      "get": {
+       "ok_rps": 1130401.0,
+       "MBps": 124.7,
+       "p50_us": 50,
+       "p99_us": 281,
+       "statuses": {
+        "200": 15826746
+       }
+      }
+     },
+     "edge_cpus": 4.14,
+     "cpu_us_per_req": 3.66,
+     "cpu_ms_per_gb": 33207.0,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3493.6,
+     "anon_mb": 509.1,
+     "loads": {
+      "get": {
+       "ok_rps": 1569186.6,
+       "MBps": 173.4,
+       "p50_us": 616,
+       "p99_us": 1251,
+       "statuses": {
+        "200": 21970173
+       }
+      }
+     },
+     "edge_cpus": 5.39,
+     "cpu_us_per_req": 3.44,
+     "cpu_ms_per_gb": 31100.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3493.2,
+     "anon_mb": 508.7,
+     "loads": {
+      "get": {
+       "ok_rps": 1592464.4,
+       "MBps": 176.0,
+       "p50_us": 610,
+       "p99_us": 1225,
+       "statuses": {
+        "200": 22296161
+       }
+      }
+     },
+     "edge_cpus": 5.36,
+     "cpu_us_per_req": 3.37,
+     "cpu_ms_per_gb": 30482.3,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3553.0,
+     "anon_mb": 568.4,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19720.1,
+       "MBps": 4736.3,
+       "p50_us": 1579,
+       "p99_us": 2479,
+       "statuses": {
+        "200": 276102
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 393.7,
+     "cpu_ms_per_gb": 1639.2,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3552.5,
+     "anon_mb": 568.0,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19988.5,
+       "MBps": 4800.7,
+       "p50_us": 1558,
+       "p99_us": 2443,
+       "statuses": {
+        "200": 279859
+       }
+      }
+     },
+     "edge_cpus": 7.75,
+     "cpu_us_per_req": 387.96,
+     "cpu_ms_per_gb": 1615.4,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3563.6,
+     "anon_mb": 579.0,
+     "loads": {
+      "post": {
+       "ok_rps": 8584.4,
+       "MBps": 3399.6,
+       "p50_us": 3689,
+       "p99_us": 4927,
+       "statuses": {
+        "200": 120190
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 910.94,
+     "cpu_ms_per_gb": 2300.2,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3563.1,
+     "anon_mb": 578.7,
+     "loads": {
+      "post": {
+       "ok_rps": 8703.4,
+       "MBps": 3446.8,
+       "p50_us": 3639,
+       "p99_us": 4867,
+       "statuses": {
+        "200": 121856
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 898.25,
+     "cpu_ms_per_gb": 2268.1,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3563.6,
+     "anon_mb": 579.1,
+     "loads": {
+      "post": {
+       "ok_rps": 6717.8,
+       "MBps": 2660.4,
+       "p50_us": 4879,
+       "p99_us": 6655,
+       "statuses": {
+        "200": 134362
+       }
+      },
+      "get": {
+       "ok_rps": 415190.2,
+       "MBps": 45.9,
+       "p50_us": 152,
+       "p99_us": 298,
+       "statuses": {
+        "200": 5813062
+       }
+      }
+     },
+     "edge_cpus": 7.08,
+     "cpu_us_per_req": 16.78,
+     "cpu_ms_per_gb": 2615.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3563.2,
+     "anon_mb": 578.7,
+     "loads": {
+      "post": {
+       "ok_rps": 6755.6,
+       "MBps": 2675.4,
+       "p50_us": 4843,
+       "p99_us": 6615,
+       "statuses": {
+        "200": 135118
+       }
+      },
+      "get": {
+       "ok_rps": 419637.6,
+       "MBps": 46.4,
+       "p50_us": 151,
+       "p99_us": 294,
+       "statuses": {
+        "200": 5875353
+       }
+      }
+     },
+     "edge_cpus": 7.08,
+     "cpu_us_per_req": 16.59,
+     "cpu_ms_per_gb": 2599.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3563.2,
+     "anon_mb": 578.7,
+     "loads": {
+      "config": {
+       "ok_rps": 1304207.4,
+       "MBps": 67.8,
+       "p50_us": 46,
+       "p99_us": 98,
+       "statuses": {
+        "200": 18260212
+       }
+      }
+     },
+     "edge_cpus": 4.21,
+     "cpu_us_per_req": 3.23,
+     "cpu_ms_per_gb": 62152.2,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3563.6,
+     "anon_mb": 579.1,
+     "loads": {
+      "config": {
+       "ok_rps": 1297317.2,
+       "MBps": 67.5,
+       "p50_us": 46,
+       "p99_us": 106,
+       "statuses": {
+        "200": 18163743
+       }
+      }
+     },
+     "edge_cpus": 4.24,
+     "cpu_us_per_req": 3.27,
+     "cpu_ms_per_gb": 62799.0,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3563.2,
+     "anon_mb": 578.7,
+     "loads": {
+      "get": {
+       "ok_rps": 1227767.3,
+       "MBps": 135.4,
+       "p50_us": 50,
+       "p99_us": 93,
+       "statuses": {
+        "200": 17189968
+       }
+      }
+     },
+     "edge_cpus": 4.55,
+     "cpu_us_per_req": 3.71,
+     "cpu_ms_per_gb": 33618.3,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3563.7,
+     "anon_mb": 579.1,
+     "loads": {
+      "get": {
+       "ok_rps": 1214126.1,
+       "MBps": 133.9,
+       "p50_us": 50,
+       "p99_us": 111,
+       "statuses": {
+        "200": 16998982
+       }
+      }
+     },
+     "edge_cpus": 4.57,
+     "cpu_us_per_req": 3.77,
+     "cpu_ms_per_gb": 34159.1,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3565.4,
+     "anon_mb": 580.9,
+     "loads": {
+      "get": {
+       "ok_rps": 1594682.2,
+       "MBps": 176.2,
+       "p50_us": 609,
+       "p99_us": 1220,
+       "statuses": {
+        "200": 22327179
+       }
+      }
+     },
+     "edge_cpus": 5.36,
+     "cpu_us_per_req": 3.36,
+     "cpu_ms_per_gb": 30447.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3565.8,
+     "anon_mb": 581.3,
+     "loads": {
+      "get": {
+       "ok_rps": 1581201.6,
+       "MBps": 174.7,
+       "p50_us": 613,
+       "p99_us": 1230,
+       "statuses": {
+        "200": 22138464
+       }
+      }
+     },
+     "edge_cpus": 5.42,
+     "cpu_us_per_req": 3.43,
+     "cpu_ms_per_gb": 31018.2,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3565.4,
+     "anon_mb": 580.9,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20167.5,
+       "MBps": 4843.7,
+       "p50_us": 1545,
+       "p99_us": 2413,
+       "statuses": {
+        "200": 282365
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 385.07,
+     "cpu_ms_per_gb": 1603.3,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3565.9,
+     "anon_mb": 581.3,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19824.6,
+       "MBps": 4761.4,
+       "p50_us": 1571,
+       "p99_us": 2459,
+       "statuses": {
+        "200": 277565
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 392.18,
+     "cpu_ms_per_gb": 1632.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3565.4,
+     "anon_mb": 580.9,
+     "loads": {
+      "post": {
+       "ok_rps": 8687.9,
+       "MBps": 3440.6,
+       "p50_us": 3647,
+       "p99_us": 4851,
+       "statuses": {
+        "200": 121639
+       }
+      }
+     },
+     "edge_cpus": 7.83,
+     "cpu_us_per_req": 900.89,
+     "cpu_ms_per_gb": 2274.8,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3565.9,
+     "anon_mb": 581.3,
+     "loads": {
+      "post": {
+       "ok_rps": 8656.6,
+       "MBps": 3428.3,
+       "p50_us": 3661,
+       "p99_us": 4871,
+       "statuses": {
+        "200": 121201
+       }
+      }
+     },
+     "edge_cpus": 7.83,
+     "cpu_us_per_req": 904.38,
+     "cpu_ms_per_gb": 2283.6,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3565.4,
+     "anon_mb": 580.9,
+     "loads": {
+      "post": {
+       "ok_rps": 6773.3,
+       "MBps": 2682.4,
+       "p50_us": 4831,
+       "p99_us": 6627,
+       "statuses": {
+        "200": 135472
+       }
+      },
+      "get": {
+       "ok_rps": 416992.5,
+       "MBps": 46.1,
+       "p50_us": 152,
+       "p99_us": 297,
+       "statuses": {
+        "200": 5838299
+       }
+      }
+     },
+     "edge_cpus": 7.08,
+     "cpu_us_per_req": 16.71,
+     "cpu_ms_per_gb": 2595.1,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3565.9,
+     "anon_mb": 581.3,
+     "loads": {
+      "post": {
+       "ok_rps": 6804.9,
+       "MBps": 2694.9,
+       "p50_us": 4787,
+       "p99_us": 6555,
+       "statuses": {
+        "200": 136105
+       }
+      },
+      "get": {
+       "ok_rps": 418489.1,
+       "MBps": 46.2,
+       "p50_us": 151,
+       "p99_us": 295,
+       "statuses": {
+        "200": 5859294
+       }
+      }
+     },
+     "edge_cpus": 7.1,
+     "cpu_us_per_req": 16.68,
+     "cpu_ms_per_gb": 2588.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3565.9,
+     "anon_mb": 581.3,
+     "loads": {
+      "config": {
+       "ok_rps": 1298485.7,
+       "MBps": 67.5,
+       "p50_us": 47,
+       "p99_us": 96,
+       "statuses": {
+        "200": 18180097
+       }
+      }
+     },
+     "edge_cpus": 4.24,
+     "cpu_us_per_req": 3.27,
+     "cpu_ms_per_gb": 62813.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3565.4,
+     "anon_mb": 580.9,
+     "loads": {
+      "config": {
+       "ok_rps": 1308234.6,
+       "MBps": 68.0,
+       "p50_us": 46,
+       "p99_us": 90,
+       "statuses": {
+        "200": 18316588
+       }
+      }
+     },
+     "edge_cpus": 4.25,
+     "cpu_us_per_req": 3.25,
+     "cpu_ms_per_gb": 62469.3,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3565.9,
+     "anon_mb": 581.3,
+     "loads": {
+      "get": {
+       "ok_rps": 1217966.2,
+       "MBps": 134.3,
+       "p50_us": 50,
+       "p99_us": 103,
+       "statuses": {
+        "200": 17052745
+       }
+      }
+     },
+     "edge_cpus": 4.57,
+     "cpu_us_per_req": 3.75,
+     "cpu_ms_per_gb": 34027.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3565.4,
+     "anon_mb": 580.9,
+     "loads": {
+      "get": {
+       "ok_rps": 1226636.3,
+       "MBps": 135.3,
+       "p50_us": 50,
+       "p99_us": 97,
+       "statuses": {
+        "200": 17174130
+       }
+      }
+     },
+     "edge_cpus": 4.54,
+     "cpu_us_per_req": 3.7,
+     "cpu_ms_per_gb": 33524.8,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3567.7,
+     "anon_mb": 583.2,
+     "loads": {
+      "get": {
+       "ok_rps": 1579697.1,
+       "MBps": 174.5,
+       "p50_us": 613,
+       "p99_us": 1236,
+       "statuses": {
+        "200": 22117362
+       }
+      }
+     },
+     "edge_cpus": 5.41,
+     "cpu_us_per_req": 3.43,
+     "cpu_ms_per_gb": 31008.0,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3565.8,
+     "anon_mb": 581.3,
+     "loads": {
+      "get": {
+       "ok_rps": 1594591.6,
+       "MBps": 176.2,
+       "p50_us": 608,
+       "p99_us": 1221,
+       "statuses": {
+        "200": 22325885
+       }
+      }
+     },
+     "edge_cpus": 5.37,
+     "cpu_us_per_req": 3.37,
+     "cpu_ms_per_gb": 30487.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3567.7,
+     "anon_mb": 583.2,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19784.2,
+       "MBps": 4751.6,
+       "p50_us": 1574,
+       "p99_us": 2471,
+       "statuses": {
+        "200": 276998
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 392.83,
+     "cpu_ms_per_gb": 1635.6,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3565.8,
+     "anon_mb": 581.3,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20156.8,
+       "MBps": 4841.1,
+       "p50_us": 1545,
+       "p99_us": 2419,
+       "statuses": {
+        "200": 282216
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 385.47,
+     "cpu_ms_per_gb": 1605.0,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3567.7,
+     "anon_mb": 583.2,
+     "loads": {
+      "post": {
+       "ok_rps": 8666.7,
+       "MBps": 3432.3,
+       "p50_us": 3655,
+       "p99_us": 4867,
+       "statuses": {
+        "200": 121343
+       }
+      }
+     },
+     "edge_cpus": 7.83,
+     "cpu_us_per_req": 903.33,
+     "cpu_ms_per_gb": 2280.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3565.8,
+     "anon_mb": 581.3,
+     "loads": {
+      "post": {
+       "ok_rps": 8714.2,
+       "MBps": 3451.1,
+       "p50_us": 3637,
+       "p99_us": 4847,
+       "statuses": {
+        "200": 122008
+       }
+      }
+     },
+     "edge_cpus": 7.83,
+     "cpu_us_per_req": 898.06,
+     "cpu_ms_per_gb": 2267.6,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3567.8,
+     "anon_mb": 583.2,
+     "loads": {
+      "post": {
+       "ok_rps": 6719.4,
+       "MBps": 2661.1,
+       "p50_us": 4871,
+       "p99_us": 6651,
+       "statuses": {
+        "200": 134394
+       }
+      },
+      "get": {
+       "ok_rps": 417587.8,
+       "MBps": 46.1,
+       "p50_us": 152,
+       "p99_us": 296,
+       "statuses": {
+        "200": 5846648
+       }
+      }
+     },
+     "edge_cpus": 7.09,
+     "cpu_us_per_req": 16.71,
+     "cpu_ms_per_gb": 2618.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3565.8,
+     "anon_mb": 581.3,
+     "loads": {
+      "post": {
+       "ok_rps": 6803.1,
+       "MBps": 2694.2,
+       "p50_us": 4795,
+       "p99_us": 6567,
+       "statuses": {
+        "200": 136069
+       }
+      },
+      "get": {
+       "ok_rps": 418673.9,
+       "MBps": 46.3,
+       "p50_us": 151,
+       "p99_us": 294,
+       "statuses": {
+        "200": 5861853
+       }
+      }
+     },
+     "edge_cpus": 7.09,
+     "cpu_us_per_req": 16.66,
+     "cpu_ms_per_gb": 2587.1,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "slow400_get64",
+     "variant": "base",
+     "round": 0,
+     "loads": {
+      "get": {
+       "ok_rps": 1193733.9,
+       "MBps": 131.6,
+       "p50_us": 50,
+       "p99_us": 182,
+       "statuses": {
+        "200": 16713479
+       }
+      }
+     },
+     "edge_cpus": 4.47,
+     "cpu_us_per_req": 3.75,
+     "cpu_ms_per_gb": 33981.2,
+     "allocs_per_req": 0.0,
+     "slow_receiving": 400
+    },
+    {
+     "work": "idle30000_get64",
+     "variant": "base",
+     "round": 0,
+     "loads": {
+      "get": {
+       "ok_rps": 1217756.2,
+       "MBps": 134.3,
+       "p50_us": 50,
+       "p99_us": 106,
+       "statuses": {
+        "200": 17049768
+       }
+      }
+     },
+     "edge_cpus": 4.55,
+     "cpu_us_per_req": 3.74,
+     "cpu_ms_per_gb": 33908.5,
+     "allocs_per_req": 0.0,
+     "idle_conns": 30000,
+     "rss_before_mb": 3663.8,
+     "rss_idle_mb": 3780.6,
+     "anon_before_mb": 590.0,
+     "anon_idle_mb": 706.8,
+     "kb_per_idle_conn": 3.99
+    },
+    {
+     "work": "slow400_get64",
+     "variant": "new",
+     "round": 0,
+     "loads": {
+      "get": {
+       "ok_rps": 1204271.3,
+       "MBps": 132.8,
+       "p50_us": 50,
+       "p99_us": 172,
+       "statuses": {
+        "200": 16861000
+       }
+      }
+     },
+     "edge_cpus": 4.47,
+     "cpu_us_per_req": 3.71,
+     "cpu_ms_per_gb": 33643.9,
+     "allocs_per_req": 0.0,
+     "slow_receiving": 400
+    },
+    {
+     "work": "idle30000_get64",
+     "variant": "new",
+     "round": 0,
+     "loads": {
+      "get": {
+       "ok_rps": 1224331.5,
+       "MBps": 135.0,
+       "p50_us": 49,
+       "p99_us": 104,
+       "statuses": {
+        "200": 17141861
+       }
+      }
+     },
+     "edge_cpus": 4.53,
+     "cpu_us_per_req": 3.7,
+     "cpu_ms_per_gb": 33525.3,
+     "allocs_per_req": 0.0,
+     "idle_conns": 30000,
+     "rss_before_mb": 3661.6,
+     "rss_idle_mb": 3767.7,
+     "anon_before_mb": 587.9,
+     "anon_idle_mb": 694.0,
+     "kb_per_idle_conn": 3.62
+    },
+    {
+     "work": "slow400_get64",
+     "variant": "base",
+     "round": 1,
+     "loads": {
+      "get": {
+       "ok_rps": 1202213.2,
+       "MBps": 132.6,
+       "p50_us": 50,
+       "p99_us": 159,
+       "statuses": {
+        "200": 16832189
+       }
+      }
+     },
+     "edge_cpus": 4.49,
+     "cpu_us_per_req": 3.74,
+     "cpu_ms_per_gb": 33883.2,
+     "allocs_per_req": 0.0,
+     "slow_receiving": 400
+    },
+    {
+     "work": "idle30000_get64",
+     "variant": "base",
+     "round": 1,
+     "loads": {
+      "get": {
+       "ok_rps": 1218527.4,
+       "MBps": 134.4,
+       "p50_us": 50,
+       "p99_us": 100,
+       "statuses": {
+        "200": 17060605
+       }
+      }
+     },
+     "edge_cpus": 4.54,
+     "cpu_us_per_req": 3.73,
+     "cpu_ms_per_gb": 33801.4,
+     "allocs_per_req": 0.0,
+     "idle_conns": 30000,
+     "rss_before_mb": 3781.5,
+     "rss_idle_mb": 3838.6,
+     "anon_before_mb": 707.7,
+     "anon_idle_mb": 764.8,
+     "kb_per_idle_conn": 1.95
+    },
+    {
+     "work": "slow400_get64",
+     "variant": "new",
+     "round": 1,
+     "loads": {
+      "get": {
+       "ok_rps": 1198547.5,
+       "MBps": 132.2,
+       "p50_us": 50,
+       "p99_us": 186,
+       "statuses": {
+        "200": 16780859
+       }
+      }
+     },
+     "edge_cpus": 4.43,
+     "cpu_us_per_req": 3.69,
+     "cpu_ms_per_gb": 33486.5,
+     "allocs_per_req": 0.0,
+     "slow_receiving": 400
+    },
+    {
+     "work": "idle30000_get64",
+     "variant": "new",
+     "round": 1,
+     "loads": {
+      "get": {
+       "ok_rps": 1220232.2,
+       "MBps": 134.6,
+       "p50_us": 50,
+       "p99_us": 112,
+       "statuses": {
+        "200": 17084573
+       }
+      }
+     },
+     "edge_cpus": 4.49,
+     "cpu_us_per_req": 3.68,
+     "cpu_ms_per_gb": 33350.0,
+     "allocs_per_req": 0.0,
+     "idle_conns": 30000,
+     "rss_before_mb": 3768.2,
+     "rss_idle_mb": 3805.7,
+     "anon_before_mb": 694.5,
+     "anon_idle_mb": 732.0,
+     "kb_per_idle_conn": 1.28
+    }
+   ]
+  },
+  {
+   "name": "8af8de8 vs f100038, slots swapped",
+   "base": "f100038",
+   "new": "8af8de8",
+   "rounds": [
+    {
+     "work": "config_64",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3171.0,
+     "anon_mb": 505.0,
+     "loads": {
+      "config": {
+       "ok_rps": 1301087.0,
+       "MBps": 67.7,
+       "p50_us": 46,
+       "p99_us": 120,
+       "statuses": {
+        "200": 18216515
+       }
+      }
+     },
+     "edge_cpus": 4.21,
+     "cpu_us_per_req": 3.23,
+     "cpu_ms_per_gb": 62125.8,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3171.0,
+     "anon_mb": 505.0,
+     "loads": {
+      "config": {
+       "ok_rps": 1306633.1,
+       "MBps": 67.9,
+       "p50_us": 46,
+       "p99_us": 93,
+       "statuses": {
+        "200": 18294190
+       }
+      }
+     },
+     "edge_cpus": 4.24,
+     "cpu_us_per_req": 3.25,
+     "cpu_ms_per_gb": 62458.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3489.5,
+     "anon_mb": 505.3,
+     "loads": {
+      "get": {
+       "ok_rps": 1218703.6,
+       "MBps": 134.4,
+       "p50_us": 50,
+       "p99_us": 108,
+       "statuses": {
+        "200": 17063070
+       }
+      }
+     },
+     "edge_cpus": 4.52,
+     "cpu_us_per_req": 3.71,
+     "cpu_ms_per_gb": 33652.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3489.6,
+     "anon_mb": 505.3,
+     "loads": {
+      "get": {
+       "ok_rps": 1221239.0,
+       "MBps": 134.7,
+       "p50_us": 50,
+       "p99_us": 98,
+       "statuses": {
+        "200": 17098565
+       }
+      }
+     },
+     "edge_cpus": 4.57,
+     "cpu_us_per_req": 3.74,
+     "cpu_ms_per_gb": 33919.1,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3492.9,
+     "anon_mb": 508.6,
+     "loads": {
+      "get": {
+       "ok_rps": 1586791.8,
+       "MBps": 175.3,
+       "p50_us": 612,
+       "p99_us": 1228,
+       "statuses": {
+        "200": 22216681
+       }
+      }
+     },
+     "edge_cpus": 5.38,
+     "cpu_us_per_req": 3.39,
+     "cpu_ms_per_gb": 30678.2,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3493.4,
+     "anon_mb": 509.0,
+     "loads": {
+      "get": {
+       "ok_rps": 1583395.2,
+       "MBps": 174.9,
+       "p50_us": 612,
+       "p99_us": 1231,
+       "statuses": {
+        "200": 22169114
+       }
+      }
+     },
+     "edge_cpus": 5.41,
+     "cpu_us_per_req": 3.42,
+     "cpu_ms_per_gb": 30942.8,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3552.2,
+     "anon_mb": 567.9,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20118.5,
+       "MBps": 4831.9,
+       "p50_us": 1548,
+       "p99_us": 2427,
+       "statuses": {
+        "200": 281679
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 386.0,
+     "cpu_ms_per_gb": 1607.2,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3552.8,
+     "anon_mb": 568.5,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19884.8,
+       "MBps": 4775.8,
+       "p50_us": 1566,
+       "p99_us": 2453,
+       "statuses": {
+        "200": 278406
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 390.59,
+     "cpu_ms_per_gb": 1626.3,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3562.9,
+     "anon_mb": 578.6,
+     "loads": {
+      "post": {
+       "ok_rps": 8682.2,
+       "MBps": 3438.4,
+       "p50_us": 3647,
+       "p99_us": 4875,
+       "statuses": {
+        "200": 121559
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 900.91,
+     "cpu_ms_per_gb": 2274.8,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3563.5,
+     "anon_mb": 579.1,
+     "loads": {
+      "post": {
+       "ok_rps": 8684.0,
+       "MBps": 3439.1,
+       "p50_us": 3649,
+       "p99_us": 4867,
+       "statuses": {
+        "200": 121585
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 900.72,
+     "cpu_ms_per_gb": 2274.4,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3562.9,
+     "anon_mb": 578.6,
+     "loads": {
+      "post": {
+       "ok_rps": 6806.9,
+       "MBps": 2695.7,
+       "p50_us": 4791,
+       "p99_us": 6567,
+       "statuses": {
+        "200": 136145
+       }
+      },
+      "get": {
+       "ok_rps": 417573.1,
+       "MBps": 46.1,
+       "p50_us": 151,
+       "p99_us": 294,
+       "statuses": {
+        "200": 5846442
+       }
+      }
+     },
+     "edge_cpus": 7.08,
+     "cpu_us_per_req": 16.69,
+     "cpu_ms_per_gb": 2582.6,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3563.5,
+     "anon_mb": 579.2,
+     "loads": {
+      "post": {
+       "ok_rps": 6834.7,
+       "MBps": 2706.7,
+       "p50_us": 4759,
+       "p99_us": 6555,
+       "statuses": {
+        "200": 136701
+       }
+      },
+      "get": {
+       "ok_rps": 418374.8,
+       "MBps": 46.2,
+       "p50_us": 151,
+       "p99_us": 294,
+       "statuses": {
+        "200": 5857664
+       }
+      }
+     },
+     "edge_cpus": 7.09,
+     "cpu_us_per_req": 16.67,
+     "cpu_ms_per_gb": 2575.4,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3563.5,
+     "anon_mb": 579.2,
+     "loads": {
+      "config": {
+       "ok_rps": 1309636.1,
+       "MBps": 68.1,
+       "p50_us": 46,
+       "p99_us": 90,
+       "statuses": {
+        "200": 18336209
+       }
+      }
+     },
+     "edge_cpus": 4.26,
+     "cpu_us_per_req": 3.25,
+     "cpu_ms_per_gb": 62509.8,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3562.9,
+     "anon_mb": 578.6,
+     "loads": {
+      "config": {
+       "ok_rps": 1298014.9,
+       "MBps": 67.5,
+       "p50_us": 46,
+       "p99_us": 105,
+       "statuses": {
+        "200": 18173504
+       }
+      }
+     },
+     "edge_cpus": 4.21,
+     "cpu_us_per_req": 3.24,
+     "cpu_ms_per_gb": 62324.6,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3563.5,
+     "anon_mb": 579.2,
+     "loads": {
+      "get": {
+       "ok_rps": 1218915.3,
+       "MBps": 134.4,
+       "p50_us": 50,
+       "p99_us": 99,
+       "statuses": {
+        "200": 17066033
+       }
+      }
+     },
+     "edge_cpus": 4.55,
+     "cpu_us_per_req": 3.73,
+     "cpu_ms_per_gb": 33838.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3562.9,
+     "anon_mb": 578.6,
+     "loads": {
+      "get": {
+       "ok_rps": 1218090.9,
+       "MBps": 134.3,
+       "p50_us": 50,
+       "p99_us": 106,
+       "statuses": {
+        "200": 17054503
+       }
+      }
+     },
+     "edge_cpus": 4.54,
+     "cpu_us_per_req": 3.72,
+     "cpu_ms_per_gb": 33774.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3565.9,
+     "anon_mb": 581.6,
+     "loads": {
+      "get": {
+       "ok_rps": 1584009.7,
+       "MBps": 175.0,
+       "p50_us": 613,
+       "p99_us": 1227,
+       "statuses": {
+        "200": 22177717
+       }
+      }
+     },
+     "edge_cpus": 5.41,
+     "cpu_us_per_req": 3.41,
+     "cpu_ms_per_gb": 30896.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3565.0,
+     "anon_mb": 580.7,
+     "loads": {
+      "get": {
+       "ok_rps": 1589173.5,
+       "MBps": 175.6,
+       "p50_us": 610,
+       "p99_us": 1229,
+       "statuses": {
+        "200": 22250016
+       }
+      }
+     },
+     "edge_cpus": 5.37,
+     "cpu_us_per_req": 3.38,
+     "cpu_ms_per_gb": 30591.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3565.9,
+     "anon_mb": 581.6,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19760.7,
+       "MBps": 4746.0,
+       "p50_us": 1577,
+       "p99_us": 2467,
+       "statuses": {
+        "200": 276668
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 393.04,
+     "cpu_ms_per_gb": 1636.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3565.0,
+     "anon_mb": 580.7,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20140.1,
+       "MBps": 4837.1,
+       "p50_us": 1546,
+       "p99_us": 2427,
+       "statuses": {
+        "200": 281981
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 385.49,
+     "cpu_ms_per_gb": 1605.1,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3565.9,
+     "anon_mb": 581.6,
+     "loads": {
+      "post": {
+       "ok_rps": 8657.9,
+       "MBps": 3428.8,
+       "p50_us": 3661,
+       "p99_us": 4883,
+       "statuses": {
+        "200": 121219
+       }
+      }
+     },
+     "edge_cpus": 7.83,
+     "cpu_us_per_req": 903.9,
+     "cpu_ms_per_gb": 2282.4,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3565.0,
+     "anon_mb": 580.7,
+     "loads": {
+      "post": {
+       "ok_rps": 8662.2,
+       "MBps": 3430.5,
+       "p50_us": 3657,
+       "p99_us": 4883,
+       "statuses": {
+        "200": 121279
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 902.98,
+     "cpu_ms_per_gb": 2280.1,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3565.9,
+     "anon_mb": 581.6,
+     "loads": {
+      "post": {
+       "ok_rps": 6800.5,
+       "MBps": 2693.2,
+       "p50_us": 4803,
+       "p99_us": 6567,
+       "statuses": {
+        "200": 136017
+       }
+      },
+      "get": {
+       "ok_rps": 419739.0,
+       "MBps": 46.4,
+       "p50_us": 151,
+       "p99_us": 294,
+       "statuses": {
+        "200": 5876766
+       }
+      }
+     },
+     "edge_cpus": 7.09,
+     "cpu_us_per_req": 16.62,
+     "cpu_ms_per_gb": 2587.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3565.0,
+     "anon_mb": 580.7,
+     "loads": {
+      "post": {
+       "ok_rps": 6795.5,
+       "MBps": 2691.2,
+       "p50_us": 4807,
+       "p99_us": 6583,
+       "statuses": {
+        "200": 135918
+       }
+      },
+      "get": {
+       "ok_rps": 418244.5,
+       "MBps": 46.2,
+       "p50_us": 151,
+       "p99_us": 296,
+       "statuses": {
+        "200": 5855879
+       }
+      }
+     },
+     "edge_cpus": 7.08,
+     "cpu_us_per_req": 16.65,
+     "cpu_ms_per_gb": 2586.0,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3565.0,
+     "anon_mb": 580.7,
+     "loads": {
+      "config": {
+       "ok_rps": 1308431.9,
+       "MBps": 68.0,
+       "p50_us": 46,
+       "p99_us": 94,
+       "statuses": {
+        "200": 18319356
+       }
+      }
+     },
+     "edge_cpus": 4.24,
+     "cpu_us_per_req": 3.24,
+     "cpu_ms_per_gb": 62410.6,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "config_64",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3565.9,
+     "anon_mb": 581.6,
+     "loads": {
+      "config": {
+       "ok_rps": 1304399.1,
+       "MBps": 67.8,
+       "p50_us": 46,
+       "p99_us": 92,
+       "statuses": {
+        "200": 18262886
+       }
+      }
+     },
+     "edge_cpus": 4.22,
+     "cpu_us_per_req": 3.24,
+     "cpu_ms_per_gb": 62299.8,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3565.0,
+     "anon_mb": 580.7,
+     "loads": {
+      "get": {
+       "ok_rps": 1225970.5,
+       "MBps": 135.2,
+       "p50_us": 50,
+       "p99_us": 96,
+       "statuses": {
+        "200": 17164815
+       }
+      }
+     },
+     "edge_cpus": 4.56,
+     "cpu_us_per_req": 3.72,
+     "cpu_ms_per_gb": 33697.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_64",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3565.9,
+     "anon_mb": 581.6,
+     "loads": {
+      "get": {
+       "ok_rps": 1219876.3,
+       "MBps": 134.5,
+       "p50_us": 50,
+       "p99_us": 95,
+       "statuses": {
+        "200": 17079484
+       }
+      }
+     },
+     "edge_cpus": 4.56,
+     "cpu_us_per_req": 3.74,
+     "cpu_ms_per_gb": 33887.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3567.4,
+     "anon_mb": 583.1,
+     "loads": {
+      "get": {
+       "ok_rps": 1590037.2,
+       "MBps": 175.7,
+       "p50_us": 611,
+       "p99_us": 1228,
+       "statuses": {
+        "200": 22262112
+       }
+      }
+     },
+     "edge_cpus": 5.37,
+     "cpu_us_per_req": 3.38,
+     "cpu_ms_per_gb": 30568.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "get_blob_1024",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3567.5,
+     "anon_mb": 583.2,
+     "loads": {
+      "get": {
+       "ok_rps": 1585735.1,
+       "MBps": 175.2,
+       "p50_us": 612,
+       "p99_us": 1227,
+       "statuses": {
+        "200": 22201885
+       }
+      }
+     },
+     "edge_cpus": 5.41,
+     "cpu_us_per_req": 3.41,
+     "cpu_ms_per_gb": 30895.5,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3567.4,
+     "anon_mb": 583.1,
+     "loads": {
+      "sizes": {
+       "ok_rps": 20094.4,
+       "MBps": 4826.2,
+       "p50_us": 1550,
+       "p99_us": 2429,
+       "statuses": {
+        "200": 281342
+       }
+      }
+     },
+     "edge_cpus": 7.76,
+     "cpu_us_per_req": 386.37,
+     "cpu_ms_per_gb": 1608.7,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "sizes_4000_32",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3567.5,
+     "anon_mb": 583.2,
+     "loads": {
+      "sizes": {
+       "ok_rps": 19854.2,
+       "MBps": 4768.5,
+       "p50_us": 1568,
+       "p99_us": 2455,
+       "statuses": {
+        "200": 277975
+       }
+      }
+     },
+     "edge_cpus": 7.77,
+     "cpu_us_per_req": 391.29,
+     "cpu_ms_per_gb": 1629.2,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3567.4,
+     "anon_mb": 583.1,
+     "loads": {
+      "post": {
+       "ok_rps": 8661.8,
+       "MBps": 3430.3,
+       "p50_us": 3657,
+       "p99_us": 4891,
+       "statuses": {
+        "200": 121274
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 903.03,
+     "cpu_ms_per_gb": 2280.2,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "post_4000_32",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3567.5,
+     "anon_mb": 583.2,
+     "loads": {
+      "post": {
+       "ok_rps": 8698.8,
+       "MBps": 3445.0,
+       "p50_us": 3641,
+       "p99_us": 4863,
+       "statuses": {
+        "200": 121793
+       }
+      }
+     },
+     "edge_cpus": 7.82,
+     "cpu_us_per_req": 899.53,
+     "cpu_ms_per_gb": 2271.4,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3567.4,
+     "anon_mb": 583.1,
+     "loads": {
+      "post": {
+       "ok_rps": 6790.5,
+       "MBps": 2689.2,
+       "p50_us": 4795,
+       "p99_us": 6591,
+       "statuses": {
+        "200": 135818
+       }
+      },
+      "get": {
+       "ok_rps": 417407.5,
+       "MBps": 46.1,
+       "p50_us": 152,
+       "p99_us": 294,
+       "statuses": {
+        "200": 5844150
+       }
+      }
+     },
+     "edge_cpus": 7.08,
+     "cpu_us_per_req": 16.69,
+     "cpu_ms_per_gb": 2587.9,
+     "allocs_per_req": 0.0
+    },
+    {
+     "work": "mixed_get64_post32",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3567.5,
+     "anon_mb": 583.2,
+     "loads": {
+      "post": {
+       "ok_rps": 6840.3,
+       "MBps": 2708.9,
+       "p50_us": 4767,
+       "p99_us": 6531,
+       "statuses": {
+        "200": 136812
+       }
+      },
+      "get": {
+       "ok_rps": 418922.2,
+       "MBps": 46.3,
+       "p50_us": 151,
+       "p99_us": 294,
+       "statuses": {
+        "200": 5865332
+       }
+      }
+     },
+     "edge_cpus": 7.1,
+     "cpu_us_per_req": 16.68,
+     "cpu_ms_per_gb": 2577.2,
+     "allocs_per_req": 0.0
+    }
+   ]
+  },
+  {
+   "name": "cold clones, 5 rounds",
+   "base": "8af8de8",
+   "new": "f100038",
+   "rounds": [
+    {
+     "work": "cold_clone_8",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3260.4,
+     "anon_mb": 504.9,
+     "loads": {
+      "cold": {
+       "ok_rps": 34.1,
+       "MBps": 80436.6,
+       "p50_us": 227455,
+       "p99_us": 338431,
+       "statuses": {
+        "200": 477
+       }
+      }
+     },
+     "edge_cpus": 2.06,
+     "cpu_us_per_req": 60497.07,
+     "cpu_ms_per_gb": 25.6,
+     "allocs_per_req": 0.13
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3260.1,
+     "anon_mb": 504.9,
+     "loads": {
+      "cold": {
+       "ok_rps": 36.4,
+       "MBps": 85832.8,
+       "p50_us": 204671,
+       "p99_us": 313343,
+       "statuses": {
+        "200": 509
+       }
+      }
+     },
+     "edge_cpus": 2.27,
+     "cpu_us_per_req": 62388.82,
+     "cpu_ms_per_gb": 26.5,
+     "allocs_per_req": 0.12
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3260.1,
+     "anon_mb": 504.9,
+     "loads": {
+      "cold": {
+       "ok_rps": 31.9,
+       "MBps": 75209.1,
+       "p50_us": 243455,
+       "p99_us": 357119,
+       "statuses": {
+        "200": 446
+       }
+      }
+     },
+     "edge_cpus": 2.02,
+     "cpu_us_per_req": 63352.85,
+     "cpu_ms_per_gb": 26.9,
+     "allocs_per_req": 0.14
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3260.4,
+     "anon_mb": 504.9,
+     "loads": {
+      "cold": {
+       "ok_rps": 34.0,
+       "MBps": 80268.0,
+       "p50_us": 223231,
+       "p99_us": 347903,
+       "statuses": {
+        "200": 476
+       }
+      }
+     },
+     "edge_cpus": 2.04,
+     "cpu_us_per_req": 59969.17,
+     "cpu_ms_per_gb": 25.4,
+     "allocs_per_req": 0.13
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3260.4,
+     "anon_mb": 505.0,
+     "loads": {
+      "cold": {
+       "ok_rps": 33.5,
+       "MBps": 79087.5,
+       "p50_us": 231807,
+       "p99_us": 335871,
+       "statuses": {
+        "200": 469
+       }
+      }
+     },
+     "edge_cpus": 1.95,
+     "cpu_us_per_req": 58147.86,
+     "cpu_ms_per_gb": 24.6,
+     "allocs_per_req": 0.13
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3260.1,
+     "anon_mb": 505.0,
+     "loads": {
+      "cold": {
+       "ok_rps": 34.0,
+       "MBps": 80267.9,
+       "p50_us": 227967,
+       "p99_us": 342783,
+       "statuses": {
+        "200": 476
+       }
+      }
+     },
+     "edge_cpus": 2.02,
+     "cpu_us_per_req": 59351.53,
+     "cpu_ms_per_gb": 25.1,
+     "allocs_per_req": 0.13
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "new",
+     "round": 3,
+     "rss_mb": 3260.2,
+     "anon_mb": 505.0,
+     "loads": {
+      "cold": {
+       "ok_rps": 33.3,
+       "MBps": 78581.7,
+       "p50_us": 233087,
+       "p99_us": 332799,
+       "statuses": {
+        "200": 466
+       }
+      }
+     },
+     "edge_cpus": 2.0,
+     "cpu_us_per_req": 59938.54,
+     "cpu_ms_per_gb": 25.4,
+     "allocs_per_req": 0.14
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "base",
+     "round": 3,
+     "rss_mb": 3260.4,
+     "anon_mb": 505.0,
+     "loads": {
+      "cold": {
+       "ok_rps": 33.1,
+       "MBps": 78244.5,
+       "p50_us": 228479,
+       "p99_us": 345087,
+       "statuses": {
+        "200": 464
+       }
+      }
+     },
+     "edge_cpus": 1.99,
+     "cpu_us_per_req": 60119.51,
+     "cpu_ms_per_gb": 25.4,
+     "allocs_per_req": 0.14
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "base",
+     "round": 4,
+     "rss_mb": 3260.4,
+     "anon_mb": 505.0,
+     "loads": {
+      "cold": {
+       "ok_rps": 33.9,
+       "MBps": 79930.7,
+       "p50_us": 224127,
+       "p99_us": 330751,
+       "statuses": {
+        "200": 474
+       }
+      }
+     },
+     "edge_cpus": 2.06,
+     "cpu_us_per_req": 60913.0,
+     "cpu_ms_per_gb": 25.8,
+     "allocs_per_req": 0.13
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "new",
+     "round": 4,
+     "rss_mb": 3260.2,
+     "anon_mb": 505.0,
+     "loads": {
+      "cold": {
+       "ok_rps": 34.1,
+       "MBps": 80436.6,
+       "p50_us": 217471,
+       "p99_us": 342527,
+       "statuses": {
+        "200": 477
+       }
+      }
+     },
+     "edge_cpus": 2.17,
+     "cpu_us_per_req": 63634.87,
+     "cpu_ms_per_gb": 27.0,
+     "allocs_per_req": 0.13
+    }
+   ]
+  },
+  {
+   "name": "cold clones, 5 rounds, slots swapped",
+   "base": "f100038",
+   "new": "8af8de8",
+   "rounds": [
+    {
+     "work": "cold_clone_8",
+     "variant": "base",
+     "round": 0,
+     "rss_mb": 3259.9,
+     "anon_mb": 504.9,
+     "loads": {
+      "cold": {
+       "ok_rps": 35.9,
+       "MBps": 84821.0,
+       "p50_us": 211455,
+       "p99_us": 322559,
+       "statuses": {
+        "200": 503
+       }
+      }
+     },
+     "edge_cpus": 2.24,
+     "cpu_us_per_req": 62533.3,
+     "cpu_ms_per_gb": 26.5,
+     "allocs_per_req": 0.13
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "new",
+     "round": 0,
+     "rss_mb": 3260.4,
+     "anon_mb": 504.9,
+     "loads": {
+      "cold": {
+       "ok_rps": 36.9,
+       "MBps": 87181.8,
+       "p50_us": 204543,
+       "p99_us": 306431,
+       "statuses": {
+        "200": 517
+       }
+      }
+     },
+     "edge_cpus": 2.3,
+     "cpu_us_per_req": 62329.22,
+     "cpu_ms_per_gb": 26.4,
+     "allocs_per_req": 0.12
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "new",
+     "round": 1,
+     "rss_mb": 3260.4,
+     "anon_mb": 504.9,
+     "loads": {
+      "cold": {
+       "ok_rps": 33.6,
+       "MBps": 79256.2,
+       "p50_us": 227711,
+       "p99_us": 337407,
+       "statuses": {
+        "200": 470
+       }
+      }
+     },
+     "edge_cpus": 2.02,
+     "cpu_us_per_req": 60117.65,
+     "cpu_ms_per_gb": 25.5,
+     "allocs_per_req": 0.13
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "base",
+     "round": 1,
+     "rss_mb": 3260.0,
+     "anon_mb": 505.0,
+     "loads": {
+      "cold": {
+       "ok_rps": 34.1,
+       "MBps": 80436.6,
+       "p50_us": 222079,
+       "p99_us": 361727,
+       "statuses": {
+        "200": 477
+       }
+      }
+     },
+     "edge_cpus": 2.03,
+     "cpu_us_per_req": 59441.71,
+     "cpu_ms_per_gb": 25.2,
+     "allocs_per_req": 0.13
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "base",
+     "round": 2,
+     "rss_mb": 3260.0,
+     "anon_mb": 505.0,
+     "loads": {
+      "cold": {
+       "ok_rps": 34.7,
+       "MBps": 81954.1,
+       "p50_us": 214399,
+       "p99_us": 357631,
+       "statuses": {
+        "200": 486
+       }
+      }
+     },
+     "edge_cpus": 2.18,
+     "cpu_us_per_req": 62793.95,
+     "cpu_ms_per_gb": 26.6,
+     "allocs_per_req": 0.13
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "new",
+     "round": 2,
+     "rss_mb": 3260.5,
+     "anon_mb": 505.0,
+     "loads": {
+      "cold": {
+       "ok_rps": 34.4,
+       "MBps": 81111.1,
+       "p50_us": 215295,
+       "p99_us": 331263,
+       "statuses": {
+        "200": 481
+       }
+      }
+     },
+     "edge_cpus": 2.16,
+     "cpu_us_per_req": 62818.26,
+     "cpu_ms_per_gb": 26.6,
+     "allocs_per_req": 0.13
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "new",
+     "round": 3,
+     "rss_mb": 3260.5,
+     "anon_mb": 505.0,
+     "loads": {
+      "cold": {
+       "ok_rps": 32.4,
+       "MBps": 76558.1,
+       "p50_us": 230015,
+       "p99_us": 351999,
+       "statuses": {
+        "200": 454
+       }
+      }
+     },
+     "edge_cpus": 2.09,
+     "cpu_us_per_req": 64473.77,
+     "cpu_ms_per_gb": 27.3,
+     "allocs_per_req": 0.14
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "base",
+     "round": 3,
+     "rss_mb": 3260.0,
+     "anon_mb": 505.0,
+     "loads": {
+      "cold": {
+       "ok_rps": 31.6,
+       "MBps": 74534.7,
+       "p50_us": 243327,
+       "p99_us": 365311,
+       "statuses": {
+        "200": 442
+       }
+      }
+     },
+     "edge_cpus": 2.05,
+     "cpu_us_per_req": 64840.18,
+     "cpu_ms_per_gb": 27.5,
+     "allocs_per_req": 0.14
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "base",
+     "round": 4,
+     "rss_mb": 3260.0,
+     "anon_mb": 505.0,
+     "loads": {
+      "cold": {
+       "ok_rps": 35.3,
+       "MBps": 83303.4,
+       "p50_us": 214143,
+       "p99_us": 334591,
+       "statuses": {
+        "200": 494
+       }
+      }
+     },
+     "edge_cpus": 2.18,
+     "cpu_us_per_req": 61726.66,
+     "cpu_ms_per_gb": 26.2,
+     "allocs_per_req": 0.13
+    },
+    {
+     "work": "cold_clone_8",
+     "variant": "new",
+     "round": 4,
+     "rss_mb": 3260.5,
+     "anon_mb": 505.0,
+     "loads": {
+      "cold": {
+       "ok_rps": 32.8,
+       "MBps": 77401.3,
+       "p50_us": 238079,
+       "p99_us": 349183,
+       "statuses": {
+        "200": 459
+       }
+      }
+     },
+     "edge_cpus": 2.08,
+     "cpu_us_per_req": 63535.09,
+     "cpu_ms_per_gb": 26.9,
+     "allocs_per_req": 0.14
+    }
+   ]
+  }
+ ]
+}

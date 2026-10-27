@@ -1,0 +1,215 @@
+{
+ "how": "benches/load.sh 10 s per scenario against f100038 on ~/gvfs-bench/prof/sg7-inl (inline SearchGold, a week of slabs); edge on CPUs 0-3,16-19 with --alloc-guard strict --prefetch-idx never, loadgen on 8-15,24-31; WARM_TS=1792439915",
+ "scenarios": {
+  "get-blob": {
+   "batch": 64,
+   "bytes": 1365733090,
+   "conn_errors": 0,
+   "conns": 64,
+   "depth": 1,
+   "duration_s": 10.001000808,
+   "lat_us": {
+    "max": 1887,
+    "mean": 51.08352731265726,
+    "p50": 49,
+    "p90": 68,
+    "p99": 100,
+    "p999": 299,
+    "p9999": 361
+   },
+   "mbps": 136.55964200178076,
+   "ok": 12393503,
+   "ok_rps": 1239226.2772427925,
+   "proto": "h1",
+   "rate_target": 0.0,
+   "requests": 12393503,
+   "rps": 1239226.2772427925,
+   "statuses": {
+    "200": 12393503
+   },
+   "streams": 1,
+   "timeouts": 0,
+   "workload": "get-object"
+  },
+  "get-tree": {
+   "batch": 64,
+   "bytes": 7242550962,
+   "conn_errors": 0,
+   "conns": 64,
+   "depth": 1,
+   "duration_s": 10.001006748,
+   "lat_us": {
+    "max": 38143,
+    "mean": 353.6448308533868,
+    "p50": 328,
+    "p90": 550,
+    "p99": 853,
+    "p999": 2613,
+    "p9999": 18207
+   },
+   "mbps": 724.1821893029284,
+   "ok": 1806894,
+   "ok_rps": 180671.21096197065,
+   "proto": "h1",
+   "rate_target": 0.0,
+   "requests": 1806894,
+   "rps": 180671.21096197065,
+   "statuses": {
+    "200": 1806894
+   },
+   "streams": 1,
+   "timeouts": 0,
+   "workload": "get-object"
+  },
+  "post-4000": {
+   "batch": 4000,
+   "bytes": 41409129001,
+   "conn_errors": 0,
+   "conns": 32,
+   "depth": 1,
+   "duration_s": 10.000996207,
+   "lat_us": {
+    "max": 99903,
+    "mean": 86030.76789587851,
+    "p50": 86015,
+    "p90": 90623,
+    "p99": 94463,
+    "p999": 96703,
+    "p9999": 99903
+   },
+   "mbps": 4140.500420549754,
+   "ok": 3688,
+   "ok_rps": 368.7632635455513,
+   "proto": "h1",
+   "rate_target": 0.0,
+   "requests": 3688,
+   "rps": 368.7632635455513,
+   "statuses": {
+    "200": 3688
+   },
+   "streams": 1,
+   "timeouts": 0,
+   "workload": "post-objects"
+  },
+  "prefetch-cold": {
+   "batch": 64,
+   "bytes": 810929886000,
+   "conn_errors": 0,
+   "conns": 8,
+   "depth": 1,
+   "duration_s": 10.001002308,
+   "lat_us": {
+    "max": 381439,
+    "mean": 250324.9230769231,
+    "p50": 241023,
+    "p90": 335359,
+    "p99": 376831,
+    "p999": 381439,
+    "p9999": 381439
+   },
+   "mbps": 81084.86139947404,
+   "ok": 312,
+   "ok_rps": 31.19687311245044,
+   "proto": "h1",
+   "rate_target": 0.0,
+   "requests": 312,
+   "rps": 31.19687311245044,
+   "statuses": {
+    "200": 312
+   },
+   "streams": 1,
+   "timeouts": 0,
+   "workload": "prefetch"
+  },
+  "prefetch-fresh": {
+   "batch": 64,
+   "bytes": 103538400,
+   "conn_errors": 0,
+   "conns": 64,
+   "depth": 1,
+   "duration_s": 10.000996518,
+   "lat_us": {
+    "max": 3199,
+    "mean": 48.894161702324936,
+    "p50": 47,
+    "p90": 65,
+    "p99": 92,
+    "p999": 297,
+    "p9999": 387
+   },
+   "mbps": 10.352808324015458,
+   "ok": 12942300,
+   "ok_rps": 1294101.0405019321,
+   "proto": "h1",
+   "rate_target": 0.0,
+   "requests": 12942300,
+   "rps": 1294101.0405019321,
+   "statuses": {
+    "200": 12942300
+   },
+   "streams": 1,
+   "timeouts": 0,
+   "workload": "prefetch"
+  },
+  "prefetch-warm": {
+   "batch": 64,
+   "bytes": 191203429780,
+   "conn_errors": 0,
+   "conns": 64,
+   "depth": 1,
+   "duration_s": 10.000695304,
+   "lat_us": {
+    "max": 6739,
+    "mean": 886.1565530817655,
+    "p50": 879,
+    "p90": 1252,
+    "p99": 1565,
+    "p999": 1947,
+    "p9999": 3801
+   },
+   "mbps": 19119.01362533502,
+   "ok": 721340,
+   "ok_rps": 72128.98484283227,
+   "proto": "h1",
+   "rate_target": 0.0,
+   "requests": 721340,
+   "rps": 72128.98484283227,
+   "statuses": {
+    "200": 721340
+   },
+   "streams": 1,
+   "timeouts": 0,
+   "workload": "prefetch"
+  },
+  "sizes-4000": {
+   "batch": 4000,
+   "bytes": 41497963334,
+   "conn_errors": 0,
+   "conns": 32,
+   "depth": 1,
+   "duration_s": 10.000990118,
+   "lat_us": {
+    "max": 3909,
+    "mean": 1877.204668959283,
+    "p50": 1836,
+    "p90": 2301,
+    "p99": 2775,
+    "p999": 3149,
+    "p9999": 3495
+   },
+   "mbps": 4149.385495273219,
+   "ok": 170402,
+   "ok_rps": 17038.512986159916,
+   "proto": "h1",
+   "rate_target": 0.0,
+   "requests": 170402,
+   "rps": 17038.512986159916,
+   "statuses": {
+    "200": 170402
+   },
+   "streams": 1,
+   "timeouts": 0,
+   "workload": "sizes"
+  }
+ }
+}
