@@ -629,7 +629,7 @@ formats and algorithms in `opus/DESIGN.md`, "Stores with real blobs"). A store c
 | blob packs + segments + `blobs.bin` | whole-blob git packs (upstream zlib kept, or stored blocks when incompressible: byte ranges in place); 48-byte records with 64-bit offsets and lengths; a CAS'd list whose segments stay a geometric progression by blob count (O(log n) segments, each record rewritten O(log n) times) |
 | pipeline, blobs first | `blob:none` window; copy the blobs its new trees reference that the store lacks; publish `blobs.bin`; only then the slab and the manifest naming that `blobs.bin` generation |
 | `gvfs-daemon mirror` | the seed of the blobs: every blob of the history, planned from the store's own trees and sizes in one parallel pass (the tip's tree first, in path order), resumable, parallel, rate-capped, never re-copying what windows copied meanwhile, sizes checked; records `blobs.bin` as mirrored. Also the repair, on demand |
-| edge | blobs from the packs (mapped, or from Azure through a local 4 MiB block cache, never downloaded whole); a single-flight read-through proxy for the L0 overlay's blobs, only for ids the trees name (a sealed tree's blob that a complete store lacks is proxied too, but counted as `gvfs_blobs_missing_total`); `GSZ1` sizes section on opt-in; `GET /gvfs/blobs/<oid>?offset&length`; ready only once the history is mirrored |
+| edge | blobs from the packs (mapped, or from Azure through a local 4 MiB block cache, never downloaded whole); a single-flight read-through proxy for the L0 overlay's blobs, only for ids the trees name (a sealed tree's blob that a complete store lacks is proxied too, but counted as `gvfs_blobs_missing_total`); `GSZ1` sizes section on opt-in; `GET /gvfs/blobs/<oid>?offset&length` (removed since: §15, #13); ready only once the history is mirrored |
 
 **Gates** (stock git judges every byte):
 
@@ -1218,7 +1218,7 @@ by batch, each commit with a regression test that fails on the code before it.
 | 10 | Proxy cache: eviction can drop a re-fetched blob's newer entry; `Proxy.idle` is unbounded; a `BlobPack` is dropped on a hot path | 2 | fixed `de10f8e` |
 | 11 | `BlockCache::evict` clones and sorts every block, and unlinks files, under its lock | 3 | fixed `9043258` |
 | 12 | `repack::write_copied` lacks the delta-depth bound; a resolver chain past 4,096 grows outside a cold section; a corrupt declared size can size a buffer | 3 | fixed `2a21a67` |
-| 13 | A range of a compressed blob inflates from the entry's start: CPU amplification | later | open: needs restart points in blob packs (below) |
+| 13 | A range of a compressed blob inflates from the entry's start: CPU amplification | 4 | closed: the range endpoint was removed (`4cebc50`) |
 | 14 | `valid_id` is not enforced on segment and pack ids | 4 | fixed `f171590` |
 | 15 | CLI usage drift (`--workers`' default, undocumented flags); the sync and async upstreams duplicate their protocol logic; `prefault` is dead code | 3, 4 | fixed `69928e1`, `90aeff6`, `fe0f0d9` |
 
@@ -1464,19 +1464,20 @@ by batch, each commit with a regression test that fails on the code before it.
   socket is drained, so POSTs keep their extra wake: about 0.25 µs (what a GET saves) of a
   900 µs request.
 
-**Still open: #13.** Blob packs keep a compressible blob's zlib stream as the upstream wrote
-it. Only blobs of 1 MiB or more that do not compress are rewritten as stored blocks, whose
-bytes can be read in place. Deflate has no restart points, so a range inside a compressed
-blob is inflated from the entry's start: about 1.4 s of a core per GB before the range
-(zlib-rs inflates 0.71 GB/s of text here). Keeping those blobs compressed keeps full
-fetches, which are what git clients make, as small as the upstream's. The cost falls on
-range reads, which only opus's own `/gvfs/blobs/<id>?offset=` extension makes. No standard
-client calls it. Still, a sequential reader of a large compressible blob pays quadratically,
-and asking for the last byte of one is a CPU amplification. The fix is restart points made
-when a blob is copied, with their offsets recorded beside its record. Either the blob is
-deflated again with a full flush every few MiB, or the inflater's state, a 32 KiB window, is
-saved every few MiB. Either changes the store format. Meanwhile, a cap on concurrent range
-inflations would bound the amplification.
+**#13, closed by removing the endpoint (`4cebc50`).** A range inside a compressed blob was
+inflated from the entry's start: about 1.4 s of a core per GB before the range (zlib-rs
+inflates 0.71 GB/s of text here). Asking for the last byte of a large compressible blob was
+a CPU amplification, and a sequential reader paid quadratically. Fixing that needed restart
+points in the blob pack format. But `GET /gvfs/blobs/<id>?offset=&length=` was opus's own
+extension: the separate-blobs plan added it for a ProjFS/FUSE client that would read huge
+files piecewise, as HFS's 64 KB chunks allowed. No such client exists, and Scalar and
+gvfs-helper fetch whole objects, so the endpoint is gone: about 470 lines of handler code,
+helpers, tests and bench requests. The path is now a 404. Blobs of 1 MiB or more that do not
+compress are still written as stored blocks, which clients inflate at the speed of a copy.
+Every other response stays byte-identical: 1,920, 1,920 and 2,064 in the three modes, and
+`ab_remote.py`'s 372 requests per cache configuration (it no longer sends ranges).
+Conformance stays 918/0, gvfs-helper 18/18 and fable's client 15/15. The only pipelining
+test now pipelines two prefetches with different cursors.
 
 **Validation of batch 4** (`8af8de8`, the same checks):
 
