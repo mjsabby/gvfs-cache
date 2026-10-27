@@ -17,7 +17,6 @@
 
 mod common;
 
-use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
@@ -54,37 +53,53 @@ impl Azurite {
             );
             return None;
         };
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let child = Command::new(bin)
+        // Any free port, as Azurite reports it: a port picked here and released could be
+        // taken by another test's server before Azurite binds it.
+        let mut child = Command::new(bin)
             .args([
                 "--blobHost",
                 "127.0.0.1",
                 "--blobPort",
-                &port.to_string(),
+                "0",
                 "--silent",
                 "--skipApiVersionCheck",
                 "--inMemoryPersistence",
             ])
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        let mut a = Azurite {
-            child,
-            endpoint: format!("http://127.0.0.1:{port}/{ACCOUNT}"),
-        };
+        let out = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufRead::lines(std::io::BufReader::new(out)) {
+                let Ok(line) = line else { break };
+                let port = line
+                    .split_once("listens on http://127.0.0.1:")
+                    .and_then(|(_, p)| p.trim().parse::<u16>().ok());
+                if let Some(port) = port {
+                    let _ = tx.send(port);
+                }
+            }
+        });
         let deadline = Instant::now() + Duration::from_secs(30);
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(Instant::now() < deadline, "Azurite did not start");
-            if let Ok(Some(status)) = a.child.try_wait() {
+        let port = loop {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(port) => break port,
+                // Its output closed: it is exiting.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    std::thread::sleep(Duration::from_millis(50))
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if let Ok(Some(status)) = child.try_wait() {
                 panic!("Azurite exited: {status}");
             }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        Some(a)
+            assert!(Instant::now() < deadline, "Azurite did not start");
+        };
+        Some(Azurite {
+            child,
+            endpoint: format!("http://127.0.0.1:{port}/{ACCOUNT}"),
+        })
     }
 
     fn connection_string(&self) -> String {

@@ -471,6 +471,8 @@ pub fn run(o: Options) -> Result<()> {
 
     // 4. The runtime and its buffers, then seal.
     let listener = TcpListener::bind(&bind).ctx(&format!("binding {bind}"))?;
+    // As bound (`--bind` with port 0 takes any free port, and the log says which).
+    let addr = listener.local_addr().ctx("reading the bound address")?;
     // std listens with a backlog of 128: a burst of new clients (a fleet starting at 09:00,
     // every client reconnecting after a restart) overflows it, and the rest wait for SYN
     // retries (1 s, 3 s, ...). Listening again raises the queue to the system's limit
@@ -511,7 +513,7 @@ pub fn run(o: Options) -> Result<()> {
     ctx.ready.store(true, Ordering::Relaxed);
     let v = ctx.view();
     crate::log!(
-        "serving on http://{bind}: {} slabs ({} in L0), tip {}, {}, {workers} workers",
+        "serving on http://{addr}: {} slabs ({} in L0), tip {}, {}, {workers} workers",
         v.all.len(),
         v.l0_len,
         v.tip,

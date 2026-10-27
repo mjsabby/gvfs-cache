@@ -229,18 +229,14 @@ impl Server {
     }
 
     fn spawn(args: &[&str], env: &[(&str, &str)], ready: bool) -> Server {
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let bind = format!("127.0.0.1:{port}");
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_gvfs-daemon"));
         // Defaults first: the last occurrence of a flag wins, so a test can override them.
+        // The server takes any free port and logs it: a port picked here and released could
+        // be taken by another test's server first, and this test would talk to that one.
         cmd.arg("serve")
             .args([
                 "--bind",
-                &bind,
+                "127.0.0.1:0",
                 "--workers",
                 "8",
                 "--arenas",
@@ -249,11 +245,42 @@ impl Server {
                 "strict",
             ])
             .args(args)
-            .envs(env.iter().copied());
+            .envs(env.iter().copied())
+            .stderr(Stdio::piped());
         gvfs_daemon::upstream::hermetic_git_env(&mut cmd);
-        let child = cmd.spawn().unwrap();
-        let mut s = Server { child, port };
+        let mut child = cmd.spawn().unwrap();
+        let log = child.stderr.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // Passes the log through, and the port on from its "serving on" line.
+        std::thread::spawn(move || {
+            for line in std::io::BufRead::lines(std::io::BufReader::new(log)) {
+                let Ok(line) = line else { break };
+                let _ = writeln!(std::io::stderr(), "{line}");
+                let addr = line
+                    .split_once("serving on http://")
+                    .and_then(|(_, rest)| rest.split_once(": "))
+                    .and_then(|(addr, _)| addr.parse::<std::net::SocketAddr>().ok());
+                if let Some(addr) = addr {
+                    let _ = tx.send(addr.port());
+                }
+            }
+        });
         let deadline = Instant::now() + Duration::from_secs(30);
+        let port = loop {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(port) => break port,
+                // Its log closed: it is exiting.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    std::thread::sleep(Duration::from_millis(50))
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if let Ok(Some(status)) = child.try_wait() {
+                panic!("server exited during startup: {status}");
+            }
+            assert!(Instant::now() < deadline, "server did not start");
+        };
+        let mut s = Server { child, port };
         while Instant::now() < deadline {
             match s.try_get("/healthz") {
                 Ok((200, _, _)) => return s,
