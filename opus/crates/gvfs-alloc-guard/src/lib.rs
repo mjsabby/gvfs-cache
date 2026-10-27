@@ -259,16 +259,6 @@ impl Drop for ColdSectionGuard {
     }
 }
 
-/// Touches one byte per 4 KiB page so the kernel backs the whole buffer with physical
-/// memory at boot instead of taking minor faults on the hot path.
-pub fn prefault(buf: &mut [u8]) {
-    for page in buf.chunks_mut(4096) {
-        if let Some(b) = page.first_mut() {
-            *b = std::hint::black_box(0);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
