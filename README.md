@@ -1,9 +1,7 @@
 # gvfs-daemon
 
 One Rust binary that puts a fast [GVFS protocol](https://github.com/microsoft/VFSForGit/blob/master/Protocol.md)
-layer in front of a huge Azure DevOps (or any git) repository whose files are
-`~~Git-hfs 1.0` pointers. It is the *Unified Binary Architecture* of the design PDF, built
-on two primitives:
+layer in front of a Git repository and is built on two primitives:
 
 * **`ingest_git_delta(have, want)`**: one fetch from the upstream git server becomes an
   immutable **slab**: a pack plus a `.mphf` index (minimal perfect hash + 40-byte object
@@ -19,11 +17,11 @@ The same binary runs as the scheduled **pipeline** (15-minute slabs rolled up th
 localhost proxy, same code). The server keeps the minutes since the last sealed slab in
 RAM as L0 slabs (one per push), built by the very same `ingest_git_delta` and `repack`.
 
-Every prefetch response, cold clone included, is exactly **one pack**, as native ADO
+Every prefetch response, cold clone included, is exactly **one pack**, as native Git
 sends, with its `.idx` for VFS for Git (which installs it instead of indexing the pack).
 
 ```text
-          ADO / git server (upload-pack v2, v0 fallback; smart HTTP or local path)
+          Git server (upload-pack v2, v0 fallback; smart HTTP or local path)
              │ have/want: new commits only                 │ have/want: new commits only
              ▼                                             ▼
   gvfs-daemon pipeline (cron, every 15 min)      gvfs-daemon serve  (edge or 127.0.0.1 proxy)
@@ -37,8 +35,7 @@ sends, with its `.idx` for VFS for Git (which installs it instead of indexing th
         (a directory, or Azure Blob Storage)
 ```
 
-See [DESIGN.md](DESIGN.md) for formats, algorithms, engineering rules, and where and why
-this implementation departs from the PDF.
+See [DESIGN.md](DESIGN.md) for formats, algorithms, engineering rules.
 
 ## Build and test
 
