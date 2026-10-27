@@ -15,9 +15,9 @@
 //! per-object work. The upstream / object-store clients (TLS records, rare cold-path
 //! publication) live outside those regions and are only reflected in `post_seal`.
 //!
-//! Together with `gvfs-mmap` this is one of the two crates in the workspace that contain
-//! `unsafe` code: the trait `GlobalAlloc` is `unsafe` to implement. Every block forwards
-//! verbatim to `System`.
+//! Together with `gvfs-mmap` and `gvfs-prefetch`, this is one of the three crates in the
+//! workspace that contain `unsafe` code: the trait `GlobalAlloc` is `unsafe` to implement.
+//! Every block forwards verbatim to `System`.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

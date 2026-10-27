@@ -1,7 +1,7 @@
 # gvfs-daemon — tests and benchmarks (fable), as a standard for comparing implementations
 
 This document lists every test and benchmark that was run on the `fable` implementation
-(`/home/muks/gvfs-daemon/fable`), written so the same procedure can be applied to any other
+(`/home/muks/gvfs-daemon/alt_clients/fable`), written so the same procedure can be applied to any other
 implementation of the unified-binary GVFS architecture. Each item states **what** is checked,
 **how** (exact commands or an equivalent an implementation must provide), the **pass criterion
 or metric**, and fable's **result**. Section 9 is a blank reporting template.

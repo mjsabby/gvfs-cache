@@ -5,7 +5,7 @@ Session record and reproducible, implementation-neutral comparison protocol.
 - Session: `df64b0ab-3ec1-4466-9f23-7cd38015f48d`.
 - Work performed: 2026-10-24 through 2026-10-25, UTC.
 - Report prepared: 2026-10-25.
-- Current implementation directory: `/home/muks/gvfs-daemon/astra`.
+- Current implementation directory: `/home/muks/gvfs-daemon/alt_clients/astra`.
 - Original execution directory: `/home/muks/astra/gvfs-daemon`; it was subsequently moved into the comparison repository.
 - Current packaging commit: `820249c82dfffd18687e695037592280187ca612`.
 - Current `astra` Git tree: `9ba4a1ef1b286ba1e2721ff7d45aa57b884b1b12`.
@@ -145,7 +145,7 @@ P-RETAIN is a compression reference: its rollups do not discover new deltas amon
 Final executed gate:
 
 ```sh
-cd /home/muks/gvfs-daemon/astra
+cd /home/muks/gvfs-daemon/alt_clients/astra
 cargo fmt --all
 cargo test --workspace --lib --tests --examples --message-format=short --quiet
 cargo clippy --workspace --all-targets --message-format=short --quiet -- -D warnings
@@ -400,7 +400,7 @@ For the historical pack-plus-index policy, have the server adapter append `--pre
 
 ```sh
 #!/bin/sh
-exec /home/muks/gvfs-daemon/astra/target/release/gvfs-daemon "$@" --prefetch-index
+exec /home/muks/gvfs-daemon/alt_clients/astra/target/release/gvfs-daemon "$@" --prefetch-index
 ```
 
 Then run the unchanged driver with a new output directory:
@@ -644,7 +644,7 @@ Full GNU time counters, including filesystem input/output operation counters, ar
 
 ## 11. Reproduction commands and smoke lanes
 
-All commands assume `cd /home/muks/gvfs-daemon/astra`. Substitute paths for another implementation. Use fresh output directories; do not erase or mutate SearchGold to prepare a run.
+All commands assume `cd /home/muks/gvfs-daemon/alt_clients/astra`. Substitute paths for another implementation. Use fresh output directories; do not erase or mutate SearchGold to prepare a run.
 
 ### 11.1 Freeze a replay-compatible baseline
 
@@ -919,7 +919,7 @@ idle_repo_poll_every_1m,11521,1,1,1,1,4405522053,8,0,8,0,11519,0
 
 ## Appendix C. Evidence inventory and fingerprints
 
-All paths below are under `/home/muks/gvfs-daemon/astra`.
+All paths below are under `/home/muks/gvfs-daemon/alt_clients/astra`.
 
 | Evidence | Files |
 |---|---|

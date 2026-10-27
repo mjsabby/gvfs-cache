@@ -60,7 +60,7 @@ In particular:
 Current implementation root, abbreviated as `SOL` below:
 
 ```text
-/home/muks/gvfs-daemon/sol
+/home/muks/gvfs-daemon/alt_clients/sol
 ```
 
 The work originally ran under `/home/muks/sol/gvfs-daemon`; some retained logs,
@@ -928,7 +928,7 @@ native Git setup commands as well as the workload harness.
 ### 11.1 Automated suite and release build
 
 ```sh
-cd /home/muks/gvfs-daemon/sol
+cd /home/muks/gvfs-daemon/alt_clients/sol
 cargo fmt --all --check
 cargo test --workspace --all-targets --locked --message-format=short
 cargo clippy --workspace --all-targets --locked --message-format=short -- -D warnings

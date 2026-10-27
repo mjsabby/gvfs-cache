@@ -1,23 +1,113 @@
-# gvfs-daemon: five implementations, one standard comparison
+# gvfs-daemon: report
 
-**Recommendation: opus**, with the fixes and optimizations made in this branch (`opus/`, commits
-`cdda1ae`…`f7d9bef`). It is the only implementation that is correct on every check *and*
-fastest or near-fastest on every workload that moves real bytes. Section 1 explains the call
-and its trade-offs; sections 3–8 are the evidence; section 9 lists every defect found, per
-implementation, including the opus defects this comparison found and fixed. Section 11
-studies client-side pack lifecycles; section 12 adds a store mode for real blobs in their own
-packs (`--blobs separate`), with sizes travelling beside the trees. Section 15 reports an
-independent code review of opus and the fixes it led to.
+This repository is **opus**, a Rust daemon that serves a Git monorepo over the
+[GVFS protocol](https://github.com/microsoft/VFSForGit/blob/master/Protocol.md). One binary
+runs in three roles:
 
-All numbers: AMD Ryzen 9 9950X (16C/32T), 89 GiB, Linux 7.3, rustc 1.97.1, git 2.53, loopback.
-Each implementation built as shipped (`cargo build --release`, its own profile). The harness is
-in `bench/` (Python, stock git as the only judge of correctness); raw results in `bench/results/`.
+* the scheduled **pipeline**, which turns the upstream's history into time-windowed packs in
+  object storage;
+* the **edge** (or localhost proxy), which serves them;
+* the **mirror**, which seeds stores whose blobs live in packs of their own.
+
+README.md covers usage, and DESIGN.md the formats and algorithms.
+
+opus was chosen from five implementations of the same specification by one standard
+comparison. This report is the evidence for that choice. It also records every change made to
+opus since, each one measured and validated:
+
+* §1: where opus stands, its trade-offs, and why it was chosen;
+* §2–§10: the comparison (method, results, the defects found, how to reproduce it);
+* §11: client-side pack lifecycles, and day and week superset deliveries;
+* §12: real blobs in packs of their own (`--blobs separate`);
+* §13: a CPU and wait analysis with BPF and perf;
+* §14: the edge's connections moved from a thread per request to tokio;
+* §15: an independent code review, and the fixes it led to;
+* §16: ARM64, the Rust 1.99.1 toolchain, and the repository's layout.
+
+Of the other four implementations, fable, sol and astra are kept in `alt_clients/`, each with
+its own `tests_plus_benchmarks_<name>.md`. Their clients take part in the cross-client tests,
+and `bench/` can still run the whole comparison. argon, which never worked as a server, was
+removed.
+
+All numbers come from an AMD Ryzen 9 9950X (16 cores, 32 threads) with 89 GiB, Linux 7.3,
+git 2.53, over loopback. The comparison and §11–§15 used builds from rustc 1.97.1, and §16
+from 1.99.1. The harness is in `bench/` (Python, with stock git as the only judge of
+correctness); raw results are in `bench/results/`.
 
 ---
 
-## 1. Verdict
+## 1. Summary
 
-| | **opus** (final) | sol | fable | astra | argon |
+### Where opus stands
+
+* **Correctness.** Stock git judges every byte (`index-pack --strict`, `verify-pack`,
+  `rev-list --missing=print`, `cat-file`); opus's own reader is never trusted.
+  * Lifecycle conformance: 918 of 918 checks (§4). Microsoft's gvfs-helper passes 18 of 18
+    cross-client checks, and fable's client hook 15 of 15.
+  * A week of SearchGold replayed (1,646 pushes, 9 client behaviours): no object missed, and
+    84 of 84 cold clones exact (§6, §11).
+  * 14 days of a 170 GB repository with real blobs: 0 failures in 21,612 client events (§12).
+  * Every change since §13 left every response byte-identical unless it was meant to change
+    it. The check covers 5,904 requests on three SearchGold stores, with 4.8–5.5 GB of
+    prefetch streams per store, and 372 requests per cache setting on an Azure (Azurite)
+    store.
+  * No heap allocation on any request path: `--alloc-guard strict` aborts on one.
+* **Speed** (SearchGold after a week of pipeline runs, separate blobs, the edge on 8 CPUs;
+  §16 has the latest run):
+  * GET of a blob: 1.22M req/s at 3.7 µs of CPU each on 64 connections, p99 0.1 ms; 1.59M
+    req/s on 1,024, p99 1.2 ms;
+  * POST of 4,000 blobs: 8,700 req/s at 0.9 ms of CPU each; sizes of 4,000 ids: 20,100
+    req/s at 0.39 ms;
+  * cold clones through `sendfile`: 26 ms of CPU per GB, about 80 GB/s for 8 at a time
+    (bound by memory bandwidth);
+  * GETs keep their rate beside 400 slow downloaders, and beside 30,000 idle connections at
+    about 3 KB each (§14).
+* **Hardening** (§15): strict HTTP framing (no request smuggling), one deadline per request,
+  caps on connections, request size and arena growth, no credentials in errors or logs, and
+  checked ids from the store.
+* **Platforms:** Linux on x86-64 and ARM64. Rust 1.99.1, edition 2024, pinned in
+  `rust-toolchain.toml` (§16).
+
+### Trade-offs
+
+None is egregious, and most come with a flag.
+
+* **POST answers carry delta bases** rather than resolving deltas: about 25% more bytes than
+  fable's exact packs (183 KB vs 145 KB per 64 ids), for about a twelfth of the server CPU.
+  That suits a localhost proxy or a LAN edge; over a thin WAN link exact packs would cost
+  fewer bytes.
+* **Day and week supersets cost bytes** (§11). Each warm client receives every sealed day and
+  week whole, once (0.3–0.7 MB a day per client on SearchGold): 0.98–1.40× git's ideal instead
+  of 0.94–1.04×. In exchange, Scalar's default maintenance keeps a client's packs bounded (215
+  for a 1-minute agent). `--superset-tier 168h` (weeks only) or `never` (exact covers) trade
+  that back. fable with its own client hook keeps 13 packs per agent, at 3.8–5.3× git's ideal
+  bytes.
+* **GETs behind heavy requests** (§14). tokio does not preempt, so a GET waits for the heavy
+  requests ahead of it to yield. At the default `--quantum-us 100` the GET p99 is 4× better
+  than with a thread per request, but the median is higher (152–157 µs instead of 40–84 µs).
+  A shorter quantum favours GETs over heavy requests.
+* **Idle keep-alive connections cost 3.4 KB each** (a parked task): 340 MB per 100,000.
+  `--max-idle-conns` and `--max-conns` cap them.
+* **A slow reader of a large POST pack holds its arena** while the pack streams (§15, batch
+  1). Put a buffering load balancer in front of an edge whose clients are slow.
+* **The first VFS for Git cold clone after each manifest change** waits about 4 s while the
+  280 MB `.idx` is built. gvfs-helper does not ask for it, and later clones get the cached one.
+* **Genesis peaks at 12–17 GB of RSS** on SearchGold (fable: 7 GB).
+* **The baseline grows by appending each week** (6–7 s, no upstream traffic), so objects
+  orphaned by a force push stay in it.
+* **Separate-blob stores mirror the whole history** before their edges serve, and nothing
+  repairs them by itself: running `gvfs-daemon mirror` again does (§12).
+* **Linux only** (`sendfile`, `statfs`, `/proc`). ARM64 is tested under emulation; its speed
+  has not been measured on ARM64 hardware.
+
+### Why opus: the comparison
+
+Five implementations of one specification (opus, sol, fable, astra and argon) went through
+one standard comparison (§2), each as shipped, and each fixed where it could not otherwise
+make progress. The table shows them at the end of the comparison: opus at `f7d9bef`, when it
+still served a thread per request. The numbers above come from later builds.
+
+| | **opus** (`f7d9bef`) | sol | fable | astra | argon |
 |---|---|---|---|---|---|
 | Correct on every check (sections 3–6) | ✅ (after the fixes in §8) | ⚠️ 413s at scale unless tuned; 503 storms under POST load | ✅ | ❌ | ❌ |
 | GET blob / commit (req/s, 8 server threads) · CPU per GET | 595K / 791K → **1.01M / 1.02M** · **4.9 µs** | **1.01M / 1.02M** · 5.3 µs | 115K / 117K · 65 µs | 535K / 533K · 8.3 µs | — |
@@ -31,24 +121,19 @@ in `bench/` (Python, stock git as the only judge of correctness); raw results in
 | Packs a client keeps under Scalar's default maintenance (1-min / 15-min agent, after a week) | **215 / 80**, bounded (exact covers: 1,247 / 482, growing ~170 / 65 a day) | not measured | 17 / 14 (13 / 13 with its own hook) | not measured | — |
 | 7-day replay: missed objects / cold clones exact | **0 / 84 of 84** (3 builds) | 0 / 84 of 84 | 0 / 84 of 84 (1 non-canonical `.idx`) | 0 / — (aborted) | — |
 
-**Why opus.** With this branch's changes it ties sol on the tiniest requests (GET of a commit or
-small blob at ~1M req/s, 4.9 µs of CPU per request vs sol's 5.3) and is within 4 % of sol and
-13 % of fable on up-to-date prefetch. On everything that costs real CPU or bandwidth — batched
-POSTs, sizes, cold clones (`sendfile`, ~10× less CPU than sol/fable), commit closures, genesis
-— it is the fastest, by 1.05× (genesis vs fable) to 2.3× (sizes vs sol) over the runner-up,
-without a single error, at the lowest memory after fable. Its warm-client traffic is the closest
-to git's own ideal of the five (§6). Correctness: it passes every conformance, cross-client,
-JSON, scale and replay check after the fixes below. A later CPU and wait analysis (§13) made
-it faster still on a store carrying a week of slabs, with byte-identical responses: blob batches
-1.8× (inline) to 5.5× (separate blobs), sizes 3.2× to 11×, and cold prefetches 31-41% cheaper.
-Its connection layer now runs on tokio (§14), with the same bytes on the wire.
-* **Small requests:** 22–35% less CPU each, and p99 at 1,024 connections falls from 15.7 ms
-  to 1.3 ms.
-* **Slow downloaders:** it keeps serving beside them; they stalled the 256 worker threads.
-* **hyper:** its server was ruled out (20× the CPU per cloned GB, no `sendfile`); its client
-  carries the edge's fetches.
+**Why opus.** With the changes made during the comparison it tied sol on the tiniest requests
+(GET of a commit or small blob at ~1M req/s, 4.9 µs of CPU per request vs sol's 5.3) and was
+within 4 % of sol and 13 % of fable on up-to-date prefetch. On everything that costs real CPU
+or bandwidth — batched POSTs, sizes, cold clones (`sendfile`, ~10× less CPU than sol/fable),
+commit closures, genesis — it was the fastest, by 1.05× (genesis vs fable) to 2.3× (sizes vs
+sol) over the runner-up, without a single error, at the lowest memory after fable. Its
+warm-client traffic was the closest to git's own ideal of the five (§6). It passed every
+conformance, cross-client, JSON, scale and replay check after the fixes below. It has since
+become faster still, with byte-identical responses: blob batches 1.8× (inline) to 5.5×
+(separate blobs), sizes 3.2× to 11×, cold prefetches 31–41% cheaper (§13), and small requests
+22–35% cheaper on tokio, which also keeps serving beside slow downloaders (§14).
 
-**What was fixed/optimized in opus** (each A/B-measured and re-verified; details in §8):
+**What the comparison fixed in opus** (each A/B-measured and re-verified; details in §8):
 
 1. **Bug — duplicate objects in cold-clone packs.** Upstreams without reachability bitmaps
    (SearchGold's own clone; any repository with reverts or re-added files) re-send objects that
@@ -67,6 +152,8 @@ Its connection layer now runs on tokio (§14), with the same bytes on the wire.
    limit. Now 1,000 idle connections cost a table slot each, every busy client is served, and 8,000
    sporadic requests a second from 2,048 keep-alive agents get p99 23 µs. No throughput cost
    (each A/B'd: 0.99–1.02× on GET, up-to-date prefetch, POST 64 and sizes).
+   *Since replaced:* on tokio (§14) no connection waits for a thread, so the parking, the
+   hold and the linger are gone. The raised listen backlog stays.
 3. **Faster:** head and body of small responses in one `writev`; `/gvfs/sizes` formatted
    without `core::fmt`; small non-tree deltas stored whole at repack (+0.1 % baseline size).
    Net, in the final interleaved run against the shipped binary: GET blob **1.69×**, GET commit
@@ -81,26 +168,6 @@ Its connection layer now runs on tokio (§14), with the same bytes on the wire.
    once, and stock `multi-pack-index expire` deletes the packs it subsumes. It now keeps
    215 (15-minute agent: 80). This is fable's superset tombstoning at day/week granularity,
    for 0.98–1.40× git's ideal bytes instead of fable's 1.85–5.3×.
-
-**Trade-offs of choosing opus** (none egregious; know them):
-
-* **Thread-per-connection for active transfers.** Idle clients no longer hold threads, but a
-  client *receiving* a response holds a worker until done (blocking `sendfile`, 120 s per write).
-  256 simultaneous slow cold clones over WAN would occupy all default workers — raise
-  `--workers` (threads are cheap) on a remote edge with many slow links (connections take turns
-  between requests, but not in the middle of a response). Tail latency at saturation is higher
-  than sol's (GET p99 0.3 ms vs 0.12 ms at 1M req/s).
-* **POST responses carry delta bases** instead of resolving deltas: ~25 % more bytes than
-  fable's exact packs (183 KB vs 145 KB per 64 ids) for ~12× less server CPU. Right for a
-  localhost proxy or LAN edge; on a thin WAN link fable's choice costs fewer bytes.
-* **First VFS-for-Git cold clone after each manifest change** waits ~4 s while the 280 MB `.idx`
-  is built (gvfs-helper does not ask for it; later clones get the cached one).
-* **Genesis peaks at ~12–17 GB RSS** (pipeline runner sizing), more than fable (7 GB).
-* **Day/week supersets cost bytes**: each warm client receives every sealed day and week
-  whole once (0.3–0.7 MB a day per client on SearchGold), 0.98–1.40× git's ideal instead
-  of 0.94–1.04×. `--superset-tier 168h` (weeks only) or `never` (exact) trade that back for
-  more packs on Scalar-default clients (§11). With fable's own client hook, fable keeps
-  fewer packs (13 vs opus's 80–232 for agents) at 3.8–5.3× git's ideal bytes.
 
 **Why not the others** (details §9):
 
@@ -126,11 +193,16 @@ Its connection layer now runs on tokio (§14), with the same bytes on the wire.
   sizes 49× slower than opus; default clustered cold pack 4.4 GB vs 2.6 GB; 12 GB RSS.
 * **argon** — not a working server: `GET /gvfs/objects` returns 404 for every deltified tree,
   warm prefetch packs are thin (missing delta bases: `index-pack` fails), hot-path allocations,
-  local-path upstream only. Dropped after the small-corpus suite.
+  local-path upstream only. Dropped after the small-corpus suite, and removed from the
+  repository since.
 
 ---
 
 ## 2. Method (what "standard comparison" means here)
+
+Sections 2–10 are the comparison as it was run, with opus's builds of the time (up to
+`f7d9bef`). fable, sol and astra now build from `alt_clients/<name>`. argon has been removed,
+with its adapter, so the scripts compare four implementations.
 
 The five `tests_plus_benchmarks_*.md` documents were merged into one implementation-neutral
 protocol, driven only through each binary's CLI and HTTP API (adapters in `bench/impls.py`) and
@@ -336,7 +408,7 @@ Reading the table:
   fastest or within noise of the fastest on every one, without errors. sol answers 99.999 % of
   concurrent POSTs with `503 arenas busy`, and the few it serves carry 50–1,100× opus's bytes.
   fable's packs are the most exact (no delta bases) at 12× opus's CPU.
-* Net effect of this branch on opus (same run): GET blob **1.69×**, GET commit 1.29×, sizes
+* Net effect of the comparison's changes on opus (same run): GET blob **1.69×**, GET commit 1.29×, sizes
   1.28×, up-to-date prefetch 1.23×, POST 64 1.07×, POST 4,000 1.05×, GET tree 1.04×, closure
   1.00×, cold clone 0.99× (A/B).
 * "opus final" in this table is `75271a2`. The two later commits (`70091b7`, `9b736e2`) change
@@ -344,7 +416,7 @@ Reading the table:
   blob/commit (and tree), up-to-date prefetch, POST 64 and sizes (3 alternating rounds each),
   with the same CPU per request and p99.
 
-## 8. opus changes in this branch
+## 8. opus changes during the comparison
 
 All changes keep opus's invariants (`forbid(unsafe_code)`, the clippy deny list, zero hot-path
 allocations — `/metrics` `gvfs_alloc_hot_path_total` stayed 0 in every run). Each was A/B'd
@@ -370,6 +442,10 @@ Not done (bigger changes; candidates for later): resolve-and-cache for deep ADO 
 (GET tree spends 32 % in deflate and ~25 % inflating chains of mean depth 23); a non-blocking
 write path so slow downloaders do not hold workers; building the cold `.idx` eagerly.
 
+The connection changes above (the parking in `cdda1ae`, `70091b7`'s hold, `9b736e2`'s linger)
+worked around a thread per request. The tokio edge (§14) replaced them, and with them the
+non-blocking write path above; only the raised listen backlog stays. The other changes stand.
+
 ## 9. Defects found, per implementation
 
 Severity: **C** correctness (a client can end up wrong or rejected), **A** availability (a
@@ -382,7 +458,8 @@ bursts wait for SYN retries (fixed). The first version of the idle-connection fi
 100 ms per request, which capped sporadic keep-alive traffic at ~2,500 req/s (now 5 ms).
 P: `/gvfs/sizes` formatting, two writes per small response, deltified small objects (all
 fixed). Remaining by design: POST
-responses include delta bases; workers held for the length of a response.
+responses include delta bases. Workers held for the length of a response went with the tokio
+edge (§14).
 
 **sol** — A: rejected git upload-pack keep-alive packets, so genesis of any large repository
 from a git upstream failed after 5 s (fixed in `sol/src/upstream.rs`, 1 hunk). A: needs many
@@ -432,8 +509,8 @@ temp file in a multithreaded cache save.
 
 ```sh
 cd bench
-python3 smoke.py                         # 1 minute triage of all five
-python3 conformance.py                   # lifecycle suite, all five in parallel (~10 min)
+python3 smoke.py                         # 1 minute triage of all four
+python3 conformance.py                   # lifecycle suite, all four in parallel (~10 min)
 python3 conformance.py opus-orig opus    # original vs final opus
 python3 cross_clients.py                 # gvfs-helper (~/git/bin-wrappers/git), fable hook, astra sync
 python3 json_variants.py
@@ -455,19 +532,27 @@ FROZEN=<dir with the superset build> python3 replay.py --seed opus@ss && \
 WS_REGIMES=scalar,vfs,geometric python3 workstation.py opus opus@ss fable fable@h24
 python3 ws_report.py opus opus@ss fable fable@h24        # bytes, packs per regime, projection
 PC_SIZES=0,100,1000,5000,20000 python3 packcount.py opus agent-1m   # what pack count costs git
-cargo run --release --example clients -- --repo ~/SearchGold --from 2026-10-10 --days 14 \
-  --work <scratch> --superset-tier 24h|168h|never      # (in opus/) opus's own 14-day simulator
+(cd .. && cargo run --release --example clients -- --repo ~/SearchGold --from 2026-10-10 \
+  --days 14 --work <scratch> --superset-tier 24h|168h|never)   # opus's own 14-day simulator
 # §12: --blobs separate
-(cd ../opus && cargo test --release --test separate && \
+(cd .. && cargo test --release --test separate && \
   cargo test --release --test separate -- --ignored blob_over_4gib)  # ~13 GB under target/
 python3 separate_seed.py --jobs 8                        # real-content seed, ~/gvfs-bench/sep-seed
 gvfs-daemon pipeline --store fs:<dir> --upstream ~/SearchGold --branch main --tier 15m \
   --blobs separate                                       # SearchGold metadata in separate mode
-# §14: the connection layer on tokio (first, in opus/: cargo build --release --bin gvfs-daemon
-# --example spike_tokio; the store: build_store.py)
-python3 spike_tokio.py check --dir ~/gvfs-bench/prof/sg7-sep   # spike responses = serve's
-THREADS_BIN=<a build of 5dada58> python3 spike_tokio.py bench --dir ~/gvfs-bench/prof/sg7-sep
-                                                         # threads vs tokio, ~1 h; prof/out/spike.json
+# §13 on: a store with a week of slabs (writes <dir>/store, up.git, blobs.txt), then profiles
+python3 build_store.py --history ~/gvfs-bench/replay/history-w7.json \
+  --objects ~/SearchGold/.git/objects --work ~/gvfs-bench/prof/sg7-sep --blobs separate
+python3 profile_bpf.py serve --stores sg7-sep --only get_blob   # on-CPU, counters, off-CPU
+# Checking a change (§13–§16): byte identity on a store (--upstream <repo>: with a live tip),
+# the same on Azurite, then load in both slot orders (swap BASE_BIN and NEW_BIN; ~1 h each)
+python3 ab_responses.py --store <dir>/store --git <dir>/up.git --blobs <dir>/blobs.txt \
+  --base <old build> --new ../target/release/gvfs-daemon
+python3 ab_remote.py --base <old build> --new ../target/release/gvfs-daemon
+BASE_BIN=<old build> python3 ab_load.py bench --dir ~/gvfs-bench/prof/sg7-sep
+# §14's spike (examples/spike_tokio.rs, with bench/spike_tokio.py's check mode) is in git
+# history before 94416d6; ab_load.py is that harness's bench mode, for any two builds.
+# §16: the ARM64 tests under qemu are in §16.
 ```
 Scratch data lives under `~/gvfs-bench` (SearchGold stores ~16 GB); `/tmp` is a tmpfs here.
 The shell's injected `GIT_CONFIG_*` is stripped by `gvfslib.clean_env`.
@@ -620,13 +705,13 @@ consumer needs the HFS side channel. The alternative adopted here:
 * the blob sizes a client needs to project a tree travel with the trees, as a side table.
 
 **What it is** (opus `5870cd0`…`60e9164`, whole-history mirror `aa475fa`…`37a4ded`;
-formats and algorithms in `opus/DESIGN.md`, "Stores with real blobs"). A store chooses its mode at genesis
+formats and algorithms in `DESIGN.md`, "Stores with real blobs"). A store chooses its mode at genesis
 (`pipeline --blobs separate`); inline stores are unchanged, manifest byte for byte.
 
 | piece | what it does |
 |---|---|
 | sizes tables | `slabs/<id>.sizes`: sorted `(id, size)` of the blobs a slab's trees introduce; rollups union them |
-| blob packs + segments + `blobs.bin` | whole-blob git packs (upstream zlib kept, or stored blocks when incompressible: byte ranges in place); 48-byte records with 64-bit offsets and lengths; a CAS'd list whose segments stay a geometric progression by blob count (O(log n) segments, each record rewritten O(log n) times) |
+| blob packs + segments + `blobs.bin` | whole-blob git packs (upstream zlib kept, or stored blocks when incompressible, which clients unpack at the speed of a copy; optional, see DESIGN.md); 48-byte records with 64-bit offsets and lengths; a CAS'd list whose segments stay a geometric progression by blob count (O(log n) segments, each record rewritten O(log n) times) |
 | pipeline, blobs first | `blob:none` window; copy the blobs its new trees reference that the store lacks; publish `blobs.bin`; only then the slab and the manifest naming that `blobs.bin` generation |
 | `gvfs-daemon mirror` | the seed of the blobs: every blob of the history, planned from the store's own trees and sizes in one parallel pass (the tip's tree first, in path order), resumable, parallel, rate-capped, never re-copying what windows copied meanwhile, sizes checked; records `blobs.bin` as mirrored. Also the repair, on demand |
 | edge | blobs from the packs (mapped, or from Azure through a local 4 MiB block cache, never downloaded whole); a single-flight read-through proxy for the L0 overlay's blobs, only for ids the trees name (a sealed tree's blob that a complete store lacks is proxied too, but counted as `gvfs_blobs_missing_total`); `GSZ1` sizes section on opt-in; `GET /gvfs/blobs/<oid>?offset&length` (removed since: §15, #13); ready only once the history is mirrored |
@@ -649,6 +734,9 @@ formats and algorithms in `opus/DESIGN.md`, "Stores with real blobs"). A store c
 | Stock microsoft/git 2.56 | `gvfs-helper prefetch` (no blobs), a checkout faulting every blob byte for byte (16 MiB included), an old version (from the store: nothing proxied), a sparse cone that never fetches blobs outside it |
 | Azure (Azurite) | streaming block uploads; an edge serving every blob loose and in packs by ranged reads, holding only segment indexes locally |
 | Beyond 4 GiB | a 4,294,979,641-byte blob: copied by a pipeline window in 7.0 s at an **11 MiB** peak RSS; served loose (hashes to its id), in a pack (`index-pack --strict`), and by ranges past 4 GiB |
+
+The checks of byte ranges (`GET /gvfs/blobs`) in these gates, and below, went with that
+endpoint when it was removed (§15, #13).
 
 A code review of the separate-mode diff raised four findings. Three were bugs, now fixed,
 each with a regression test that failed before the fix:
@@ -825,7 +913,7 @@ SHA-1s), so ADO's serving rate, not the daemon, will set the seed time.
   stores whole files, so the chunk-level dedup HFS had is gone: a small edit to a 10 GB file
   costs 10 GB again, upstream and here.
 * *Not done from the plan:*
-  * a reference client for `GSZ1` and ranges (the replay's harness plays that part);
+  * a reference client for `GSZ1` (the replay's harness plays that part);
   * reachability GC of blob packs.
 
 ## 13. CPU and wait analysis (BPF, perf)
@@ -876,7 +964,7 @@ End to end with the final build:
 | `5bb4df3` | Inline store: an id only the baseline has (most of them) paid an MPHF probe in each of 11 newer slabs; 63% of POST and 87% of sizes CPU in lookups | Blocked Bloom filters, one per view over all slabs before the baseline, one per such slab: no false negatives, same answers | Inline POST 2,112 → 3,155, sizes 6,049 → 11,190 (1.85×) |
 | `5bb4df3` | `plan_objects` looked every id up twice (commit check, then plan): 22% of inline POST CPU | The check's lookups kept for the plan (up to 8,192 ids) | Inline POST → 3,357 req/s (1.59×), 3.75 → 2.36 ms CPU, p99 39 → 18 ms |
 | `a4734cb` | A cold prefetch's `.idx` and `GSZ1` (165 MB and 93 MB on SearchGold) were copied into the socket: each byte also cost a socket buffer page zeroed by `init_on_alloc`. 4% of the bytes, 27% of the CPU | Sections of 1 MiB or more moved to a memfd once (mapped, no second copy) and sent with `sendfile` | Edge CPU per cold prefetch: with `.idx` 87.8 → 51.4 ms (27.0 → 34.9 req/s), with sizes 73.4 → 50.5 ms |
-| `75fd11e` | Batched lookups waited for one DRAM read at a time: each id's record sits at a random place in an index far larger than the caches (the blob set's 160 MB, the baseline's 9M records). One load was 68% of a sizes request | Each batch loop has the CPU start loading the record of the id 16 places ahead, and the POST send loop the blob entries ahead, so the misses overlap. `_mm_prefetch` needs one `unsafe` block, isolated in `crates/gvfs-prefetch`; plain loads in its place (safe) were 4-11% slower | POST 4,000 blobs 4,824 → 9,035 req/s (1.87×), sizes 10,593 → 20,487 (1.93×); inline 1.14× and 1.77× |
+| `75fd11e` | Batched lookups waited for one DRAM read at a time: each id's record sits at a random place in an index far larger than the caches (the blob set's 160 MB, the baseline's 9M records). One load was 68% of a sizes request | Each batch loop has the CPU start loading the record of the id 16 places ahead, and the POST send loop the blob entries ahead, so the misses overlap. `_mm_prefetch` needs one `unsafe` block, isolated in `crates/gvfs-prefetch`; plain loads in its place (safe) were 4-11% slower. ARM64 got the same hint later (`prfm`, §16) | POST 4,000 blobs 4,824 → 9,035 req/s (1.87×), sizes 10,593 → 20,487 (1.93×); inline 1.14× and 1.77× |
 
 All of it against the original build, interleaved (df4a1df → 75fd11e, 8 CPUs):
 
@@ -887,8 +975,8 @@ All of it against the original build, interleaved (df4a1df → 75fd11e, 8 CPUs):
 | blob GET | 961K → 1.00M (+4.5%) | 983K → 1.02M (+3.3%) |
 
 Blob GETs rose 7% (separate) and 4% (inline). Large-blob paths were already cheap and did not
-change: about 40 µs of CPU per 1 MiB range at 48K ranges/s, and whole large blobs leave
-through `sendfile`.
+change: about 40 µs of CPU per 1 MiB range at 48K ranges/s (the range endpoint has since been
+removed, §15), and whole large blobs leave through `sendfile`.
 
 **What remains is mostly inherent:**
 
@@ -949,11 +1037,14 @@ through `sendfile`.
 
 ## 14. Connection layer: std threads vs tokio (spike, then the port)
 
+The spike's part was written before the port, so its "today" is the thread-per-request edge.
+
 **Question.** Today the edge runs one request per thread: 256 workers, with idle keep-alive
 connections parked in an epoll set until their next request. Would an async runtime serve
 better, and if so with hyper or with the edge's own HTTP/1 framing?
 
-**Method.** `opus/examples/spike_tokio.rs` serves the same store on tokio 1.54 (8 workers) with
+**Method.** A spike, `examples/spike_tokio.rs` (deleted once the port was done, §16; it is in
+git history before `94416d6`), serves the same store on tokio 1.54 (8 workers) with
 the edge's own building blocks: request parser and router, view lookups, loose-object splice
 plans, prefetch plans, the sizes loop. It runs in one of two modes:
 
@@ -977,7 +1068,8 @@ content type, body):
 `bench/spike_tokio.py bench` ran on the week-old SearchGold store with separate blobs, the
 edge on 8 CPUs and loadgen on 16. It took medians of 3 interleaved rounds (round-to-round spread
 within 2%), plus 2 rounds of the slow-client and idle-connection tests. Results are in
-`bench/results/spike-tokio.json`.
+`bench/results/spike-tokio.json`. The harness is now `bench/ab_load.py`, which keeps the bench
+mode for any two builds of the edge.
 
 Small requests (req/s · p99 µs · edge CPU µs per request):
 
@@ -1045,7 +1137,7 @@ GETs beside other load (GET req/s · p50 · p99 in µs):
 
 ### The port
 
-The edge now runs this way (`opus/src/serve/`):
+The edge now runs this way (`src/serve/`):
 
 * **Connections:** a tokio runtime with one worker per CPU (`--workers`) and a task per
   connection (`conn.rs`). The edge's own HTTP/1.1 runs on tokio's sockets (`httpd.rs`): it
@@ -1512,4 +1604,108 @@ test now pipelines two prefetches with different cursors.
 * **The 1 MiB step was left over from the old design.** With threads, a write blocked, so each
   step had to be buffered before it was written. The tokio port kept the step after its reason
   was gone, and the cache's whole-read logic stopped seeing whole reads.
+
+## 16. ARM64, the Rust 1.99.1 toolchain, and the repository's layout
+
+**ARM64.** Nothing in opus depends on x86-64 for correctness. It does depend on Linux
+(`sendfile`, `statfs`, `/proc`). It cross-builds for `aarch64-unknown-linux-gnu`, and every
+suite passes as ARM64 binaries under qemu-user, including the daemons the tests start (through
+binfmt): lib 72, Azure 4, e2e 14, separate 10. Two speedups were x86-64 only, and both now
+have an ARM64 counterpart:
+
+* **SHA-1** (`5cac7c3`). `sha1` 0.10 used SHA-NI on x86-64 but software SHA-1 on ARM64, at
+  half the speed (1.47 vs 2.93 GB/s on this machine). SHA-1 is 28% of a blob batch's CPU at
+  the edge (the pack's trailer), and the pipeline and the mirror hash every object. `sha1`
+  0.11 finds the ARMv8 SHA extension at run time, as it finds SHA-NI. On x86-64 the speed and
+  the digests are unchanged; under qemu the ARM64 code is taken, and its digests equal the
+  software ones.
+* **The prefetch hint** (`4300666`). Batched lookups rely on it to overlap their DRAM misses
+  (on x86-64 it nearly doubled the rate of 4,000-blob POSTs and of sizes requests, §13).
+  ARM64 now issues `prfm pldl1keep` through `asm!` (the ARM64 prefetch intrinsic is not
+  stable), at the same 8 places as x86-64's `prefetcht0`, checked in both disassemblies.
+
+ARM64 has only run under emulation here, so its speed is unmeasured. Under qemu,
+`slow_clients_hold_no_arena` failed twice in about 25 runs made in parallel with other
+emulated suites: its client sends an 8 MB body within a 2 s request deadline, and emulation
+runs 10–20× slower. It passed alone, in 14 later parallel runs, and 15 of 15 times on x86-64,
+so the test is unchanged.
+
+**Toolchain** (`96e192f`). `rust-toolchain.toml` pins Rust 1.99.1 with clippy, rustfmt and the
+x86-64 and ARM64 Linux targets. `rust-version` went from 1.86 to 1.99.1, so the MSRV-aware
+resolver holds no dependency back. Every crate was already on edition 2024, here and in the
+alt clients, which also build with 1.99.1. The higher `rust-version` turned on clippy lints
+that 1.86 kept off, all fixed without a change in behaviour:
+
+* 19 nested `if`s became let-chains;
+* six `chunks_exact` loops became `as_chunks` (two have gone back since, below);
+* two `fetch_update`s (deprecated in 1.99) became `try_update`;
+* a loop over one element became plain code.
+
+**A regression the load A/B found.** Against `8af8de8`, sizes requests of 4,000 ids lost
+1.4–2.2% (in both slot orders), at 1.5–2.2% more CPU each. The toolchain commit caused it:
+clippy 1.99's `chunks_exact_to_as_chunks` had the hex codec's loops rewritten with
+`as_chunks`, and LLVM vectorizes the encoder's new form worse (6.0 ns per id instead of 5.1;
+in isolation, the decoder's code is the same either way). A sizes request decodes every id
+once and encodes it once. Built with the old loops, the same tree answered sizes 3.2–3.4%
+faster in both slot orders, so the codec keeps `chunks_exact`, with the lint allowed on those
+two functions and the reason beside them.
+
+**Dependencies.** Every dependency, direct or not, is at its latest release. `nix` was the
+last one behind: 0.29 to 0.31 (`ff61237`), where `MemFdCreateFlag` became `MFdFlags`.
+
+**Layout** (`60240a1`). opus moved from `opus/` to the repository's root. fable, sol and astra
+moved to `alt_clients/<name>`, each with its `tests_plus_benchmarks_<name>.md`; the root
+workspace excludes them, and each still builds on its own. argon was deleted: it never worked
+as a server (§1), and nothing used it. The harness finds every build through
+`binary_path(name)` in `bench/impls.py`.
+
+**Dead code** (`94416d6`):
+
+* The tokio spike went, its job done: `examples/spike_tokio.rs` (1,315 lines) and its
+  dev-dependencies. `Cargo.lock` lost six crates, and the build has no proc macros left.
+* So did the public surface only the spike used: `serve::load_view` is gone, and
+  `format_head_with` and `raise_fd_limit` are private again.
+* `TreeEntry::is_gitlink` had no caller, and `scan_oids`, which only tests used, became a
+  test helper.
+* `bench/spike_tokio.py` became `bench/ab_load.py`: its load A/B of any two builds
+  (`BASE_BIN`, `NEW_BIN`), without the spike's check mode.
+* The usage text now lists `ingest --verify-idx`.
+* The rest was audited: every remaining public item is used outside tests, every `serve` flag
+  is read, every metric is counted and exported, and no bench script passes a removed flag.
+
+**Validation** (`f100038`, the checks of §15):
+
+* `cargo test`, clippy and rustfmt are clean on x86-64 and ARM64, the ARM64 tests under qemu.
+* Byte identity with the threads build: 1,920, 1,920 and 2,064 responses identical, with 8,623
+  blobs proxied in the third mode. `ab_remote.py`: 372 identical requests in each cache
+  configuration, with the same cache counts as `8af8de8`'s.
+* Conformance 918/0. gvfs-helper 18/18, fable's client 15/15.
+* Load against `8af8de8`, the last build measured (§15, batch 4), on the week-old SearchGold
+  store with separate blobs: medians of 3 interleaved rounds, then again with the builds'
+  slots swapped (the slow-downloader and idle-connection tests ran once). Cold clones, which
+  vary most, had 5 rounds in each order.
+
+| Workload | Run 1: `8af8de8` → `f100038` | Run 2, slots swapped | Mean |
+|---|---|---|---|
+| GET blob, 64 connections: req/s · CPU per request | 1,214K → 1,227K (+1.0%) · 3.77 → 3.70 µs | 1,220K → 1,219K (−0.1%) · 3.74 → 3.72 µs | +0.5% |
+| GET blob, 1,024 connections | 1,580K → 1,595K (+0.9%) · 3.43 → 3.37 µs | 1,584K → 1,589K (+0.3%) · 3.41 → 3.38 µs | +0.6% |
+| Config, 64 connections | 1,297K → 1,304K (+0.5%) | 1,307K → 1,301K (−0.4%) | 0.0% |
+| POST of 4,000 blobs, 32 connections | 8,657 → 8,703 (+0.5%) · 904 → 898 µs | 8,684 → 8,662 (−0.3%) · 901 → 903 µs | +0.1% |
+| Sizes of 4,000 ids, 32 connections | 19,784 → 20,157 (+1.9%) · 393 → 385 µs | 19,854 → 20,118 (+1.3%) · 391 → 386 µs | +1.6% |
+| 64 GET beside 32 POST connections: GETs · POSTs per s | 417.6K → 418.7K · 6,719 → 6,773 | 418.9K → 417.6K · 6,835 → 6,796 | 0.0% · +0.1% |
+| 64 GET beside 400 slow downloaders | 1,198K → 1,201K (+0.3%) | | |
+| 64 GET beside 30,000 idle connections | 1,218K → 1,222K (+0.3%); 3.0 → 2.5 KB per idle connection | | |
+| Cold clones, 8 at a time: GB/s · CPU per GB | 79.9 → 80.3 · 25 → 26 ms | 79.3 → 82.0 · 27 → 26 ms | +1.9% |
+
+Every workload is at or above `8af8de8`: sizes gain 1.6% and GETs about 0.5%, at up to 2%
+less CPU per request. Cold clones vary more from round to round (74–87 GB/s for one binary)
+than between the builds.
+
+The README's load table was measured again on this build (`benches/load.sh`, the inline
+week-old store), with the edge pinned to 8 CPUs as everywhere in this report; the earlier
+table let the edge and loadgen share all 32. The script also sampled ids with `shuf
+--random-source=<(yes)`, the biased recipe of §9; it now seeds a uniform source. GET tree and
+POST of 4,000 ids agree with §7 (181K req/s against 182K; 369 POSTs a second at 11.2 MB each
+against 352 at 11.0 MB), and GETs, up-to-date prefetches and sizes show the gains of §13 and
+§14.
 

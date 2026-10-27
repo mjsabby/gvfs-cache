@@ -12,10 +12,15 @@ layer in front of a Git repository and is built on two primitives:
   per-directory clusters, so a rollup built only from stored slabs is as small as one
   upstream fetch of its whole range.
 
-The same binary runs as the scheduled **pipeline** (15-minute slabs rolled up through
-1h / 6h / 12h / 24h / 168h tiers in object storage) and as the **server** (remote edge or
-localhost proxy, same code). The server keeps the minutes since the last sealed slab in
-RAM as L0 slabs (one per push), built by the very same `ingest_git_delta` and `repack`.
+The same binary runs in three roles:
+
+* the scheduled **pipeline**: 15-minute slabs, rolled up through 1h / 6h / 12h / 24h / 168h
+  tiers in object storage;
+* the **server** (`serve`): a remote edge or a localhost proxy, with the same code. It keeps
+  the minutes since the last sealed slab in RAM as L0 slabs (one per push), built by the very
+  same `ingest_git_delta` and `repack`;
+* the **mirror**, for stores whose blobs live in packs of their own (`--blobs separate`): it
+  copies every blob of the history into the store, and repairs the store on demand.
 
 Every prefetch response, cold clone included, is exactly **one pack**, as native Git
 sends, with its `.idx` for VFS for Git (which installs it instead of indexing the pack).
@@ -35,14 +40,39 @@ sends, with its `.idx` for VFS for Git (which installs it instead of indexing th
         (a directory, or Azure Blob Storage)
 ```
 
-See [DESIGN.md](DESIGN.md) for formats, algorithms, engineering rules.
+Also in this repository:
+
+* [DESIGN.md](DESIGN.md): formats, algorithms and engineering rules;
+* [REPORT.md](REPORT.md): why this implementation, opus, was chosen out of five, and every
+  measurement and change since;
+* [tests_plus_benchmarks_opus.md](tests_plus_benchmarks_opus.md): the tests and benchmarks
+  of its first build;
+* `alt_clients/`: three of the other implementations (fable, sol and astra), kept for the
+  cross-client tests and the comparison. Each builds on its own, outside this workspace;
+* `bench/`: the harness behind REPORT.md (Python; stock git judges every byte).
 
 ## Build and test
+
+The toolchain is pinned in `rust-toolchain.toml` (Rust 1.99.1, edition 2024), and rustup
+installs it on first use. The daemon runs on Linux, on x86-64 or ARM64.
 
 ```sh
 cargo build --release            # target/release/gvfs-daemon
 cargo test --workspace --release # unit tests + end-to-end tests (needs git on PATH)
 cargo clippy --workspace --all-targets
+```
+
+To cross-build for ARM64 on x86-64, install an ARM64 C toolchain (Debian and Ubuntu:
+`gcc-aarch64-linux-gnu`). To run the tests as ARM64 binaries, also install `qemu-user` and
+`qemu-user-binfmt`; binfmt runs the daemons the tests start under qemu too.
+
+```sh
+export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+       CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+cargo build --release --target aarch64-unknown-linux-gnu
+CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUNNER="qemu-aarch64 -L /usr/aarch64-linux-gnu" \
+QEMU_LD_PREFIX=/usr/aarch64-linux-gnu \
+    cargo test --release --target aarch64-unknown-linux-gnu --workspace
 ```
 
 The end-to-end tests (`tests/`) run the real binary against scratch repositories and
@@ -73,18 +103,23 @@ git config remote.origin.url http://edge:8080/org/SearchGold
 git gvfs-helper --cache-server=disable prefetch
 ```
 
-`gvfs-daemon help` lists every flag. Stores: `fs:<dir>` (or a plain path) or
-`azure:<container>[/<prefix>]`, with credentials (account key or SAS connection string)
-in `AZURE_STORAGE_CONNECTION_STRING` or the variable named by `--store-auth-env`.
+`gvfs-daemon help` lists every flag. Stores are named by:
+
+* `fs:<dir>`, or a plain path;
+* `azure:<container>[/<prefix>]`, with credentials (an account key or a SAS connection
+  string) in `AZURE_STORAGE_CONNECTION_STRING`, or in the variable `--store-auth-env` names.
 
 ### Scheduling the pipeline
 
-Run one job every 15 minutes with the highest tier that is due. Runners need no state:
-everything comes from the store. A tier's rollup folds everything below it, so
-`--tier 6h` also covers the 1h rollup, and `168h` folds the whole pyramid into the week's
-delta and appends it to the baseline. Only the new commits are fetched from the upstream;
-every rollup is repacked from slabs already in the store. Concurrent runs are safe: the
-manifest is published with compare-and-swap, and the loser starts over.
+Run one job every 15 minutes with the highest tier that is due:
+
+* Runners need no state: everything comes from the store.
+* A tier's rollup folds everything below it: `--tier 6h` also covers the 1h rollup, and
+  `168h` folds the whole pyramid into the week's delta and appends it to the baseline.
+* Only the new commits are fetched from the upstream; every rollup is repacked from slabs
+  already in the store.
+* Concurrent runs are safe: the manifest is published with compare-and-swap, and the loser
+  starts over.
 
 ```sh
 m=$(date -u +%M) h=$(date -u +%H) dow=$(date -u +%u)
@@ -125,17 +160,22 @@ gvfs-daemon mirror --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT \
 gvfs-daemon serve --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT ...
 ```
 
-An edge of such a store reports ready (`/healthz`) once the mirror has copied the whole
-history. Stock gvfs-helper works unchanged: it prefetches commits and trees and faults
-blobs in (`GET`/`POST /gvfs/objects`). Clients that want sizes without blobs send
-`X-GVFS-Sizes: 1` with a prefetch and get a `GSZ1` section after the packs.
+An edge of such a store:
 
-Nothing repairs such a store by itself, and nothing should need to. If storage loses a
-blob pack or a segment index, edges and pipeline runs carry on (they log a warning, and
-edges serve the blobs involved through the proxy); an edge whose sealed trees name a blob
-the store lacks counts it in `gvfs_blobs_missing_total`. Either is the signal to run
-`gvfs-daemon mirror` again: it takes what the store lost out of `blobs.bin` and copies
-whatever is not listed, and on a whole store it copies nothing.
+* reports ready (`/healthz`) once the mirror has copied the whole history;
+* works with stock gvfs-helper unchanged, which prefetches commits and trees and faults
+  blobs in (`GET`/`POST /gvfs/objects`);
+* sends sizes without blobs to clients that ask: a prefetch with `X-GVFS-Sizes: 1` gets a
+  `GSZ1` section after the packs.
+
+Nothing repairs such a store by itself, and nothing should need to:
+
+* If storage loses a blob pack or a segment index, edges and pipeline runs carry on. They
+  log a warning, and edges serve the blobs involved through the proxy.
+* An edge whose sealed trees name a blob the store lacks counts it in
+  `gvfs_blobs_missing_total`.
+* Either is the signal to run `gvfs-daemon mirror` again. It takes what the store lost out
+  of `blobs.bin` and copies whatever is not listed; on a whole store it copies nothing.
 
 ### Inspecting
 
@@ -148,17 +188,31 @@ gvfs-daemon inspect slab /nvme/gvfs-cache/base-1792879257-83da3df7dce1a81c.mphf
 #   3341849 GitHFS pointers -> 255.81 TiB of content; 592 other blobs (12.79 MiB)
 ```
 
-`inspect slab --write-idx out.idx` writes the `.idx` a VFS for Git client would be sent
-with that pack. `gvfs-daemon repack --out <dir> [--frozen <base.mphf>] <slab.mphf>...` runs
-the optimal splice by hand.
+Two more tools work on slabs directly:
 
-`curl http://edge:8080/metrics` reports request, byte, and L0 counters, the manifest
-generation, and `gvfs_alloc_hot_path_total`, which must stay 0. Separate-blob stores add
-`gvfs_blobs_from_store_total`, `gvfs_blobs_proxied_total`, `gvfs_blobs_missing_total`
-(should stay 0), `gvfs_blobs_unavailable_total`, `gvfs_blobs_generation` and
-`gvfs_blobs_complete`, and for blob packs in object storage the
-edge's block cache (`gvfs_blob_cache_{hits,misses,fetches,bypass}_total`, `gvfs_blob_cache_bytes`;
-size it with `--blob-cache-mib`, default 32 GiB).
+* `inspect slab --write-idx out.idx` writes the `.idx` a VFS for Git client would be sent
+  with that pack;
+* `gvfs-daemon repack --out <dir> [--frozen <base.mphf>] <slab.mphf>...` runs the optimal
+  splice by hand.
+
+`curl http://edge:8080/metrics` reports, in Prometheus text format:
+
+* **requests:** `gvfs_requests_total` by endpoint, prefetch packs sent, 404s
+  (`gvfs_not_found_total`), 503s for want of an arena or growth budget (`gvfs_busy_total`),
+  errors, and the bytes and objects sent;
+* **the store:** slabs, L0 slabs, L0 ingests, manifest loads and the manifest's generation;
+* **allocations:** `gvfs_alloc_hot_path_total` (and its bytes), which must stay 0, and every
+  allocation since startup, anywhere (`gvfs_alloc_post_seal_total`);
+* **connections:** open and idle; idle ones closed after `--idle-secs`, ones closed because
+  `--max-idle-conns` was reached, and how often `--max-conns` held new ones back. Also the
+  shared budget left for oversized buffers (`gvfs_buffer_spare_bytes`), and the room arenas
+  have grown into for commit expansions (`gvfs_grown_objects`, within `--grow-objects`);
+* **separate-blob stores:** blobs served from the store, proxied, missing (should stay 0)
+  and unavailable; the `blobs.bin` generation, and whether it is complete
+  (`gvfs_blobs_complete`);
+* **blob packs in object storage:** the edge's block cache
+  (`gvfs_blob_cache_{hits,misses,fetches,bypass}_total`, `gvfs_blob_cache_bytes`); size it
+  with `--blob-cache-mib` (default 32 GiB).
 
 ## Performance
 
@@ -205,37 +259,49 @@ one self-contained upstream pack of exactly the objects the client lacks.
 | developer: fetch each weekday morning | 9 | 9 | 9.0 | 5.9 | 1.53 | 1.31 | 1.02 |
 | developer: back after 8 days off | 3 | 3 | 5.0 | 4.3 | 1.17 | 1.09 | 1.02 |
 
-Warm rows exclude each client's initial clone (one pack, 1.00× ideal). Every response is
-one pack: the slabs from the client's cursor to the tip, repacked together when there are
-several. The default `--superset-tier 24h` also sends each sealed day and week to each
-client whole, once (0.65 MiB a day here), so that stock client maintenance can delete the
-small packs it subsumes; `168h` does it for weeks only and `never` sends exact covers
-(the last two columns; DESIGN.md, "Prefetch plans"). Before plans were exact covers
-(DESIGN.md, "Warm traffic"), warm clients got 2.2-2.5× the ideal. Keeping replaced slabs
-listed costs 277 slabs (29.5 MiB) and a 38 KB manifest.
+Notes on this table:
 
-Load (`benches/load.sh`, loadgen on the same host, `--alloc-guard strict`: 0 hot-path
-allocations, 0 errors):
+* Warm rows exclude each client's initial clone (one pack, 1.00× ideal).
+* Every response is one pack: the slabs from the client's cursor to the tip, repacked
+  together when there are several.
+* The default `--superset-tier 24h` also sends each sealed day and week to each client
+  whole, once (0.65 MiB a day here), so that stock client maintenance can delete the small
+  packs it subsumes. `168h` does it for weeks only, and `never` sends exact covers (the last
+  two columns; DESIGN.md, "Prefetch plans").
+* Before plans were exact covers (DESIGN.md, "Warm traffic"), warm clients got 2.2-2.5× the
+  ideal.
+* Keeping replaced slabs listed costs 277 slabs (29.5 MiB) and a 38 KB manifest.
+
+Load (`benches/load.sh` against `f100038`): SearchGold after a week of pipeline runs (an
+inline store, 12 live slabs), the edge on 8 CPUs (4 cores and their SMT siblings) with
+`--alloc-guard strict` and `--prefetch-idx never`, loadgen on the other 16 CPUs. Ids are
+400,000 sampled uniformly from main. There were 0 hot-path allocations and 0 errors.
 
 | Workload | Throughput | p50 / p99 |
 |---|---|---|
-| `GET /gvfs/objects/<blob>` (loose) | 1.02M req/s | 59 / 128 µs |
-| `GET /gvfs/objects/<tree>` (deltified: resolved, deflated) | 265K req/s, 1.3 GB/s | 190 / 853 µs |
-| `POST /gvfs/objects`, 4000 ids → one pack | 1,106 req/s, 10.0 GB/s | 28 / 41 ms |
-| `POST /gvfs/sizes`, 4000 ids | 19.2K req/s | 1.5 / 3.0 ms |
-| prefetch, up to date | 1.09M req/s | 55 / 121 µs |
-| prefetch, warm (266 KB L0 pack) | 71K req/s | 0.84 ms |
-| prefetch, cold (2.6 GB pack via `sendfile`) | 48.5 GB/s aggregate (8 conns) | 392 ms |
+| `GET /gvfs/objects/<blob>` (loose) | 1.24M req/s | 49 / 100 µs |
+| `GET /gvfs/objects/<tree>` (deltified: resolved, deflated) | 181K req/s, 0.72 GB/s | 328 / 853 µs |
+| `POST /gvfs/objects`, 4000 ids → one pack (11.2 MB, delta bases included) | 369 req/s, 4.1 GB/s | 86 / 94 ms |
+| `POST /gvfs/sizes`, 4000 ids | 17.0K req/s | 1.8 / 2.8 ms |
+| prefetch, up to date | 1.29M req/s | 47 / 92 µs |
+| prefetch, warm (265 KB: the last 3.3 hours of slabs) | 72K req/s, 19.1 GB/s | 0.88 / 1.57 ms |
+| prefetch, cold (2.6 GB pack via `sendfile`) | 81 GB/s aggregate (8 conns) | 241 / 377 ms |
+
+A uniform sample is mostly trees (57% of main's objects), most of them deltified: the
+costliest objects to serve. With separate blobs, a POST of 4,000 blobs runs at 8,700 req/s,
+and sizes of 4,000 at 20,100 (REPORT.md §16).
 
 ## Repository layout
 
 ```text
-src/main.rs, cli.rs        command dispatch and flag parsing (no framework)
+src/main.rs, cli.rs        command dispatch and flag parsing (no framework); lib.rs: the modules
 src/ingest.rs              primitive 1: ingest_git_delta + the parallel pack indexer
 src/splice.rs              primitive 2 on the wire: pack plans, object splices
 src/repack.rs              primitive 2 into a slab: the optimal splice (tree clusters)
 src/idx.rs                 the git .idx of a prefetch pack (merged per-slab sorted runs)
 src/slab.rs, mphf.rs       slab index format and the partitioned PTHash MPHF
+src/idfilter.rs            blocked Bloom filters that rule slabs out of a lookup
+src/timeline.rs            commit-derived timestamps; which slabs answer a client's cursor
 src/pipeline.rs            the scheduled job: genesis, 15m, rollups, weekly, GC
 src/mirror.rs              --blobs separate: the resumable seed (and on-demand repair) of the blob packs
 src/separate.rs            --blobs separate: what pipeline, mirror and edge share (sizes, blob index,
@@ -253,15 +319,21 @@ src/aclient.rs             the async HTTP client (hyper, tokio-rustls): the upst
 src/http.rs                the blocking HTTP client (the Azure store's other calls, tests)
 src/pack.rs, zlib.rs, delta.rs, object.rs, hfs.rs   git formats (delta.rs: tree delta encoder)
 src/arena.rs               per-request arenas (no allocation while serving)
+src/inspect.rs             `gvfs-daemon inspect`: the manifest and slabs, readable
+src/util.rs, fsutil.rs, b64.rs   errors, ids, hex, time, logging; durable writes; base64
 crates/gvfs-alloc-guard    counting global allocator that enforces zero hot-path allocations
 crates/gvfs-mmap           the one memory map
-crates/gvfs-prefetch       the one cache prefetch hint (batched lookups); with the two above,
-                           the only `unsafe` in the workspace
+crates/gvfs-prefetch       the one cache prefetch hint (batched lookups; x86-64 and ARM64);
+                           with the two above, the only `unsafe` in the workspace
 tests/                     end-to-end tests (pipeline, serve, HTTP v2/v0, gvfs-helper, Azure,
                            separate blobs)
 benches/load.sh            the load table above
 benches/rollup.sh          the rollup table above (any repository, any week)
 examples/clients.rs        the client traffic table above (simulated clock, any window)
-examples/spike_tokio.rs    the connection layer on tokio, with its own HTTP/1 or hyper's
-                           (REPORT.md §14; its dev-dependencies are not in the binary)
+rust-toolchain.toml        the pinned toolchain (Rust 1.99.1; x86-64 and ARM64 Linux targets)
+DESIGN.md, REPORT.md       the design, and the evidence: the comparison and every change since
+bench/                     the harness behind REPORT.md (conformance, cross-client, replays,
+                           load, profiles, byte-identity A/Bs of two builds)
+alt_clients/               fable, sol and astra: other implementations of the same design, each
+                           a workspace of its own with its tests_plus_benchmarks_<name>.md
 ```

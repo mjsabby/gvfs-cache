@@ -6,14 +6,17 @@ change). The README covers usage and benchmarks.
 
 ## Engineering rules
 
-These are the rules of `gvfs-server/opus/DESIGN.md`, applied to this workspace:
+These rules come from the design of this daemon's predecessor (`opus/DESIGN.md` in the
+gvfs-server repository), and they hold for the whole workspace:
 
 1. **Safe Rust.** The main crate inherits `unsafe_code = "forbid"` from the workspace.
    Three operations cannot be written safely: a `GlobalAlloc` implementation, `mmap(2)`,
-   and a cache prefetch hint (`_mm_prefetch` is a `#[target_feature(enable = "sse")]`
-   function, so calling it from code that does not itself list `sse` is `unsafe`, although
-   every x86-64 CPU has SSE). Each lives in its own tiny crate (`crates/gvfs-alloc-guard`,
-   `crates/gvfs-mmap`, `crates/gvfs-prefetch`) with `undocumented_unsafe_blocks` denied.
+   and a cache prefetch hint. On x86-64 the hint is `_mm_prefetch`, a
+   `#[target_feature(enable = "sse")]` function, so calling it from code that does not
+   itself list `sse` is `unsafe`, although every x86-64 CPU has SSE. On ARM64 it is a
+   `prfm pldl1keep` instruction, written with `asm!`. Each operation lives in its own tiny
+   crate (`crates/gvfs-alloc-guard`, `crates/gvfs-mmap`, `crates/gvfs-prefetch`) with
+   `undocumented_unsafe_blocks` denied.
 2. **No panics.** `unwrap_used`, `expect_used`, `panic`, `indexing_slicing`,
    `arithmetic_side_effects`, `todo`, `unimplemented`, and `unreachable` are denied. Slices
    are read with `.get()` and slice patterns; arithmetic is checked, saturating, or
@@ -31,7 +34,8 @@ These are the rules of `gvfs-server/opus/DESIGN.md`, applied to this workspace:
 4. **Few dependencies, in-house wire formats.** pkt-line, pack/idx/delta, the GVFS
    prefetch stream, HTTP/1.1 (client and server), JSON scanning, base64, the manifest, and
    the slab index are written here. Dependencies are only what would be unwise to rewrite:
-   `zlib-rs` (SIMD inflate/deflate), `sha1` (SHA-NI), `ring` + `rustls` + `webpki-roots`
+   `zlib-rs` (SIMD inflate/deflate), `sha1` (the CPU's SHA instructions, found at run
+   time: SHA-NI on x86-64, the SHA extension on ARMv8), `ring` + `rustls` + `webpki-roots`
    (TLS, HMAC), `nix` (`sendfile`), `memmap2`, and `tokio` (the edge's runtime: sockets,
    timers, its scheduler, child processes). There is no CLI framework and no serde. The
    edge's HTTP/1.1 server stays in-house on tokio's sockets: hyper's server copies every

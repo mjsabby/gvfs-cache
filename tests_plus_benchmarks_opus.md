@@ -1,6 +1,6 @@
 # gvfs-daemon: standard tests and benchmarks
 
-This lists every test and measurement run on **opus** (`/home/muks/gvfs-daemon/opus`) during its build. It is written so that **argon, astra, fable and sol** (`/home/muks/gvfs-daemon/<name>`) can go through the same suite. Each item has a stable ID, a setup, a procedure, and a pass criterion or metric, followed by opus's result. §9 is the cross-implementation results matrix with opus filled in.
+This lists every test and measurement run on **opus** (this repository's root) during its build. It was written so that **argon, astra, fable and sol** could go through the same suite; astra, fable and sol now live in `alt_clients/<name>`, and argon was removed. Each item has a stable ID, a setup, a procedure, and a pass criterion or metric, followed by opus's result. §9 is the cross-implementation results matrix with opus filled in. This document records opus as it was built; REPORT.md has the comparison and everything measured and changed since.
 
 ## 0. Requirements under test
 
@@ -23,7 +23,7 @@ This lists every test and measurement run on **opus** (`/home/muks/gvfs-daemon/o
 - **opus stages.** Each opus result says which stage it was measured on:
   - **P1, initial design.** Slabs were the upstream's packs, kept verbatim. Rollups re-fetched from the upstream, prefetch concatenated whole slabs, there was no `.idx`, and timestamps came from the wall clock.
   - **P2, optimal splice.** The pipeline only repacks stored slabs, with per-directory tree clusters. The seed's REF deltas are re-pointed as OFS deltas, and non-git clients are sent a `.idx`.
-  - **P3, final** (the snapshot in `opus/`). Timestamps are derived from commits. Replaced slabs are retained and rollups cascade. Each push gets one L0 slab. Every prefetch is the exact cover from the client's cursor, repacked into one pack.
+  - **P3, final** (the snapshot the comparison started from). Timestamps are derived from commits. Replaced slabs are retained and rollups cascade. Each push gets one L0 slab. Every prefetch is the exact cover from the client's cursor, repacked into one pack.
 
   The request paths (GET, POST, sizes, pack streaming) did not change materially after P1, but prefetch plan selection did. Re-measure P1/P2 numbers on P3 before ranking.
 - **Units.** Sizes are in bytes, with KiB/MiB/GiB = 2^10/2^20/2^30. Throughput in GB/s is 10^9 B/s, as loadgen reports it. Times are wall clock.
@@ -44,7 +44,7 @@ This lists every test and measurement run on **opus** (`/home/muks/gvfs-daemon/o
 | RAM | 89 GiB |
 | OS | Linux 7.3.0. CPU mitigations are compiled out. `init_on_alloc` is on, so the kernel zeroes every TCP send page; this shows in send-bound profiles. |
 | Disk | NVMe with ext4 for `/home`. `/tmp` is a 45 GB tmpfs (RAM), so keep multi-GB scratch data under `/home`. |
-| Toolchain | rustc 1.97.1. git 2.53.0 for upstreams and all validation. Microsoft git 2.56.0.vfs.0.2.5 at `~/git/bin-wrappers/git` for `gvfs-helper`. |
+| Toolchain | rustc 1.97.1 (now 1.99.1, pinned by `rust-toolchain.toml`). git 2.53.0 for upstreams and all validation. Microsoft git 2.56.0.vfs.0.2.5 at `~/git/bin-wrappers/git` for `gvfs-helper`. |
 | Load generator | `~/gvfs-server-benchmark/target/loadgen/release/loadgen` (Rust/hyper, closed loop, HTTP/1.1, HDR histograms) |
 | Azure | Azurite emulator (npm `azurite`): in-memory, Shared Key, path-style endpoint |
 | Placement | Loopback only, nothing pinned. Server, load generator and upstream shared all 32 threads. |
@@ -59,7 +59,7 @@ G is an upstream bare repository (`git init --bare -b main`) plus a worktree tha
 2. It adds `p` pointer files at `d<i%4>/e<i%3>/f<k>-<i>.dat` with the content `~~Git-hfs 1.0\nblob:<k*1000+i as 64 uppercase hex digits>\nsize:<k*7+i>\n`.
 3. It commits as `t <t@t>` and pushes `HEAD:main`.
 
-Reference: `opus/tests/common/mod.rs` (`Upstream`).
+Reference: `tests/common/mod.rs` (`Upstream`).
 
 ### 3.2 SG: SearchGold
 
