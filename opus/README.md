@@ -250,9 +250,11 @@ src/manifest.rs, store.rs, azure.rs    manifest.bin (CAS) and the fs / Azure sto
 src/serve/                 the server on tokio: view (prefetch plans), httpd, conn (a task per
                            connection), handlers, budget (yields), live L0 loop, blobs (blob
                            packs and the read-through proxy), blobcache
-src/upstream.rs, http.rs, pktline.rs   git protocol v2/v0 over smart HTTP or a local repo
-src/aclient.rs             the edge's async HTTP client (hyper, tokio-rustls) for its fetches
-                           while serving (Azure ranged reads, the blob proxy's upstream)
+src/upstream.rs, pktline.rs   git protocol v2/v0 over smart HTTP or a local repo (async;
+                           `Upstream` blocks on it for the pipeline, mirror and live loop)
+src/aclient.rs             the async HTTP client (hyper, tokio-rustls): the upstream's requests
+                           and the edge's Azure ranged reads
+src/http.rs                the blocking HTTP client (the Azure store's other calls, tests)
 src/pack.rs, zlib.rs, delta.rs, object.rs, hfs.rs   git formats (delta.rs: tree delta encoder)
 src/arena.rs               per-request arenas (no allocation while serving)
 crates/gvfs-alloc-guard    counting global allocator that enforces zero hot-path allocations

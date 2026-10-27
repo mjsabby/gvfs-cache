@@ -3,9 +3,11 @@
 //!
 //! The edge's fetches while it serves (ranged reads of blob packs in object storage, the
 //! blob proxy's requests to the upstream) use it, so that a slow or stalled origin parks a
-//! task instead of holding a thread. The pipeline, the mirror and the edge's live loop run
-//! on their own threads and keep the blocking [`crate::http`] client. A client's connections
-//! run on the runtime that made them: use one from a single runtime.
+//! task instead of holding a thread. Every request to the upstream goes through it: the
+//! pipeline, the mirror and the edge's live loop make theirs through
+//! [`crate::upstream::Upstream`], which runs them on a runtime of its own. Their calls to
+//! object storage keep the blocking [`crate::http`] client. A client's connections run on
+//! the runtime that made them: use one from a single runtime.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;

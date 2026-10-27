@@ -1,8 +1,9 @@
 //! A small blocking HTTP/1.1 client (plain or TLS via rustls) with streaming bodies.
 //!
-//! Used for the upstream git server (smart HTTP) and the Azure Blob store. One `Client`
-//! owns at most one keep-alive connection to one origin; callers that need parallelism
-//! create several clients.
+//! Used for the Azure Blob store's calls from threads that block (the pipeline, the mirror,
+//! the edge's live loop; the upstream's requests go through [`crate::aclient`]). One
+//! `Client` owns at most one keep-alive connection to one origin; callers that need
+//! parallelism create several clients.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;

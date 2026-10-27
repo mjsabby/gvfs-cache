@@ -37,8 +37,9 @@ These are the rules of `gvfs-server/opus/DESIGN.md`, applied to this workspace:
    edge's HTTP/1.1 server stays in-house on tokio's sockets: hyper's server copies every
    body (no `sendfile`) and allocates per request (REPORT.md §14). Its fetches while it
    serves (object storage, the blob proxy's upstream) use hyper's client with
-   `tokio-rustls` (`src/aclient.rs`); the pipeline, the mirror and the live loop keep the
-   blocking in-house client on their own threads.
+   `tokio-rustls` (`src/aclient.rs`), and so does every request to the upstream: the
+   pipeline, the mirror and the live loop block on theirs (`Upstream` runs them on a
+   runtime of its own). Their object-store calls keep the blocking in-house client.
 
 Code style: plain structs, slices, and indices into arenas; explicit loops; no trait
 hierarchies or generic plumbing.

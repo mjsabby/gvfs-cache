@@ -1670,11 +1670,12 @@ fn a_manifest_names_the_blobs_generation_its_trees_need() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The edge's async upstream client (`AsyncUpstream`, the blob proxy's) over each transport
-/// it meets: a local repository; smart HTTP with protocol v2 (blobs by id, `object-info`,
-/// as Azure DevOps allows them); and a GVFS upstream (another edge: `POST /gvfs/objects` and
-/// `POST /gvfs/sizes`). Every blob asked for arrives, verified by id as it streams in, and
-/// every size is git's.
+/// The upstream client over each transport it meets: a local repository; smart HTTP with
+/// protocol v2 (blobs by id, `object-info`, as Azure DevOps allows them); and a GVFS upstream
+/// (another edge: `POST /gvfs/objects` and `POST /gvfs/sizes`). Through `AsyncUpstream` (the
+/// blob proxy's) every blob asked for arrives, verified by id as it streams in; through the
+/// blocking `Upstream` (the pipeline's and the mirror's) as one pack git indexes. Every size
+/// is git's.
 #[test]
 fn async_upstream_fetches_blobs_and_sizes_over_every_transport() {
     use gvfs_daemon::serve::blobs::fetch_into;
@@ -1764,6 +1765,20 @@ fn async_upstream_fetches_blobs_and_sizes_over_every_transport() {
             vec![sizes[0]],
             "{label}"
         );
+
+        // The blocking client makes the same requests on a runtime of its own.
+        let mut b = gvfs_daemon::upstream::Upstream::open(&spec, "main", &auth).unwrap();
+        let mut pack = Vec::new();
+        b.fetch_objects(&oids, &mut pack).unwrap();
+        let repo = fresh_repo(&root, &format!("blocking-{label}"));
+        assert_eq!(install_pack(&repo, &pack), oids.len(), "{label}");
+        let ids: Vec<String> = blobs.keys().cloned().collect();
+        assert!(
+            cat_batch(&repo, &ids) == cat_batch(&up.bare, &ids),
+            "{label}: blob contents"
+        );
+        assert_eq!(b.object_sizes(&oids).unwrap(), sizes, "{label}");
+        assert_eq!(b.object_sizes(one).unwrap(), vec![sizes[0]], "{label}");
     }
     assert!(http.v2_posts() > 0);
     edge.assert_clean();

@@ -17,40 +17,21 @@
 //! `POST /gvfs/sizes`, otherwise through protocol v2 (`filter`, `want <id>`, `object-info`)
 //! where the server advertises it.
 //!
-//! [`Upstream`] is blocking (the pipeline, the mirror, the edge's live loop, each on its
-//! own thread); [`AsyncUpstream`] makes the same requests for the edge's blob proxy while it
-//! serves.
+//! [`AsyncUpstream`] makes every request, on the async client or an async `git upload-pack`,
+//! so that a fetch parks its task, not a thread: the edge's blob proxy uses it while it
+//! serves. [`Upstream`] makes the same requests for threads that block (the pipeline, the
+//! mirror, the edge's live loop), on a runtime of its own.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use crate::http::{Client, Url};
+use crate::http::Url;
 use crate::pktline::{self, Pkt};
 use crate::util::{Context, Oid, Result};
 
 const AGENT: &str = concat!("agent=gvfs-daemon/", env!("CARGO_PKG_VERSION"), "\n");
-
-enum Transport {
-    Local { git_dir: PathBuf },
-    Http { client: Client },
-}
-
-pub struct Upstream {
-    transport: Transport,
-    /// `refs/heads/<branch>`.
-    pub branch_ref: String,
-    /// Protocol v2 (detected for HTTP; always for local repositories).
-    v2: bool,
-    detected: bool,
-    /// Protocol v2 capabilities advertised over HTTP (`fetch=... filter`, `object-info`).
-    caps: Vec<String>,
-    /// The HTTP upstream answers the GVFS protocol (`GET /gvfs/config`): detected once.
-    gvfs: Option<bool>,
-    /// Human-readable description for logs.
-    pub label: String,
-}
 
 /// Ids per `object-info` / `/gvfs/sizes` request, and per blob batch.
 pub const BATCH: usize = 4000;
@@ -76,236 +57,51 @@ pub struct Auth {
     pub header: Option<String>,
 }
 
+/// The upstream for threads that block: [`AsyncUpstream`]'s requests, each run to its end on
+/// a runtime of this upstream's own (on the calling thread). Not for use inside a runtime.
+pub struct Upstream {
+    inner: AsyncUpstream,
+    rt: tokio::runtime::Runtime,
+    /// `refs/heads/<branch>`.
+    branch_ref: String,
+}
+
 impl Upstream {
     /// `spec` is an http(s) URL or a local repository path.
     pub fn open(spec: &str, branch: &str, auth: &Auth) -> Result<Upstream> {
-        refuse_password(spec)?;
+        let inner = AsyncUpstream::open(spec, auth)?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ctx("starting the upstream's runtime")?;
         let branch_ref = if branch.starts_with("refs/") {
             branch.to_string()
         } else {
             format!("refs/heads/{branch}")
         };
-        let transport = if spec.starts_with("http://") || spec.starts_with("https://") {
-            let mut client = Client::new(Url::parse(spec)?, Duration::from_secs(300));
-            if let Some(h) = &auth.header {
-                client
-                    .default_headers
-                    .push(("Authorization".into(), h.clone()));
-            }
-            Transport::Http { client }
-        } else {
-            let p = PathBuf::from(spec.strip_prefix("file://").unwrap_or(spec));
-            if !p.exists() {
-                crate::bail!(
-                    "upstream {}: no such repository",
-                    crate::http::redacted(spec)
-                );
-            }
-            Transport::Local { git_dir: p }
-        };
-        let is_local = matches!(transport, Transport::Local { .. });
         Ok(Upstream {
-            transport,
+            inner,
+            rt,
             branch_ref,
-            v2: true,
-            detected: is_local,
-            caps: Vec::new(),
-            gvfs: if is_local { Some(false) } else { None },
-            label: crate::http::redacted(spec),
         })
     }
 
-    /// Runs one stateless request and hands the response stream to `on_response`.
-    fn rpc<T>(
-        &mut self,
-        request: &[u8],
-        v2: bool,
-        on_response: impl FnOnce(&mut dyn Read) -> Result<T>,
-    ) -> Result<T> {
-        match &mut self.transport {
-            Transport::Local { git_dir } => {
-                let mut cmd = Command::new("git");
-                // Our own repository: allow what separate-blob stores ask for.
-                cmd.args([
-                    "-c",
-                    "uploadpack.allowFilter=true",
-                    "-c",
-                    "uploadpack.allowAnySHA1InWant=true",
-                    "-c",
-                    "transfer.advertiseObjectInfo=true",
-                ]);
-                cmd.arg("upload-pack").arg("--stateless-rpc").arg(&*git_dir);
-                hermetic_git_env(&mut cmd);
-                if v2 {
-                    cmd.env("GIT_PROTOCOL", "version=2");
-                }
-                let mut child = cmd
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .ctx("running git upload-pack")?;
-                {
-                    let mut stdin = child.stdin.take().ctx("upload-pack stdin")?;
-                    stdin.write_all(request).ctx("writing to upload-pack")?;
-                }
-                let mut stdout = child.stdout.take().ctx("upload-pack stdout")?;
-                let result = on_response(&mut stdout);
-                drop(stdout);
-                let out = child.wait_with_output().ctx("waiting for upload-pack")?;
-                match result {
-                    Err(e) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        Err(crate::err!("{e} ({})", stderr.trim()))
-                    }
-                    Ok(v) if out.status.success() => Ok(v),
-                    Ok(_) => crate::bail!(
-                        "git upload-pack failed: {}",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    ),
-                }
-            }
-            Transport::Http { client } => {
-                let mut headers = vec![
-                    ("Content-Type", "application/x-git-upload-pack-request"),
-                    ("Accept", "application/x-git-upload-pack-result"),
-                ];
-                if v2 {
-                    headers.push(("Git-Protocol", "version=2"));
-                }
-                let mut resp = client
-                    .request("POST", "/git-upload-pack", &headers, request)?
-                    .ensure_ok("git-upload-pack")?;
-                let v = on_response(&mut resp)?;
-                resp.finish()?;
-                Ok(v)
-            }
-        }
-    }
-
-    /// Detects protocol v2 from the HTTP capability advertisement (once).
-    fn detect(&mut self) -> Result<()> {
-        if self.detected {
-            return Ok(());
-        }
-        if let Transport::Http { client } = &mut self.transport {
-            let mut resp = client
-                .request(
-                    "GET",
-                    "/info/refs?service=git-upload-pack",
-                    &[("Git-Protocol", "version=2")],
-                    b"",
-                )?
-                .ensure_ok("info/refs")?;
-            let body = resp.body_vec(64 << 20)?;
-            self.v2 = advertisement_is_v2(&body)?;
-            if self.v2 {
-                self.caps = advertised_caps(&body)?;
-            }
-        }
-        self.detected = true;
-        Ok(())
-    }
-
-    /// Whether the upstream offers protocol v2 capability `name` (`fetch` features are
-    /// matched as `fetch:<feature>`). Local repositories offer everything we ask for.
-    fn has_cap(&self, name: &str) -> bool {
-        has_cap(
-            matches!(self.transport, Transport::Local { .. }),
-            &self.caps,
-            name,
-        )
-    }
-
-    /// Whether this is an HTTP upstream answering the GVFS protocol (detected once).
-    pub fn is_gvfs(&mut self) -> bool {
-        if let Some(g) = self.gvfs {
-            return g;
-        }
-        let g = match &mut self.transport {
-            Transport::Http { client } => client
-                .request("GET", "/gvfs/config", &[], b"")
-                .ok()
-                .and_then(|mut r| {
-                    let ok = r.status == 200;
-                    let _ = r.body_vec(1 << 20);
-                    ok.then_some(true)
-                })
-                .unwrap_or(false),
-            Transport::Local { .. } => false,
-        };
-        self.gvfs = Some(g);
-        g
+    /// Human-readable description for logs (no credentials).
+    pub fn label(&self) -> &str {
+        &self.inner.label
     }
 
     /// The current tip of the followed branch.
     pub fn head(&mut self) -> Result<Oid> {
-        self.detect()?;
-        if !self.v2 {
-            return self.head_v0();
-        }
-        let mut req = Vec::new();
-        pktline::put_str(&mut req, "command=ls-refs\n");
-        pktline::put_str(&mut req, AGENT);
-        pktline::delim(&mut req);
-        pktline::put_str(&mut req, &format!("ref-prefix {}\n", self.branch_ref));
-        pktline::flush(&mut req);
-        let branch = self.branch_ref.clone();
-        let found = self.rpc(&req, true, |r| {
-            let mut rd = pktline::Reader::new(r);
-            let mut found = None;
-            loop {
-                match rd.read()? {
-                    Pkt::Data(n) => {
-                        let line = rd.line(n);
-                        check_err(line)?;
-                        let (hex, rest) = line.split_at_checked(40).ctx("bad ls-refs line")?;
-                        let name = rest.strip_prefix(b" ").unwrap_or(rest);
-                        let name = name.split(|&b| b == b' ').next().unwrap_or(name);
-                        if name == branch.as_bytes() {
-                            found = Oid::from_hex(hex);
-                        }
-                    }
-                    Pkt::Flush | Pkt::Eof => return Ok(found),
-                    _ => {}
-                }
-            }
-        })?;
-        found.with_ctx_str(|| format!("{}: no {}", self.label, self.branch_ref))
-    }
-
-    fn head_v0(&mut self) -> Result<Oid> {
-        let Transport::Http { client } = &mut self.transport else {
-            crate::bail!("v0 is only used over HTTP");
-        };
-        let mut resp = client
-            .request("GET", "/info/refs?service=git-upload-pack", &[], b"")?
-            .ensure_ok("info/refs")?;
-        let body = resp.body_vec(256 << 20)?;
-        drop(resp);
-        let mut rd = pktline::Reader::new(&body[..]);
-        loop {
-            match rd.read()? {
-                Pkt::Data(n) => {
-                    let line = rd.line(n);
-                    let line = line.split(|&b| b == 0).next().unwrap_or(line);
-                    if let Some((hex, name)) = line.split_at_checked(40) {
-                        if name.strip_prefix(b" ") == Some(self.branch_ref.as_bytes()) {
-                            return Oid::from_hex(hex).ctx("bad ref line");
-                        }
-                    }
-                }
-                Pkt::Eof => crate::bail!("{}: no {}", self.label, self.branch_ref),
-                _ => {}
-            }
-        }
+        self.rt.block_on(self.inner.head(&self.branch_ref))
     }
 
     /// Fetches the objects reachable from `want` but not from any of `haves` (none =
     /// everything) as one non-thin pack, written to `out`. Returns the pack length. Haves
     /// the upstream does not know (history rewritten) are ignored by it.
     pub fn fetch(&mut self, haves: &[Oid], want: &Oid, out: &mut dyn Write) -> Result<u64> {
-        self.fetch_with(haves, std::slice::from_ref(want), None, out)
+        self.rt
+            .block_on(self.inner.fetch(haves, want, None, &mut ToWriter(out)))
     }
 
     /// Like [`Upstream::fetch`] with a filter (`blob:none`: commits and trees only).
@@ -316,105 +112,33 @@ impl Upstream {
         filter: &str,
         out: &mut dyn Write,
     ) -> Result<u64> {
-        self.detect()?;
-        if !self.v2 || !self.has_cap("fetch:filter") {
-            crate::bail!(
-                "{}: the upstream does not support fetch filters",
-                self.label
-            );
-        }
-        self.fetch_with(haves, std::slice::from_ref(want), Some(filter), out)
+        self.rt.block_on(
+            self.inner
+                .fetch(haves, want, Some(filter), &mut ToWriter(out)),
+        )
     }
 
     /// Fetches exactly the objects `oids` (blobs) as one pack written to `out`: through
     /// `POST /gvfs/objects` from a GVFS upstream, else as protocol v2 `want`s. Returns the
     /// pack length.
     pub fn fetch_objects(&mut self, oids: &[Oid], out: &mut dyn Write) -> Result<u64> {
-        if self.is_gvfs() {
-            let body = gvfs_objects_body(oids);
-            let Transport::Http { client } = &mut self.transport else {
-                crate::bail!("GVFS upstreams are HTTP");
-            };
-            let mut resp = client
-                .request(
-                    "POST",
-                    "/gvfs/objects",
-                    &[
-                        ("Content-Type", "application/json"),
-                        ("Accept", "application/x-git-packfile"),
-                    ],
-                    body.as_bytes(),
-                )?
-                .ensure_ok("POST /gvfs/objects")?;
-            let n = std::io::copy(&mut resp, out).ctx("reading /gvfs/objects")?;
-            resp.finish()?;
-            return Ok(n);
-        }
-        self.detect()?;
-        if !self.v2 {
-            crate::bail!("{}: fetching blobs by id needs protocol v2", self.label);
-        }
-        self.fetch_with(&[], oids, None, out)
+        self.rt
+            .block_on(self.inner.fetch_objects(oids, &mut ToWriter(out)))
     }
 
     /// The sizes of objects `oids`, in order (`None`: the upstream does not have it):
     /// `POST /gvfs/sizes` from a GVFS upstream, else protocol v2 `object-info`.
     pub fn object_sizes(&mut self, oids: &[Oid]) -> Result<Vec<Option<u64>>> {
-        let mut out = Vec::with_capacity(oids.len());
-        for batch in oids.chunks(BATCH) {
-            if self.is_gvfs() {
-                self.gvfs_sizes(batch, &mut out)?;
-            } else {
-                self.object_info(batch, &mut out)?;
-            }
-        }
-        Ok(out)
+        self.rt.block_on(self.inner.object_sizes(oids))
     }
+}
 
-    fn gvfs_sizes(&mut self, oids: &[Oid], out: &mut Vec<Option<u64>>) -> Result<()> {
-        let body = gvfs_sizes_body(oids);
-        let Transport::Http { client } = &mut self.transport else {
-            crate::bail!("GVFS upstreams are HTTP");
-        };
-        let mut resp = client
-            .request(
-                "POST",
-                "/gvfs/sizes",
-                &[("Content-Type", "application/json")],
-                body.as_bytes(),
-            )?
-            .ensure_ok("POST /gvfs/sizes")?;
-        let text = resp.body_vec(oids.len().saturating_mul(128).saturating_add(1 << 16))?;
-        let found = parse_gvfs_sizes(&text);
-        out.extend(oids.iter().map(|o| found.get(o).copied()));
-        Ok(())
-    }
+/// A fetched pack's pieces, written to a blocking writer.
+struct ToWriter<'a>(&'a mut dyn Write);
 
-    fn object_info(&mut self, oids: &[Oid], out: &mut Vec<Option<u64>>) -> Result<()> {
-        self.detect()?;
-        if !self.v2 || !self.has_cap("object-info") {
-            crate::bail!(
-                "{}: the upstream offers neither /gvfs/sizes nor object-info",
-                self.label
-            );
-        }
-        let req = object_info_request(oids);
-        let found = self.rpc(&req, true, |r| parse_object_info(r, oids.len()))?;
-        out.extend(oids.iter().map(|o| found.get(o).copied()));
-        Ok(())
-    }
-
-    fn fetch_with(
-        &mut self,
-        haves: &[Oid],
-        wants: &[Oid],
-        filter: Option<&str>,
-        out: &mut dyn Write,
-    ) -> Result<u64> {
-        self.detect()?;
-        let req = fetch_request(self.v2, haves, wants, filter)?;
-        let v2 = self.v2;
-        self.rpc(&req, v2, |r| read_pack_response(r, v2, out))
+impl PackPieces for ToWriter<'_> {
+    async fn put(&mut self, piece: bytes::Bytes) -> Result<()> {
+        self.0.write_all(&piece).ctx("writing pack")
     }
 }
 
@@ -621,6 +345,48 @@ fn parse_gvfs_sizes(text: &[u8]) -> std::collections::HashMap<Oid, u64> {
     found
 }
 
+/// The id of `branch_ref` in an `ls-refs` response.
+fn ls_refs_tip(body: &[u8], branch_ref: &str) -> Result<Option<Oid>> {
+    let mut rd = pktline::Reader::new(body);
+    let mut found = None;
+    loop {
+        match rd.read()? {
+            Pkt::Data(n) => {
+                let line = rd.line(n);
+                check_err(line)?;
+                let (hex, rest) = line.split_at_checked(40).ctx("bad ls-refs line")?;
+                let name = rest.strip_prefix(b" ").unwrap_or(rest);
+                let name = name.split(|&b| b == b' ').next().unwrap_or(name);
+                if name == branch_ref.as_bytes() {
+                    found = Oid::from_hex(hex);
+                }
+            }
+            Pkt::Flush | Pkt::Eof => return Ok(found),
+            _ => {}
+        }
+    }
+}
+
+/// The id of `branch_ref` in a v0 ref advertisement.
+fn v0_refs_tip(body: &[u8], branch_ref: &str) -> Result<Option<Oid>> {
+    let mut rd = pktline::Reader::new(body);
+    loop {
+        match rd.read()? {
+            Pkt::Data(n) => {
+                let line = rd.line(n);
+                let line = line.split(|&b| b == 0).next().unwrap_or(line);
+                if let Some((hex, name)) = line.split_at_checked(40) {
+                    if name.strip_prefix(b" ") == Some(branch_ref.as_bytes()) {
+                        return Oid::from_hex(hex).ctx("bad ref line").map(Some);
+                    }
+                }
+            }
+            Pkt::Eof => return Ok(None),
+            _ => {}
+        }
+    }
+}
+
 fn advertisement_is_v2(body: &[u8]) -> Result<bool> {
     let mut rd = pktline::Reader::new(body);
     loop {
@@ -645,23 +411,9 @@ fn check_err(line: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Reads a fetch response up to and through its side-band pack stream.
-fn read_pack_response(r: &mut dyn Read, v2: bool, out: &mut dyn Write) -> Result<u64> {
-    let mut parse = PackStream::new(v2);
-    let mut buf = vec![0u8; 64 << 10];
-    while !parse.done {
-        let n = r.read(&mut buf).ctx("reading the pack stream")?;
-        if n == 0 {
-            break;
-        }
-        parse.feed(buf.get(..n).unwrap_or(&[]), out)?;
-    }
-    parse.finish()
-}
-
-/// A fetch response's parser, fed the response in pieces of any size (the blocking and the
-/// async transports share it): pkt-lines up to the pack, then the side-band stream, whose
-/// channel-1 bytes are the pack, written to `out`. It ends at the first flush packet.
+/// A fetch response's parser, fed the response in pieces of any size: pkt-lines up to the
+/// pack, then the side-band stream, whose channel-1 bytes are the pack, written to `out`.
+/// It ends at the first flush packet.
 struct PackStream {
     v2: bool,
     in_pack: bool,
@@ -796,16 +548,15 @@ impl<T> OptionCtx<T> for Option<T> {
     }
 }
 
-/// Where an async fetch puts the pack, a piece at a time (awaited: a sink may hand its
-/// pieces on to other threads, with backpressure).
+/// Where a fetch puts the pack, a piece at a time (awaited: a sink may hand its pieces on
+/// to other threads, with backpressure).
 pub trait PackPieces {
-    fn put(&mut self, piece: bytes::Bytes) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn put(&mut self, piece: bytes::Bytes) -> impl std::future::Future<Output = Result<()>>;
 }
 
-/// The upstream for the edge's requests (the blob proxy): the requests and parsers of
-/// [`Upstream`], on the async client (smart HTTP, GVFS) or an async `git upload-pack` (a
-/// local repository), so that a fetch parks its task, not a thread. Use one from a single
-/// runtime (its connections run there).
+/// The upstream's requests, on the async client (smart HTTP, GVFS) or an async
+/// `git upload-pack` (a local repository), so that a fetch parks its task, not a thread.
+/// Use one from a single runtime (its connections run there).
 pub struct AsyncUpstream {
     transport: AsyncTransport,
     v2: bool,
@@ -919,7 +670,7 @@ impl AsyncUpstream {
         })
     }
 
-    /// Starts one stateless request (as [`Upstream`]'s `rpc`).
+    /// Starts one stateless request.
     async fn rpc(&mut self, request: &[u8], v2: bool) -> Result<AsyncBody> {
         match &mut self.transport {
             AsyncTransport::Local { git_dir } => {
@@ -1038,13 +789,65 @@ impl AsyncUpstream {
         g
     }
 
-    /// [`Upstream::fetch_objects`]: exactly the blobs `oids` as one pack, handed to `out` in
-    /// pieces; returns its length.
-    pub async fn fetch_objects<P: PackPieces + Send>(
+    /// The current tip of branch `branch_ref` (`refs/heads/<branch>`).
+    pub async fn head(&mut self, branch_ref: &str) -> Result<Oid> {
+        self.detect().await?;
+        let found = if self.v2 {
+            let mut req = Vec::new();
+            pktline::put_str(&mut req, "command=ls-refs\n");
+            pktline::put_str(&mut req, AGENT);
+            pktline::delim(&mut req);
+            pktline::put_str(&mut req, &format!("ref-prefix {branch_ref}\n"));
+            pktline::flush(&mut req);
+            let mut body = self.rpc(&req, true).await?;
+            let read = body.read_all(64 << 20).await;
+            let found = read.and_then(|b| ls_refs_tip(&b, branch_ref));
+            body.finish(found).await?
+        } else {
+            let AsyncTransport::Http { client } = &self.transport else {
+                crate::bail!("v0 is only used over HTTP");
+            };
+            let mut resp = client
+                .request(
+                    "GET",
+                    "/info/refs?service=git-upload-pack",
+                    &[],
+                    bytes::Bytes::new(),
+                )
+                .await?
+                .ensure_ok("info/refs")
+                .await?;
+            v0_refs_tip(&resp.body_vec(256 << 20).await?, branch_ref)?
+        };
+        found.with_ctx_str(|| format!("{}: no {branch_ref}", self.label))
+    }
+
+    /// The objects reachable from `want` but not from any of `haves` (none = everything),
+    /// filtered by `filter` if given (`blob:none`: commits and trees only), as one non-thin
+    /// pack handed to `out` in pieces. Returns the pack length. Haves the upstream does not
+    /// know (history rewritten) are ignored by it.
+    pub async fn fetch<P: PackPieces>(
         &mut self,
-        oids: &[Oid],
+        haves: &[Oid],
+        want: &Oid,
+        filter: Option<&str>,
         out: &mut P,
     ) -> Result<u64> {
+        self.detect().await?;
+        if filter.is_some() && (!self.v2 || !self.has_cap("fetch:filter")) {
+            crate::bail!(
+                "{}: the upstream does not support fetch filters",
+                self.label
+            );
+        }
+        self.fetch_with(haves, std::slice::from_ref(want), filter, out)
+            .await
+    }
+
+    /// Exactly the blobs `oids` as one pack, handed to `out` in pieces: through
+    /// `POST /gvfs/objects` from a GVFS upstream, else as protocol v2 `want`s. Returns the
+    /// pack length.
+    pub async fn fetch_objects<P: PackPieces>(&mut self, oids: &[Oid], out: &mut P) -> Result<u64> {
         if self.is_gvfs().await {
             let body = gvfs_objects_body(oids);
             let AsyncTransport::Http { client } = &self.transport else {
@@ -1074,9 +877,22 @@ impl AsyncUpstream {
         if !self.v2 {
             crate::bail!("{}: fetching blobs by id needs protocol v2", self.label);
         }
-        let req = fetch_request(true, &[], oids, None)?;
-        let mut body = self.rpc(&req, true).await?;
-        let mut parse = PackStream::new(true);
+        self.fetch_with(&[], oids, None, out).await
+    }
+
+    /// One fetch request (protocol v2, or v0 where the upstream speaks only that), its pack
+    /// handed to `out` in pieces.
+    async fn fetch_with<P: PackPieces>(
+        &mut self,
+        haves: &[Oid],
+        wants: &[Oid],
+        filter: Option<&str>,
+        out: &mut P,
+    ) -> Result<u64> {
+        let v2 = self.v2;
+        let req = fetch_request(v2, haves, wants, filter)?;
+        let mut body = self.rpc(&req, v2).await?;
+        let mut parse = PackStream::new(v2);
         let fed: Result<()> = async {
             while !parse.done {
                 let Some(c) = body.chunk().await? else { break };
@@ -1093,7 +909,8 @@ impl AsyncUpstream {
         body.finish(result).await
     }
 
-    /// [`Upstream::object_sizes`]: the sizes of `oids`, in order (`None`: not there).
+    /// The sizes of objects `oids`, in order (`None`: the upstream does not have it):
+    /// `POST /gvfs/sizes` from a GVFS upstream, else protocol v2 `object-info`.
     pub async fn object_sizes(&mut self, oids: &[Oid]) -> Result<Vec<Option<u64>>> {
         let mut out = Vec::with_capacity(oids.len());
         for batch in oids.chunks(BATCH) {
@@ -1161,7 +978,7 @@ mod tests {
             assert!(!e.contains("s3cret"), "{e}");
         }
         let u = Upstream::open("https://org@dev.azure.com/org/p/_git/r", "main", &auth).unwrap();
-        assert_eq!(u.label, "https://dev.azure.com/org/p/_git/r");
+        assert_eq!(u.label(), "https://dev.azure.com/org/p/_git/r");
     }
 
     fn git(dir: &std::path::Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
