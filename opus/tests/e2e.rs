@@ -1323,3 +1323,120 @@ fn http_framing_is_strict() {
     server.assert_clean();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Slow clients hold no arena (`--arenas 1` here): a POST body that stalls is read into the
+/// connection's own buffer, and a sizes answer the client does not read sits there too, so
+/// other POSTs are answered at once (they used to wait 10 s for the arena, then get 503).
+/// And a request must arrive whole within `--idle-secs`: trickled bytes do not extend it.
+#[test]
+fn slow_clients_hold_no_arena() {
+    use std::io::Write;
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    let root = tempdir("slowclients");
+    let mut up = Upstream::new(&root);
+    up.commit(2);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--cache-dir",
+        cache.to_str().unwrap(),
+        "--arenas",
+        "1",
+        "--idle-secs",
+        "2",
+        "--arena-mib",
+        "32",
+    ]);
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        s
+    };
+    let ids: Vec<String> = up.objects(&up.tip()).into_iter().take(3).collect();
+    let small = format!("[\"{}\",\"{}\"]", ids[0], ids[1]);
+    let sizes = |body: &str| {
+        let mut s = connect();
+        let t0 = Instant::now();
+        write!(
+            s,
+            "POST /gvfs/sizes HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let (head, answer) = raw_response(&mut s, false);
+        (head, answer, t0.elapsed())
+    };
+
+    // A request sent a byte every 300 ms: each read used to restart its timer.
+    let trickled = |start: &'static [u8]| {
+        let s = connect();
+        let mut writer = s.try_clone().unwrap();
+        let t = std::thread::spawn(move || {
+            let _ = writer.write_all(start);
+            for _ in 0..20 {
+                std::thread::sleep(Duration::from_millis(300));
+                if writer.write_all(b"a").is_err() {
+                    break;
+                }
+            }
+        });
+        (s, t)
+    };
+
+    // A body trickled in holds no arena: another POST is answered at once...
+    let t0 = Instant::now();
+    let (mut slow, t) =
+        trickled(b"POST /gvfs/sizes HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n[");
+    std::thread::sleep(Duration::from_millis(300));
+    let (head, answer, took) = sizes(&small);
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    assert!(String::from_utf8_lossy(&answer).contains(&ids[1]));
+    assert!(took < Duration::from_secs(1), "{took:?}");
+    // ...and the trickled request is cut off 2 s after its first byte.
+    let (head, _) = raw_response(&mut slow, false);
+    assert!(head.starts_with("HTTP/1.1 408 "), "{head}");
+    assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+    drop(slow);
+    t.join().unwrap();
+
+    // So is a trickled head.
+    let t0 = Instant::now();
+    let (mut slow, t) = trickled(b"GET /gvfs/config HTTP/1.1\r\nX-Pad: ");
+    let (head, _) = raw_response(&mut slow, false);
+    assert!(head.starts_with("HTTP/1.1 408 "), "{head}");
+    assert!(t0.elapsed() < Duration::from_secs(4), "{:?}", t0.elapsed());
+    drop(slow);
+    t.join().unwrap();
+
+    // A sizes answer (8 MB, beyond what socket buffers hold) its client does not read.
+    let many = format!(
+        "[{}]",
+        std::iter::repeat_n(format!("\"{}\"", ids[2]), 130_000)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let mut unread = connect();
+    write!(
+        unread,
+        "POST /gvfs/sizes HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{many}",
+        many.len()
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(1000));
+    let (head, _, took) = sizes(&small);
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    assert!(took < Duration::from_secs(2), "{took:?}");
+    // The reader that did not read still gets its whole answer.
+    let (head, answer) = raw_response(&mut unread, false);
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    assert_eq!(answer.iter().filter(|&&c| c == b'{').count(), 130_000);
+    assert_eq!(server.metric("gvfs_busy_total"), 0);
+    server.assert_clean();
+    let _ = std::fs::remove_dir_all(&root);
+}

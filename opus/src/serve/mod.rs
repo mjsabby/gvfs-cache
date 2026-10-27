@@ -81,6 +81,13 @@ pub struct Ctx {
     /// Buffers of the connections with a request in progress.
     pub bufs: conn::Pool,
     pub deadlines: httpd::Deadlines,
+    /// What connection buffers may grow by, together, for request bodies and answers larger
+    /// than one buffer.
+    pub spare: httpd::Spare,
+    /// The largest request body, and the largest answer built in a connection's buffer (a
+    /// sizes answer).
+    pub body_max: usize,
+    pub out_max: usize,
     /// Connections waiting for their next request (to within `idle_fold` per thread: see
     /// [`conn`]), and how many may.
     pub idle: AtomicI64,
@@ -239,7 +246,8 @@ pub fn main(args: &[String]) -> Result<()> {
         arena_bytes: f.num("arena-mib", 8usize)?.saturating_mul(1 << 20),
         arena_objects: f.num("arena-objects", 1usize << 18)?,
         cache_servers,
-        idle_timeout: Duration::from_secs(f.num("idle-secs", 30u64)?),
+        // At most a year: deadlines are instants, which must not overflow.
+        idle_timeout: Duration::from_secs(f.num("idle-secs", 30u64)?.min(365 * 86400)),
         write_timeout: Duration::from_secs(120),
         prefetch_idx,
         max_idle_conns: f.num("max-idle-conns", 65536usize)?,
@@ -348,6 +356,17 @@ pub fn run(o: Options) -> Result<()> {
     let ctx = Arc::new(Ctx {
         view: RwLock::new(Arc::new(first)),
         bufs: conn::Pool::new(workers, CONN_BUFS, OUT_BYTES),
+        // Bodies and answers may take, together, what one body and one answer per arena
+        // would (as when bodies and answers lived in the arenas).
+        spare: httpd::Spare::new(
+            arenas.max(1).saturating_mul(
+                arena_bytes
+                    .saturating_div(4)
+                    .saturating_add(arena_bytes / 2),
+            ),
+        ),
+        body_max: arena_bytes / 4,
+        out_max: arena_bytes / 2,
         deadlines: httpd::Deadlines {
             idle: idle_timeout,
             patience: idle_timeout,
@@ -1056,7 +1075,8 @@ pub fn metrics_text(ctx: &Ctx) -> String {
          gvfs_blob_cache_bytes {}\n\
          gvfs_connections_idle {}\n\
          gvfs_connections_idle_closed_total {}\n\
-         gvfs_connections_idle_overflow_total {}\n",
+         gvfs_connections_idle_overflow_total {}\n\
+         gvfs_buffer_spare_bytes {}\n",
         get(&m.prefetch),
         get(&m.object_get),
         get(&m.object_post),
@@ -1089,7 +1109,8 @@ pub fn metrics_text(ctx: &Ctx) -> String {
         ctx.blob_cache.as_ref().map_or(0, |c| c.bytes()),
         ctx.idle.load(Ordering::Relaxed).max(0),
         get(&m.idle_closed),
-        get(&m.idle_overflow)
+        get(&m.idle_overflow),
+        ctx.spare.left()
     )
 }
 

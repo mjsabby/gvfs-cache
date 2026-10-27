@@ -1,9 +1,11 @@
 //! Request scratch memory: allocated once at startup, leased per request, reset in O(1).
 //!
-//! Every per-request structure (the request body, parsed ids, the dedupe set, the splice
-//! plan, resolver buffers, small response bodies) lives in an [`Arena`]. A request leases
+//! Every per-request structure of the planning (parsed ids, the dedupe sets, the splice
+//! plan, resolver buffers, a resolved loose object) lives in an [`Arena`]. A request leases
 //! one from the [`ArenaPool`] (waiting briefly when all are busy: built-in backpressure)
-//! and returns it on drop, so steady-state serving performs no heap allocation.
+//! once its body is in (the body is read into the connection's own buffer, so that a slow
+//! client holds no arena), and returns it on drop, so steady-state serving performs no heap
+//! allocation.
 
 use std::sync::Mutex;
 use std::time::Duration;
@@ -152,8 +154,6 @@ fn shrink<T>(v: &mut Vec<T>, n: usize) {
 
 /// Scratch memory for one request.
 pub struct Arena {
-    /// Request body.
-    pub body: Vec<u8>,
     /// Object ids parsed from the request.
     pub oids: Vec<Oid>,
     /// The request position of each of `oids` once the store's blobs have been taken out
@@ -213,7 +213,6 @@ impl Arena {
     pub fn new(bytes: usize, objects: usize) -> Arena {
         let quarter = bytes / 4;
         let mut a = Arena {
-            body: Vec::with_capacity(quarter),
             oids: Vec::with_capacity(objects),
             oid_at: Vec::with_capacity(objects),
             found: Vec::with_capacity(FOUND),
@@ -233,7 +232,6 @@ impl Arena {
             objects,
         };
         // Touch every page now so requests never take first-touch faults.
-        a.body.resize(a.body.capacity(), 0);
         a.out.resize(a.out.capacity(), 0);
         a.reset();
         a
@@ -248,7 +246,6 @@ impl Arena {
             self.splice.shrink(n);
             self.grow = false;
         }
-        self.body.clear();
         self.oids.clear();
         self.oid_at.clear();
         self.found.clear();

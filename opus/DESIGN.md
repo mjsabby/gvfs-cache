@@ -403,7 +403,7 @@ a descriptor: when its next request's bytes arrive it takes a 16 KiB head buffer
 256 KiB output buffer from a pool, and gives them back once the response is out. A
 connection is closed after `--idle-secs` (30) without a request, or when it goes idle after a
 response while `--max-idle-conns` (65,536) others are (its client reconnects; a new
-connection is always served first). A request must arrive whole
+connection is always served first). A request must arrive whole, head and body,
 within `--idle-secs` once begun, and each wait for a client to take more of a response is
 bounded at 120 s. A response waiting on a slow client parks its task: the worker serves
 other connections meanwhile, and `sendfile` resumes when the socket drains (REPORT.md §14:
@@ -419,11 +419,19 @@ the heavy requests' expense. Moving such work to tokio's blocking pool does not 
 priority, because its threads share the CPUs with the workers. Work that blocks or computes
 for seconds (a plan built once per view, a large object's delta chain) runs in
 `block_in_place` sections, which hand the worker's other tasks to another thread. Fetches
-from object storage or the upstream are awaited: a request waiting on them parks its task. POST
-bodies and their working sets live in a leased arena (default: 2 × cores arenas of 8 MiB and
-2^18 ids), awaited without holding a thread; if all arenas are busy for 10 s, the request
-gets a 503. A commit closure larger than its arena grows it in a `cold_section`; `reset`
-shrinks it back. The server speaks plain HTTP/1.1: put TLS and HTTP/2 on the load balancer in
+from object storage or the upstream are awaited: a request waiting on them parks its task.
+
+A POST's working set (its ids, dedupe sets, the splice plan) lives in a leased arena
+(default: 2 × cores arenas of 8 MiB and 2^18 ids), awaited without holding a thread; if all
+arenas are busy for 10 s, the request gets a 503. Arenas are few, so a slow client must not
+hold one: the body is read first, into the connection's own output buffer (bodies of up to
+256 KiB fit it; a larger one, up to a quarter of `--arena-mib`, grows it as its bytes arrive,
+from a budget shared by all connections, else 503), and only the whole request leases an
+arena. A sizes answer is built in that buffer too, and a resolved loose object that fits is
+copied there, so the arena is free before the client reads. A pack answer streams from its
+plan in the arena, which a slow reader therefore still holds (put a load balancer that
+buffers responses in front of an edge). A commit closure larger than its arena grows it in a
+`cold_section`; `reset` shrinks it back. The server speaks plain HTTP/1.1: put TLS and HTTP/2 on the load balancer in
 front of an edge. The localhost proxy needs neither.
 
 ## Stores with real blobs (`--blobs separate`)

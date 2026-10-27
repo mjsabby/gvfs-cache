@@ -35,9 +35,12 @@ use super::Ctx;
 use super::blobs::BlobPack;
 use super::budget::{Budget, blocking, cold};
 use super::conn::Bufs;
-use super::httpd::{Method, Out, Request, read_body, respond_text, write_head, write_response};
+use super::httpd::{
+    Body, Grow, Method, Out, Request, format_head, read_body, respond_text, write_all, write_head,
+    write_response,
+};
 use super::view::{Prefetch, View};
-use crate::arena::{Arena, BlobSrc};
+use crate::arena::{Arena, BlobSrc, Lease};
 use crate::blobs::BlobRec;
 use crate::pack::{OBJ_BLOB, OBJ_COMMIT, OBJ_TREE, ObjectHeader, pack_header, parse_entry_header};
 use crate::splice::{ObjRef, Piece, piece_bytes};
@@ -158,6 +161,7 @@ pub async fn handle(
     b: &mut Bufs,
     stream: &TcpStream,
     req: &Request,
+    deadline: tokio::time::Instant,
 ) -> std::io::Result<bool> {
     // HEAD asks what GET would answer.
     let method = match req.method {
@@ -232,32 +236,43 @@ pub async fn handle(
             }
         }
         Route::ObjectsPost | Route::SizesPost => {
-            let Some(mut lease) = ctx.arenas.lease(ctx.arena_wait).await else {
+            // The whole body first, into this connection's own buffer: a client that sends
+            // slowly holds nothing shared. The arena is leased once the request is whole.
+            let mut body = Grow {
+                buf: &mut b.out,
+                extra: &mut b.extra,
+                max: ctx.body_max,
+                spare: &ctx.spare,
+            };
+            let t = ctx.deadlines.write;
+            match read_body(stream, &mut b.input, req, &mut body, deadline, t).await {
+                Ok(Body::Read) => {}
+                Ok(Body::TooLarge) => {
+                    respond(ctx, stream, 413, "request too large\n", false).await?;
+                    return Ok(false);
+                }
+                Ok(Body::Busy) => {
+                    inc(&ctx.metrics.busy);
+                    respond(ctx, stream, 503, "busy\n", false).await?;
+                    return Ok(false);
+                }
+                Err(e) => {
+                    super::httpd::refuse(stream, &e, t).await;
+                    return Ok(false);
+                }
+            }
+            let Some(lease) = ctx.arenas.lease(ctx.arena_wait).await else {
                 inc(&ctx.metrics.busy);
                 respond(ctx, stream, 503, "busy\n", false).await?;
                 return Ok(false);
             };
-            let Some(arena) = lease.arena() else {
-                return Ok(false);
-            };
-            match read_body(stream, &mut b.input, req, &mut arena.body, &ctx.deadlines).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    respond(ctx, stream, 413, "request too large\n", false).await?;
-                    return Ok(false);
-                }
-                Err(e) => {
-                    super::httpd::refuse(stream, &e, ctx.deadlines.write).await;
-                    return Ok(false);
-                }
-            }
             if route == Route::SizesPost {
                 inc(&ctx.metrics.sizes);
-                sizes(ctx, stream, arena, keep).await
+                sizes(ctx, b, stream, lease, keep).await
             } else {
                 inc(&ctx.metrics.object_post);
                 let (loose_ok, pack_ok) = (req.accepts_loose, req.accepts_pack);
-                objects_post(ctx, b, stream, arena, loose_ok, pack_ok, keep).await
+                objects_post(ctx, b, stream, lease, loose_ok, pack_ok, keep).await
             }
         }
         // An unread POST body would be parsed as the next request: close instead.
@@ -832,7 +847,7 @@ async fn loose(
     view: &Arc<View>,
     k: u16,
     slot: u32,
-    arena: Option<&mut Arena>,
+    lease: Option<Lease<'_>>,
     keep: bool,
 ) -> std::io::Result<bool> {
     let Some(slab) = view.all.get(usize::from(k)) else {
@@ -846,6 +861,8 @@ async fn loose(
     if !rec.is_delta() {
         if let Ok(plan) = LooseSplice::plan(rec.kind, rec.size, entry.get(hdr_len..).unwrap_or(&[]))
         {
+            // A whole entry needs no arena.
+            drop(lease);
             let zlib_at = rec.offset.saturating_add(u64_of(hdr_len));
             let mut out = Out::new(stream, &mut b.out, ctx.deadlines.write);
             out.head(200, CT_LOOSE, u64_of(plan.total_len()), keep)?;
@@ -871,20 +888,19 @@ async fn loose(
         }
     }
     // Deltified (or unusual) entry: resolve and deflate in an arena.
-    let mut lease = None;
-    let arena = match arena {
-        Some(a) => a,
-        None => {
-            lease = ctx.arenas.lease(ctx.arena_wait).await;
-            match lease.as_mut().and_then(|l| l.arena()) {
-                Some(a) => a,
-                None => {
-                    inc(&ctx.metrics.busy);
-                    respond(ctx, stream, 503, "busy\n", false).await?;
-                    return Ok(false);
-                }
+    let mut lease = match lease {
+        Some(l) => l,
+        None => match ctx.arenas.lease(ctx.arena_wait).await {
+            Some(l) => l,
+            None => {
+                inc(&ctx.metrics.busy);
+                respond(ctx, stream, 503, "busy\n", false).await?;
+                return Ok(false);
             }
-        }
+        },
+    };
+    let Some(arena) = lease.arena() else {
+        return Ok(false);
     };
     let Arena {
         resolver,
@@ -924,12 +940,24 @@ async fn loose(
         }
     };
     let t = ctx.deadlines.write;
-    write_response(stream, 200, CT_LOOSE, buf.get(..n).unwrap_or(&[]), keep, t).await?;
+    let object = buf.get(..n).unwrap_or(&[]);
+    let mut head = [0u8; 320];
+    let h = format_head(&mut head, 200, CT_LOOSE, u64_of(n), keep);
+    if h.saturating_add(n) <= b.out.capacity() {
+        // Almost every resolved object (a tree, a commit) fits this connection's buffer:
+        // copied there, the arena is free before the client reads.
+        b.out.clear();
+        b.out.extend_from_slice(head.get(..h).unwrap_or(&[]));
+        b.out.extend_from_slice(object);
+        drop(lease);
+        write_all(stream, &b.out, t).await?;
+    } else {
+        write_response(stream, 200, CT_LOOSE, object, keep, t).await?;
+    }
     ctx.metrics
         .bytes_out
         .fetch_add(u64_of(n), Ordering::Relaxed);
     inc(&ctx.metrics.objects_out);
-    drop(lease);
     Ok(keep)
 }
 
@@ -1022,20 +1050,24 @@ pub fn scan_number(body: &[u8], key: &[u8]) -> Option<u64> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `POST /gvfs/objects`, its body read into `b.out`.
 async fn objects_post(
     ctx: &Ctx,
     b: &mut Bufs,
     stream: &TcpStream,
-    arena: &mut Arena,
+    mut lease: Lease<'_>,
     accepts_loose: bool,
     accepts_pack: bool,
     keep: bool,
 ) -> std::io::Result<bool> {
+    let Some(arena) = lease.arena() else {
+        return Ok(false);
+    };
     let mut budget = Budget::new();
-    let depth = scan_number(&arena.body, b"\"commitDepth")
+    let depth = scan_number(&b.out, b"\"commitDepth")
         .unwrap_or(1)
         .clamp(1, 1000);
-    if !scan_ids(&arena.body, &mut arena.oids, &mut budget).await {
+    if !scan_ids(&b.out, &mut arena.oids, &mut budget).await {
         respond(ctx, stream, 413, "too many objects\n", keep).await?;
         return Ok(keep);
     }
@@ -1043,6 +1075,8 @@ async fn objects_post(
         respond(ctx, stream, 400, "no objectIds\n", keep).await?;
         return Ok(keep);
     }
+    // The body is parsed: the buffer goes back to answering, at its pooled size.
+    b.shrink(&ctx.spare);
     let view = ctx.view();
     // One object: a loose object when the client accepts one (not a commit: those expand),
     // except that a large blob goes out as a pack to a client that takes both: its
@@ -1065,7 +1099,7 @@ async fn objects_post(
                 let large_blob =
                     rec.is_some_and(|r| r.kind == OBJ_BLOB && r.size >= LOOSE_BLOB_MAX);
                 if accepts_loose && !is_commit && !(accepts_pack && large_blob) {
-                    return loose(ctx, b, stream, &view, k, slot, Some(arena), keep).await;
+                    return loose(ctx, b, stream, &view, k, slot, Some(lease), keep).await;
                 }
             }
             None => {
@@ -1644,22 +1678,35 @@ async fn size_outside_slabs(ctx: &Ctx, view: &View, oid: &Oid) -> Option<u64> {
         .flatten()
 }
 
+/// `POST /gvfs/sizes`, its body read into `b.out`: `[{"Id":..,"Size":..}]`. The answer is
+/// built in the connection's buffer, where the body was, so that the arena is free before
+/// the client reads it.
 async fn sizes(
     ctx: &Ctx,
+    b: &mut Bufs,
     stream: &TcpStream,
-    arena: &mut Arena,
+    mut lease: Lease<'_>,
     keep: bool,
 ) -> std::io::Result<bool> {
+    let Some(arena) = lease.arena() else {
+        return Ok(false);
+    };
     let mut budget = Budget::new();
-    if !scan_ids(&arena.body, &mut arena.oids, &mut budget).await {
+    if !scan_ids(&b.out, &mut arena.oids, &mut budget).await {
         respond(ctx, stream, 413, "too many objects\n", keep).await?;
         return Ok(keep);
     }
     let view = ctx.view();
-    let Arena { oids, out, .. } = arena;
-    out.clear();
-    let mut ok = out.capacity() > 2;
-    out.push(b'[');
+    let oids = &arena.oids;
+    let mut out = Grow {
+        buf: &mut b.out,
+        extra: &mut b.extra,
+        max: ctx.out_max,
+        spare: &ctx.spare,
+    };
+    out.buf.clear();
+    let mut ok = out.buf.capacity() > 2;
+    out.buf.push(b'[');
     for (i, oid) in oids.iter().enumerate() {
         if budget.due() {
             budget.pause().await;
@@ -1685,16 +1732,22 @@ async fn sizes(
                 },
             },
         };
-        ok &= size_item(out, i == 0, oid, size);
+        // Room for one more item, growing the buffer if the answer outgrows it.
+        ok = ok && out.room(out.buf.len().saturating_add(ITEM_MAX));
+        ok = ok && size_item(out.buf, i == 0, oid, size);
     }
-    ok &= crate::util::try_push(out, b']');
+    ok = ok && out.room(out.buf.len().saturating_add(1)) && crate::util::try_push(out.buf, b']');
     if !ok {
         respond(ctx, stream, 413, "response too large\n", keep).await?;
         return Ok(keep);
     }
-    write_response(stream, 200, CT_JSON, out, keep, ctx.deadlines.write).await?;
+    drop(lease);
+    write_response(stream, 200, CT_JSON, &b.out, keep, ctx.deadlines.write).await?;
     Ok(keep)
 }
+
+/// The longest item [`size_item`] writes.
+const ITEM_MAX: usize = 80;
 
 /// `,{"Id":"<40 hex>","Size":<digits>}` (no comma first) onto `out`; false if it does not
 /// fit. Every copy has a constant length (the digits' right-aligned 20-byte buffer goes in

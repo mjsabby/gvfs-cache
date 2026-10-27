@@ -2,8 +2,8 @@
 //! sockets.
 //!
 //! Request heads are parsed in the connection's head buffer into ranges (no allocation);
-//! bodies (Content-Length or chunked) are read into the request arena; response heads are
-//! formatted on the stack. [`Out`] coalesces small pieces into one buffer and sends large
+//! bodies (Content-Length or chunked) are read into the connection's output buffer before
+//! any shared resource is taken ([`Grow`]); response heads are formatted on the stack. [`Out`] coalesces small pieces into one buffer and sends large
 //! file-backed ranges with `sendfile(2)` straight from the page cache whenever the socket
 //! is writable: a slow reader parks its task, never a thread. Every wait has a deadline
 //! ([`Deadlines`]).
@@ -12,10 +12,12 @@ use std::fs::File;
 use std::future::Future;
 use std::io::Write;
 use std::os::fd::AsFd;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::io::Interest;
 use tokio::net::TcpStream;
+use tokio::time::Instant;
 
 use crate::slab::Slab;
 
@@ -58,7 +60,8 @@ pub struct Request {
 pub struct Deadlines {
     /// Between requests (`--idle-secs`).
     pub idle: Duration,
-    /// For the rest of a request once it has begun (head or body).
+    /// For all of a request, head and body, once its first byte is here: a client that
+    /// trickles bytes cannot keep a request open longer.
     pub patience: Duration,
     /// For the client to take more of a response.
     pub write: Duration,
@@ -116,13 +119,107 @@ pub async fn within(
     }
 }
 
+/// `f`, or `TimedOut` once `deadline` has passed.
+pub async fn until(
+    deadline: Instant,
+    f: impl Future<Output = std::io::Result<()>>,
+) -> std::io::Result<()> {
+    match tokio::time::timeout_at(deadline, f).await {
+        Ok(r) => r,
+        Err(_) => Err(std::io::ErrorKind::TimedOut.into()),
+    }
+}
+
+/// Bytes that connection output buffers may hold beyond their pooled size, all together:
+/// bodies and answers larger than one buffer grow it from here, as their bytes arrive, so
+/// that many large requests at once take a bounded amount of memory.
+pub struct Spare {
+    left: AtomicUsize,
+}
+
+impl Spare {
+    pub fn new(bytes: usize) -> Spare {
+        Spare {
+            left: AtomicUsize::new(bytes),
+        }
+    }
+
+    /// Takes `n` bytes, if that many are left.
+    pub fn take(&self, n: usize) -> bool {
+        self.left
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |l| l.checked_sub(n))
+            .is_ok()
+    }
+
+    /// Returns `n` bytes taken before.
+    pub fn give(&self, n: usize) {
+        self.left.fetch_add(n, Ordering::AcqRel);
+    }
+
+    pub fn left(&self) -> usize {
+        self.left.load(Ordering::Relaxed)
+    }
+}
+
+/// A connection's output buffer, allowed to grow past its pooled size (up to `max` bytes,
+/// taking the growth from `spare`): a request body, or an answer, larger than it.
+pub struct Grow<'a> {
+    pub buf: &'a mut Vec<u8>,
+    /// What this buffer holds from `spare` (returned when it shrinks back).
+    pub extra: &'a mut usize,
+    pub max: usize,
+    pub spare: &'a Spare,
+}
+
+impl Grow<'_> {
+    /// Grows the buffer toward `want` bytes of capacity: doubling, so that what it takes stays
+    /// within twice what it holds, never past `want` or `max` (a cold section). False if it
+    /// cannot grow.
+    pub fn more(&mut self, want: usize) -> bool {
+        let cap = self.buf.capacity();
+        let target = want.min(self.max).min(cap.saturating_mul(2).max(64 << 10));
+        if target <= cap {
+            return false;
+        }
+        let add = target.saturating_sub(cap);
+        if !self.spare.take(add) {
+            return false;
+        }
+        let _cold = gvfs_alloc_guard::cold_section();
+        self.buf
+            .reserve_exact(target.saturating_sub(self.buf.len()));
+        *self.extra = self.extra.saturating_add(add);
+        true
+    }
+
+    /// Capacity for at least `total` bytes; false if the buffer cannot grow that far.
+    pub fn room(&mut self, total: usize) -> bool {
+        while self.buf.capacity() < total {
+            if !self.more(total) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// How reading a request body ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Body {
+    Read,
+    /// Larger than the edge takes (the caller answers 413 and closes).
+    TooLarge,
+    /// No memory to spare for a body this large right now (503, and close).
+    Busy,
+}
+
 /// Reads one request head: [`Head::Idle`] if nothing is readable after all, [`Head::Closed`]
 /// on a clean close between requests. Once part of a head is here, the rest must follow
-/// within `patience`.
+/// by `deadline`.
 pub async fn read_head(
     stream: &TcpStream,
     input: &mut Input,
-    patience: Duration,
+    deadline: Instant,
 ) -> std::io::Result<Head> {
     loop {
         if let Some(end) = find_head_end(input.buf.get(..input.filled).unwrap_or(&[])) {
@@ -139,7 +236,7 @@ pub async fn read_head(
                 if input.filled == 0 {
                     return Ok(Head::Idle);
                 }
-                within(patience, stream.readable()).await?;
+                until(deadline, stream.readable()).await?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
@@ -343,31 +440,31 @@ pub fn parse_head(head: &[u8], head_len: usize) -> std::io::Result<Request> {
     Ok(req)
 }
 
-/// Reads the request body into `body` (whose capacity bounds it). Returns false if the
-/// body does not fit (the caller answers 413 and closes).
+/// Reads the request body into `body`, all of it by `deadline` (the request's), growing the
+/// buffer as the bytes arrive if it must (see [`Grow`]).
 pub async fn read_body(
     stream: &TcpStream,
     input: &mut Input,
     req: &Request,
-    body: &mut Vec<u8>,
-    d: &Deadlines,
-) -> std::io::Result<bool> {
-    body.clear();
+    body: &mut Grow<'_>,
+    deadline: Instant,
+    write: Duration,
+) -> std::io::Result<Body> {
+    body.buf.clear();
     let declared = usize::try_from(req.content_length.unwrap_or(0)).unwrap_or(usize::MAX);
-    if !req.chunked && declared > body.capacity() {
+    if !req.chunked && declared > body.max {
         // Refused before the client is told to send it.
-        return Ok(false);
+        return Ok(Body::TooLarge);
     }
     if req.expect_continue {
-        write_all(stream, b"HTTP/1.1 100 Continue\r\n\r\n", d.write).await?;
+        write_all(stream, b"HTTP/1.1 100 Continue\r\n\r\n", write).await?;
     }
     input.consume(req.head_len);
     if !req.chunked {
-        read_exact_into(stream, input, body, declared, d.patience).await?;
-        return Ok(true);
+        return read_exact_into(stream, input, body, declared, deadline).await;
     }
     loop {
-        let n = line_len(stream, input, d.patience).await?;
+        let n = line_len(stream, input, deadline).await?;
         let size = input
             .buf
             .get(..n)
@@ -377,22 +474,25 @@ pub async fn read_body(
         if size == 0 {
             // Trailers (ignored), then the blank line.
             loop {
-                let t = line_len(stream, input, d.patience).await?;
+                let t = line_len(stream, input, deadline).await?;
                 let trailer = input.buf.get(..t).unwrap_or(&[]);
                 if trailer.iter().any(|&c| c == b'\r' || c == b'\n') {
                     return Err(bad("bare CR or LF in a trailer"));
                 }
                 input.consume(t.saturating_add(2));
                 if t == 0 {
-                    return Ok(true);
+                    return Ok(Body::Read);
                 }
             }
         }
-        if body.len().saturating_add(size) > body.capacity() {
-            return Ok(false);
+        if body.buf.len().saturating_add(size) > body.max {
+            return Ok(Body::TooLarge);
         }
-        read_exact_into(stream, input, body, size, d.patience).await?;
-        if line_len(stream, input, d.patience).await? != 0 {
+        let read = read_exact_into(stream, input, body, size, deadline).await?;
+        if read != Body::Read {
+            return Ok(read);
+        }
+        if line_len(stream, input, deadline).await? != 0 {
             return Err(bad("missing chunk terminator"));
         }
         input.consume(2);
@@ -425,7 +525,7 @@ fn chunk_size(line: &[u8]) -> Option<usize> {
 async fn line_len(
     stream: &TcpStream,
     input: &mut Input,
-    patience: Duration,
+    deadline: Instant,
 ) -> std::io::Result<usize> {
     loop {
         if let Some(p) = input
@@ -443,25 +543,25 @@ async fn line_len(
         let n = read_some(
             stream,
             input.buf.get_mut(input.filled..).unwrap_or(&mut []),
-            patience,
+            deadline,
         )
         .await?;
         input.filled = input.filled.saturating_add(n);
     }
 }
 
-/// At least one byte into `buf` (waiting up to `patience` for it).
+/// At least one byte into `buf` (waiting until `deadline` for it).
 async fn read_some(
     stream: &TcpStream,
     buf: &mut [u8],
-    patience: Duration,
+    deadline: Instant,
 ) -> std::io::Result<usize> {
     loop {
         match stream.try_read(buf) {
             Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => return Ok(n),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                within(patience, stream.readable()).await?;
+                until(deadline, stream.readable()).await?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
@@ -469,25 +569,42 @@ async fn read_some(
     }
 }
 
-/// Moves `n` body bytes into `body`: buffered ones first, then straight from the socket.
+/// Appends `n` body bytes to `body`: buffered ones first, then straight from the socket.
+/// The buffer grows only as far as the bytes that arrived need ([`Body::Busy`] if it cannot),
+/// and each byte of it is zeroed once before the socket fills it.
 async fn read_exact_into(
     stream: &TcpStream,
     input: &mut Input,
-    body: &mut Vec<u8>,
+    body: &mut Grow<'_>,
     n: usize,
-    patience: Duration,
-) -> std::io::Result<()> {
+    deadline: Instant,
+) -> std::io::Result<Body> {
+    let start = body.buf.len();
+    let end = start.saturating_add(n);
     let from_buf = n.min(input.filled);
-    body.extend_from_slice(input.buf.get(..from_buf).unwrap_or(&[]));
-    input.consume(from_buf);
-    let mut at = body.len();
-    let end = at.saturating_add(n.saturating_sub(from_buf));
-    body.resize(end, 0);
-    while at < end {
-        let got = read_some(stream, body.get_mut(at..end).unwrap_or(&mut []), patience).await?;
-        at = at.saturating_add(got);
+    if !body.room(start.saturating_add(from_buf)) {
+        return Ok(Body::Busy);
     }
-    Ok(())
+    body.buf
+        .extend_from_slice(input.buf.get(..from_buf).unwrap_or(&[]));
+    input.consume(from_buf);
+    // `body.buf.len()` marks what is zeroed (and read into, up to `filled`).
+    let mut filled = body.buf.len();
+    while filled < end {
+        if filled == body.buf.len() {
+            if body.buf.len() == body.buf.capacity() && !body.more(end) {
+                body.buf.truncate(filled);
+                return Ok(Body::Busy);
+            }
+            let upto = end.min(body.buf.capacity());
+            body.buf.resize(upto, 0);
+        }
+        let into = body.buf.get_mut(filled..).unwrap_or(&mut []);
+        let got = read_some(stream, into, deadline).await?;
+        filled = filled.saturating_add(got);
+    }
+    body.buf.truncate(filled);
+    Ok(Body::Read)
 }
 
 /// All of `b`, waiting up to `t` each time the socket is full.

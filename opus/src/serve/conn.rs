@@ -26,7 +26,24 @@ use super::httpd::{self, Head, Input};
 /// The buffers of a connection with a request in progress.
 pub struct Bufs {
     pub input: Input,
+    /// The response buffer; also where a request body is read (before an arena is leased).
     pub out: Vec<u8>,
+    /// What `out` took from [`Ctx::spare`] to grow past its pooled size.
+    pub extra: usize,
+    pooled: usize,
+}
+
+impl Bufs {
+    /// `out` back to its pooled size, its growth returned to `spare` (a cold section).
+    pub fn shrink(&mut self, spare: &httpd::Spare) {
+        if self.extra > 0 {
+            let _cold = gvfs_alloc_guard::cold_section();
+            self.out.clear();
+            self.out.shrink_to(self.pooled);
+            spare.give(self.extra);
+            self.extra = 0;
+        }
+    }
 }
 
 /// Connection buffers, made at startup in per-thread shards; more are made (a cold
@@ -132,6 +149,8 @@ fn new_bufs(out_bytes: usize) -> Bufs {
     Bufs {
         input: Input::new(),
         out: Vec::with_capacity(out_bytes),
+        extra: 0,
+        pooled: out_bytes,
     }
 }
 
@@ -202,7 +221,9 @@ async fn connection(ctx: &Ctx, stream: &TcpStream) {
             Some(b) => b,
             None => ctx.bufs.take(),
         };
-        match request(ctx, stream, &mut b).await {
+        let next = request(ctx, stream, &mut b).await;
+        b.shrink(&ctx.spare);
+        match next {
             Next::Again => {
                 served = true;
                 if b.input.filled > 0 {
@@ -221,7 +242,11 @@ async fn connection(ctx: &Ctx, stream: &TcpStream) {
 }
 
 async fn request(ctx: &Ctx, stream: &TcpStream, b: &mut Bufs) -> Next {
-    let req = match httpd::read_head(stream, &mut b.input, ctx.deadlines.patience).await {
+    // All of the request, head and body, must arrive by then: a client that trickles bytes
+    // cannot hold its buffers (or, for a POST, wait in line for an arena) for longer.
+    let now = tokio::time::Instant::now();
+    let deadline = now.checked_add(ctx.deadlines.patience).unwrap_or(now);
+    let req = match httpd::read_head(stream, &mut b.input, deadline).await {
         Ok(Head::Request(r)) => r,
         Ok(Head::Idle) => return Next::Idle,
         Ok(Head::Closed) => return Next::Close,
@@ -230,7 +255,7 @@ async fn request(ctx: &Ctx, stream: &TcpStream, b: &mut Bufs) -> Next {
             return Next::Close;
         }
     };
-    match super::handlers::handle(ctx, b, stream, &req).await {
+    match super::handlers::handle(ctx, b, stream, &req, deadline).await {
         Ok(true) => Next::Again,
         Ok(false) | Err(_) => Next::Close,
     }
