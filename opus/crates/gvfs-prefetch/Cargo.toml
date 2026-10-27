@@ -7,10 +7,12 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Like `gvfs-mmap`, this crate cannot inherit `forbid(unsafe_code)`: `_mm_prefetch` is a
-# `#[target_feature(enable = "sse")]` function, so calling it from a function that does not
-# list `sse` itself is `unsafe` (even though SSE is part of every x86-64 CPU, and a
-# prefetch never dereferences its pointer). It contains exactly one `unsafe` block.
+# Like `gvfs-mmap`, this crate cannot inherit `forbid(unsafe_code)`: on x86-64,
+# `_mm_prefetch` is a `#[target_feature(enable = "sse")]` function, so calling it from a
+# function that does not list `sse` itself is `unsafe` (even though SSE is part of every
+# x86-64 CPU, and a prefetch never dereferences its pointer); on ARM64, the hint is inline
+# assembly (`prfm`), which is `unsafe` too. It has one `unsafe` block per architecture, and
+# a build compiles one of them.
 [lints.rust]
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"

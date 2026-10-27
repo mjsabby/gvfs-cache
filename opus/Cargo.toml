@@ -12,8 +12,8 @@ publish = false
 # Invariant 1 (100% safe Rust) and invariant 2 (zero panics) hold for every crate that
 # opts into `[lints] workspace = true`. The three tiny crates that cannot (`gvfs-alloc-guard`:
 # `unsafe impl GlobalAlloc`; `gvfs-mmap`: one `mmap(2)` of an immutable file; `gvfs-prefetch`:
-# one `_mm_prefetch` hint) re-declare the same clippy denials and confine their `unsafe` to a
-# single documented item each.
+# one prefetch hint, `_mm_prefetch` on x86-64 and `prfm` on ARM64) re-declare the same
+# clippy denials and confine their `unsafe` to a single documented item each.
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
