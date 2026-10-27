@@ -1872,21 +1872,12 @@ async fn fetch_unresolved(
 const AHEAD: usize = 16;
 
 /// The size of an object no slab and no blob pack has: a blob the trees name (sizes
-/// tables), or known to the upstream.
-async fn size_outside_slabs(ctx: &Ctx, view: &View, oid: &Oid) -> Option<u64> {
-    if let Some(s) = view.blob_size(oid) {
-        return Some(s);
-    }
-    let proxy = ctx.proxy.as_ref()?;
-    if let Some((_, r)) = proxy.cached(oid) {
-        return Some(r.size);
-    }
-    cold(proxy.sizes(std::slice::from_ref(oid)))
-        .await
-        .ok()?
-        .first()
-        .copied()
-        .flatten()
+/// tables), or one the proxy holds; exactly the blobs a GET serves ([`find_blob`]). Any
+/// other id is unknown, without asking the upstream: a request of made-up ids must not
+/// cost it a lookup each, nor hold an arena while they wait.
+fn size_outside_slabs(ctx: &Ctx, view: &View, oid: &Oid) -> Option<u64> {
+    view.blob_size(oid)
+        .or_else(|| Some(ctx.proxy.as_ref()?.cached(oid)?.1.size))
 }
 
 /// `POST /gvfs/sizes`, its body read into `b.out`: `[{"Id":..,"Size":..}]`. The answer is
@@ -1937,7 +1928,7 @@ async fn sizes(
                     .and_then(|s| s.rec(slot))
                     .map(|r| r.size)
                     .unwrap_or(0),
-                None => match size_outside_slabs(ctx, &view, oid).await {
+                None => match size_outside_slabs(ctx, &view, oid) {
                     Some(s) => s,
                     None => return not_found(ctx, stream, keep).await,
                 },

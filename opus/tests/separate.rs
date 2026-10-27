@@ -694,6 +694,27 @@ fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
         .filter(|(id, _)| !history.contains_key(id))
         .collect();
     assert_eq!(warm_sizes, introduced);
+    // Sizes answer what a GET serves: the push's new blob (its L0 slab's table names it),
+    // but not a blob only the upstream has, which no tree names (asking the upstream per
+    // unknown id, holding an arena, let made-up ids cost it a lookup each).
+    let sizes = |ids: &[String]| {
+        let (status, _, body) = server.post(
+            "/gvfs/sizes",
+            json_ids(ids, None).as_bytes(),
+            "application/json",
+        );
+        (status, (status == 200).then(|| parse_sizes_json(&body)))
+    };
+    let (status, got) = sizes(std::slice::from_ref(&new_id));
+    assert_eq!((status, got.unwrap()[&new_id]), (200, 10));
+    let loose = git_stdin(
+        &up.bare,
+        &["hash-object", "-w", "--stdin"],
+        b"upstream only\n",
+    );
+    let unnamed = String::from_utf8(loose).unwrap().trim().to_string();
+    assert_eq!(server.get(&format!("/gvfs/objects/{unnamed}")).0, 404);
+    assert_eq!(sizes(&[new_id.clone(), unnamed]).0, 404);
 
     // The pipeline seals it, blobs first; the edge then serves those blobs from the store.
     pipeline(&root, &store, &up, "15m", &[]);

@@ -460,14 +460,6 @@ impl Proxy {
             }
         }
     }
-
-    /// Sizes the upstream knows (cold path).
-    pub async fn sizes(&self, oids: &[Oid]) -> Result<Vec<Option<u64>>> {
-        let mut up = self.connection()?;
-        let r = up.object_sizes(oids).await?;
-        lock(&self.idle).push(up);
-        Ok(r)
-    }
 }
 
 /// What [`fetch_into`]'s network side hands its blocking side.

@@ -637,7 +637,8 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   header and trailer were written then, so that file goes out as it is: as cheap for the
   edge as a loose object (0.01 s of CPU for 1 GiB; hashing a fresh trailer took 0.38 s).
 * **Sizes.** `POST /gvfs/sizes` answers blobs from their segment records (the sizes
-  tables for blobs the store lacks). A prefetch that
+  tables for blobs the store lacks), exactly the blobs a GET serves: an id none of them
+  has is a 404 without asking the upstream. A prefetch that
   sends `X-GVFS-Sizes: 1` gets, after its packs, `"GSZ1" | count u64 | (id[20] | size
   u64)*`: the union of the tables of the slabs in that response (a cold clone: the
   history's; a warm prefetch: what its window introduced). The section is built once per
