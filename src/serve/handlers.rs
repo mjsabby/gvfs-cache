@@ -891,19 +891,6 @@ async fn loose(
 /// large blob: milliseconds of inflating, applying and deflating).
 const RESOLVE_INLINE_MAX: u64 = 256 << 10;
 
-/// Every quoted 40-hex-digit string in `body`, appended to `out` up to its capacity.
-/// Returns false if `out` overflowed.
-pub fn scan_oids(body: &[u8], out: &mut Vec<Oid>) -> bool {
-    let mut at = 0usize;
-    loop {
-        match scan_oids_step(body, &mut at, out, usize::MAX) {
-            Scan::More => {}
-            Scan::Done => return true,
-            Scan::Full => return false,
-        }
-    }
-}
-
 /// Where [`scan_oids_step`] stopped.
 pub enum Scan {
     Done,
@@ -913,7 +900,8 @@ pub enum Scan {
     Full,
 }
 
-/// [`scan_oids`] from byte `*at`, stopping after `max` ids (so that a caller can yield).
+/// Every quoted 40-hex-digit string in `body` from byte `*at`, appended to `out` up to its
+/// capacity, stopping after `max` ids (so that a caller can yield).
 pub fn scan_oids_step(body: &[u8], at: &mut usize, out: &mut Vec<Oid>, max: usize) -> Scan {
     let mut i = *at;
     let mut taken = 0usize;
@@ -946,7 +934,8 @@ pub fn scan_oids_step(body: &[u8], at: &mut usize, out: &mut Vec<Oid>, max: usiz
 /// Ids parsed between budget checks (~10 µs).
 const SCAN_STEP: usize = 256;
 
-/// [`scan_oids`], yielding as `budget` says.
+/// Every quoted 40-hex-digit string in `body`, appended to `out` up to its capacity (false
+/// if `out` overflowed), yielding as `budget` says.
 async fn scan_ids(body: &[u8], out: &mut Vec<Oid>, budget: &mut Budget) -> bool {
     let mut at = 0usize;
     loop {
@@ -1738,6 +1727,18 @@ fn size_item(out: &mut Vec<u8>, first: bool, oid: &Oid, size: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every id of `body` at once ([`scan_oids_step`] without a step limit).
+    fn scan_oids(body: &[u8], out: &mut Vec<Oid>) -> bool {
+        let mut at = 0usize;
+        loop {
+            match scan_oids_step(body, &mut at, out, usize::MAX) {
+                Scan::More => {}
+                Scan::Done => return true,
+                Scan::Full => return false,
+            }
+        }
+    }
 
     #[test]
     fn routes_and_json() {

@@ -14,11 +14,6 @@ impl TreeEntry<'_> {
     pub fn is_tree(&self) -> bool {
         self.mode == b"40000"
     }
-
-    /// Submodule commit: not an object of this repository.
-    pub fn is_gitlink(&self) -> bool {
-        self.mode == b"160000"
-    }
 }
 
 /// Iterates a tree's entries; stops (and sets `malformed`) at the first bad record.

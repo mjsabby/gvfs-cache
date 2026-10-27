@@ -30,10 +30,11 @@ USAGE:
         it as an L0 slab in RAM (one per push). Without it, it serves sealed slabs only.
         Every prefetch is one pack of exactly what the client lacks.
 
-    gvfs-daemon ingest --pack <FILE> --out <DIR> [--threads N]
+    gvfs-daemon ingest --pack <FILE> --out <DIR> [--threads N] [--verify-idx <FILE.idx>]
     gvfs-daemon ingest --upstream <URL|PATH> --want <OID|REF> [--have <OID>] --out <DIR>
         Run ingest_git_delta once and write <DIR>/<id>.pack + <id>.mphf (debugging,
-        benchmarks).
+        benchmarks). --verify-idx checks the slab against git's .idx of the same pack:
+        the same objects at the same offsets.
 
     gvfs-daemon repack --out <DIR> [--frozen <FILE.mphf>] [--mode trees|copy] <FILE.mphf>...
         The optimal splice by hand: slabs (oldest first) become one slab with trees

@@ -761,7 +761,7 @@ pub fn format_head(
 }
 
 /// [`format_head`] with `extra` header lines (each ending in CRLF) before the blank line.
-pub fn format_head_with(
+fn format_head_with(
     buf: &mut [u8],
     status: u16,
     content_type: &str,

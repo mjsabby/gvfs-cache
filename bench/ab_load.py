@@ -1,32 +1,25 @@
 #!/usr/bin/env python3
-"""The edge's connection layer, A/B: the thread-per-request edge (`threads`, before the port),
-the tokio edge (`tokio`), and the spike's variants (`examples/spike_tokio.rs`: `own`,
-`hyper`, `own-blk`, `own-nice`, `own-yield`), on one store.
+"""Load A/B of two gvfs-daemon builds on one store: `base` (env BASE_BIN) against `new` (env
+NEW_BIN, by default this repository's release build).
 
-    python3 bench/spike_tokio.py check --dir ~/gvfs-bench/prof/sg7-sep
-    python3 bench/spike_tokio.py bench --dir ~/gvfs-bench/prof/sg7-sep --rounds 3
-    python3 bench/spike_tokio.py bench --dir ~/gvfs-bench/prof/sg7-sep \
-        --variants threads,own,hyper,own-blk,own-nice,own-yield     # REPORT.md §14's spike
+    BASE_BIN=<an older build> python3 bench/ab_load.py bench --dir ~/gvfs-bench/prof/sg7-sep
+    python3 bench/ab_load.py bench --dir ... --only get_blob_64,post_4000_32 --slow 0 --idle 0
+    python3 bench/ab_load.py summary <results.json>
 
-`check`: the tokio edge and each spike variant answer the same requests with the same
-status, content type, length and body as the thread-per-request edge: config, blobs (GET), commits and trees (GET, whole
-entries), unknown ids, up-to-date prefetches, cold and warm prefetches with and without
-sizes and `.idx`, sizes batches.
-
-`bench`: per workload, every variant in turn (the order rotating each round): edge CPU per
-request, req/s, p50/p99 latency, allocations per request (`gvfs_alloc_post_seal_total`).
-Then a GET load beside slow downloaders (clients reading a cold prefetch at 80 KB/s), and
-beside idle keep-alive connections (with the edge's resident memory).
+Per workload, each build in turn (the order rotating each round): edge CPU per request,
+req/s, p50/p99 latency, allocations per request (`gvfs_alloc_post_seal_total`). Then a GET
+load beside slow downloaders (clients reading a cold prefetch at 80 KB/s), and beside idle
+keep-alive connections (with the edge's resident memory). The slot a build runs in biases
+results by up to 0.3%: before calling a smaller difference, swap BASE_BIN and NEW_BIN.
 
 `--dir` holds `store/`, `up.git` and `blobs.txt` (bench/build_store.py). The edge runs on
-SERVER_CPUS, loadgen on LOADGEN_CPUS, this script (slow and idle clients) on CLIENT_CPUS.
+SERVER_CPUS, loadgen on LOADGEN_CPUS, this script (slow and idle clients) on CLIENT_CPUS;
+SERVE_EXTRA adds flags to both builds' `serve` (e.g. `--quantum-us 50`).
 """
 import argparse
 import collections
-import hashlib
 import json
 import os
-import random
 import resource
 import shutil
 import socket
@@ -38,16 +31,12 @@ import threading
 import time
 
 sys.path.insert(0, os.path.dirname(__file__))
-from gvfslib import clean_env, free_port, metrics, request, wait_http  # noqa: E402
+from gvfslib import clean_env, free_port, metrics, wait_http  # noqa: E402
 from profile_bpf import LOADGEN_CPUS, OUT, SERVER_CPUS, cpu_seconds, loadgen_starter, wait_load  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# `threads`: the thread-per-request edge (before the tokio port, commit 5dada58); `tokio`: the
-# edge as built now. Both run `gvfs-daemon serve` (env THREADS_BIN / TOKIO_BIN).
-THREADS_BIN = os.environ.get("THREADS_BIN", os.path.expanduser("~/gvfs-bench/prof/bin/gvfs-daemon-threads"))
-TOKIO_BIN = os.environ.get("TOKIO_BIN", os.path.join(REPO, "target/release/gvfs-daemon"))
-SPIKE_BIN = os.path.join(REPO, "target/release/examples/spike_tokio")
-DAEMONS = {"threads": THREADS_BIN, "tokio": TOKIO_BIN}
+BUILDS = {"base": os.environ.get("BASE_BIN"),
+          "new": os.environ.get("NEW_BIN", os.path.join(REPO, "target/release/gvfs-daemon"))}
 CLIENT_CPUS = os.environ.get("CLIENT_CPUS", "4-7,20-23")
 GIT_UA = "git/2.53.0.vfs.0.0"
 UP_TO_DATE = 9999999999
@@ -62,25 +51,19 @@ def cpus(spec):
 
 
 def command(variant, store, port, cache, idle):
-    bind = f"127.0.0.1:{port}"
-    if variant in DAEMONS:
-        cmd = [DAEMONS[variant], "serve", "--store", f"fs:{store}", "--bind", bind, "--cache-dir", cache,
-               "--alloc-guard", "count", "--idle-secs", str(idle)]
-        # The runtime's threads: one per edge CPU (the thread-per-request edge keeps its 256);
-        # TOKIO_EXTRA: more flags (e.g. `--quantum-us 50`).
-        extra = ["--workers", str(len(cpus(SERVER_CPUS)))] + os.environ.get("TOKIO_EXTRA", "").split()
-        return cmd + (extra if variant == "tokio" else [])
-    mode, _, heavy = variant.partition("-")
-    cmd = [SPIKE_BIN, "--mode", mode, "--store", f"fs:{store}", "--bind", bind, "--cache-dir", cache,
-           "--threads", str(len(cpus(SERVER_CPUS))), "--idle-secs", str(idle)]
-    return cmd + (["--heavy", {"blk": "blocking", "nice": "nice", "yield": "yield"}[heavy]] if heavy else [])
+    """`serve` for build `variant`: one runtime thread per edge CPU, plus SERVE_EXTRA."""
+    if not BUILDS.get(variant):
+        sys.exit(f"no build for {variant!r}: set {variant.upper()}_BIN")
+    return [BUILDS[variant], "serve", "--store", f"fs:{store}", "--bind", f"127.0.0.1:{port}",
+            "--cache-dir", cache, "--alloc-guard", "count", "--idle-secs", str(idle),
+            "--workers", str(len(cpus(SERVER_CPUS)))] + os.environ.get("SERVE_EXTRA", "").split()
 
 
 def start(variant, store, idle=30):
     port = free_port()
-    cache = os.path.join(OUT, f"spike-cache-{variant}")
+    cache = os.path.join(OUT, f"ab-load-cache-{variant}")
     shutil.rmtree(cache, ignore_errors=True)
-    log = open(os.path.join(OUT, f"spike-{variant}.log"), "wb")
+    log = open(os.path.join(OUT, f"ab-load-{variant}.log"), "wb")
     p = subprocess.Popen(["taskset", "-c", SERVER_CPUS] + command(variant, store, port, cache, idle),
                          stdout=subprocess.DEVNULL, stderr=log, env=clean_env())
     wait_http(port, "/healthz", timeout=1800, proc=p)
@@ -92,95 +75,6 @@ def stop(servers):
         p.terminate()
     for p, _ in servers.values():
         p.wait()
-
-
-# ------------------------------------------------------------------------------- check
-
-def stream(port, path, headers):
-    """Status, the headers that matter, length and SHA-256 of a (large) body, streamed."""
-    import http.client
-    c = http.client.HTTPConnection("127.0.0.1", port, timeout=3600)
-    try:
-        c.request("GET", path, headers=headers)
-        r = c.getresponse()
-        h, n, first = hashlib.sha256(), 0, b""
-        while True:
-            chunk = r.read(1 << 20)
-            if not chunk:
-                break
-            if not first:
-                first = chunk[:32]
-            h.update(chunk)
-            n += len(chunk)
-        keep = ("content-type", "content-length", "x-gvfs-pack-start", "x-gvfs-pack-end", "x-gvfs-sizes")
-        hdrs = {k.lower(): v for k, v in r.getheaders() if k.lower() in keep}
-        return {"status": r.status, "headers": hdrs, "len": n, "sha256": h.hexdigest()}, first
-    finally:
-        c.close()
-
-
-def check(a):
-    store, up = os.path.join(a.dir, "store"), os.path.join(a.dir, "up.git")
-    blobs = [x for x in open(os.path.join(a.dir, "blobs.txt")).read().split() if x]
-    variants = ("threads", "tokio", "own", "hyper")
-    servers = {v: start(v, store) for v in variants}
-    rnd = random.Random(7)
-    reqs = [("GET", "/gvfs/config", None, {}), ("GET", "/healthz", None, {})]
-    for h in ({}, {"X-GVFS-Sizes": "1"}):
-        reqs.append(("GET", f"/gvfs/prefetch?lastPackTimestamp={UP_TO_DATE}", None, h))
-    reqs += [("GET", f"/gvfs/objects/{o}", None, {}) for o in rnd.sample(blobs, min(4000, len(blobs)))]
-    commits = subprocess.run(["git", "--git-dir", up, "rev-list", "--first-parent", "-n", "300", "HEAD"],
-                             capture_output=True, text=True, check=True, env=clean_env()).stdout.split()
-    trees = subprocess.run(["git", "--git-dir", up, "rev-parse"] + [c + "^{tree}" for c in commits],
-                           capture_output=True, text=True, check=True, env=clean_env()).stdout.split()
-    reqs += [("GET", f"/gvfs/objects/{o}", None, {}) for o in commits + trees]
-    reqs.append(("GET", "/gvfs/objects/" + "0" * 40, None, {}))
-    for n in (1, 2, 17, 100, 1000, 4000, 4000):
-        body = json.dumps([rnd.choice(blobs) for _ in range(n)]).encode()
-        reqs.append(("POST", "/gvfs/sizes", body, {"Content-Type": "application/json"}))
-    reqs.append(("POST", "/gvfs/sizes", json.dumps(commits[:50] + trees[:50]).encode(), {}))
-    reqs.append(("POST", "/gvfs/sizes", json.dumps(blobs[:5] + ["1" * 40]).encode(), {}))
-    stats = collections.Counter()
-    bad = []
-    try:
-        for method, path, body, headers in reqs:
-            rs = {v: request(port, method, path, body=body, headers=headers) for v, (_, port) in servers.items()}
-            base = rs["threads"]
-            for v in variants[1:]:
-                r = rs[v]
-                if r.status == 404 and b"delta: not in the spike" in r.body:
-                    stats[f"{v} delta (not served by the spike)"] += 1
-                    continue
-                same = (r.status, r.headers.get("content-type"), r.body) == \
-                    (base.status, base.headers.get("content-type"), base.body)
-                stats[f"{v} {'same' if same else 'DIFFERENT'} {method} {base.status}"] += 1
-                if not same:
-                    bad.append((v, method, path, base.status, r.status, len(base.body), len(r.body)))
-        # The tip's timestamp, from the cold pack's GPRE header.
-        _, first = stream(servers["threads"][1], "/gvfs/prefetch?lastPackTimestamp=0", {"User-Agent": GIT_UA})
-        tip = int.from_bytes(first[8:16], "little")
-        git_sizes = {"User-Agent": GIT_UA, "X-GVFS-Sizes": "1"}
-        streams = [(0, git_sizes), (0, {"User-Agent": GIT_UA}), (0, {"User-Agent": "GVFS/1.0"}),
-                   (tip - 3600, git_sizes), (tip - 86400, git_sizes), (tip - 3 * 86400, {"User-Agent": GIT_UA}),
-                   (tip - 7 * 86400, git_sizes)]
-        for since, headers in streams:
-            path = f"/gvfs/prefetch?lastPackTimestamp={since}"
-            got = {v: stream(port, path, headers)[0] for v, (_, port) in servers.items()}
-            for v in variants[1:]:
-                same = got[v] == got["threads"]
-                stats[f"{v} {'same' if same else 'DIFFERENT'} prefetch stream"] += 1
-                if not same:
-                    bad.append((v, "GET", path, got["threads"], got[v]))
-            print(f"prefetch since {since} {headers}: {got['threads']['len']:,} bytes "
-                  f"{got['threads']['sha256'][:16]}", flush=True)
-    finally:
-        stop(servers)
-    for k, n in sorted(stats.items()):
-        print(f"  {n:6d}  {k}")
-    for b in bad[:20]:
-        print("  MISMATCH", b)
-    print("check:", "OK" if not bad else f"{len(bad)} mismatches")
-    return 0 if not bad else 1
 
 
 # ------------------------------------------------------------------------------- bench
@@ -233,18 +127,10 @@ def workloads(blobs):
     w["cold_clone_8"] = [("cold", cold, 8)]
     w["sizes_4000_32"] = [("sizes", sizes, 32)]
     w["mixed_get64_sizes32"] = [("sizes", sizes, 32), ("get", get, 64)]
-    # POST /gvfs/objects (not in the spike: `gvfs-daemon serve` only).
     post = ["--workload", "post-objects", "--oids", blobs, "--batch", "4000", "--bodies", "512"]
     w["post_4000_32"] = [("post", post, 32)]
     w["mixed_get64_post32"] = [("post", post, 32), ("get", get, 64)]
     return w
-
-
-def runs(variant, work):
-    """Whether `variant` serves workload `work`."""
-    if work.startswith(("post", "mixed_get64_post")):
-        return variant in DAEMONS
-    return "-" not in variant or "sizes" in work
 
 
 def slow_reader(port, stop_evt, started):
@@ -332,7 +218,7 @@ def bench(a):
     work = workloads(blobs)
     names = [n for n in work if not a.only or n in a.only.split(",")]
     results = []
-    out_path = os.path.join(OUT, "spike.json")
+    out_path = os.path.join(OUT, "ab-load.json")
 
     def record(r):
         results.append(r)
@@ -345,15 +231,13 @@ def bench(a):
             for n in names:
                 k = rnd % len(variants)
                 for v in variants[k:] + variants[:k]:
-                    if not runs(v, n):
-                        continue
                     p, port = servers[v]
                     res = run_loads(port, p.pid, work[n], a.secs)
                     record({"work": n, "variant": v, "round": rnd, "rss_mb": round(rss_mb(p.pid), 1),
                             "anon_mb": round(rss_mb(p.pid, "RssAnon:"), 1), **res})
         get = ["--workload", "get-object", "--oids", blobs]
         for rnd in range(a.extra_rounds):
-            for v in [x for x in variants if "-" not in x]:
+            for v in variants:
                 p, port = servers[v]
                 if a.slow:
                     record({"work": f"slow{a.slow}_get64", "variant": v, "round": rnd,
@@ -401,11 +285,9 @@ def summarize(results):
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("check")
-    c.add_argument("--dir", required=True)
     b = sub.add_parser("bench")
     b.add_argument("--dir", required=True)
-    b.add_argument("--variants", default="threads,tokio")
+    b.add_argument("--variants", default="base,new")
     b.add_argument("--rounds", type=int, default=3)
     b.add_argument("--secs", type=float, default=10)
     b.add_argument("--only", default=None)
@@ -417,8 +299,6 @@ def main():
     a = ap.parse_args()
     os.makedirs(OUT, exist_ok=True)
     os.sched_setaffinity(0, cpus(CLIENT_CPUS))
-    if a.cmd == "check":
-        sys.exit(check(a))
     if a.cmd == "summary":
         summarize(json.load(open(a.file)))
         return
