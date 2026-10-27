@@ -1,4 +1,4 @@
-//! `gvfs-daemon pipeline`: the scheduled job (ADO pipeline / GitHub Action, every 15 min).
+//! `gvfs-cache pipeline`: the scheduled job (ADO pipeline / GitHub Action, every 15 min).
 //! Runners are stateless: everything a run needs comes from the store.
 //!
 //! The upstream is asked for every commit exactly once: by the one-time seed, then by the
@@ -37,7 +37,7 @@
 //! table (`slabs/<id>.sizes`) for the blobs its trees introduce:
 //!
 //! * Genesis takes every size from the upstream and publishes the history;
-//!   `gvfs-daemon mirror` then copies every blob of it (edges serve once it has).
+//!   `gvfs-cache mirror` then copies every blob of it (edges serve once it has).
 //! * A 15m run works **blobs first**: it lists the blobs its new trees reference, copies
 //!   the ones `blobs.bin` lacks (verified by id as they stream through), publishes them in
 //!   `blobs.bin`, and only then publishes its slab, recording the `blobs.bin` generation
@@ -89,7 +89,7 @@ fn retention(tier: Tier, keep_weeks: usize) -> u64 {
     }
 }
 
-/// `gvfs-daemon pipeline ...`
+/// `gvfs-cache pipeline ...`
 pub fn main(args: &[String]) -> Result<()> {
     let f = crate::cli::Flags::parse(
         args,
@@ -149,7 +149,7 @@ pub fn main(args: &[String]) -> Result<()> {
         cache_dir: f
             .get("cache-dir")
             .map(PathBuf::from)
-            .unwrap_or_else(|| work_dir.join("gvfs-daemon-store-cache")),
+            .unwrap_or_else(|| work_dir.join("gvfs-cache-store-cache")),
     };
     let m = run(&mut opts)?;
     crate::log!("published manifest:\n{}", m.describe());
@@ -345,7 +345,7 @@ fn genesis(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<M
 
 /// Genesis of a `--blobs separate` store: the history's commits and trees (`blob:none`),
 /// every size their trees need from the upstream, and `blobs.bin` naming the genesis
-/// commit, not mirrored: `gvfs-daemon mirror` copies the history's blobs.
+/// commit, not mirrored: `gvfs-cache mirror` copies the history's blobs.
 fn genesis_separate(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<Manifest> {
     crate::log!(
         "no manifest in {}: genesis (blobs separate) from {head}",

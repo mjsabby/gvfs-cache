@@ -1,5 +1,5 @@
-"""Adapters: one uniform interface over the gvfs-daemon CLIs: opus (this repository) and
-the other implementations kept in `alt_clients/` for cross-testing.
+"""Adapters: one uniform interface over the implementations' CLIs: opus (this repository's
+`gvfs-cache`) and the others kept in `alt_clients/` for cross-testing (each a `gvfs-daemon`).
 
 Standard tiers: 15m 1h 6h 12h 24h 168h.  `step(tier)` performs one scheduled pipeline run
 "ingest new commits, then roll up everything up to `tier`" in whatever way the
@@ -17,10 +17,11 @@ TIERS = ["15m", "1h", "6h", "12h", "24h", "168h"]
 
 
 def binary_path(name):
-    """The release build of implementation `name`: opus at the repository root, the others
-    in `alt_clients/<name>/`."""
-    base = ROOT if name == "opus" else os.path.join(ROOT, "alt_clients", name)
-    return os.path.join(base, "target", "release", "gvfs-daemon")
+    """The release build of implementation `name`: opus's `gvfs-cache` at the repository
+    root, the others' `gvfs-daemon` (the specification's name) in `alt_clients/<name>/`."""
+    if name == "opus":
+        return os.path.join(ROOT, "target", "release", "gvfs-cache")
+    return os.path.join(ROOT, "alt_clients", name, "target", "release", "gvfs-daemon")
 
 
 class Server:

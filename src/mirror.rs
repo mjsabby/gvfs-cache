@@ -1,4 +1,4 @@
-//! `gvfs-daemon mirror`: copies every blob of the history into a `--blobs separate` store,
+//! `gvfs-cache mirror`: copies every blob of the history into a `--blobs separate` store,
 //! resumably. Edges serve the store once this has finished.
 //!
 //! The work is planned from the store's own metadata, never from the upstream: blob ids
@@ -61,7 +61,7 @@ pub struct Options {
     pub publish_every: Duration,
 }
 
-/// `gvfs-daemon mirror ...`
+/// `gvfs-cache mirror ...`
 pub fn main(args: &[String]) -> Result<()> {
     let f = crate::cli::Flags::parse(
         args,

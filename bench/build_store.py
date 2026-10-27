@@ -32,7 +32,7 @@ def main():
     ap.add_argument("--work", required=True)
     ap.add_argument("--blobs", choices=["inline", "separate"], default="separate")
     ap.add_argument("--days", type=float, default=14)
-    ap.add_argument("--bin", default=None, help="gvfs-daemon binary (default: the release build)")
+    ap.add_argument("--bin", default=None, help="gvfs-cache binary (default: the release build)")
     ap.add_argument("--perf", default=None,
                     help="perf.data path: record every CPU (frame pointers) during the window runs")
     a = ap.parse_args()

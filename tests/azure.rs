@@ -22,9 +22,9 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
 
 use common::*;
-use gvfs_daemon::azure::AzureStore;
-use gvfs_daemon::http::{Client, Url};
-use gvfs_daemon::store::{Cond, Store};
+use gvfs_cache::azure::AzureStore;
+use gvfs_cache::http::{Client, Url};
+use gvfs_cache::store::{Cond, Store};
 
 const ACCOUNT: &str = "devstoreaccount1";
 /// Azurite's published development key.
@@ -111,16 +111,13 @@ impl Azurite {
 
     /// Creates a container (provisioning is not the daemon's job).
     fn create_container(&self, name: &str) {
-        let key = gvfs_daemon::b64::decode(KEY).unwrap();
+        let key = gvfs_cache::b64::decode(KEY).unwrap();
         let headers = [
-            (
-                "x-ms-date",
-                gvfs_daemon::azure::http_date(SystemTime::now()),
-            ),
+            ("x-ms-date", gvfs_cache::azure::http_date(SystemTime::now())),
             ("x-ms-version", "2021-08-06".to_string()),
         ];
         let query = [("restype", "container".to_string())];
-        let sts = gvfs_daemon::azure::string_to_sign(
+        let sts = gvfs_cache::azure::string_to_sign(
             ACCOUNT,
             "PUT",
             &format!("/{ACCOUNT}/{name}"),
@@ -128,7 +125,7 @@ impl Azurite {
             &headers,
             0,
         );
-        let sig = gvfs_daemon::b64::encode(
+        let sig = gvfs_cache::b64::encode(
             ring::hmac::sign(
                 &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key),
                 sts.as_bytes(),
@@ -163,7 +160,7 @@ impl Backend {
         let unique = format!(
             "gvd-{test}-{}-{}",
             std::process::id(),
-            gvfs_daemon::util::now_secs()
+            gvfs_cache::util::now_secs()
         );
         if let (Some(file), Ok(container)) = (
             std::env::var_os("GVFS_TEST_AZURE_CS_FILE"),
@@ -265,7 +262,7 @@ fn azure_store_operations() {
         b"small"
     );
 
-    let now = gvfs_daemon::util::now_secs();
+    let now = gvfs_cache::util::now_secs();
     let mut listed = store.list("slabs/").unwrap();
     listed.sort_by(|a, b| a.key.cmp(&b.key));
     assert_eq!(
@@ -353,7 +350,7 @@ fn azure_pipeline_and_serve() {
         pipeline_at(&root, store, &upstream, tier, &args, &env)
             .unwrap_or_else(|log| panic!("pipeline {tier}: {log}"))
     };
-    let t0 = gvfs_daemon::util::now_secs();
+    let t0 = gvfs_cache::util::now_secs();
     run("15m", t0, &[]);
     up.commit(5);
     run("15m", t0 + 900, &[]);
@@ -394,7 +391,7 @@ fn azure_pipeline_and_serve() {
     };
     let listed = || {
         let (bytes, _) = backend.store("").get("manifest.bin").unwrap().unwrap();
-        let m = gvfs_daemon::manifest::Manifest::decode(&bytes).unwrap();
+        let m = gvfs_cache::manifest::Manifest::decode(&bytes).unwrap();
         let mut v: Vec<String> = m
             .slabs()
             .flat_map(|x| [format!("{}.pack", x.id), format!("{}.mphf", x.id)])
@@ -434,7 +431,7 @@ fn azure_pipeline_and_serve() {
     // GC removed the slabs the rollups and the weekly rebuild replaced.
     let s = backend.store("");
     let (bytes, _) = s.get("manifest.bin").unwrap().unwrap();
-    let m = gvfs_daemon::manifest::Manifest::decode(&bytes).unwrap();
+    let m = gvfs_cache::manifest::Manifest::decode(&bytes).unwrap();
     let mut keys: Vec<String> = s
         .list("slabs/")
         .unwrap()
@@ -488,7 +485,7 @@ fn azure_separate_store() {
     };
     run(&["--blobs", "separate"]);
     let work = root.join("mirror-work");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gvfs-daemon"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gvfs-cache"));
     cmd.args(["mirror", "--store", &store, "--store-auth-env", "GVD_AZ_CS"])
         .args([
             "--upstream",
@@ -498,7 +495,7 @@ fn azure_separate_store() {
         ])
         .args(["--publish-secs", "0", "--blob-pack-mib", "1", "--jobs", "2"])
         .envs(env.iter().copied());
-    gvfs_daemon::upstream::hermetic_git_env(&mut cmd);
+    gvfs_cache::upstream::hermetic_git_env(&mut cmd);
     let out = cmd.output().unwrap();
     assert!(
         out.status.success(),
@@ -517,8 +514,8 @@ fn azure_separate_store() {
     // The runner's cache holds only what the store lists.
     let s = backend.store("");
     let (bytes, _) = s.get("manifest.bin").unwrap().unwrap();
-    let m = gvfs_daemon::manifest::Manifest::decode(&bytes).unwrap();
-    let (bm, _) = gvfs_daemon::blobcopy::load(&s).unwrap();
+    let m = gvfs_cache::manifest::Manifest::decode(&bytes).unwrap();
+    let (bm, _) = gvfs_cache::blobcopy::load(&s).unwrap();
     let listed: std::collections::HashSet<String> = m
         .slabs()
         .flat_map(|x| {
@@ -530,7 +527,7 @@ fn azure_separate_store() {
         })
         .chain(bm.segments.iter().map(|g| format!("{}.bidx", g.id)))
         .collect();
-    let cached: Vec<String> = std::fs::read_dir(root.join("pipeline-work/gvfs-daemon-store-cache"))
+    let cached: Vec<String> = std::fs::read_dir(root.join("pipeline-work/gvfs-cache-store-cache"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
@@ -679,7 +676,7 @@ fn azure_separate_store() {
 fn an_object_store_edge_needs_a_cache_dir() {
     let cs = "DefaultEndpointsProtocol=http;AccountName=a;AccountKey=AAAA;\
               BlobEndpoint=http://127.0.0.1:1/a";
-    let out = Command::new(env!("CARGO_BIN_EXE_gvfs-daemon"))
+    let out = Command::new(env!("CARGO_BIN_EXE_gvfs-cache"))
         .args([
             "serve",
             "--store",

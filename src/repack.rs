@@ -1009,7 +1009,7 @@ impl Repacker {
     }
 }
 
-/// `gvfs-daemon repack [--frozen <FILE.mphf>] [--mode trees|copy] --out <DIR> <FILE.mphf>...`:
+/// `gvfs-cache repack [--frozen <FILE.mphf>] [--mode trees|copy] --out <DIR> <FILE.mphf>...`:
 /// the optimal splice by hand (inspection, measurements).
 pub fn main(args: &[String]) -> Result<()> {
     let f = crate::cli::Flags::parse(args, &["out", "frozen", "mode", "tier", "threads"])?;

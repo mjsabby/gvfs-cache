@@ -41,7 +41,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from gvfslib import clean_env, free_port, metrics, request, wait_http  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(ROOT, "target/release/gvfs-daemon")
+BIN = os.path.join(ROOT, "target/release/gvfs-cache")
 MSGIT = os.environ.get("GVFS_TEST_MSGIT", os.path.expanduser("~/git/bin-wrappers/git"))
 SCALAR = os.path.join(os.path.dirname(MSGIT), "scalar")
 # core.gvfs as `scalar clone` sets it: block commands, missing OK, skip reachability,

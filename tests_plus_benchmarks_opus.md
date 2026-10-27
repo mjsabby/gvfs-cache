@@ -1,4 +1,4 @@
-# gvfs-daemon: standard tests and benchmarks
+# gvfs-cache: standard tests and benchmarks
 
 This lists every test and measurement run on **opus** (this repository's root) during its build. It was written so that **argon, astra, fable and sol** could go through the same suite; astra, fable and sol now live in `alt_clients/<name>`, and argon was removed. Each item has a stable ID, a setup, a procedure, and a pass criterion or metric, followed by opus's result. §9 is the cross-implementation results matrix with opus filled in. This document records opus as it was built; REPORT.md has the comparison and everything measured and changed since.
 
@@ -90,15 +90,15 @@ Each implementation must expose these capabilities. The last column shows how op
 
 | Capability | Used by | opus |
 |---|---|---|
-| One pipeline run with a tier, an injected clock and a branch. The first run on an empty store is the seed. | T-10 to T-17, B-05, B-11 | `gvfs-daemon pipeline --store fs:<dir> --upstream <path or url> --tier <15m, 1h, 6h, 12h, 24h or 168h> [--now <unix-secs>] [--branch <b>] [--keep-weeks N] [--gc-grace-secs N] [--token-env VAR]` |
-| A server that follows the store and, optionally, the upstream | T-03 to T-17, B-07 to B-10 | `gvfs-daemon serve --store … [--upstream …] --bind 127.0.0.1:<port> --poll-ms 100 --cache-dir <dir> --alloc-guard strict`. Tests also pass `--workers 8 --arenas 4`. |
+| One pipeline run with a tier, an injected clock and a branch. The first run on an empty store is the seed. | T-10 to T-17, B-05, B-11 | `gvfs-cache pipeline --store fs:<dir> --upstream <path or url> --tier <15m, 1h, 6h, 12h, 24h or 168h> [--now <unix-secs>] [--branch <b>] [--keep-weeks N] [--gc-grace-secs N] [--token-env VAR]` |
+| A server that follows the store and, optionally, the upstream | T-03 to T-17, B-07 to B-10 | `gvfs-cache serve --store … [--upstream …] --bind 127.0.0.1:<port> --poll-ms 100 --cache-dir <dir> --alloc-guard strict`. Tests also pass `--workers 8 --arenas 4`. |
 | The GVFS protocol, under any path prefix (`/org/repo/gvfs/…`) | all server tests | `GET /gvfs/config`, `GET /gvfs/prefetch?lastPackTimestamp=T`, `GET /gvfs/objects/<id>`, `POST /gvfs/objects`, `POST /gvfs/sizes` |
-| Published state: generation, tip, tip timestamp, slabs by tier | T-10 to T-14 | `gvfs-daemon inspect manifest --store …`; `/metrics` `gvfs_manifest_generation` |
+| Published state: generation, tip, tip timestamp, slabs by tier | T-10 to T-14 | `gvfs-cache inspect manifest --store …`; `/metrics` `gvfs_manifest_generation` |
 | Live-tip state | T-05, T-10 to T-13 | `/metrics` `gvfs_l0_slabs` |
 | Hot-path allocations and server errors | T-18, B-09 | `/metrics` `gvfs_alloc_hot_path_total` and `gvfs_errors_total`. A neutral substitute is `~/gvfs-server-benchmark/tools/allocshim` (LD_PRELOAD counter). |
-| Offline: index a pack and compare it with git's `.idx` | T-01, S-01, B-02 | `gvfs-daemon ingest --pack <P> --out <D> --threads N --verify-idx <git.idx>` |
-| Offline: fetch a commit range, and repack slabs | B-06, B-12 | `gvfs-daemon ingest --upstream <repo> [--have H] --want W --out D`; `gvfs-daemon repack --tier T --out D [--mode copy] [--frozen F] <slab.mphf>...` |
-| Export a prefetch pack's `.idx` | S-02 | `gvfs-daemon inspect slab <S.mphf> --write-idx out.idx` |
+| Offline: index a pack and compare it with git's `.idx` | T-01, S-01, B-02 | `gvfs-cache ingest --pack <P> --out <D> --threads N --verify-idx <git.idx>` |
+| Offline: fetch a commit range, and repack slabs | B-06, B-12 | `gvfs-cache ingest --upstream <repo> [--have H] --want W --out D`; `gvfs-cache repack --tier T --out D [--mode copy] [--frozen F] <slab.mphf>...` |
+| Export a prefetch pack's `.idx` | S-02 | `gvfs-cache inspect slab <S.mphf> --write-idx out.idx` |
 
 - **Clock injection.** Since P3, opus derives every timestamp from commits; `--now` only drives garbage collection. An implementation without a `--now` flag can run its pipeline under libfaketime, with the harness writing the simulated time before each event. If it stamps from the server's clock, run the server that way too.
 - **Content policy.** This must be declared. opus prefetch packs hold every object reachable from the tip: commits, trees and all blobs, including SG's 592 non-pointer blobs. An implementation that leaves blobs out should compute B-11's ideal with `--filter=blob:none`; it is then complete only for commits and trees.
@@ -638,22 +638,22 @@ cargo clippy --workspace --all-targets
 
 # S-01 / B-02
 P=/home/muks/SearchGold/.git/objects/pack/pack-ec111cc94ed5a20453e303e45695428e4ac3a35b
-time ./target/release/gvfs-daemon ingest --pack $P.pack --out /home/muks/scratch/ingest --threads 32 --verify-idx $P.idx
+time ./target/release/gvfs-cache ingest --pack $P.pack --out /home/muks/scratch/ingest --threads 32 --verify-idx $P.idx
 time git index-pack --threads=32 -o /home/muks/scratch/git.idx $P.pack
 
 # Scale store (S-02..S-05, B-03, B-07..B-10): a bare repo sharing SearchGold's objects, main at the seed.
 git clone -q --bare --shared /home/muks/SearchGold /home/muks/scratch/up.git
-./target/release/gvfs-daemon pipeline --store fs:/home/muks/scratch/store --upstream /home/muks/scratch/up.git --tier 15m
-./target/release/gvfs-daemon serve --store fs:/home/muks/scratch/store --upstream /home/muks/scratch/up.git \
+./target/release/gvfs-cache pipeline --store fs:/home/muks/scratch/store --upstream /home/muks/scratch/up.git --tier 15m
+./target/release/gvfs-cache serve --store fs:/home/muks/scratch/store --upstream /home/muks/scratch/up.git \
     --bind 127.0.0.1:18081 --cache-dir /home/muks/scratch/cache --alloc-guard strict --prefetch-idx never
 git init -q /home/muks/scratch/client && git -C /home/muks/scratch/client config remote.origin.url http://127.0.0.1:18081/org/repo
 time ~/git/bin-wrappers/git -C /home/muks/scratch/client gvfs-helper --cache-server=disable prefetch     # B-08 (a)
 time git clone -q --bare --no-local /home/muks/scratch/up.git /home/muks/scratch/native.git              # B-08 (b)
 benches/load.sh 127.0.0.1:18081 /home/muks/scratch/up.git 10      # B-09; WARM_TS=<cursor> adds the warm row
-./target/release/gvfs-daemon inspect slab /home/muks/scratch/store/slabs/base-*.mphf --write-idx /home/muks/scratch/base.idx  # S-02 (compare with git index-pack)
+./target/release/gvfs-cache inspect slab /home/muks/scratch/store/slabs/base-*.mphf --write-idx /home/muks/scratch/base.idx  # S-02 (compare with git index-pack)
 
 # B-06
-BIN=target/release/gvfs-daemon benches/rollup.sh /home/muks/SearchGold 2026-10-17 /home/muks/scratch/rollup
+BIN=target/release/gvfs-cache benches/rollup.sh /home/muks/SearchGold 2026-10-17 /home/muks/scratch/rollup
 
 # B-11 (about 6 minutes; leaves about 8.5 GB in --work)
 cargo build --release --example clients

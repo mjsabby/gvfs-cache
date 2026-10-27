@@ -1,4 +1,4 @@
-//! `gvfs-daemon inspect`: human-readable views of the manifest and of slabs.
+//! `gvfs-cache inspect`: human-readable views of the manifest and of slabs.
 
 use std::path::{Path, PathBuf};
 

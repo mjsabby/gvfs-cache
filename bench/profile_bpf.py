@@ -30,12 +30,18 @@ sys.path.insert(0, os.path.dirname(__file__))
 from gvfslib import clean_env, free_port, wait_http  # noqa: E402
 
 BENCH = os.path.expanduser("~/gvfs-bench")
-FP_BIN = os.path.join(BENCH, "prof/target/release/gvfs-daemon")
+FP_BIN = os.path.join(BENCH, "prof/target/release/gvfs-cache")
 LOADGEN = os.path.expanduser("~/gvfs-server-benchmark/target/loadgen/release/loadgen")
 SERVER_CPUS = os.environ.get("SERVER_CPUS", "0-3,16-19")
 LOADGEN_CPUS = os.environ.get("LOADGEN_CPUS", "8-15,24-31")
 OUT = os.path.join(BENCH, "prof/out")
 HASH = re.compile(r"::h[0-9a-f]{16}$")
+# opus's crate: gvfs_cache, or gvfs_daemon in builds from before the rename (and in alt_clients/).
+CRATES = ("gvfs_cache", "gvfs_daemon")
+
+
+def is_ours(sym):
+    return any(c in sym for c in CRATES)
 
 
 def demangle(text):
@@ -135,7 +141,7 @@ def summarize_offcpu(text, top=20):
             user, kern = parts[1:i], parts[i + 1:]
         else:
             user, kern = parts[1:], []
-        ours = [clean(p) for p in user if "gvfs_daemon" in p]
+        ours = [clean(p) for p in user if is_ours(p)]
         where = ours[-1] if ours else (clean(user[-1]) if user else "?")
         sysc = next((("sys_" + m.group(1)) for m in (SYS.match(f) for f in kern) if m), None)
         reason = sysc or next((f for f in reversed(kern) if f not in SCHED), "?")
@@ -247,7 +253,8 @@ def loadgen_starter(port, args, conns, secs):
 
 
 def short(sym, n=110):
-    sym = sym.replace("gvfs_daemon::", "")
+    for c in CRATES:
+        sym = sym.replace(c + "::", "")
     return sym if len(sym) <= n else sym[:n] + "..."
 
 
@@ -263,7 +270,7 @@ def report(name, res):
     for s, p in on["self"][:16]:
         print(f"    {p:6.2f}%  {short(s)}")
     print("  inclusive, ours:")
-    for s, p in [x for x in on["inclusive_user"] if "gvfs_daemon" in x[0]][:16]:
+    for s, p in [x for x in on["inclusive_user"] if is_ours(x[0])][:16]:
         print(f"    {p:6.2f}%  {short(s)}")
     off = res["offcpu"]
     print(f"  off-CPU {off['total_s']} s; by thread kind: {off['by_thread_kind'][:6]}")

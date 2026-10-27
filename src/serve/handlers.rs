@@ -71,7 +71,7 @@ pub struct Metrics {
     /// Blobs served from the store's blob packs, and through the proxy.
     pub blobs_store: AtomicU64,
     pub blobs_proxied: AtomicU64,
-    /// Blobs a sealed tree names that a complete store lacked (a fault: `gvfs-daemon
+    /// Blobs a sealed tree names that a complete store lacked (a fault: `gvfs-cache
     /// mirror` repairs the store).
     pub blobs_missing: AtomicU64,
     pub unavailable: AtomicU64,
@@ -269,7 +269,7 @@ fn health(ctx: &Ctx) -> (u16, &'static str) {
     let blobs = ctx.view().blobs.as_ref().is_none_or(|b| b.complete);
     match (started, blobs) {
         (true, true) => (200, "ok\n"),
-        (true, false) => (503, "blobs incomplete (gvfs-daemon mirror running)\n"),
+        (true, false) => (503, "blobs incomplete (gvfs-cache mirror running)\n"),
         _ => (503, "starting\n"),
     }
 }
@@ -346,7 +346,7 @@ fn missing(ctx: &Ctx, generation: u64, count: usize, first: &Oid) {
         .fetch_add(u64_of(count), Ordering::Relaxed);
     crate::log!(
         "serve: {count} blobs of sealed trees are not in blobs.bin generation {generation} \
-         (first: {first}); proxying them. gvfs-daemon mirror copies them into the store"
+         (first: {first}); proxying them. gvfs-cache mirror copies them into the store"
     );
 }
 

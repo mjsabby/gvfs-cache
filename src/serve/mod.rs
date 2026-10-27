@@ -1,4 +1,4 @@
-//! `gvfs-daemon serve`: the GVFS server. The same code is the remote edge
+//! `gvfs-cache serve`: the GVFS server. The same code is the remote edge
 //! (`--bind 0.0.0.0:8080`) and the localhost proxy (`--bind 127.0.0.1:8080`).
 //!
 //! Boot (also crash recovery — there is no other state):
@@ -166,7 +166,7 @@ pub struct Options {
     pub supersets: Option<Tier>,
 }
 
-/// `gvfs-daemon serve ...`
+/// `gvfs-cache serve ...`
 pub fn main(args: &[String]) -> Result<()> {
     let f = crate::cli::Flags::parse(
         args,
@@ -253,7 +253,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "an edge of an object store keeps its slabs (gigabytes) and its caches of blob \
              packs in --cache-dir: give it a directory on local disk"
         ),
-        None => std::env::temp_dir().join("gvfs-daemon-cache"),
+        None => std::env::temp_dir().join("gvfs-cache"),
     };
     let opts = Options {
         store,
@@ -1075,7 +1075,7 @@ impl Live {
             if set.complete {
                 ", complete"
             } else {
-                " (not complete: gvfs-daemon mirror running)"
+                " (not complete: gvfs-cache mirror running)"
             }
         );
         self.blobs = Some(Arc::new(set));

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load A/B of two gvfs-daemon builds on one store: `base` (env BASE_BIN) against `new` (env
+"""Load A/B of two builds of opus on one store: `base` (env BASE_BIN) against `new` (env
 NEW_BIN, by default this repository's release build).
 
     BASE_BIN=<an older build> python3 bench/ab_load.py bench --dir ~/gvfs-bench/prof/sg7-sep
@@ -36,7 +36,7 @@ from profile_bpf import LOADGEN_CPUS, OUT, SERVER_CPUS, cpu_seconds, loadgen_sta
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILDS = {"base": os.environ.get("BASE_BIN"),
-          "new": os.environ.get("NEW_BIN", os.path.join(REPO, "target/release/gvfs-daemon"))}
+          "new": os.environ.get("NEW_BIN", os.path.join(REPO, "target/release/gvfs-cache"))}
 CLIENT_CPUS = os.environ.get("CLIENT_CPUS", "4-7,20-23")
 GIT_UA = "git/2.53.0.vfs.0.0"
 UP_TO_DATE = 9999999999

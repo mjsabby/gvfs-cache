@@ -1,4 +1,4 @@
-# gvfs-daemon
+# gvfs-cache
 
 One Rust binary that puts a fast [GVFS protocol](https://github.com/microsoft/VFSForGit/blob/master/Protocol.md)
 layer in front of a Git repository and is built on two primitives:
@@ -29,7 +29,7 @@ sends, with its `.idx` for VFS for Git (which installs it instead of indexing th
           Git server (upload-pack v2, v0 fallback; smart HTTP or local path)
              │ have/want: new commits only                 │ have/want: new commits only
              ▼                                             ▼
-  gvfs-daemon pipeline (cron, every 15 min)      gvfs-daemon serve  (edge or 127.0.0.1 proxy)
+  gvfs-cache pipeline (cron, every 15 min)       gvfs-cache serve  (edge or 127.0.0.1 proxy)
    ingest_git_delta → repack → 15m slab           L0: one repacked slab in RAM
    rollup 1h/6h/12h/24h: repack from the store    mmap'd slabs + MPHF lookups
    168h: weekly delta + baseline append           /gvfs/prefetch  → ONE pack (+ .idx)
@@ -57,7 +57,7 @@ The toolchain is pinned in `rust-toolchain.toml` (Rust 1.99.1, edition 2024), an
 installs it on first use. The daemon runs on Linux, on x86-64 or ARM64.
 
 ```sh
-cargo build --release            # target/release/gvfs-daemon
+cargo build --release            # target/release/gvfs-cache
 cargo test --workspace --release # unit tests + end-to-end tests (needs git on PATH)
 cargo clippy --workspace --all-targets
 ```
@@ -90,11 +90,11 @@ Some tests also use extra tools when present and skip otherwise:
 
 ```sh
 # First run on an empty store is the one-time seed: the whole branch becomes the baseline.
-gvfs-daemon pipeline --store azure:gvfs/searchgold --tier 15m \
+gvfs-cache pipeline --store azure:gvfs/searchgold --tier 15m \
     --upstream https://dev.azure.com/org/proj/_git/SearchGold --token-env ADO_PAT
 
 # The edge (or, with --bind 127.0.0.1:8080, the localhost proxy on an agent VM).
-gvfs-daemon serve --store azure:gvfs/searchgold --bind 0.0.0.0:8080 \
+gvfs-cache serve --store azure:gvfs/searchgold --bind 0.0.0.0:8080 \
     --upstream https://dev.azure.com/org/proj/_git/SearchGold --token-env ADO_PAT \
     --cache-dir /nvme/gvfs-cache
 
@@ -103,7 +103,7 @@ git config remote.origin.url http://edge:8080/org/SearchGold
 git gvfs-helper --cache-server=disable prefetch
 ```
 
-`gvfs-daemon help` lists every flag. Stores are named by:
+`gvfs-cache help` lists every flag. Stores are named by:
 
 * `fs:<dir>`, or a plain path;
 * `azure:<container>[/<prefix>]`, with credentials (an account key or a SAS connection
@@ -129,7 +129,7 @@ tier=15m
 [ "$m" = 00 ] && [ $((10#$h % 12)) = 0 ] && tier=12h
 [ "$m" = 00 ] && [ "$h" = 00 ] && tier=24h
 [ "$m" = 00 ] && [ "$h" = 00 ] && [ "$dow" = 7 ] && tier=168h
-gvfs-daemon pipeline --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT --tier $tier
+gvfs-cache pipeline --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT --tier $tier
 ```
 
 A crashed or skipped run only makes the next 15m slab wider. Slab files that no manifest
@@ -144,12 +144,12 @@ Prefetch and cold clones then carry no blobs at all. See [DESIGN.md](DESIGN.md#s
 
 ```sh
 # Genesis: the history's commits and trees, and every blob's size, from the upstream.
-gvfs-daemon pipeline --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT \
+gvfs-cache pipeline --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT \
     --tier 15m --blobs separate
 
 # The seed of the blobs: every blob of the history (the tip's first), resumable,
 # verified by id and size, published as it goes; edges report ready once it is done.
-gvfs-daemon mirror --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT \
+gvfs-cache mirror --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT \
     --jobs 16 [--rate-mbps 4000] [--max-items N]
 
 # Then schedule the pipeline as below: every run copies its window's new blobs before
@@ -157,7 +157,7 @@ gvfs-daemon mirror --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT \
 # persistent disk: a run reuses the store objects the previous one downloaded). Edges
 # serve blobs from the blob packs (mapped, or read by range from Azure) and proxy only
 # the blobs of the commits the pipeline has not sealed yet.
-gvfs-daemon serve --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT ...
+gvfs-cache serve --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT ...
 ```
 
 An edge of such a store:
@@ -174,14 +174,14 @@ Nothing repairs such a store by itself, and nothing should need to:
   log a warning, and edges serve the blobs involved through the proxy.
 * An edge whose sealed trees name a blob the store lacks counts it in
   `gvfs_blobs_missing_total`.
-* Either is the signal to run `gvfs-daemon mirror` again. It takes what the store lost out
+* Either is the signal to run `gvfs-cache mirror` again. It takes what the store lost out
   of `blobs.bin` and copies whatever is not listed; on a whole store it copies nothing.
 
 ### Inspecting
 
 ```sh
-gvfs-daemon inspect manifest --store azure:gvfs/searchgold
-gvfs-daemon inspect slab /nvme/gvfs-cache/base-1792879257-83da3df7dce1a81c.mphf
+gvfs-cache inspect manifest --store azure:gvfs/searchgold
+gvfs-cache inspect slab /nvme/gvfs-cache/base-1792879257-83da3df7dce1a81c.mphf
 #   9222096 objects (9222096 pack entries), 4503 partitions x 512 buckets, ...
 #   657912 commits, 5221743 trees, 3342441 blobs, 0 tags
 #   3506901 deltas (mean depth 23.3, max 50)
@@ -192,7 +192,7 @@ Two more tools work on slabs directly:
 
 * `inspect slab --write-idx out.idx` writes the `.idx` a VFS for Git client would be sent
   with that pack;
-* `gvfs-daemon repack --out <dir> [--frozen <base.mphf>] <slab.mphf>...` runs the optimal
+* `gvfs-cache repack --out <dir> [--frozen <base.mphf>] <slab.mphf>...` runs the optimal
   splice by hand.
 
 `curl http://edge:8080/metrics` reports, in Prometheus text format:
@@ -319,7 +319,7 @@ src/aclient.rs             the async HTTP client (hyper, tokio-rustls): the upst
 src/http.rs                the blocking HTTP client (the Azure store's other calls, tests)
 src/pack.rs, zlib.rs, delta.rs, object.rs, hfs.rs   git formats (delta.rs: tree delta encoder)
 src/arena.rs               per-request arenas (no allocation while serving)
-src/inspect.rs             `gvfs-daemon inspect`: the manifest and slabs, readable
+src/inspect.rs             `gvfs-cache inspect`: the manifest and slabs, readable
 src/util.rs, fsutil.rs, b64.rs   errors, ids, hex, time, logging; durable writes; base64
 crates/gvfs-alloc-guard    counting global allocator that enforces zero hot-path allocations
 crates/gvfs-mmap           the one memory map

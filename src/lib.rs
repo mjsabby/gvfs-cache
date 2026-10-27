@@ -1,4 +1,4 @@
-//! `gvfs-daemon`: the unified GVFS monorepo acceleration layer.
+//! `gvfs-cache`: the unified GVFS monorepo acceleration layer.
 //!
 //! One binary, two primitives:
 //!

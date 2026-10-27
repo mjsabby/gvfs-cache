@@ -1,4 +1,4 @@
-# gvfs-daemon design
+# gvfs-cache design
 
 This is how the *Unified Binary Architecture* from the design PDF is built, what the code
 guarantees, and where it departs from the PDF (with the measurements that motivated each
@@ -517,7 +517,7 @@ so that byte ranges could be read in place, through an endpoint since removed (R
 ### The consistency rule
 
 Once `blobs.bin` is complete, every blob of every tree in the store is in a blob pack it
-lists (a manifest's trees' at the `blobs.bin` generation the manifest names). `gvfs-daemon
+lists (a manifest's trees' at the `blobs.bin` generation the manifest names). `gvfs-cache
 mirror` makes that true for the history up to genesis; every pipeline run keeps it for its
 window by copying, before it publishes its trees, the blobs that the trees in its pack
 reference and the store lacks. That check is enough, whatever the upstream: an upstream
@@ -589,7 +589,7 @@ Measured (`tests/separate.rs`, `blob_over_4gib_end_to_end`): a pipeline window w
 4,294,979,641-byte incompressible blob ran in 7.0 s at an 11 MiB peak RSS. The local git
 upstream's `pack-objects` held 4.1 GB to send it: that cost is the upstream's.
 
-### `gvfs-daemon mirror` (`src/mirror.rs`)
+### `gvfs-cache mirror` (`src/mirror.rs`)
 
 The seed of the blobs: every blob of every tree in the store, planned from the store, never
 from the upstream (ids from the slabs' trees, sizes from the sizes tables, minus what

@@ -31,14 +31,14 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
-use gvfs_daemon::manifest::{MANIFEST_KEY, Manifest};
-use gvfs_daemon::pipeline;
-use gvfs_daemon::serve::view::{Prefetch, View};
-use gvfs_daemon::serve::{LiveTip, retain_l0};
-use gvfs_daemon::slab::{Slab, Tier};
-use gvfs_daemon::store::Store;
-use gvfs_daemon::upstream::{Auth, Upstream};
-use gvfs_daemon::util::Oid;
+use gvfs_cache::manifest::{MANIFEST_KEY, Manifest};
+use gvfs_cache::pipeline;
+use gvfs_cache::serve::view::{Prefetch, View};
+use gvfs_cache::serve::{LiveTip, retain_l0};
+use gvfs_cache::slab::{Slab, Tier};
+use gvfs_cache::store::Store;
+use gvfs_cache::upstream::{Auth, Upstream};
+use gvfs_cache::util::Oid;
 
 const DAY: u64 = 86_400;
 /// Bytes of an empty `GPRE` response, and the framing of a one-pack response.
@@ -81,7 +81,7 @@ fn tier_at(t: u64) -> Tier {
 fn git(dir: &Path, args: &[&str]) -> String {
     let mut cmd = Command::new("git");
     cmd.args(args).current_dir(dir);
-    gvfs_daemon::upstream::hermetic_git_env(&mut cmd);
+    gvfs_cache::upstream::hermetic_git_env(&mut cmd);
     let out = cmd.output().unwrap();
     assert!(
         out.status.success(),
@@ -293,7 +293,7 @@ fn mib(b: u64) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let f = gvfs_daemon::cli::Flags::parse(
+    let f = gvfs_cache::cli::Flags::parse(
         &args,
         &[
             "repo",
@@ -313,7 +313,7 @@ fn main() {
     let work = PathBuf::from(f.require("work").unwrap());
     let branch = f.get("branch").unwrap_or("HEAD").to_string();
     let threads: usize = f
-        .num("threads", gvfs_daemon::util::default_threads())
+        .num("threads", gvfs_cache::util::default_threads())
         .unwrap();
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(work.join("pipeline")).unwrap();
@@ -366,7 +366,7 @@ fn main() {
         gc_grace: 7200,
         threads,
         blobs: None,
-        blob_pack_bytes: gvfs_daemon::separate::ITEM_BYTES,
+        blob_pack_bytes: gvfs_cache::separate::ITEM_BYTES,
         cache_dir: work.join("pipeline-cache"),
     };
     let mut edge = Edge {

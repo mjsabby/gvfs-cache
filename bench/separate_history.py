@@ -42,7 +42,7 @@ from gvfslib import check_loose, clean_env, free_port, metrics, request, wait_ht
 from separate_seed import corpus  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.path.join(ROOT, "target/release/gvfs-daemon")
+BIN = os.path.join(ROOT, "target/release/gvfs-cache")
 LOADGEN = os.path.expanduser("~/gvfs-server-benchmark/target/loadgen/release/loadgen")
 SERVER_CPUS = os.environ.get("SERVER_CPUS", "0-3,16-19")
 LOADGEN_CPUS = os.environ.get("LOADGEN_CPUS", "8-15,24-31")

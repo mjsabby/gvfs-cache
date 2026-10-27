@@ -1025,7 +1025,7 @@ pub fn ingest_git_delta_with(
     }
 }
 
-/// `gvfs-daemon ingest ...`
+/// `gvfs-cache ingest ...`
 pub fn main(args: &[String]) -> Result<()> {
     let f = crate::cli::Flags::parse(
         args,

@@ -30,7 +30,7 @@ unimplemented = "deny"
 unreachable = "deny"
 
 [package]
-name = "gvfs-daemon"
+name = "gvfs-cache"
 description = "Unified GVFS monorepo acceleration layer: one binary for the scheduled slab pipeline and the edge / localhost server."
 version.workspace = true
 edition.workspace = true
@@ -39,11 +39,11 @@ license.workspace = true
 publish.workspace = true
 
 [lib]
-name = "gvfs_daemon"
+name = "gvfs_cache"
 path = "src/lib.rs"
 
 [[bin]]
-name = "gvfs-daemon"
+name = "gvfs-cache"
 path = "src/main.rs"
 
 [lints]

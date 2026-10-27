@@ -81,7 +81,7 @@ pub struct TempDir {
 impl TempDir {
     pub fn new(parent: &Path, label: &str) -> Result<TempDir> {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!("gvfs-daemon-{label}-{}-{seq}", std::process::id()));
+        let path = parent.join(format!("gvfs-cache-{label}-{}-{seq}", std::process::id()));
         fs::create_dir_all(&path).ctx(&format!("creating {}", path.display()))?;
         Ok(TempDir { path })
     }

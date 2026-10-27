@@ -3,21 +3,21 @@
 # the pipeline sees it and compares, per day and for the week, the size of
 #
 #   concat     the 15-minute packs as fetched, concatenated (a plain splice)
-#   repacked   gvfs-daemon's optimal splice of its 15-minute slabs (what is published)
+#   repacked   gvfs-cache's optimal splice of its 15-minute slabs (what is published)
 #   one fetch  the upstream's own pack for the whole range (git pack-objects / ADO)
 #
 # and the weekly baseline: seeded at the week's start, grown by the repacked week, against
 # a fresh full fetch at the week's end.
 #
 # usage: benches/rollup.sh <repo> <week-start YYYY-MM-DD> [out-dir]
-# env:   BIN (default target/release/gvfs-daemon), DAYS (default 7), BASELINE=0 to skip
+# env:   BIN (default target/release/gvfs-cache), DAYS (default 7), BASELINE=0 to skip
 #        the full fetches (each is a complete pack of the repository).
 set -euo pipefail
 
 REPO=${1:?usage: rollup.sh <repo> <week-start YYYY-MM-DD> [out-dir]}
 START=${2:?week start date}
 OUT=${3:-/tmp/gvd-rollup}
-BIN=${BIN:-$(dirname "$0")/../target/release/gvfs-daemon}
+BIN=${BIN:-$(dirname "$0")/../target/release/gvfs-cache}
 DAYS=${DAYS:-7}
 BASELINE=${BASELINE:-1}
 THREADS=${THREADS:-$(nproc)}
@@ -27,7 +27,7 @@ mkdir -p "$OUT"/{raw15,m15,day,dayone,week,base}
 
 size() { stat -c %s "$1"/*.pack; }
 human() { numfmt --to=iec-i --suffix=B --format=%.2f "$1"; }
-# Runs `gvfs-daemon <args>` writing into <dir>, which must end up with one slab.
+# Runs `gvfs-cache <args>` writing into <dir>, which must end up with one slab.
 slab_into() {
     local dir=$1
     shift

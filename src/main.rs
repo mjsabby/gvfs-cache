@@ -1,8 +1,8 @@
-//! `gvfs-daemon` binary entry point: parse the command, dispatch, report.
+//! `gvfs-cache` binary entry point: parse the command, dispatch, report.
 #![forbid(unsafe_code)]
 
 use gvfs_alloc_guard::SealedAllocator;
-use gvfs_daemon::{cli, ingest, inspect, mirror, pipeline, repack, serve};
+use gvfs_cache::{cli, ingest, inspect, mirror, pipeline, repack, serve};
 
 #[global_allocator]
 static GLOBAL: SealedAllocator = SealedAllocator;
@@ -25,14 +25,14 @@ fn main() -> std::process::ExitCode {
             print!("{}", cli::USAGE);
             Ok(())
         }
-        other => Err(gvfs_daemon::err!(
-            "unknown command {other:?} (see `gvfs-daemon help`)"
+        other => Err(gvfs_cache::err!(
+            "unknown command {other:?} (see `gvfs-cache help`)"
         )),
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("gvfs-daemon {command}: {e}");
+            eprintln!("gvfs-cache {command}: {e}");
             std::process::ExitCode::FAILURE
         }
     }

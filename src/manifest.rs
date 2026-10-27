@@ -138,7 +138,7 @@ impl Manifest {
         }
         let version = le_u32(body, 8).unwrap_or(0);
         if body.get(..8) != Some(&MAGIC[..]) || !(1..=VERSION).contains(&version) {
-            crate::bail!("not a gvfs-daemon manifest (or an unsupported version)");
+            crate::bail!("not a gvfs-cache manifest (or an unsupported version)");
         }
         let generation = le_u64(body, 12).ctx("manifest header")?;
         let tip =
@@ -214,7 +214,7 @@ impl Manifest {
         })
     }
 
-    /// Human-readable dump (`gvfs-daemon inspect manifest`).
+    /// Human-readable dump (`gvfs-cache inspect manifest`).
     pub fn describe(&self) -> String {
         let mut s = format!(
             "generation {}  tip {}  max_ts {}\n",

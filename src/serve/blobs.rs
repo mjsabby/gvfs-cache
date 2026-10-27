@@ -143,7 +143,7 @@ pub struct BlobSet {
 impl BlobSet {
     /// Opens what `bm` lists, reusing what `prev` already has open. What the store lost (a
     /// segment, a local pack: gone, or another length) is left out with a warning, and its
-    /// blobs come through the proxy, counted as missing, until `gvfs-daemon mirror` repairs
+    /// blobs come through the proxy, counted as missing, until `gvfs-cache mirror` repairs
     /// `blobs.bin`. (A lost pack in object storage shows only when it is read.)
     pub fn load(
         store: &Arc<Store>,
@@ -165,7 +165,7 @@ impl BlobSet {
             crate::log!(
                 "serve: warning: blobs.bin generation {} lists {what} {id}, which the store does \
                  not hold ({why}); its blobs come through the proxy, counted as missing, until \
-                 gvfs-daemon mirror repairs blobs.bin",
+                 gvfs-cache mirror repairs blobs.bin",
                 bm.generation
             );
         };

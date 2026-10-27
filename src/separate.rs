@@ -7,7 +7,7 @@
 //! its size in the sizes table of the slab whose trees introduced it, so sizes are complete
 //! for every tree a client can see, before and after the mirror.
 //!
-//! `gvfs-daemon mirror` makes it true for the history up to genesis (every blob of every
+//! `gvfs-cache mirror` makes it true for the history up to genesis (every blob of every
 //! tree in the slabs). A pipeline run keeps it by working blobs first: it copies the blobs
 //! that the trees in its window's pack reference and the store lacks, publishes them in
 //! `blobs.bin`, and only then publishes the trees. (Until the mirror has finished, a run
@@ -110,7 +110,7 @@ pub struct BlobIndex {
 impl BlobIndex {
     /// The segments `bm` lists. One the store no longer holds is left out (its blobs count
     /// as not copied, so a pipeline run copies again those its window needs), with a
-    /// warning: `gvfs-daemon mirror` repairs `blobs.bin`.
+    /// warning: `gvfs-cache mirror` repairs `blobs.bin`.
     pub fn load(store: &Store, work: &Path, bm: &BlobManifest) -> Result<BlobIndex> {
         let mut segments = Vec::with_capacity(bm.segments.len());
         for s in &bm.segments {
@@ -118,7 +118,7 @@ impl BlobIndex {
                 Ok(seg) => segments.push(seg),
                 Err(e) if e.is_not_found() => crate::log!(
                     "warning: blobs.bin generation {} lists segment {}, which the store does \
-                     not hold ({e}); its blobs count as missing until gvfs-daemon mirror \
+                     not hold ({e}); its blobs count as missing until gvfs-cache mirror \
                      repairs blobs.bin",
                     bm.generation,
                     s.id

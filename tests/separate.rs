@@ -15,13 +15,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use common::*;
-use gvfs_daemon::blobcopy;
-use gvfs_daemon::manifest::Manifest;
-use gvfs_daemon::pack::{OBJ_BLOB, OBJ_COMMIT, OBJ_TREE, parse_entry_header};
-use gvfs_daemon::sizes::Sizes;
-use gvfs_daemon::slab::{Slab, SlabMeta};
-use gvfs_daemon::store::Store;
-use gvfs_daemon::util::Oid;
+use gvfs_cache::blobcopy;
+use gvfs_cache::manifest::Manifest;
+use gvfs_cache::pack::{OBJ_BLOB, OBJ_COMMIT, OBJ_TREE, parse_entry_header};
+use gvfs_cache::sizes::Sizes;
+use gvfs_cache::slab::{Slab, SlabMeta};
+use gvfs_cache::store::Store;
+use gvfs_cache::util::Oid;
 
 fn sizes_of(store_dir: &Path, meta: &SlabMeta) -> BTreeMap<String, u64> {
     Sizes::open(&store_dir.join(meta.sizes_key()))
@@ -65,7 +65,7 @@ fn store_blobs(root: &Path, store_dir: &Path) -> HashMap<String, Vec<u8>> {
         git_stdin(&check, &["index-pack", "--stdin", "--strict"], &bytes);
     }
     let mut out = HashMap::new();
-    let mut inf = gvfs_daemon::zlib::Inflater::new();
+    let mut inf = gvfs_cache::zlib::Inflater::new();
     for meta in &bm.segments {
         let seg = blobcopy::open_segment(&store, root, meta).unwrap();
         for rec in seg.records() {
@@ -245,7 +245,7 @@ fn separate_store_pipeline_copies_blobs_before_trees() {
 
     // GC keeps everything listed (sizes tables, blob packs, segments) and drops the rest.
     std::fs::write(store_dir.join("blobs/orphan.pack"), b"x").unwrap();
-    let far = (gvfs_daemon::util::now_secs() + 86_400 * 30).to_string();
+    let far = (gvfs_cache::util::now_secs() + 86_400 * 30).to_string();
     pipeline(
         &root,
         &store,
@@ -266,17 +266,17 @@ fn separate_store_pipeline_copies_blobs_before_trees() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Runs `gvfs-daemon mirror`; `Err` holds the log of a failure.
+/// Runs `gvfs-cache mirror`; `Err` holds the log of a failure.
 fn mirror(root: &Path, store: &str, up: &Upstream, extra: &[&str]) -> Result<String, String> {
     let work = root.join("mirror-work");
     std::fs::create_dir_all(&work).unwrap();
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-daemon"));
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-cache"));
     cmd.args(["mirror", "--store", store, "--upstream"])
         .arg(&up.bare)
         .args(["--work-dir", work.to_str().unwrap(), "--threads", "2"])
         .args(["--jobs", "3", "--publish-secs", "0"])
         .args(extra);
-    gvfs_daemon::upstream::hermetic_git_env(&mut cmd);
+    gvfs_cache::upstream::hermetic_git_env(&mut cmd);
     let out = cmd.output().unwrap();
     let log = String::from_utf8_lossy(&out.stderr).into_owned();
     if out.status.success() {
@@ -564,7 +564,7 @@ fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
             Some(seg.packs()[rec.pack as usize].id.clone())
         })
         .unwrap();
-    assert!(pack == std::fs::read(store_dir.join(gvfs_daemon::blobs::pack_key(&own))).unwrap());
+    assert!(pack == std::fs::read(store_dir.join(gvfs_cache::blobs::pack_key(&own))).unwrap());
     // So does a client that takes only packs.
     let (_, ct, only) = server.post("/gvfs/objects", json_ids(one, None).as_bytes(), CT_PACK);
     assert_eq!(ct, CT_PACK);
@@ -760,7 +760,7 @@ fn stock_gvfs_helper_checks_out_a_separate_store() {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(args);
-        gvfs_daemon::upstream::hermetic_git_env(&mut c);
+        gvfs_cache::upstream::hermetic_git_env(&mut c);
         let out = c.output().unwrap();
         assert!(
             out.status.success(),
@@ -1109,7 +1109,7 @@ fn mirror_survives_being_killed() {
     // Two runs that publish only at the end (killed: their finished packs are uploaded
     // but never listed), then one that publishes as it goes.
     for (delay_ms, publish) in [(300u64, "3600"), (500, "3600"), (400, "0")] {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-daemon"));
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-cache"));
         cmd.args(["mirror", "--store", &store, "--upstream"])
             .arg(&up.bare)
             .args(["--work-dir", work.to_str().unwrap(), "--jobs", "2"])
@@ -1122,7 +1122,7 @@ fn mirror_survives_being_killed() {
                 "240",
             ])
             .stderr(std::process::Stdio::null());
-        gvfs_daemon::upstream::hermetic_git_env(&mut cmd);
+        gvfs_cache::upstream::hermetic_git_env(&mut cmd);
         let mut child = cmd.spawn().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         let _ = child.kill();
@@ -1153,11 +1153,11 @@ fn mirror_survives_being_killed() {
     let listed: std::collections::HashSet<String> = bm
         .packs
         .iter()
-        .map(|p| gvfs_daemon::blobs::pack_key(&p.id))
+        .map(|p| gvfs_cache::blobs::pack_key(&p.id))
         .chain(
             bm.segments
                 .iter()
-                .map(|m| gvfs_daemon::blobs::segment_key(&m.id)),
+                .map(|m| gvfs_cache::blobs::segment_key(&m.id)),
         )
         .collect();
     let on_disk = || -> Vec<String> {
@@ -1167,7 +1167,7 @@ fn mirror_survives_being_killed() {
             .map(|o| o.key)
             .collect()
     };
-    let far = (gvfs_daemon::util::now_secs() + 86_400).to_string();
+    let far = (gvfs_cache::util::now_secs() + 86_400).to_string();
     pipeline(
         &root,
         &store,
@@ -1321,7 +1321,7 @@ fn reused_old_versions_are_in_the_store() {
 /// A blob a sealed tree names that a complete store has lost track of (here: its segment
 /// and packs dropped from `blobs.bin`) is a fault, not a 404: an edge stays ready, serves
 /// it through the proxy, and counts it in `gvfs_blobs_missing_total` once per upstream
-/// fetch. `gvfs-daemon mirror`, run on demand, copies it again.
+/// fetch. `gvfs-cache mirror`, run on demand, copies it again.
 #[test]
 fn a_blob_missing_from_a_complete_store_is_served_and_counted() {
     let root = tempdir("sep-missing");
@@ -1431,7 +1431,7 @@ fn a_blob_missing_from_a_complete_store_is_served_and_counted() {
 
 /// Storage loses a blob pack and a segment index of a complete store. Edges still boot and
 /// serve every blob (what the lost files held through the proxy, counted as missing) and
-/// pipeline runs go on; nothing repairs the store by itself. `gvfs-daemon mirror`, run on
+/// pipeline runs go on; nothing repairs the store by itself. `gvfs-cache mirror`, run on
 /// demand, takes the losses out of `blobs.bin` and copies those blobs again, each once.
 #[test]
 fn mirror_repairs_what_storage_lost() {
@@ -1478,8 +1478,8 @@ fn mirror_repairs_what_storage_lost() {
         .unwrap()
         .packs[0]
         .clone();
-    std::fs::remove_file(store_dir.join(gvfs_daemon::blobs::segment_key(&window_seg.id))).unwrap();
-    std::fs::remove_file(store_dir.join(gvfs_daemon::blobs::pack_key(&pack))).unwrap();
+    std::fs::remove_file(store_dir.join(gvfs_cache::blobs::segment_key(&window_seg.id))).unwrap();
+    std::fs::remove_file(store_dir.join(gvfs_cache::blobs::pack_key(&pack))).unwrap();
 
     // An edge boots and serves every blob of the history, byte for byte.
     let cache = root.join("cache");
@@ -1578,10 +1578,10 @@ fn a_manifest_names_the_blobs_generation_its_trees_need() {
 
     // What the dead run left: the window's blobs, published.
     let s = Store::open(&store, "").unwrap();
-    let mut u = gvfs_daemon::upstream::Upstream::open(
+    let mut u = gvfs_cache::upstream::Upstream::open(
         up.bare.to_str().unwrap(),
         "main",
-        &gvfs_daemon::upstream::Auth::default(),
+        &gvfs_cache::upstream::Auth::default(),
     )
     .unwrap();
     let new: Vec<Oid> = git_blobs(&up.bare, &[&format!("{g}..{t}")])
@@ -1589,12 +1589,12 @@ fn a_manifest_names_the_blobs_generation_its_trees_need() {
         .map(|k| Oid::from_hex(k.as_bytes()).unwrap())
         .collect();
     let work = root.join("dead-run");
-    let (published, _) = gvfs_daemon::separate::copy_needed(
+    let (published, _) = gvfs_cache::separate::copy_needed(
         &mut u,
         &s,
         &work,
         &new,
-        gvfs_daemon::separate::ITEM_BYTES,
+        gvfs_cache::separate::ITEM_BYTES,
         2,
     )
     .unwrap();
@@ -1619,8 +1619,8 @@ fn a_manifest_names_the_blobs_generation_its_trees_need() {
 /// is git's.
 #[test]
 fn async_upstream_fetches_blobs_and_sizes_over_every_transport() {
-    use gvfs_daemon::serve::blobs::fetch_into;
-    use gvfs_daemon::upstream::{AsyncUpstream, Auth};
+    use gvfs_cache::serve::blobs::fetch_into;
+    use gvfs_cache::upstream::{AsyncUpstream, Auth};
     use std::collections::HashSet;
 
     let root = tempdir("sep-async-up");
@@ -1668,7 +1668,7 @@ fn async_upstream_fetches_blobs_and_sizes_over_every_transport() {
         .build()
         .unwrap();
     let basic = Auth {
-        header: Some(gvfs_daemon::http::basic_auth("", "secret")),
+        header: Some(gvfs_cache::http::basic_auth("", "secret")),
     };
     let transports = [
         (
@@ -1708,7 +1708,7 @@ fn async_upstream_fetches_blobs_and_sizes_over_every_transport() {
         );
 
         // The blocking client makes the same requests on a runtime of its own.
-        let mut b = gvfs_daemon::upstream::Upstream::open(&spec, "main", &auth).unwrap();
+        let mut b = gvfs_cache::upstream::Upstream::open(&spec, "main", &auth).unwrap();
         let mut pack = Vec::new();
         b.fetch_objects(&oids, &mut pack).unwrap();
         let repo = fresh_repo(&root, &format!("blocking-{label}"));

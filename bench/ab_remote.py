@@ -8,7 +8,7 @@ It builds its store in Azurite (`azurite-blob` on PATH) from a generated upstrea
 text, random binaries around the stored-block (1 MiB) and own-pack (16 MiB) thresholds,
 and long compressible text (compressed entries of many MiB), over three commits.
 
-    PATH=$HOME/.local/bin:$PATH python3 bench/ab_remote.py --base <gvfs-daemon> --new <gvfs-daemon>
+    PATH=$HOME/.local/bin:$PATH python3 bench/ab_remote.py --base <old build> --new <new build>
 """
 import argparse
 import base64

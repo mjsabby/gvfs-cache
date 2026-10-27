@@ -13,7 +13,7 @@
 //! Stores that keep blobs apart (`--blobs separate`) also need: commits and trees without
 //! blobs (`filter blob:none`), blobs by id, and blob sizes. A local repository serves them
 //! through `upload-pack` (allowed here with `-c`); an HTTP upstream that speaks the GVFS
-//! protocol (Azure DevOps, another gvfs-daemon) through `POST /gvfs/objects` and
+//! protocol (Azure DevOps, another gvfs-cache) through `POST /gvfs/objects` and
 //! `POST /gvfs/sizes`, otherwise through protocol v2 (`filter`, `want <id>`, `object-info`)
 //! where the server advertises it.
 //!
@@ -31,7 +31,7 @@ use crate::http::Url;
 use crate::pktline::{self, Pkt};
 use crate::util::{Context, Oid, Result};
 
-const AGENT: &str = concat!("agent=gvfs-daemon/", env!("CARGO_PKG_VERSION"), "\n");
+const AGENT: &str = concat!("agent=gvfs-cache/", env!("CARGO_PKG_VERSION"), "\n");
 
 /// Ids per `object-info` / `/gvfs/sizes` request, and per blob batch.
 pub const BATCH: usize = 4000;

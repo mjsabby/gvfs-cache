@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use gvfs_daemon::http::{Client, Url};
-use gvfs_daemon::manifest::{MANIFEST_KEY, Manifest};
+use gvfs_cache::http::{Client, Url};
+use gvfs_cache::manifest::{MANIFEST_KEY, Manifest};
 
 pub const CT_PACK: &str = "application/x-git-packfile";
 pub const CT_LOOSE: &str = "application/x-git-loose-object";
@@ -35,7 +35,7 @@ pub fn git_cmd(dir: &Path) -> Command {
     c.current_dir(dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null");
-    gvfs_daemon::upstream::hermetic_git_env(&mut c);
+    gvfs_cache::upstream::hermetic_git_env(&mut c);
     c
 }
 
@@ -156,13 +156,13 @@ impl Upstream {
     }
 }
 
-/// Runs `gvfs-daemon pipeline` against a local upstream; returns its log.
+/// Runs `gvfs-cache pipeline` against a local upstream; returns its log.
 pub fn pipeline(root: &Path, store: &str, up: &Upstream, tier: &str, extra: &[&str]) -> String {
     pipeline_at(root, store, up.bare.to_str().unwrap(), tier, extra, &[])
         .unwrap_or_else(|log| panic!("pipeline --tier {tier} {extra:?} failed:\n{log}"))
 }
 
-/// Runs `gvfs-daemon pipeline` against any upstream spec; `Err` holds the log of a failure.
+/// Runs `gvfs-cache pipeline` against any upstream spec; `Err` holds the log of a failure.
 pub fn pipeline_at(
     root: &Path,
     store: &str,
@@ -173,7 +173,7 @@ pub fn pipeline_at(
 ) -> Result<String, String> {
     let work = root.join("pipeline-work");
     std::fs::create_dir_all(&work).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gvfs-daemon"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gvfs-cache"));
     cmd.args([
         "pipeline",
         "--store",
@@ -188,7 +188,7 @@ pub fn pipeline_at(
     .args(["--work-dir", work.to_str().unwrap()])
     .args(extra)
     .envs(env.iter().copied());
-    gvfs_daemon::upstream::hermetic_git_env(&mut cmd);
+    gvfs_cache::upstream::hermetic_git_env(&mut cmd);
     let out = cmd.output().unwrap();
     let log = String::from_utf8_lossy(&out.stderr).into_owned();
     if out.status.success() {
@@ -229,7 +229,7 @@ impl Server {
     }
 
     fn spawn(args: &[&str], env: &[(&str, &str)], ready: bool) -> Server {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_gvfs-daemon"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_gvfs-cache"));
         // Defaults first: the last occurrence of a flag wins, so a test can override them.
         // The server takes any free port and logs it: a port picked here and released could
         // be taken by another test's server first, and this test would talk to that one.
@@ -247,7 +247,7 @@ impl Server {
             .args(args)
             .envs(env.iter().copied())
             .stderr(Stdio::piped());
-        gvfs_daemon::upstream::hermetic_git_env(&mut cmd);
+        gvfs_cache::upstream::hermetic_git_env(&mut cmd);
         let mut child = cmd.spawn().unwrap();
         let log = child.stderr.take().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
@@ -303,7 +303,7 @@ impl Server {
         Client::new(Url::parse(&self.url()).unwrap(), Duration::from_secs(600))
     }
 
-    fn try_get(&self, path: &str) -> gvfs_daemon::util::Result<(u16, String, Vec<u8>)> {
+    fn try_get(&self, path: &str) -> gvfs_cache::util::Result<(u16, String, Vec<u8>)> {
         let mut c = self.client();
         let mut r = c.request("GET", path, &[], b"")?;
         let ct = r.header("content-type").unwrap_or("").to_string();
@@ -600,7 +600,7 @@ impl SmartHttp {
         let port = listener.local_addr().unwrap().port();
         let posts = Arc::new(AtomicUsize::new(0));
         let v2_posts = Arc::new(AtomicUsize::new(0));
-        let expected_auth = gvfs_daemon::http::basic_auth("", token);
+        let expected_auth = gvfs_cache::http::basic_auth("", token);
         let (repo, p, p2) = (repo.to_path_buf(), posts.clone(), v2_posts.clone());
         std::thread::spawn(move || {
             for conn in listener.incoming() {

@@ -123,7 +123,7 @@ name = "gvfs-alloc-guard"
 version = "0.1.0"
 
 [[package]]
-name = "gvfs-daemon"
+name = "gvfs-cache"
 version = "0.1.0"
 dependencies = [
  "bytes",

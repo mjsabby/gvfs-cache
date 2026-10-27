@@ -12,7 +12,7 @@
 mod common;
 
 use common::*;
-use gvfs_daemon::slab::Tier;
+use gvfs_cache::slab::Tier;
 
 fn store_spec(dir: &std::path::Path) -> String {
     format!("fs:{}", dir.display())
@@ -413,7 +413,7 @@ fn pyramid_rollups_and_weekly_rebuilds() {
     up.commit(4);
     let store_dir = root.join("store");
     let store = store_spec(&store_dir);
-    let mut now = gvfs_daemon::util::now_secs();
+    let mut now = gvfs_cache::util::now_secs();
     step(&root, &store, &up, &mut now, "15m", &[]);
     let genesis = manifest(&store_dir);
 
@@ -605,7 +605,7 @@ fn sealed_days_reach_warm_clients_whole_once() {
     up.commit(4);
     let store_dir = root.join("store");
     let store = store_spec(&store_dir);
-    let mut now = gvfs_daemon::util::now_secs();
+    let mut now = gvfs_cache::util::now_secs();
     step(&root, &store, &up, &mut now, "15m", &[]);
     let cache = |n: &str| root.join(n).to_str().unwrap().to_string();
     let (c1, c2) = (cache("cache1"), cache("cache2"));
@@ -631,7 +631,7 @@ fn sealed_days_reach_warm_clients_whole_once() {
     let install = |repo: &std::path::Path, pack: &[u8], age: u64| {
         let out = git_stdin(repo, &["index-pack", "--stdin"], pack);
         let hash = String::from_utf8(out).unwrap().trim().replace("pack\t", "");
-        let stamp = format!("@{}", gvfs_daemon::util::now_secs() - age);
+        let stamp = format!("@{}", gvfs_cache::util::now_secs() - age);
         for ext in ["pack", "idx"] {
             let f = repo.join(format!("objects/pack/pack-{hash}.{ext}"));
             let ok = std::process::Command::new("touch")
@@ -754,7 +754,7 @@ fn ingest_cli_matches_git_index() {
             pack_file.to_str().unwrap(),
         ],
     );
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-daemon"))
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-cache"))
         .args([
             "ingest",
             "--pack",
@@ -779,7 +779,7 @@ fn ingest_cli_matches_git_index() {
         .map(|e| e.unwrap().path())
         .find(|p| p.extension().is_some_and(|x| x == "mphf"))
         .unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-daemon"))
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-cache"))
         .args(["inspect", "slab", index.to_str().unwrap()])
         .output()
         .unwrap();
@@ -837,7 +837,7 @@ fn gvfs_helper_against_the_daemon() {
         c.current_dir(&client)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null");
-        gvfs_daemon::upstream::hermetic_git_env(&mut c);
+        gvfs_cache::upstream::hermetic_git_env(&mut c);
         let mut child = c
             .args(["gvfs-helper", "--cache-server=disable", cmd])
             .stdin(std::process::Stdio::piped())
@@ -934,7 +934,7 @@ fn smart_http_upstream_v2_and_v0() {
 
         up.commit(5);
         up.commit(5);
-        let mut now = gvfs_daemon::util::now_secs() + 900;
+        let mut now = gvfs_cache::util::now_secs() + 900;
         pipeline_at(
             &root,
             &store,
@@ -1009,7 +1009,7 @@ fn smart_http_upstream_v2_and_v0() {
 /// thread), and every response is the right one for its connection.
 #[test]
 fn busy_connections_beyond_the_workers_take_turns() {
-    use gvfs_daemon::http::{Client, Url};
+    use gvfs_cache::http::{Client, Url};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;

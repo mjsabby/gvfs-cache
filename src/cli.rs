@@ -1,4 +1,4 @@
-//! Command-line parsing: `gvfs-daemon <command> [--flag value]...`.
+//! Command-line parsing: `gvfs-cache <command> [--flag value]...`.
 //!
 //! Deliberately tiny (no framework): every command lists the flags it accepts, unknown
 //! flags are errors, and values are parsed where they are used.
@@ -6,43 +6,43 @@
 use crate::util::Result;
 
 pub const USAGE: &str = "\
-gvfs-daemon - unified GVFS monorepo acceleration layer (one binary, two primitives)
+gvfs-cache - unified GVFS monorepo acceleration layer (one binary, two primitives)
 
 USAGE:
-    gvfs-daemon pipeline --store <SPEC> --upstream <URL|PATH> --tier <TIER> [OPTIONS]
+    gvfs-cache pipeline --store <SPEC> --upstream <URL|PATH> --tier <TIER> [OPTIONS]
         Scheduled job (ADO pipeline / GitHub Action, every 15 minutes; runners keep no
         state): fetch the commits since the manifest's tip (the only time the upstream
         is asked for them), repack them into a 15m slab, then roll up every tier up to
         TIER by repacking slabs from the store. With no manifest yet: the one-time seed.
         TIER: 15m | 1h | 6h | 12h | 24h | 168h  (168h = weekly delta + new baseline)
 
-    gvfs-daemon mirror --store <SPEC> --upstream <URL|PATH> [OPTIONS]
+    gvfs-cache mirror --store <SPEC> --upstream <URL|PATH> [OPTIONS]
         Copies every blob of the history into a --blobs separate store, resumably:
         planned from the store's own trees and sizes tables (the tip's tree first),
         skipping blobs already copied, verified by id and size as they stream in,
         published to blobs.bin as it goes. When the last blob is in, blobs.bin is
         complete and edges serve. Run again at any time: it copies only what is missing.
 
-    gvfs-daemon serve --store <SPEC> [--upstream <URL|PATH>] [--bind <ADDR>] [OPTIONS]
+    gvfs-cache serve --store <SPEC> [--upstream <URL|PATH>] [--bind <ADDR>] [OPTIONS]
         GVFS server. Remote edge: --bind 0.0.0.0:8080. Localhost proxy: --bind
         127.0.0.1:8080 (the default). With --upstream it bridges the minutes since the
         last sealed slab: it polls the branch, fetches each new commit once, and keeps
         it as an L0 slab in RAM (one per push). Without it, it serves sealed slabs only.
         Every prefetch is one pack of exactly what the client lacks.
 
-    gvfs-daemon ingest --pack <FILE> --out <DIR> [--threads N] [--verify-idx <FILE.idx>]
-    gvfs-daemon ingest --upstream <URL|PATH> --want <OID|REF> [--have <OID>] --out <DIR>
+    gvfs-cache ingest --pack <FILE> --out <DIR> [--threads N] [--verify-idx <FILE.idx>]
+    gvfs-cache ingest --upstream <URL|PATH> --want <OID|REF> [--have <OID>] --out <DIR>
         Run ingest_git_delta once and write <DIR>/<id>.pack + <id>.mphf (debugging,
         benchmarks). --verify-idx checks the slab against git's .idx of the same pack:
         the same objects at the same offsets.
 
-    gvfs-daemon repack --out <DIR> [--frozen <FILE.mphf>] [--mode trees|copy] <FILE.mphf>...
+    gvfs-cache repack --out <DIR> [--frozen <FILE.mphf>] [--mode trees|copy] <FILE.mphf>...
         The optimal splice by hand: slabs (oldest first) become one slab with trees
         re-deltified by directory (--mode copy: deltas re-pointed only). --frozen appends
         to that slab, kept byte for byte, as the weekly baseline rebuild does.
 
-    gvfs-daemon inspect manifest --store <SPEC>
-    gvfs-daemon inspect slab <FILE.mphf> [--threads N] [--write-idx <FILE.idx>]
+    gvfs-cache inspect manifest --store <SPEC>
+    gvfs-cache inspect slab <FILE.mphf> [--threads N] [--write-idx <FILE.idx>]
         The slab index header; with the .pack beside it, object counts, delta depths and
         GitHFS pointer coverage (how much content the pointers stand for). --write-idx
         writes the git .idx a VFS for Git client would be sent with this pack.
@@ -77,7 +77,7 @@ PIPELINE OPTIONS:
     --cache-dir <DIR>          separate stores: store objects a run downloads (sizes
                                tables, segment indexes), kept for the next run and pruned
                                to what the store lists (default:
-                               <work-dir>/gvfs-daemon-store-cache)
+                               <work-dir>/gvfs-cache-store-cache)
 
 MIRROR OPTIONS:
     --jobs <N>                 parallel copies, one upstream connection each (default: 4)

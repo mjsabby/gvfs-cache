@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Load scenarios against a running `gvfs-daemon serve` (the README's benchmark table).
+# Load scenarios against a running `gvfs-cache serve` (the README's benchmark table).
 #
 #   benches/load.sh <host:port> <upstream.git> [seconds-per-scenario]
 #

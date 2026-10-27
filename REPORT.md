@@ -1,4 +1,4 @@
-# gvfs-daemon: report
+# gvfs-cache: report
 
 This repository is **opus**, a Rust daemon that serves a Git monorepo over the
 [GVFS protocol](https://github.com/microsoft/VFSForGit/blob/master/Protocol.md). One binary
@@ -96,7 +96,7 @@ None is egregious, and most come with a flag.
 * **The baseline grows by appending each week** (6–7 s, no upstream traffic), so objects
   orphaned by a force push stay in it.
 * **Separate-blob stores mirror the whole history** before their edges serve, and nothing
-  repairs them by itself: running `gvfs-daemon mirror` again does (§12).
+  repairs them by itself: running `gvfs-cache mirror` again does (§12).
 * **Linux only** (`sendfile`, `statfs`, `/proc`). ARM64 is tested under emulation; its speed
   has not been measured on ARM64 hardware.
 
@@ -538,7 +538,7 @@ PC_SIZES=0,100,1000,5000,20000 python3 packcount.py opus agent-1m   # what pack 
 (cd .. && cargo test --release --test separate && \
   cargo test --release --test separate -- --ignored blob_over_4gib)  # ~13 GB under target/
 python3 separate_seed.py --jobs 8                        # real-content seed, ~/gvfs-bench/sep-seed
-gvfs-daemon pipeline --store fs:<dir> --upstream ~/SearchGold --branch main --tier 15m \
+gvfs-cache pipeline --store fs:<dir> --upstream ~/SearchGold --branch main --tier 15m \
   --blobs separate                                       # SearchGold metadata in separate mode
 # §13 on: a store with a week of slabs (writes <dir>/store, up.git, blobs.txt), then profiles
 python3 build_store.py --history ~/gvfs-bench/replay/history-w7.json \
@@ -547,8 +547,8 @@ python3 profile_bpf.py serve --stores sg7-sep --only get_blob   # on-CPU, counte
 # Checking a change (§13–§16): byte identity on a store (--upstream <repo>: with a live tip),
 # the same on Azurite, then load in both slot orders (swap BASE_BIN and NEW_BIN; ~1 h each)
 python3 ab_responses.py --store <dir>/store --git <dir>/up.git --blobs <dir>/blobs.txt \
-  --base <old build> --new ../target/release/gvfs-daemon
-python3 ab_remote.py --base <old build> --new ../target/release/gvfs-daemon
+  --base <old build> --new ../target/release/gvfs-cache
+python3 ab_remote.py --base <old build> --new ../target/release/gvfs-cache
 BASE_BIN=<old build> python3 ab_load.py bench --dir ~/gvfs-bench/prof/sg7-sep
 # §14's spike (examples/spike_tokio.rs, with bench/spike_tokio.py's check mode) is in git
 # history before 94416d6; ab_load.py is that harness's bench mode, for any two builds.
@@ -713,7 +713,7 @@ formats and algorithms in `DESIGN.md`, "Stores with real blobs"). A store choose
 | sizes tables | `slabs/<id>.sizes`: sorted `(id, size)` of the blobs a slab's trees introduce; rollups union them |
 | blob packs + segments + `blobs.bin` | whole-blob git packs (upstream zlib kept, or stored blocks when incompressible, which clients unpack at the speed of a copy; optional, see DESIGN.md); 48-byte records with 64-bit offsets and lengths; a CAS'd list whose segments stay a geometric progression by blob count (O(log n) segments, each record rewritten O(log n) times) |
 | pipeline, blobs first | `blob:none` window; copy the blobs its new trees reference that the store lacks; publish `blobs.bin`; only then the slab and the manifest naming that `blobs.bin` generation |
-| `gvfs-daemon mirror` | the seed of the blobs: every blob of the history, planned from the store's own trees and sizes in one parallel pass (the tip's tree first, in path order), resumable, parallel, rate-capped, never re-copying what windows copied meanwhile, sizes checked; records `blobs.bin` as mirrored. Also the repair, on demand |
+| `gvfs-cache mirror` | the seed of the blobs: every blob of the history, planned from the store's own trees and sizes in one parallel pass (the tip's tree first, in path order), resumable, parallel, rate-capped, never re-copying what windows copied meanwhile, sizes checked; records `blobs.bin` as mirrored. Also the repair, on demand |
 | edge | blobs from the packs (mapped, or from Azure through a local 4 MiB block cache, never downloaded whole); a single-flight read-through proxy for the L0 overlay's blobs, only for ids the trees name (a sealed tree's blob that a complete store lacks is proxied too, but counted as `gvfs_blobs_missing_total`); `GSZ1` sizes section on opt-in; `GET /gvfs/blobs/<oid>?offset&length` (removed since: §15, #13); ready only once the history is mirrored |
 
 **Gates** (stock git judges every byte):
@@ -895,7 +895,7 @@ SHA-1s), so ADO's serving rate, not the daemon, will set the seed time.
   blobs first. ADO's serving rate decides how long it takes.
 * *Repair is on demand.* No run checks or repairs the store by itself. If storage loses a pack
   or a segment, edges and runs carry on (warnings; edges proxy those blobs and count them as
-  missing), and `gvfs-daemon mirror`, run again, repairs `blobs.bin`. A lost pack in Azure shows
+  missing), and `gvfs-cache mirror`, run again, repairs `blobs.bin`. A lost pack in Azure shows
   only when it is read (5xx for its blobs until the repair).
 
 * *ADO capabilities:* protocol v2 `filter blob:none`, `object-info` and fetching blobs by id (genesis,
@@ -1058,7 +1058,7 @@ Endpoints: config, GET of an object (blobs and whole slab entries), prefetch (up
 warm, with sizes, with `.idx`) and POST sizes. Not covered: POST `/gvfs/objects`, deltas as
 loose objects, blob ranges, the proxy and the live tip.
 
-`bench/spike_tokio.py check` found every response identical to `gvfs-daemon serve`'s (status,
+`bench/spike_tokio.py check` found every response identical to `gvfs-cache serve`'s (status,
 content type, body):
 
 * 4,318 GETs;
