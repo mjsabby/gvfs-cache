@@ -35,7 +35,7 @@ use super::Ctx;
 use super::blobs::BlobPack;
 use super::budget::{Budget, blocking, cold};
 use super::conn::Bufs;
-use super::httpd::{Method, Out, Request, read_body, respond_text, write_response};
+use super::httpd::{Method, Out, Request, read_body, respond_text, write_head, write_response};
 use super::view::{Prefetch, View};
 use crate::arena::{Arena, BlobSrc};
 use crate::blobs::BlobRec;
@@ -49,6 +49,7 @@ const CT_PACK: &str = "application/x-git-packfile";
 const CT_LOOSE: &str = "application/x-git-loose-object";
 const CT_JSON: &str = "application/json";
 const CT_BYTES: &str = "application/octet-stream";
+const CT_TEXT: &str = "text/plain";
 
 /// Request counters exposed at `/metrics`.
 #[derive(Default)]
@@ -96,6 +97,8 @@ pub enum Route {
     Health,
     Metrics,
     NotFound,
+    /// A query parameter that should be a number is not.
+    BadRequest,
 }
 
 /// Maps a request path (any prefix before `/gvfs/`) and query to an endpoint.
@@ -106,22 +109,27 @@ pub fn route(method: Method, path: &[u8], query: &[u8]) -> Route {
         .and_then(|i| path.get(i.saturating_add(6)..));
     match (method, gvfs) {
         (Method::Get, Some(b"config")) => Route::Config,
-        (Method::Get, Some(b"prefetch")) => {
-            Route::Prefetch(query_number(query, b"lastPackTimestamp").unwrap_or(0))
-        }
+        (Method::Get, Some(b"prefetch")) => match query_number(query, b"lastPackTimestamp") {
+            Ok(since) => Route::Prefetch(since.unwrap_or(0)),
+            Err(()) => Route::BadRequest,
+        },
         (Method::Get, Some(rest)) if rest.starts_with(b"objects/") => rest
             .get(8..)
             .and_then(Oid::from_hex)
             .map(Route::ObjectGet)
             .unwrap_or(Route::NotFound),
         (Method::Get, Some(rest)) if rest.starts_with(b"blobs/") => {
-            match rest.get(6..).and_then(Oid::from_hex) {
-                Some(oid) => Route::BlobRange(
-                    oid,
-                    query_number(query, b"offset").unwrap_or(0),
-                    query_number(query, b"length"),
-                ),
-                None => Route::NotFound,
+            let oid = rest.get(6..).and_then(Oid::from_hex);
+            match (
+                oid,
+                query_number(query, b"offset"),
+                query_number(query, b"length"),
+            ) {
+                (None, _, _) => Route::NotFound,
+                (Some(oid), Ok(offset), Ok(length)) => {
+                    Route::BlobRange(oid, offset.unwrap_or(0), length)
+                }
+                _ => Route::BadRequest,
             }
         }
         (Method::Post, Some(b"objects")) => Route::ObjectsPost,
@@ -132,11 +140,16 @@ pub fn route(method: Method, path: &[u8], query: &[u8]) -> Route {
     }
 }
 
-fn query_number(query: &[u8], key: &[u8]) -> Option<u64> {
-    query.split(|&b| b == b'&').find_map(|kv| {
-        let v = kv.strip_prefix(key)?.strip_prefix(b"=")?;
-        std::str::from_utf8(v).ok()?.parse().ok()
-    })
+/// Query parameter `key`: absent, or a decimal number. `Err` if present but anything else
+/// (an unreadable cursor must not silently become a cold clone).
+fn query_number(query: &[u8], key: &[u8]) -> Result<Option<u64>, ()> {
+    let value = query
+        .split(|&b| b == b'&')
+        .find_map(|kv| kv.strip_prefix(key)?.strip_prefix(b"="));
+    match value {
+        None => Ok(None),
+        Some(v) => super::httpd::decimal_u64(v).map(Some).ok_or(()),
+    }
 }
 
 /// Handles one request. Returns whether the connection may be reused.
@@ -146,14 +159,18 @@ pub async fn handle(
     stream: &TcpStream,
     req: &Request,
 ) -> std::io::Result<bool> {
-    let route = route(
-        req.method,
-        b.input.bytes(req.path),
-        b.input.bytes(req.query),
-    );
+    // HEAD asks what GET would answer.
+    let method = match req.method {
+        Method::Head => Method::Get,
+        m => m,
+    };
+    let route = route(method, b.input.bytes(req.path), b.input.bytes(req.query));
     let keep = req.keep_alive;
     if req.method != Method::Post {
         b.input.consume(req.head_len);
+    }
+    if req.method == Method::Head {
+        return head(ctx, stream, route, keep).await;
     }
     match route {
         Route::Config => {
@@ -163,14 +180,7 @@ pub async fn handle(
             Ok(keep)
         }
         Route::Health => {
-            let started = ctx.ready.load(Ordering::Relaxed);
-            // A separate-blob store is ready once every blob of its history is in it.
-            let blobs = ctx.view().blobs.as_ref().is_none_or(|b| b.complete);
-            let (status, text) = match (started, blobs) {
-                (true, true) => (200, "ok\n"),
-                (true, false) => (503, "blobs incomplete (gvfs-daemon mirror running)\n"),
-                _ => (503, "starting\n"),
-            };
+            let (status, text) = health(ctx);
             respond(ctx, stream, status, text, keep).await?;
             Ok(keep)
         }
@@ -230,9 +240,16 @@ pub async fn handle(
             let Some(arena) = lease.arena() else {
                 return Ok(false);
             };
-            if !read_body(stream, &mut b.input, req, &mut arena.body, &ctx.deadlines).await? {
-                respond(ctx, stream, 413, "request too large\n", false).await?;
-                return Ok(false);
+            match read_body(stream, &mut b.input, req, &mut arena.body, &ctx.deadlines).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    respond(ctx, stream, 413, "request too large\n", false).await?;
+                    return Ok(false);
+                }
+                Err(e) => {
+                    super::httpd::refuse(stream, &e, ctx.deadlines.write).await;
+                    return Ok(false);
+                }
             }
             if route == Route::SizesPost {
                 inc(&ctx.metrics.sizes);
@@ -245,7 +262,45 @@ pub async fn handle(
         }
         // An unread POST body would be parsed as the next request: close instead.
         Route::NotFound => not_found(ctx, stream, keep && req.method != Method::Post).await,
+        Route::BadRequest => {
+            respond(ctx, stream, 400, BAD_REQUEST, keep).await?;
+            Ok(keep)
+        }
     }
+}
+
+const NOT_FOUND: &str = "not found\n";
+const BAD_REQUEST: &str = "bad request\n";
+
+/// `/healthz`: ready once started and (a separate-blob store) once every blob of the
+/// history is in the store.
+fn health(ctx: &Ctx) -> (u16, &'static str) {
+    let started = ctx.ready.load(Ordering::Relaxed);
+    let blobs = ctx.view().blobs.as_ref().is_none_or(|b| b.complete);
+    match (started, blobs) {
+        (true, true) => (200, "ok\n"),
+        (true, false) => (503, "blobs incomplete (gvfs-daemon mirror running)\n"),
+        _ => (503, "starting\n"),
+    }
+}
+
+/// `HEAD`: the head GET would answer with, and no body, where that answer is cheap to know
+/// (the configuration, health, a 404 or 400); otherwise 405 with `Allow: GET`, since the
+/// length alone would cost the answer's whole work (a prefetch plan, an object).
+async fn head(ctx: &Ctx, stream: &TcpStream, route: Route, keep: bool) -> std::io::Result<bool> {
+    let (status, content_type, len, extra): (u16, &str, usize, &[u8]) = match route {
+        Route::Config => (200, CT_JSON, ctx.config_json.len(), b""),
+        Route::Health => {
+            let (status, text) = health(ctx);
+            (status, CT_TEXT, text.len(), b"")
+        }
+        Route::NotFound => (404, CT_TEXT, NOT_FOUND.len(), b""),
+        Route::BadRequest => (400, CT_TEXT, BAD_REQUEST.len(), b""),
+        _ => (405, CT_TEXT, 0, b"Allow: GET\r\n"),
+    };
+    let t = ctx.deadlines.write;
+    write_head(stream, status, content_type, u64_of(len), keep, extra, t).await?;
+    Ok(keep)
 }
 
 /// A small plain-text response.
@@ -261,7 +316,7 @@ async fn respond(
 
 async fn not_found(ctx: &Ctx, stream: &TcpStream, keep: bool) -> std::io::Result<bool> {
     inc(&ctx.metrics.not_found);
-    respond(ctx, stream, 404, "not found\n", keep).await?;
+    respond(ctx, stream, 404, NOT_FOUND, keep).await?;
     Ok(keep)
 }
 
@@ -1715,6 +1770,28 @@ mod tests {
         assert_eq!(
             route(Method::Get, b"/gvfs/objects/zz", b""),
             Route::NotFound
+        );
+        // Unreadable numbers are refused, not read as 0 (a cold clone).
+        for q in [
+            &b"lastPackTimestamp=abc"[..],
+            b"lastPackTimestamp=",
+            b"lastPackTimestamp=+5",
+            b"lastPackTimestamp=-1",
+            b"lastPackTimestamp=99999999999999999999",
+        ] {
+            assert_eq!(route(Method::Get, b"/gvfs/prefetch", q), Route::BadRequest);
+        }
+        assert_eq!(
+            route(Method::Get, b"/gvfs/prefetch", b"x=1&lastPackTimestamp=7"),
+            Route::Prefetch(7)
+        );
+        assert_eq!(
+            route(
+                Method::Get,
+                format!("/gvfs/blobs/{oid}").as_bytes(),
+                b"offset=x"
+            ),
+            Route::BadRequest
         );
         let body = format!(
             "{{\"objectIds\":[\"{oid}\", \"{}\"],\"commitDepth\" : 3}}",

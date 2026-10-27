@@ -225,9 +225,8 @@ async fn request(ctx: &Ctx, stream: &TcpStream, b: &mut Bufs) -> Next {
         Ok(Head::Request(r)) => r,
         Ok(Head::Idle) => return Next::Idle,
         Ok(Head::Closed) => return Next::Close,
-        Err(_) => {
-            let t = ctx.deadlines.write;
-            let _ = httpd::respond_text(stream, 400, "bad request\n", false, t).await;
+        Err(e) => {
+            httpd::refuse(stream, &e, ctx.deadlines.write).await;
             return Next::Close;
         }
     };

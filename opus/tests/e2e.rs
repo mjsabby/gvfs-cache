@@ -1163,3 +1163,163 @@ fn malformed_requests_and_the_idle_cap() {
     server.assert_clean();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// One response to read off a raw connection: its head, and its body (`Content-Length`
+/// bytes, none for a HEAD request).
+fn raw_response(s: &mut std::net::TcpStream, head_only: bool) -> (String, Vec<u8>) {
+    use std::io::Read;
+    let mut got = Vec::new();
+    let mut byte = [0u8; 1];
+    while !got.ends_with(b"\r\n\r\n") {
+        let n = s.read(&mut byte).unwrap();
+        assert!(
+            n > 0,
+            "closed in a response head: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        got.push(byte[0]);
+    }
+    let head = String::from_utf8(got).unwrap();
+    let len: usize = head
+        .lines()
+        .find_map(|l| {
+            l.to_ascii_lowercase()
+                .strip_prefix("content-length:")
+                .map(|v| v.trim().parse().unwrap())
+        })
+        .unwrap();
+    let mut body = vec![0u8; if head_only { 0 } else { len }];
+    s.read_exact(&mut body).unwrap();
+    (head, body)
+}
+
+/// What is left on a connection until the server closes it.
+fn rest_until_close(s: &mut std::net::TcpStream) -> Vec<u8> {
+    use std::io::Read;
+    let mut rest = Vec::new();
+    let _ = s.read_to_end(&mut rest);
+    rest
+}
+
+/// The edge frames requests strictly: shapes a proxy in front of it could frame differently
+/// (request smuggling) get one 400 and a closed connection, never a second response; a
+/// HEAD response has no body; a chunked body (extensions, trailers) reads like a sized one;
+/// an unreadable prefetch cursor is a 400, not a cold clone.
+#[test]
+fn http_framing_is_strict() {
+    use std::io::Write;
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let root = tempdir("framing");
+    let mut up = Upstream::new(&root);
+    up.commit(2);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let cache = root.join("cache");
+    let server = Server::start(&["--store", &store, "--cache-dir", cache.to_str().unwrap()]);
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        s
+    };
+
+    // A GET whose "body" is a second request: refused whole, never served twice.
+    let mut s = connect();
+    s.write_all(b"GET /gvfs/config HTTP/1.1\r\nHost: x\r\nContent-Length: 34\r\n\r\nGET /healthz HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+    let (head, _) = raw_response(&mut s, false);
+    assert!(head.starts_with("HTTP/1.1 400 "), "{head}");
+    assert_eq!(rest_until_close(&mut s), b"");
+
+    let ids: Vec<String> = up.objects(&up.tip()).into_iter().take(3).collect();
+    let json = format!("[\"{}\",\"{}\",\"{}\"]", ids[0], ids[1], ids[2]);
+    let smuggling: Vec<Vec<u8>> = vec![
+        format!("POST /gvfs/sizes HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET /healthz HTTP/1.1\r\n\r\n", json.len()).into_bytes(),
+        format!("POST /gvfs/sizes HTTP/1.1\r\nHost: x\r\nContent-Length: {0}\r\nContent-Length: {0}\r\n\r\n{json}", json.len()).into_bytes(),
+        b"POST /gvfs/sizes HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n".to_vec(),
+        b"POST /gvfs/sizes HTTP/1.1\r\nHost: x\r\nTransfer-Encoding : chunked\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        b"POST /gvfs/sizes HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n2;a\nb\r\n[]\r\n0\r\n\r\n".to_vec(),
+        b"POST /gvfs/sizes HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\n0\r\nX: a\nGET /healthz HTTP/1.1\r\n\r\n".to_vec(),
+    ];
+    for req in &smuggling {
+        let mut s = connect();
+        s.write_all(req).unwrap();
+        let (head, _) = raw_response(&mut s, false);
+        assert!(
+            head.starts_with("HTTP/1.1 400 "),
+            "{head} for {:?}",
+            String::from_utf8_lossy(req)
+        );
+        assert_eq!(
+            rest_until_close(&mut s),
+            b"",
+            "{:?}",
+            String::from_utf8_lossy(req)
+        );
+    }
+
+    // A chunked body, with an extension and a trailer, then a sized one: the same answer,
+    // and the connection still frames the next request.
+    let mut s = connect();
+    let (a, b) = json.split_at(10);
+    write!(s, "POST /gvfs/sizes HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n{:x};ext=1\r\n{a}\r\n{:x}\r\n{b}\r\n0\r\nX-Trailer: t\r\n\r\n", a.len(), b.len()).unwrap();
+    let (head, chunked) = raw_response(&mut s, false);
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    write!(
+        s,
+        "POST /gvfs/sizes HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{json}",
+        json.len()
+    )
+    .unwrap();
+    let (head, sized) = raw_response(&mut s, false);
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    assert_eq!(chunked, sized);
+    assert!(String::from_utf8_lossy(&sized).contains(&ids[2]));
+
+    // HEAD: no body, and the connection goes on. 405 where the length would cost the
+    // answer itself.
+    s.write_all(b"HEAD /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    let (head, _) = raw_response(&mut s, true);
+    assert!(
+        head.starts_with("HTTP/1.1 200 ") && head.contains("Content-Length: 3\r\n"),
+        "{head}"
+    );
+    s.write_all(b"HEAD /gvfs/prefetch HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    let (head, _) = raw_response(&mut s, true);
+    assert!(
+        head.starts_with("HTTP/1.1 405 ") && head.contains("Allow: GET\r\n"),
+        "{head}"
+    );
+    s.write_all(b"HEAD /nope HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    let (head, _) = raw_response(&mut s, true);
+    assert!(head.starts_with("HTTP/1.1 404 "), "{head}");
+    s.write_all(b"GET /gvfs/config HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    let (head, body) = raw_response(&mut s, false);
+    assert!(
+        head.starts_with("HTTP/1.1 200 ") && body.starts_with(b"{"),
+        "{head}"
+    );
+
+    // An unreadable cursor: 400, not a cold clone; the connection goes on.
+    s.write_all(b"GET /gvfs/prefetch?lastPackTimestamp=abc HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    let (head, _) = raw_response(&mut s, false);
+    assert!(head.starts_with("HTTP/1.1 400 "), "{head}");
+    s.write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    let (head, _) = raw_response(&mut s, false);
+    assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+
+    // Too large for the arena: 413 at once, without a 100 Continue first.
+    let mut s = connect();
+    s.write_all(b"POST /gvfs/objects HTTP/1.1\r\nHost: x\r\nContent-Length: 999999999\r\nExpect: 100-continue\r\n\r\n").unwrap();
+    let (head, _) = raw_response(&mut s, false);
+    assert!(head.starts_with("HTTP/1.1 413 "), "{head}");
+    server.assert_clean();
+    let _ = std::fs::remove_dir_all(&root);
+}

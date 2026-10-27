@@ -167,39 +167,100 @@ pub fn other(msg: impl std::fmt::Display) -> std::io::Error {
     std::io::Error::other(msg.to_string())
 }
 
-/// Parses a whole request head (`head_len` bytes, as [`find_head_end`] measured).
+/// `tchar` (RFC 9110 §5.6.2): what a method or a field name is made of.
+fn is_tchar(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)
+}
+
+/// `v` without leading and trailing spaces and tabs (RFC 9110 `OWS`).
+fn trim_ows(v: &[u8]) -> &[u8] {
+    let start = v
+        .iter()
+        .position(|&c| c != b' ' && c != b'\t')
+        .unwrap_or(v.len());
+    let end = v
+        .iter()
+        .rposition(|&c| c != b' ' && c != b'\t')
+        .map_or(start, |e| e.saturating_add(1));
+    v.get(start..end).unwrap_or(&[])
+}
+
+/// `1*DIGIT` as a number; `None` for anything else (a sign, spaces, a list) or overflow.
+pub fn decimal_u64(v: &[u8]) -> Option<u64> {
+    if v.is_empty() {
+        return None;
+    }
+    v.iter().try_fold(0u64, |n, &c| {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        n.checked_mul(10)?
+            .checked_add(u64::from(c.wrapping_sub(b'0')))
+    })
+}
+
+/// The CRLF-terminated lines of a head before its blank line. A bare CR or LF inside a line
+/// is an error: some parsers end lines at a bare LF, and two parsers that split a head
+/// differently frame the message differently.
+fn head_lines(head: &[u8]) -> impl Iterator<Item = std::io::Result<&[u8]>> {
+    let mut rest = head;
+    std::iter::from_fn(move || {
+        let end = rest.windows(2).position(|w| w == b"\r\n")?;
+        let line = rest.get(..end)?;
+        rest = rest.get(end.saturating_add(2)..)?;
+        if line.is_empty() {
+            return None;
+        }
+        Some(if line.iter().any(|&c| c == b'\r' || c == b'\n') {
+            Err(bad("bare CR or LF in the request head"))
+        } else {
+            Ok(line)
+        })
+    })
+}
+
+/// Parses a whole request head (`head_len` bytes through its blank line, as
+/// [`find_head_end`] measured).
+///
+/// Strict wherever a lenient reading could frame the message differently from a proxy in
+/// front of the edge (request smuggling, RFC 9112 §6.3 and §11.2), since behind a load
+/// balancer one connection carries many clients' requests: lines end in CRLF; the request
+/// line is exactly `METHOD SP target SP HTTP/1.x`; a field name is a token right before its
+/// colon; no folded lines; no control characters in values; `Content-Length` is digits,
+/// given once; `Transfer-Encoding` is `chunked` alone, given once, in HTTP/1.1 and without a
+/// `Content-Length`; only POST carries a body. Anything else is an error, which the caller
+/// answers with 400 before closing the connection.
 pub fn parse_head(head: &[u8], head_len: usize) -> std::io::Result<Request> {
-    let line_end = head
-        .iter()
-        .position(|&b| b == b'\r' || b == b'\n')
-        .ok_or_else(|| bad("empty request"))?;
-    let request_line = head.get(..line_end).unwrap_or(&[]);
-    let sp1 = request_line
-        .iter()
-        .position(|&b| b == b' ')
-        .ok_or_else(|| bad("no request target"))?;
-    let target_start = sp1.saturating_add(1);
-    let target_end = request_line
-        .iter()
-        .skip(target_start)
-        .position(|&b| b == b' ')
-        .map_or(line_end, |p| target_start.saturating_add(p));
-    let method = match request_line.get(..sp1) {
-        Some(b"GET") => Method::Get,
-        Some(b"HEAD") => Method::Head,
-        Some(b"POST") => Method::Post,
+    let mut lines = head_lines(head);
+    let request_line = lines.next().ok_or_else(|| bad("empty request"))??;
+    let mut parts = request_line.split(|&c| c == b' ');
+    let (Some(method), Some(target), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(bad("malformed request line"));
+    };
+    if method.is_empty() || !method.iter().all(|&c| is_tchar(c)) {
+        return Err(bad("bad method"));
+    }
+    if target.is_empty() || target.iter().any(|&c| c <= b' ' || c == 0x7F) {
+        return Err(bad("bad request target"));
+    }
+    let http11 = match version {
+        b"HTTP/1.1" => true,
+        b"HTTP/1.0" => false,
+        _ => return Err(bad("unsupported HTTP version")),
+    };
+    let method = match method {
+        b"GET" => Method::Get,
+        b"HEAD" => Method::Head,
+        b"POST" => Method::Post,
         _ => Method::Other,
     };
-    let target = head.get(target_start..target_end).unwrap_or(&[]);
-    let version = request_line
-        .get(target_end.saturating_add(1)..)
-        .unwrap_or(b"HTTP/1.0");
-    let lines = head
-        .get(line_end..)
-        .unwrap_or(&[])
-        .split(|&b| b == b'\n')
-        .skip(1)
-        .map(|l| l.strip_suffix(b"\r").unwrap_or(l));
+    let target_start = request_line
+        .iter()
+        .position(|&c| c == b' ')
+        .map_or(0, |p| p.saturating_add(1));
+    let target_end = target_start.saturating_add(target.len());
     let (path, query) = match target.iter().position(|&b| b == b'?') {
         Some(q) => {
             let q_at = target_start.saturating_add(q);
@@ -213,7 +274,7 @@ pub fn parse_head(head: &[u8], head_len: usize) -> std::io::Result<Request> {
         query,
         content_length: None,
         chunked: false,
-        keep_alive: version == b"HTTP/1.1",
+        keep_alive: http11,
         expect_continue: false,
         accepts_loose: false,
         accepts_pack: false,
@@ -221,25 +282,38 @@ pub fn parse_head(head: &[u8], head_len: usize) -> std::io::Result<Request> {
         wants_sizes: false,
         head_len,
     };
+    let (mut close, mut keep) = (false, false);
     for line in lines {
-        let Some(colon) = line.iter().position(|&b| b == b':') else {
-            continue;
-        };
+        let line = line?;
+        if line.first().is_some_and(|&c| c == b' ' || c == b'\t') {
+            return Err(bad("folded header line"));
+        }
+        let colon = line
+            .iter()
+            .position(|&c| c == b':')
+            .ok_or_else(|| bad("header line without a colon"))?;
         let (name, value) = line.split_at(colon);
-        let value = value.get(1..).unwrap_or(&[]).trim_ascii();
+        if name.is_empty() || !name.iter().all(|&c| is_tchar(c)) {
+            return Err(bad("bad header name"));
+        }
+        let value = trim_ows(value.get(1..).unwrap_or(&[]));
+        if value.iter().any(|&c| (c < b' ' && c != b'\t') || c == 0x7F) {
+            return Err(bad("control character in a header"));
+        }
         if name.eq_ignore_ascii_case(b"content-length") {
-            let v = std::str::from_utf8(value)
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .ok_or_else(|| bad("bad content-length"))?;
-            req.content_length = Some(v);
+            if req.content_length.is_some() {
+                return Err(bad("more than one Content-Length"));
+            }
+            req.content_length = Some(decimal_u64(value).ok_or_else(|| bad("bad Content-Length"))?);
         } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
-            req.chunked = value.eq_ignore_ascii_case(b"chunked");
+            if req.chunked || !value.eq_ignore_ascii_case(b"chunked") {
+                return Err(bad("unsupported Transfer-Encoding"));
+            }
+            req.chunked = true;
         } else if name.eq_ignore_ascii_case(b"connection") {
-            if value.eq_ignore_ascii_case(b"close") {
-                req.keep_alive = false;
-            } else if value.eq_ignore_ascii_case(b"keep-alive") {
-                req.keep_alive = true;
+            for option in value.split(|&c| c == b',').map(trim_ows) {
+                close |= option.eq_ignore_ascii_case(b"close");
+                keep |= option.eq_ignore_ascii_case(b"keep-alive");
             }
         } else if name.eq_ignore_ascii_case(b"expect") {
             req.expect_continue = value.eq_ignore_ascii_case(b"100-continue");
@@ -257,6 +331,15 @@ pub fn parse_head(head: &[u8], head_len: usize) -> std::io::Result<Request> {
             req.wants_sizes = value == b"1";
         }
     }
+    if req.chunked && (req.content_length.is_some() || !http11) {
+        return Err(bad(
+            "Transfer-Encoding with a Content-Length, or in HTTP/1.0",
+        ));
+    }
+    if method != Method::Post && (req.chunked || req.content_length.is_some_and(|n| n > 0)) {
+        return Err(bad("a body on a method without one"));
+    }
+    req.keep_alive = !close && (http11 || keep);
     Ok(req)
 }
 
@@ -270,50 +353,72 @@ pub async fn read_body(
     d: &Deadlines,
 ) -> std::io::Result<bool> {
     body.clear();
+    let declared = usize::try_from(req.content_length.unwrap_or(0)).unwrap_or(usize::MAX);
+    if !req.chunked && declared > body.capacity() {
+        // Refused before the client is told to send it.
+        return Ok(false);
+    }
     if req.expect_continue {
         write_all(stream, b"HTTP/1.1 100 Continue\r\n\r\n", d.write).await?;
     }
     input.consume(req.head_len);
-    if req.chunked {
-        loop {
-            let n = line_len(stream, input, d.patience).await?;
-            let line = input.buf.get(..n).unwrap_or(&[]);
-            let hex = line
-                .split(|&b| b == b';')
-                .next()
-                .unwrap_or(&[])
-                .trim_ascii();
-            let size = std::str::from_utf8(hex)
-                .ok()
-                .and_then(|h| usize::from_str_radix(h, 16).ok())
-                .ok_or_else(|| bad("bad chunk size"))?;
-            input.consume(n.saturating_add(2));
-            if size == 0 {
-                // Trailers, then the empty line.
-                loop {
-                    let t = line_len(stream, input, d.patience).await?;
-                    input.consume(t.saturating_add(2));
-                    if t == 0 {
-                        return Ok(true);
-                    }
+    if !req.chunked {
+        read_exact_into(stream, input, body, declared, d.patience).await?;
+        return Ok(true);
+    }
+    loop {
+        let n = line_len(stream, input, d.patience).await?;
+        let size = input
+            .buf
+            .get(..n)
+            .and_then(chunk_size)
+            .ok_or_else(|| bad("bad chunk size"))?;
+        input.consume(n.saturating_add(2));
+        if size == 0 {
+            // Trailers (ignored), then the blank line.
+            loop {
+                let t = line_len(stream, input, d.patience).await?;
+                let trailer = input.buf.get(..t).unwrap_or(&[]);
+                if trailer.iter().any(|&c| c == b'\r' || c == b'\n') {
+                    return Err(bad("bare CR or LF in a trailer"));
+                }
+                input.consume(t.saturating_add(2));
+                if t == 0 {
+                    return Ok(true);
                 }
             }
-            if body.len().saturating_add(size) > body.capacity() {
-                return Ok(false);
-            }
-            read_exact_into(stream, input, body, size, d.patience).await?;
-            if line_len(stream, input, d.patience).await? != 0 {
-                return Err(bad("missing chunk terminator"));
-            }
-            input.consume(2);
         }
+        if body.len().saturating_add(size) > body.capacity() {
+            return Ok(false);
+        }
+        read_exact_into(stream, input, body, size, d.patience).await?;
+        if line_len(stream, input, d.patience).await? != 0 {
+            return Err(bad("missing chunk terminator"));
+        }
+        input.consume(2);
     }
-    let len = usize::try_from(req.content_length.unwrap_or(0)).unwrap_or(usize::MAX);
-    if len > body.capacity() {
-        return Ok(false);
+}
+
+/// The size on a chunk's line: `1*HEXDIG`, then optionally spaces and `;` extensions
+/// (ignored). `None` for anything else (a sign, leading spaces, a bare CR or LF anywhere in
+/// the line, more than 16 digits).
+fn chunk_size(line: &[u8]) -> Option<usize> {
+    if line.iter().any(|&c| c == b'\r' || c == b'\n') {
+        return None;
     }
-    read_exact_into(stream, input, body, len, d.patience).await?;
-    Ok(true)
+    let size = line.split(|&c| c == b';').next()?;
+    let end = size
+        .iter()
+        .rposition(|&c| c != b' ' && c != b'\t')
+        .map_or(0, |e| e.saturating_add(1));
+    let size = size.get(..end)?;
+    if size.is_empty() || size.len() > 16 {
+        return None;
+    }
+    size.iter().try_fold(0usize, |n, &c| {
+        let digit = usize::try_from(char::from(c).to_digit(16)?).ok()?;
+        n.checked_mul(16)?.checked_add(digit)
+    })
 }
 
 /// Length of the CRLF-terminated line at the start of the input (reading more as needed).
@@ -467,7 +572,9 @@ pub fn format_head_with(
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        408 => "Request Timeout",
         413 => "Payload Too Large",
+        416 => "Range Not Satisfiable",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "",
@@ -481,6 +588,34 @@ pub fn format_head_with(
     let _ = cur.write_all(extra);
     let _ = cur.write_all(b"\r\n");
     usize::try_from(cur.position()).unwrap_or(0)
+}
+
+/// Only a response head, declaring a body of `len` bytes that does not follow (a HEAD
+/// response), with `extra` header lines (each ending in CRLF).
+pub async fn write_head(
+    stream: &TcpStream,
+    status: u16,
+    content_type: &str,
+    len: u64,
+    keep_alive: bool,
+    extra: &[u8],
+    t: Duration,
+) -> std::io::Result<()> {
+    let mut buf = [0u8; 320];
+    let n = format_head_with(&mut buf, status, content_type, len, keep_alive, extra);
+    write_all(stream, buf.get(..n).unwrap_or(&[]), t).await
+}
+
+/// What to answer a request whose head or body could not be read (before closing the
+/// connection): 400 for a malformed one, 408 for one that took too long; nothing if the
+/// client went away.
+pub async fn refuse(stream: &TcpStream, e: &std::io::Error, t: Duration) {
+    let (status, text) = match e.kind() {
+        std::io::ErrorKind::InvalidData => (400, "bad request\n"),
+        std::io::ErrorKind::TimedOut => (408, "request timeout\n"),
+        _ => return,
+    };
+    let _ = respond_text(stream, status, text, false, t).await;
 }
 
 /// A small plain-text response.
@@ -703,5 +838,93 @@ mod tests {
             &buf[..n],
             b"HTTP/1.1 413 Payload Too Large\r\nContent-Type: text/plain\r\nContent-Length: 18446744073709551615\r\nConnection: close\r\n\r\n"
         );
+    }
+
+    fn parse(h: &[u8]) -> std::io::Result<Request> {
+        parse_head(h, h.len())
+    }
+
+    /// Every way a head could be framed differently by a proxy in front of the edge is
+    /// refused; what real clients send is not.
+    #[test]
+    fn refuses_ambiguous_framing() {
+        let refused: &[&[u8]] = &[
+            // Content-Length: twice (even equal), signed, spaced, listed, overflowing.
+            b"POST /gvfs/sizes HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n",
+            b"POST /gvfs/sizes HTTP/1.1\r\nContent-Length: +2\r\n\r\n",
+            b"POST /gvfs/sizes HTTP/1.1\r\nContent-Length: 2 2\r\n\r\n",
+            b"POST /gvfs/sizes HTTP/1.1\r\nContent-Length: 2, 2\r\n\r\n",
+            b"POST /gvfs/sizes HTTP/1.1\r\nContent-Length: 99999999999999999999\r\n\r\n",
+            b"POST /gvfs/sizes HTTP/1.1\r\nContent-Length: \r\n\r\n",
+            // Transfer-Encoding: with a Content-Length, twice, not only chunked, in HTTP/1.0.
+            b"POST /gvfs/sizes HTTP/1.1\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"POST /gvfs/sizes HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"POST /gvfs/sizes HTTP/1.1\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+            b"POST /gvfs/sizes HTTP/1.1\r\nTransfer-Encoding: identity\r\n\r\n",
+            b"POST /gvfs/sizes HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n",
+            // A name that is not a token right before its colon, a folded line, no colon.
+            b"POST /gvfs/sizes HTTP/1.1\r\nTransfer-Encoding : chunked\r\n\r\n",
+            b"POST /gvfs/sizes HTTP/1.1\r\n Transfer-Encoding: chunked\r\n\r\n",
+            b"POST /gvfs/sizes HTTP/1.1\r\nX: a\r\n chunked\r\n\r\n",
+            b"GET /gvfs/config HTTP/1.1\r\nHost\r\n\r\n",
+            b"GET /gvfs/config HTTP/1.1\r\n: x\r\n\r\n",
+            // Bare LF or CR, control characters.
+            b"POST /gvfs/sizes HTTP/1.1\r\nX: a\nContent-Length: 5\r\n\r\n",
+            b"POST /gvfs/sizes HTTP/1.1\r\nX: a\rContent-Length: 5\r\n\r\n",
+            b"GET /gvfs/config HTTP/1.1\nHost: a\r\n\r\n",
+            b"GET /gvfs/config HTTP/1.1\r\nHost: a\x00b\r\n\r\n",
+            // The request line: extra spaces, no version, another version, a bad method.
+            b"GET  /gvfs/config HTTP/1.1\r\n\r\n",
+            b"GET /gvfs/config\r\n\r\n",
+            b"GET /gvfs/config HTTP/1.1 x\r\n\r\n",
+            b"GET /gvfs/config HTTP/2.0\r\n\r\n",
+            b"G(T /gvfs/config HTTP/1.1\r\n\r\n",
+            b"\r\nGET /gvfs/config HTTP/1.1\r\n\r\n",
+            // A body on a method without one.
+            b"GET /gvfs/config HTTP/1.1\r\nContent-Length: 40\r\n\r\n",
+            b"HEAD /gvfs/config HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"PUT /gvfs/config HTTP/1.1\r\nContent-Length: 1\r\n\r\n",
+        ];
+        for h in refused {
+            assert!(parse(h).is_err(), "{:?}", String::from_utf8_lossy(h));
+        }
+        // gvfs-helper (libcurl), VFS for Git (.NET), chunked POSTs, empty GET bodies.
+        let r = parse(b"POST /org/proj/gvfs/objects HTTP/1.1\r\nHost: e\r\nUser-Agent: git/2.53.0.vfs.0.0\r\nAccept: application/x-git-packfile\r\nAccept: application/x-git-loose-object\r\nContent-Type: application/json\r\nContent-Length: 98\r\nExpect: 100-continue\r\n\r\n").unwrap();
+        assert!(r.content_length == Some(98) && r.expect_continue && r.keep_alive);
+        let r = parse(b"POST /gvfs/sizes HTTP/1.1\r\nTransfer-Encoding: Chunked\r\nConnection: keep-alive, Upgrade\r\n\r\n").unwrap();
+        assert!(r.chunked && r.content_length.is_none() && r.keep_alive);
+        let r = parse(
+            b"GET /gvfs/config HTTP/1.1\r\nContent-Length: 0\r\nConnection: Upgrade, close\r\n\r\n",
+        )
+        .unwrap();
+        assert!(!r.keep_alive);
+        let r = parse(b"HEAD /healthz HTTP/1.0\r\nConnection: keep-alive\r\nX-Tab:\tv\t\r\n\r\n")
+            .unwrap();
+        assert!(r.method == Method::Head && r.keep_alive);
+        let h = b"GET /gvfs/prefetch?lastPackTimestamp=5 HTTP/1.1\r\n\r\n";
+        let r = parse(h).unwrap();
+        assert_eq!(&h[r.path.0..r.path.1], b"/gvfs/prefetch");
+        assert_eq!(&h[r.query.0..r.query.1], b"lastPackTimestamp=5");
+    }
+
+    #[test]
+    fn chunk_sizes_are_hex_digits_only() {
+        assert_eq!(chunk_size(b"1a"), Some(26));
+        assert_eq!(chunk_size(b"0"), Some(0));
+        assert_eq!(chunk_size(b"10 ;name=value"), Some(16));
+        assert_eq!(chunk_size(b"ffffffffffffffff"), Some(usize::MAX));
+        for bad in [
+            &b""[..],
+            b"+1",
+            b" 1",
+            b"0x1",
+            b"g",
+            b";x",
+            b"10000000000000000",
+            b"5;a\nb",
+            b"5\r",
+        ] {
+            assert_eq!(chunk_size(bad), None, "{:?}", String::from_utf8_lossy(bad));
+        }
     }
 }
