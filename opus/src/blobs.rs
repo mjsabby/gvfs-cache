@@ -494,7 +494,9 @@ impl Segment {
                 .and_then(|s| s.try_into().ok())
                 .ctx("segment packs")?;
             packs.push(PackRef {
-                id: String::from_utf8_lossy(pid).into_owned(),
+                // The edge's block cache names files after it.
+                id: checked_id(pid)
+                    .ok_or_else(|| crate::err!("blob segment {id}: bad pack id {}", shown(pid)))?,
                 len,
                 sha,
             });
@@ -633,11 +635,29 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
     out.extend_from_slice(b.get(..n).unwrap_or(b));
 }
 
-fn get_str(b: &[u8], at: &mut usize) -> Result<String> {
+/// A segment's or a pack's id, read from `blobs.bin`: it becomes a store key and a file
+/// name in edge and pipeline caches, so it must be a valid id.
+fn get_id(b: &[u8], at: &mut usize, what: &str) -> Result<String> {
     let n = us(u64::from(le_u16(b, *at).ctx("truncated blobs.bin")?));
     let s = sub(b, at.saturating_add(2), n).ctx("truncated blobs.bin")?;
     *at = at.saturating_add(2).saturating_add(n);
-    Ok(String::from_utf8_lossy(s).into_owned())
+    checked_id(s).ok_or_else(|| crate::err!("bad {what} id {} in blobs.bin", shown(s)))
+}
+
+/// `id` as a string, if it is a valid id ([`crate::manifest::valid_id`]).
+fn checked_id(id: &[u8]) -> Option<String> {
+    std::str::from_utf8(id)
+        .ok()
+        .filter(|s| crate::manifest::valid_id(s))
+        .map(str::to_string)
+}
+
+/// A rejected id for a message (its start, escaped).
+fn shown(id: &[u8]) -> String {
+    format!(
+        "{:?}",
+        String::from_utf8_lossy(id.get(..id.len().min(80)).unwrap_or(id))
+    )
 }
 
 impl BlobManifest {
@@ -698,14 +718,14 @@ impl BlobManifest {
         at = at.saturating_add(4);
         let mut segments = Vec::new();
         for _ in 0..nseg {
-            let id = get_str(body, &mut at)?;
+            let id = get_id(body, &mut at, "segment")?;
             let blobs = le_u64(body, at).ctx("truncated blobs.bin")?;
             let index_len = le_u64(body, at.saturating_add(8)).ctx("truncated blobs.bin")?;
             let np = le_u32(body, at.saturating_add(16)).ctx("truncated blobs.bin")?;
             at = at.saturating_add(20);
             let mut packs = Vec::new();
             for _ in 0..np {
-                packs.push(get_str(body, &mut at)?);
+                packs.push(get_id(body, &mut at, "pack")?);
             }
             segments.push(SegmentMeta {
                 id,
@@ -718,7 +738,7 @@ impl BlobManifest {
         at = at.saturating_add(4);
         let mut packs = Vec::new();
         for _ in 0..npacks {
-            let id = get_str(body, &mut at)?;
+            let id = get_id(body, &mut at, "pack")?;
             let len = le_u64(body, at).ctx("truncated blobs.bin")?;
             let sha: [u8; 20] = sub(body, at.saturating_add(8), 20)
                 .and_then(|s| s.try_into().ok())
@@ -951,5 +971,70 @@ mod tests {
             }
         );
         assert!(m.complete() && !old.complete());
+    }
+
+    /// Segment and pack ids from the store become store keys and file names (the edge's
+    /// block cache creates and deletes files named after pack ids): ids that are not plain
+    /// names are refused where `blobs.bin` and segments are read.
+    #[test]
+    fn ids_from_the_store_are_checked() {
+        let seg = |id: &str, pack: &str| SegmentMeta {
+            id: id.into(),
+            blobs: 1,
+            index_len: 1,
+            packs: vec![pack.into()],
+        };
+        let pack = |id: &str| PackMeta {
+            id: id.into(),
+            len: 1,
+            sha: [0; 20],
+            blobs: 1,
+        };
+        let bm = |segments, packs| BlobManifest {
+            generation: 1,
+            genesis: Oid([1; 20]),
+            mirrored: true,
+            segments,
+            packs,
+        };
+        let good = bm(vec![seg("s-1", "p_1")], vec![pack("p_1")]);
+        assert_eq!(BlobManifest::decode(&good.encode()).unwrap(), good);
+        let long = "a".repeat(65);
+        for bad in ["../x", "a/b", "", ".", "x\ny", "é", long.as_str()] {
+            for m in [
+                bm(vec![seg(bad, "p")], vec![pack("p")]),
+                bm(vec![seg("s", bad)], vec![pack("p")]),
+                bm(vec![seg("s", "p")], vec![pack(bad)]),
+            ] {
+                let e = BlobManifest::decode(&m.encode()).unwrap_err().to_string();
+                assert!(
+                    e.contains(" id ") && e.contains("blobs.bin"),
+                    "{bad:?}: {e}"
+                );
+            }
+        }
+
+        let rec = BlobRec {
+            oid: Oid([9; 20]),
+            pack: 0,
+            offset: 12,
+            entry_len: 10,
+            size: 5,
+            hdr_len: 2,
+            stored: false,
+        };
+        let segment = |pack_id: &str| {
+            let packs = [PackRef {
+                id: pack_id.into(),
+                len: 100,
+                sha: [0; 20],
+            }];
+            Segment::from_heap(build_segment(&packs, &[rec], 1).unwrap(), "s")
+        };
+        assert_eq!(segment("p-1").unwrap().find(&rec.oid), Some(rec));
+        for bad in ["../../x", "a/b", ""] {
+            let e = segment(bad).err().unwrap().to_string();
+            assert!(e.contains("bad pack id"), "{bad:?}: {e}");
+        }
     }
 }

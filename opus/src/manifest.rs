@@ -271,7 +271,8 @@ fn short(o: &Oid) -> String {
     h.get(..10).unwrap_or(&h).to_string()
 }
 
-/// Slab ids become object-store keys and file names: keep them boring.
+/// Slab, blob pack and segment ids become object-store keys and file names: keep them
+/// boring (checked where they are read from the store).
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
