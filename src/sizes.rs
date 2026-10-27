@@ -205,10 +205,10 @@ pub fn merge(tables: &[&Sizes]) -> Vec<u8> {
         }
         // Advance every table past this id.
         for (j, t) in tables.iter().enumerate() {
-            if let Some(p) = pos.get_mut(j) {
-                if t.id_at(*p) == Some(&oid.0[..]) {
-                    *p = p.saturating_add(1);
-                }
+            if let Some(p) = pos.get_mut(j)
+                && t.id_at(*p) == Some(&oid.0[..])
+            {
+                *p = p.saturating_add(1);
             }
         }
     }

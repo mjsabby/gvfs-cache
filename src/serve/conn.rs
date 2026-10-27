@@ -151,10 +151,10 @@ impl<T: Pooled> Pool<T> {
         let first = shard(n);
         for k in 0..n {
             let i = first.wrapping_add(k).checked_rem(n).unwrap_or(0);
-            if let Some(Ok(mut s)) = self.shards.get(i).map(|s| s.lock()) {
-                if let Some(b) = s.pop() {
-                    return b;
-                }
+            if let Some(Ok(mut s)) = self.shards.get(i).map(|s| s.lock())
+                && let Some(b) = s.pop()
+            {
+                return b;
             }
         }
         let _cold = gvfs_alloc_guard::cold_section();
@@ -167,11 +167,11 @@ impl<T: Pooled> Pool<T> {
         let first = shard(n);
         for k in 0..n {
             let i = first.wrapping_add(k).checked_rem(n).unwrap_or(0);
-            if let Some(Ok(mut s)) = self.shards.get(i).map(|s| s.lock()) {
-                if s.len() < s.capacity() {
-                    s.push(b);
-                    return;
-                }
+            if let Some(Ok(mut s)) = self.shards.get(i).map(|s| s.lock())
+                && s.len() < s.capacity()
+            {
+                s.push(b);
+                return;
             }
         }
         // Every shard is full (buffers made during a burst): free it.

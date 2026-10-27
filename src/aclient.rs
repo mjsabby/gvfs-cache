@@ -201,10 +201,10 @@ impl AResponse {
                 }
                 Some(Err(e)) => crate::bail!("response body: {e}"),
                 Some(Ok(f)) => {
-                    if let Ok(data) = f.into_data() {
-                        if !data.is_empty() {
-                            return Ok(Some(data));
-                        }
+                    if let Ok(data) = f.into_data()
+                        && !data.is_empty()
+                    {
+                        return Ok(Some(data));
                     }
                 }
             }

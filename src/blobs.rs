@@ -344,7 +344,9 @@ pub fn build_segment(packs: &[PackRef], recs: &[BlobRec], threads: usize) -> Res
     for (chunk, v) in out
         .get_mut(offsets_at..pilots_at)
         .unwrap_or(&mut [])
-        .chunks_exact_mut(4)
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
         .zip(&built.offsets)
     {
         chunk.copy_from_slice(&v.to_le_bytes());
@@ -352,7 +354,9 @@ pub fn build_segment(packs: &[PackRef], recs: &[BlobRec], threads: usize) -> Res
     for (chunk, v) in out
         .get_mut(pilots_at..records_at)
         .unwrap_or(&mut [])
-        .chunks_exact_mut(2)
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
         .zip(&built.pilots)
     {
         chunk.copy_from_slice(&v.to_le_bytes());

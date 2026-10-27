@@ -285,11 +285,9 @@ impl ObjectSplice {
             self.bytes.clear();
             self.bytes.shrink_to(bytes);
         }
-        for v in [&mut self.out_at] {
-            if v.capacity() > n.saturating_mul(2) {
-                v.clear();
-                v.shrink_to(n);
-            }
+        if self.out_at.capacity() > n.saturating_mul(2) {
+            self.out_at.clear();
+            self.out_at.shrink_to(n);
         }
         if self.refs.capacity() > n.saturating_mul(2) {
             self.refs.clear();
@@ -449,11 +447,11 @@ impl ObjectSplice {
             }),
             Piece::Slab { slab, start, len },
         ) = (self.pieces.last_mut(), p)
+            && *ps == slab
+            && pstart.saturating_add(*plen) == start
         {
-            if *ps == slab && pstart.saturating_add(*plen) == start {
-                *plen = plen.saturating_add(len);
-                return Ok(());
-            }
+            *plen = plen.saturating_add(len);
+            return Ok(());
         }
         if !crate::arena::push(&mut self.pieces, p, grow) {
             crate::bail!("object batch exceeds the request arena");

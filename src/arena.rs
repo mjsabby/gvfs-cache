@@ -398,7 +398,7 @@ impl ArenaPool {
             .min(self.max_objects.saturating_sub(g.base));
         let more = want.saturating_sub(g.charged);
         self.grown
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
                 t.checked_add(more).filter(|&n| n <= self.grow_budget)
             })
             .map_err(|_| Refused::Busy)?;

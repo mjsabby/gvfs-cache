@@ -699,12 +699,13 @@ impl Warmer {
                     );
                 }
             }
-            if prev_tip_ts != 0 && prev_tip_ts < view.tip_ts {
-                if let Prefetch::Pack(plan, _) = view.prefetch(prev_tip_ts) {
-                    plan.trailer();
-                    if idx {
-                        let _ = plan.idx();
-                    }
+            if prev_tip_ts != 0
+                && prev_tip_ts < view.tip_ts
+                && let Prefetch::Pack(plan, _) = view.prefetch(prev_tip_ts)
+            {
+                plan.trailer();
+                if idx {
+                    let _ = plan.idx();
                 }
             }
             prev_tip_ts = view.tip_ts;
@@ -1254,38 +1255,37 @@ impl Live {
             ctx.publish(next);
         }
         let view = ctx.view();
-        if let Some((bytes, etag)) = self.store.get(MANIFEST_KEY)? {
-            if etag != view.etag {
-                let m = Manifest::decode(&bytes)?;
-                let blobs_behind =
-                    m.separate_blobs() && self.blobs_generation() < m.blobs_generation;
-                if blobs_behind && self.waiting_for != m.generation {
-                    crate::log!(
-                        "serve: manifest generation {} waits for blobs.bin generation {} (have {})",
-                        m.generation,
-                        m.blobs_generation,
-                        self.blobs_generation()
-                    );
-                    self.waiting_for = m.generation;
-                }
-                if m.generation > view.manifest.generation && !blobs_behind {
-                    self.open_manifest(&m)?;
-                    self.prune_slabs(&m);
-                    self.l0 = self.tip.prune(&self.l0, &view.manifest, &m, &self.sealed)?;
-                    let next = self.snapshot(m, etag);
-                    crate::log!(
-                        "serve: manifest generation {} ({} slabs, {} L0)",
-                        next.manifest.generation,
-                        next.all.len(),
-                        next.l0_len
-                    );
-                    ctx.metrics.manifest_loads.fetch_add(1, Ordering::Relaxed);
-                    let next = Arc::new(next);
-                    ctx.publish(next.clone());
-                    warmer.offer(next);
-                    // The tip may now be behind the upstream: catch up below.
-                    self.last_head = Oid::ZERO;
-                }
+        if let Some((bytes, etag)) = self.store.get(MANIFEST_KEY)?
+            && etag != view.etag
+        {
+            let m = Manifest::decode(&bytes)?;
+            let blobs_behind = m.separate_blobs() && self.blobs_generation() < m.blobs_generation;
+            if blobs_behind && self.waiting_for != m.generation {
+                crate::log!(
+                    "serve: manifest generation {} waits for blobs.bin generation {} (have {})",
+                    m.generation,
+                    m.blobs_generation,
+                    self.blobs_generation()
+                );
+                self.waiting_for = m.generation;
+            }
+            if m.generation > view.manifest.generation && !blobs_behind {
+                self.open_manifest(&m)?;
+                self.prune_slabs(&m);
+                self.l0 = self.tip.prune(&self.l0, &view.manifest, &m, &self.sealed)?;
+                let next = self.snapshot(m, etag);
+                crate::log!(
+                    "serve: manifest generation {} ({} slabs, {} L0)",
+                    next.manifest.generation,
+                    next.all.len(),
+                    next.l0_len
+                );
+                ctx.metrics.manifest_loads.fetch_add(1, Ordering::Relaxed);
+                let next = Arc::new(next);
+                ctx.publish(next.clone());
+                warmer.offer(next);
+                // The tip may now be behind the upstream: catch up below.
+                self.last_head = Oid::ZERO;
             }
         }
         if self.sync_upstream(ctx)? {

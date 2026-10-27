@@ -405,10 +405,10 @@ impl Proxy {
                 {
                     let mut st = lock(&self.state);
                     for o in oids {
-                        if !found.contains_key(o) {
-                            if let Some(hit) = st.cache.get(o) {
-                                found.insert(*o, hit.clone());
-                            }
+                        if !found.contains_key(o)
+                            && let Some(hit) = st.cache.get(o)
+                        {
+                            found.insert(*o, hit.clone());
                         }
                     }
                     let missing: Vec<Oid> = oids

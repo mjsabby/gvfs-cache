@@ -20,10 +20,10 @@ pub fn temp_path(path: &Path) -> PathBuf {
 }
 
 pub fn sync_dir(path: &Path) {
-    if let Some(dir) = path.parent() {
-        if let Ok(d) = File::open(dir) {
-            let _ = d.sync_all();
-        }
+    if let Some(dir) = path.parent()
+        && let Ok(d) = File::open(dir)
+    {
+        let _ = d.sync_all();
     }
 }
 

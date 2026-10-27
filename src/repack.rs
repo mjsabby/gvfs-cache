@@ -718,10 +718,10 @@ impl Repacker {
             let ci = self.resolve(input, c)?;
             let &(at, len) = self.contents.get(ci as usize).ctx("commit")?;
             for p in commit_parents(self.raw.get(at..at.saturating_add(len)).unwrap_or(&[])) {
-                if self.ids.get(&p).is_none() {
-                    if let Some(fs) = frozen.find(&p) {
-                        self.boundary.push((time, fs));
-                    }
+                if self.ids.get(&p).is_none()
+                    && let Some(fs) = frozen.find(&p)
+                {
+                    self.boundary.push((time, fs));
                 }
             }
         }
@@ -778,10 +778,10 @@ impl Repacker {
                         continue;
                     }
                     let child = path_hash(path, e.name);
-                    if self.paths.binary_search_by_key(&child, |p| p.0).is_ok() {
-                        if let Some(cs) = frozen.find(&e.oid) {
-                            self.stack.push((cs, child));
-                        }
+                    if self.paths.binary_search_by_key(&child, |p| p.0).is_ok()
+                        && let Some(cs) = frozen.find(&e.oid)
+                    {
+                        self.stack.push((cs, child));
                     }
                 }
             }

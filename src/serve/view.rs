@@ -230,10 +230,10 @@ impl View {
     /// newer slabs' filter rules out is).
     #[inline]
     pub fn preload(&self, oid: &Oid) {
-        if !self.recent.may_contain(oid) {
-            if let Some(b) = self.all.get(self.baseline) {
-                b.preload(oid);
-            }
+        if !self.recent.may_contain(oid)
+            && let Some(b) = self.all.get(self.baseline)
+        {
+            b.preload(oid);
         }
     }
 

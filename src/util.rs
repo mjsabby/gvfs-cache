@@ -196,13 +196,11 @@ pub fn decode_hex(hex: &[u8], out: &mut [u8]) -> bool {
         return false;
     }
     let mut bad = 0u8;
-    for (o, pair) in out.iter_mut().zip(hex.chunks_exact(2)) {
-        if let [h, l] = *pair {
-            let hi = hex_value(h);
-            let lo = hex_value(l);
-            bad |= hi | lo;
-            *o = hi.wrapping_shl(4) | (lo & 0x0F);
-        }
+    for (o, &[h, l]) in out.iter_mut().zip(hex.as_chunks::<2>().0) {
+        let hi = hex_value(h);
+        let lo = hex_value(l);
+        bad |= hi | lo;
+        *o = hi.wrapping_shl(4) | (lo & 0x0F);
     }
     bad & 0xF0 == 0
 }
@@ -218,11 +216,9 @@ fn hex_digit(nibble: u8) -> u8 {
 /// Lowercase hex of `bytes` into `out` (`out.len() == 2 * bytes.len()`).
 #[inline]
 pub fn encode_hex(bytes: &[u8], out: &mut [u8]) {
-    for (pair, &b) in out.chunks_exact_mut(2).zip(bytes) {
-        if let [h, l] = pair {
-            *h = hex_digit(b.wrapping_shr(4));
-            *l = hex_digit(b);
-        }
+    for ([h, l], &b) in out.as_chunks_mut::<2>().0.iter_mut().zip(bytes) {
+        *h = hex_digit(b.wrapping_shr(4));
+        *l = hex_digit(b);
     }
 }
 

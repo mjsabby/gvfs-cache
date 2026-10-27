@@ -785,34 +785,33 @@ async fn loose(
     };
     let entry = slab.entry(&rec).unwrap_or(&[]);
     let hdr_len = parse_entry_header(entry).map(|h| h.header_len).unwrap_or(0);
-    if !rec.is_delta() {
-        if let Ok(plan) = LooseSplice::plan(rec.kind, rec.size, entry.get(hdr_len..).unwrap_or(&[]))
-        {
-            // A whole entry needs no arena.
-            drop(lease);
-            let zlib_at = rec.offset.saturating_add(u64_of(hdr_len));
-            let mut out = Out::new(stream, &mut b.out, ctx.deadlines.write);
-            out.head(200, CT_LOOSE, u64_of(plan.total_len()), keep)?;
-            if !out.put(plan.prefix()) {
-                out.bytes(plan.prefix()).await?;
-            }
-            let (at, n) = (
-                zlib_at.saturating_add(u64_of(plan.body_start)),
-                u64_of(plan.body_end.saturating_sub(plan.body_start)),
-            );
-            let small = n < SENDFILE_MIN
-                && crate::util::sub(slab.pack(), us(at), us(n)).is_some_and(|b| out.put(b));
-            if !small {
-                out.slab(slab, at, n).await?;
-            }
-            if !out.put(&plan.trailer) {
-                out.bytes(&plan.trailer).await?;
-            }
-            out.flush().await?;
-            ctx.metrics.bytes_out.fetch_add(out.sent, Ordering::Relaxed);
-            inc(&ctx.metrics.objects_out);
-            return Ok(keep);
+    if !rec.is_delta()
+        && let Ok(plan) = LooseSplice::plan(rec.kind, rec.size, entry.get(hdr_len..).unwrap_or(&[]))
+    {
+        // A whole entry needs no arena.
+        drop(lease);
+        let zlib_at = rec.offset.saturating_add(u64_of(hdr_len));
+        let mut out = Out::new(stream, &mut b.out, ctx.deadlines.write);
+        out.head(200, CT_LOOSE, u64_of(plan.total_len()), keep)?;
+        if !out.put(plan.prefix()) {
+            out.bytes(plan.prefix()).await?;
         }
+        let (at, n) = (
+            zlib_at.saturating_add(u64_of(plan.body_start)),
+            u64_of(plan.body_end.saturating_sub(plan.body_start)),
+        );
+        let small = n < SENDFILE_MIN
+            && crate::util::sub(slab.pack(), us(at), us(n)).is_some_and(|b| out.put(b));
+        if !small {
+            out.slab(slab, at, n).await?;
+        }
+        if !out.put(&plan.trailer) {
+            out.bytes(&plan.trailer).await?;
+        }
+        out.flush().await?;
+        ctx.metrics.bytes_out.fetch_add(out.sent, Ordering::Relaxed);
+        inc(&ctx.metrics.objects_out);
+        return Ok(keep);
     }
     // Deltified (or unusual) entry: resolve and deflate in an arena.
     let mut lease = match lease {
@@ -928,15 +927,15 @@ pub fn scan_oids_step(body: &[u8], at: &mut usize, out: &mut Vec<Oid>, max: usiz
         }
         let start = i.saturating_add(q).saturating_add(1);
         let end = start.saturating_add(40);
-        if body.get(end) == Some(&b'"') {
-            if let Some(oid) = body.get(start..end).and_then(Oid::from_hex) {
-                if !crate::util::try_push(out, oid) {
-                    return Scan::Full;
-                }
-                taken = taken.saturating_add(1);
-                i = end.saturating_add(1);
-                continue;
+        if body.get(end) == Some(&b'"')
+            && let Some(oid) = body.get(start..end).and_then(Oid::from_hex)
+        {
+            if !crate::util::try_push(out, oid) {
+                return Scan::Full;
             }
+            taken = taken.saturating_add(1);
+            i = end.saturating_add(1);
+            continue;
         }
         i = start;
     }
@@ -1036,11 +1035,11 @@ async fn objects_post(
                     .unwrap_or(0);
                 let large = size >= LOOSE_BLOB_MAX;
                 if !accepts_loose || (accepts_pack && large) {
-                    if let Some((pack, rec)) = stored {
-                        if own_pack(pack, &rec) {
-                            inc(&ctx.metrics.blobs_store);
-                            return whole_pack(ctx, b, stream, pack, keep).await;
-                        }
+                    if let Some((pack, rec)) = stored
+                        && own_pack(pack, &rec)
+                    {
+                        inc(&ctx.metrics.blobs_store);
+                        return whole_pack(ctx, b, stream, pack, keep).await;
                     }
                 } else if let Some((pack, rec)) = stored {
                     inc(&ctx.metrics.blobs_store);
@@ -1146,12 +1145,12 @@ async fn objects_post(
     };
     for (i, (_, src, rec)) in arena.blobs.iter().enumerate() {
         // The first two lines of an entry ahead (most are small; a large one's reads stream).
-        if let Some((_, s, r)) = arena.blobs.get(i.saturating_add(AHEAD)) {
-            if let Some(b) = pack_of(*s, r).and_then(|p| p.bytes()) {
-                let at = us(r.offset);
-                crate::util::prefetch(b, at);
-                crate::util::prefetch(b, at.saturating_add(64));
-            }
+        if let Some((_, s, r)) = arena.blobs.get(i.saturating_add(AHEAD))
+            && let Some(b) = pack_of(*s, r).and_then(|p| p.bytes())
+        {
+            let at = us(r.offset);
+            crate::util::prefetch(b, at);
+            crate::util::prefetch(b, at.saturating_add(64));
         }
         let pack = pack_of(*src, rec)
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
@@ -1321,10 +1320,10 @@ async fn plan_objects(
                 if let Some(o) = oids.get_mut(rest) {
                     *o = oid;
                 }
-                if let Some(at) = oid_at.get(i).copied() {
-                    if let Some(a) = oid_at.get_mut(rest) {
-                        *a = at;
-                    }
+                if let Some(at) = oid_at.get(i).copied()
+                    && let Some(a) = oid_at.get_mut(rest)
+                {
+                    *a = at;
                 }
                 rest = rest.saturating_add(1);
                 continue;

@@ -193,18 +193,18 @@ fn step(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<Mani
         return genesis(o, e, work, head);
     };
     let mut m = Manifest::decode(&bytes).ctx("reading manifest.bin")?;
-    if let Some(want) = o.blobs {
-        if want != m.separate_blobs() {
-            crate::bail!(
-                "this store keeps blobs {} (chosen at genesis); --blobs {} does not apply",
-                if m.separate_blobs() {
-                    "separate"
-                } else {
-                    "inline"
-                },
-                if want { "separate" } else { "inline" }
-            );
-        }
+    if let Some(want) = o.blobs
+        && want != m.separate_blobs()
+    {
+        crate::bail!(
+            "this store keeps blobs {} (chosen at genesis); --blobs {} does not apply",
+            if m.separate_blobs() {
+                "separate"
+            } else {
+                "inline"
+            },
+            if want { "separate" } else { "inline" }
+        );
     }
 
     if head != m.tip && m.separate_blobs() {

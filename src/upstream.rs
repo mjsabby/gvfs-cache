@@ -375,10 +375,10 @@ fn v0_refs_tip(body: &[u8], branch_ref: &str) -> Result<Option<Oid>> {
             Pkt::Data(n) => {
                 let line = rd.line(n);
                 let line = line.split(|&b| b == 0).next().unwrap_or(line);
-                if let Some((hex, name)) = line.split_at_checked(40) {
-                    if name.strip_prefix(b" ") == Some(branch_ref.as_bytes()) {
-                        return Oid::from_hex(hex).ctx("bad ref line").map(Some);
-                    }
+                if let Some((hex, name)) = line.split_at_checked(40)
+                    && name.strip_prefix(b" ") == Some(branch_ref.as_bytes())
+                {
+                    return Oid::from_hex(hex).ctx("bad ref line").map(Some);
                 }
             }
             Pkt::Eof => return Ok(None),

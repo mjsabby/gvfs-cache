@@ -169,7 +169,7 @@ impl Spare {
     /// Takes `n` bytes, if that many are left.
     pub fn take(&self, n: usize) -> bool {
         self.left
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |l| l.checked_sub(n))
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |l| l.checked_sub(n))
             .is_ok()
     }
 
