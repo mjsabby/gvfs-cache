@@ -570,12 +570,13 @@ pub fn msgit() -> Option<PathBuf> {
             std::env::var_os("HOME").map(|h| PathBuf::from(h).join("git/bin-wrappers/git"))
         })?;
     let ok = Command::new(&p)
-        .args(["gvfs-helper", "--help"])
+        .args(["gvfs-helper", "-h"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .ok()?;
-    // `--help` exits 129 when the command exists.
+    // `-h` exits 129 when the command exists. (`--help` would ask `man` for a page that
+    // gvfs-helper does not have, and fail wherever man-db is installed.)
     (ok.code() == Some(129) || ok.success()).then_some(p)
 }
 

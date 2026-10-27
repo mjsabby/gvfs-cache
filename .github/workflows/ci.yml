@@ -86,7 +86,7 @@ jobs:
           exec "$dir/usr/local/bin/git" "\$@"
           EOF
           chmod +x "$dir/git"
-          "$dir/git" gvfs-helper --help > /dev/null
+          test -x "$("$dir/git" --exec-path)/git-gvfs-helper"
           echo "GVFS_TEST_MSGIT=$dir/git" >> "$GITHUB_ENV"
       - name: Tests
         run: |
