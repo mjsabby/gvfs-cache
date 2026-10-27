@@ -92,7 +92,16 @@ SERVE OPTIONS:
                                blobs: a directory on local disk (required for an object
                                store; default: system temp); what the store drops goes
     --poll-ms <N>              upstream + manifest poll interval (default: 2000)
-    --workers <N>              connection threads (default: 256)
+    --workers <N>              runtime worker threads (default: one per CPU)
+    --max-conns <N>            connections open at once; past that, new ones wait in the
+                               listen queue (default: 2 x --max-idle-conns, within the file
+                               descriptor limit less a reserve for the edge's own files)
+    --max-idle-conns <N>       connections kept between requests (default: 65536); one that
+                               goes idle past that is closed (its client reconnects)
+    --idle-secs <N>            a connection's wait for its next request, and a request's
+                               (head and body) to arrive whole (default: 30)
+    --quantum-us <N>           work a long request does between yields to others
+                               (default: 100)
     --arenas <N>               request scratch arenas (default: 2 x cores)
     --arena-mib <N>            size of each arena (default: 8)
     --arena-objects <N>        ids each arena plans without growing (default: 262144)

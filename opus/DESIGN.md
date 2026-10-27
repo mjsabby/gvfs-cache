@@ -417,15 +417,21 @@ Any path prefix before `/gvfs/` is accepted.
 backlog is raised to `net.core.somaxconn` (std's 128 overflows when a fleet connects at
 once). Between requests a connection holds no buffer, only its parked task (about 3 KB) and
 a descriptor: when its next request's bytes arrive it takes a 16 KiB head buffer and a
-256 KiB output buffer from a pool, and gives them back once the response is out. A
-connection is closed after `--idle-secs` (30) without a request, or when it goes idle after a
-response while `--max-idle-conns` (65,536) others are (its client reconnects; a new
-connection is always served first). A request must arrive whole, head and body,
-within `--idle-secs` once begun, and each wait for a client to take more of a response is
-bounded at 120 s. A response waiting on a slow client parks its task: the worker serves
-other connections meanwhile, and `sendfile` resumes when the socket drains (REPORT.md §14:
-400 slow clones beside 1.2M GETs a second; with one thread per request, 256 of them stopped
-the edge).
+256 KiB output buffer from a pool, and gives them back once the response is out. A head
+that arrives in pieces waits with the head buffer only: the output buffer goes back to a
+pool meanwhile (5,000 slow heads took 62 MiB of memory, 1,278 MiB before). A connection is
+closed after `--idle-secs` (30) without a request, or when it goes idle after a response
+while `--max-idle-conns` (65,536) others are (its client reconnects; a new connection is
+always served first). At most `--max-conns` connections are open at once (default: twice
+`--max-idle-conns`, within the file descriptor limit, which the edge raises to its hard
+limit, less a reserve of a sixteenth, at least 4,096, for its own files and connections):
+past that, the edge stops accepting, and new clients wait in the listen queue until a
+connection closes (`gvfs_connections_open`, `gvfs_connections_full_total`). A request must
+arrive whole, head and body, within `--idle-secs` once begun, and each wait for a client to
+take more of a response is bounded at 120 s. A response waiting on a slow client parks its
+task: the worker serves other connections meanwhile, and `sendfile` resumes when the socket
+drains (REPORT.md §14: 400 slow clones beside 1.2M GETs a second; with one thread per
+request, 256 of them stopped the edge).
 
 Handlers that compute for long (batches of ids, commit expansion, hashing a pack) yield
 every 100 µs of work (`src/serve/budget.rs`, `--quantum-us`). tokio does not preempt:

@@ -238,10 +238,12 @@ pub enum Body {
 /// Reads one request head: [`Head::Idle`] if nothing is readable after all, [`Head::Closed`]
 /// on a clean close between requests. Once part of a head is here, the rest must follow
 /// by `deadline`.
+/// `waiting` runs before each wait for more of a head that did not come whole.
 pub async fn read_head(
     stream: &TcpStream,
     input: &mut Input,
     deadline: &mut Deadline,
+    waiting: &mut impl FnMut(),
 ) -> std::io::Result<Head> {
     loop {
         if let Some(end) = find_head_end(input.buf.get(..input.filled).unwrap_or(&[])) {
@@ -258,6 +260,7 @@ pub async fn read_head(
                 if input.filled == 0 {
                     return Ok(Head::Idle);
                 }
+                waiting();
                 until(deadline.at(), stream.readable()).await?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}

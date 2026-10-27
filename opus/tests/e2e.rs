@@ -1122,18 +1122,22 @@ fn malformed_requests_and_the_idle_cap() {
             String::from_utf8_lossy(&resp[..resp.len().min(60)])
         );
     }
-    // One whole response on a keep-alive connection, which then stays open.
-    let ask = |s: &mut TcpStream| -> Vec<u8> {
-        s.write_all(b"GET /gvfs/config HTTP/1.1\r\nHost: x\r\n\r\n")
-            .unwrap();
+    // The body of one whole 200 response to `GET path` on a keep-alive connection, which
+    // then stays open (`None`: the server had closed it).
+    let ask = |s: &mut TcpStream, path: &str| -> Option<Vec<u8>> {
+        s.write_all(format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
+            .ok()?;
         let mut got = Vec::new();
         let mut buf = [0u8; 4096];
         loop {
-            let n = s.read(&mut buf).unwrap();
-            assert!(n > 0, "closed before the response");
+            let n = s.read(&mut buf).ok()?;
+            if n == 0 {
+                return None;
+            }
             got.extend_from_slice(&buf[..n]);
             if let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") {
                 let head = String::from_utf8_lossy(&got[..end]).to_ascii_lowercase();
+                assert!(head.starts_with("http/1.1 200 "), "{head}");
                 let len: usize = head
                     .lines()
                     .find_map(|l| l.strip_prefix("content-length:"))
@@ -1142,24 +1146,47 @@ fn malformed_requests_and_the_idle_cap() {
                     .parse()
                     .unwrap();
                 if got.len() >= end + 4 + len {
-                    return got;
+                    return Some(got.split_off(end + 4));
                 }
             }
         }
     };
-    let (mut a, mut b) = (connect(), connect());
-    assert!(ask(&mut a).starts_with(b"HTTP/1.1 200 OK"));
-    assert!(ask(&mut b).starts_with(b"HTTP/1.1 200 OK"));
+    let metric = |s: &mut TcpStream, name: &str| -> Option<u64> {
+        let text = String::from_utf8(ask(s, "/metrics")?).unwrap();
+        text.lines()
+            .find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.trim().parse().ok())
+    };
+    let until = |what: &str, done: &mut dyn FnMut() -> bool| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    // A connection counts as idle until the server sees it close, the harness's readiness
+    // probe too: first wait until A, which asks, is the only one open. (A is not idle while
+    // it is served, and one other idle connection is within the cap.)
+    let mut a = connect();
+    until("the earlier connections to close", &mut || {
+        metric(&mut a, "gvfs_connections_open").unwrap() == 1
+    });
+    // A and B idle: the two allowed.
+    let mut b = connect();
+    assert!(ask(&mut b, "/gvfs/config").is_some());
+    // A new connection at the cap is answered, and closed once its response is out and the
+    // other two are idle (B may still be between its response and its wait for the next).
     let mut c = connect();
-    assert!(ask(&mut c).starts_with(b"HTTP/1.1 200 OK"));
-    let mut rest = Vec::new();
-    let _ = c.read_to_end(&mut rest);
-    assert!(rest.is_empty(), "the third idle connection is closed");
-    assert!(server.metric("gvfs_connections_idle_overflow_total") >= 1);
-    assert!(
-        ask(&mut a).starts_with(b"HTTP/1.1 200 OK"),
-        "the idle ones still serve"
-    );
+    let mut answered = 0;
+    until("the third idle connection to be closed", &mut || {
+        ask(&mut c, "/gvfs/config").map(|_| answered += 1).is_none()
+    });
+    assert!(answered >= 1, "a new connection at the cap is answered");
+    // The other two still serve, and serving one leaves only the other idle.
+    for _ in 0..3 {
+        assert!(ask(&mut a, "/gvfs/config").is_some(), "A still serves");
+        assert!(ask(&mut b, "/gvfs/config").is_some(), "B still serves");
+    }
+    assert_eq!(server.metric("gvfs_connections_idle_overflow_total"), 1);
     server.assert_clean();
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1740,13 +1767,77 @@ fn a_forced_push_the_pipeline_seals_first() {
     );
     install_pack(&saw_b, &packs[0].1);
     assert_complete(&saw_b, &c);
-    // The mirror catches up: nothing more to do.
+    // The mirror catches up (before the edge sees it again, which would otherwise find
+    // the abandoned B there first): nothing more to do.
+    let main = "+refs/heads/main:refs/heads/main";
+    git(&hidden, &["fetch", "-q", up.bare.to_str().unwrap(), main]);
     std::fs::rename(&hidden, &mirror).unwrap();
-    sync();
     let ingests = server.metric("gvfs_l0_ingests_total");
     std::thread::sleep(std::time::Duration::from_millis(300));
     assert_eq!(server.metric("gvfs_l0_ingests_total"), ingests);
     assert!(server.prefetch(t0 + 50).is_empty());
+    server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// At most `--max-conns` connections are open: past that, a new client waits (in the
+/// listen queue) until one closes, and is then served. Requests whose heads arrive in
+/// pieces are served as any other.
+#[test]
+fn connections_past_max_conns_wait_for_a_slot() {
+    use std::io::Write;
+    use std::time::Duration;
+    let root = tempdir("max-conns");
+    let mut up = Upstream::new(&root);
+    up.commit(2);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--cache-dir",
+        cache.to_str().unwrap(),
+        "--max-conns",
+        "3",
+    ]);
+    let connect = || std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    // A head in three pieces, the connection kept: served whole.
+    let mut slow = connect();
+    for piece in ["GET /healthz HT", "TP/1.1\r\nHost: x\r", "\n\r\n"] {
+        slow.write_all(piece.as_bytes()).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let (head, body) = raw_response(&mut slow, false);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"ok\n");
+    // Every slot taken (the slow connection, kept, and two idle ones).
+    let idle: Vec<_> = (0..2).map(|_| connect()).collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let mut waiting = connect();
+    waiting
+        .write_all(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+        .unwrap();
+    waiting
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let mut byte = [0u8; 1];
+    let early = std::io::Read::read(&mut waiting, &mut byte);
+    assert!(early.is_err(), "answered while every slot was taken");
+    // One closes: the waiting client is served.
+    drop(slow);
+    waiting
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let (head, body) = raw_response(&mut waiting, false);
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, b"ok\n");
+    drop(idle);
+    drop(waiting);
+    server.wait_for("free slots", |s| s.metric("gvfs_connections_open") == 1);
+    assert!(server.metric("gvfs_connections_full_total") >= 1);
     server.assert_clean();
     drop(server);
     let _ = std::fs::remove_dir_all(&root);

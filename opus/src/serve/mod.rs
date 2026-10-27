@@ -78,8 +78,13 @@ pub enum IdxPolicy {
 /// Shared by every connection.
 pub struct Ctx {
     view: RwLock<Arc<View>>,
-    /// Buffers of the connections with a request in progress.
-    pub bufs: conn::Pool,
+    /// Buffers of the connections with a request in progress, and output buffers returned
+    /// while a head arrives in pieces.
+    pub bufs: conn::Pool<conn::Bufs>,
+    pub outs: conn::Pool<Vec<u8>>,
+    /// One permit per connection that may be open (`--max-conns`).
+    pub conns: Arc<tokio::sync::Semaphore>,
+    pub max_conns: usize,
     pub deadlines: httpd::Deadlines,
     /// What connection buffers may grow by, together, for request bodies and answers larger
     /// than one buffer.
@@ -154,6 +159,8 @@ pub struct Options {
     /// Idle keep-alive connections that can wait at once (beyond that, a connection that
     /// goes idle is closed: its client reconnects).
     pub max_idle_conns: usize,
+    /// `--max-conns` (default: [`default_max_conns`]).
+    pub max_conns: Option<usize>,
     /// Sealed rollups of this tier and above (24h, or the weekly delta) are delivered whole
     /// to the warm clients inside them, once ([`view`]); `None`: exact covers only.
     pub supersets: Option<Tier>,
@@ -184,6 +191,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "alloc-guard",
             "idle-secs",
             "max-idle-conns",
+            "max-conns",
             "quantum-us",
             "prefetch-idx",
             "superset-tier",
@@ -269,6 +277,10 @@ pub fn main(args: &[String]) -> Result<()> {
         write_timeout: Duration::from_secs(120),
         prefetch_idx,
         max_idle_conns: f.num("max-idle-conns", 65536usize)?,
+        max_conns: f
+            .get("max-conns")
+            .map(|_| f.num("max-conns", 0usize))
+            .transpose()?,
         supersets,
     };
     run(opts)
@@ -315,6 +327,7 @@ pub fn run(o: Options) -> Result<()> {
         write_timeout,
         prefetch_idx,
         max_idle_conns,
+        max_conns,
         supersets,
     } = o;
     let store = Arc::new(store);
@@ -387,9 +400,26 @@ pub fn run(o: Options) -> Result<()> {
         _ => None,
     };
     let workers = workers.max(1);
+    // Connections may not take the descriptors the edge needs for its own files and sockets.
+    let fds = raise_fd_limit();
+    let max_conns = match max_conns {
+        Some(n) => {
+            if n > fds.saturating_sub(fd_reserve(fds)) {
+                crate::log!(
+                    "serve: warning: --max-conns {n} leaves the edge too few of its {fds} file \
+                     descriptors for its own files and connections"
+                );
+            }
+            n.max(1)
+        }
+        None => default_max_conns(fds, max_idle_conns),
+    };
     let ctx = Arc::new(Ctx {
         view: RwLock::new(Arc::new(first)),
-        bufs: conn::Pool::new(workers, CONN_BUFS, OUT_BYTES),
+        bufs: conn::Pool::new(workers, CONN_BUFS, OUT_BYTES, 0),
+        outs: conn::Pool::new(workers, 0, OUT_BYTES, 4),
+        conns: Arc::new(tokio::sync::Semaphore::new(max_conns)),
+        max_conns,
         // Bodies and answers may take, together, what one body and one answer per arena
         // would (as when bodies and answers lived in the arenas).
         spare: httpd::Spare::new(
@@ -440,7 +470,6 @@ pub fn run(o: Options) -> Result<()> {
     warmer.offer(ctx.view());
 
     // 4. The runtime and its buffers, then seal.
-    raise_fd_limit();
     let listener = TcpListener::bind(&bind).ctx(&format!("binding {bind}"))?;
     // std listens with a backlog of 128: a burst of new clients (a fleet starting at 09:00,
     // every client reconnecting after a restart) overflows it, and the rest wait for SYN
@@ -533,13 +562,33 @@ pub fn load_view(store: Store, cache_dir: PathBuf) -> Result<Arc<View>> {
 }
 
 /// Raises the soft open-file limit to the hard limit: every idle client holds a descriptor.
-pub fn raise_fd_limit() {
+/// Raises the soft limit on open files to the hard one; returns the limit in force.
+pub fn raise_fd_limit() -> usize {
     use nix::sys::resource::{Resource, getrlimit, setrlimit};
-    if let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) {
-        if soft < hard {
-            let _ = setrlimit(Resource::RLIMIT_NOFILE, hard, hard);
-        }
-    }
+    let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) else {
+        return 1024;
+    };
+    let limit = if soft < hard && setrlimit(Resource::RLIMIT_NOFILE, hard, hard).is_ok() {
+        hard
+    } else {
+        soft
+    };
+    usize::try_from(limit).unwrap_or(usize::MAX)
+}
+
+/// Descriptors kept for the edge's own use: open slabs, block cache and proxy files, the
+/// store's and the upstream's connections, pipes of local `git` processes.
+fn fd_reserve(fds: usize) -> usize {
+    (fds / 16).max(4096)
+}
+
+/// `--max-conns` by default: twice `--max-idle-conns` (as many working as idle), within the
+/// descriptors left after [`fd_reserve`].
+pub fn default_max_conns(fds: usize, max_idle: usize) -> usize {
+    max_idle
+        .saturating_mul(2)
+        .min(fds.saturating_sub(fd_reserve(fds)))
+        .max(64)
 }
 
 /// Connection buffers made at startup (more are made while they run out).
@@ -547,15 +596,39 @@ const CONN_BUFS: usize = 256;
 /// Bytes of each connection's output buffer (the batch a response coalesces).
 const OUT_BYTES: usize = 256 << 10;
 
-/// Accepts connections for the life of the process: one task each.
+/// Accepts connections for the life of the process: one task each, at most `--max-conns`
+/// at once (past that, new ones wait in the listen queue until one closes).
 async fn accept_loop(ctx: Arc<Ctx>, listener: tokio::net::TcpListener) {
     let mut logged: Option<Instant> = None;
+    let mut full_logged: Option<Instant> = None;
     loop {
+        let slot = match Arc::clone(&ctx.conns).try_acquire_owned() {
+            Ok(s) => s,
+            Err(_) => {
+                ctx.metrics.conns_full.fetch_add(1, Ordering::Relaxed);
+                if full_logged.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                    crate::log!(
+                        "serve: {} connections open (--max-conns): new ones wait",
+                        ctx.max_conns
+                    );
+                    full_logged = Some(Instant::now());
+                }
+                match Arc::clone(&ctx.conns).acquire_owned().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                }
+            }
+        };
         match listener.accept().await {
             Ok((stream, _)) => {
-                tokio::spawn(conn::HotPath::new(conn::serve(Arc::clone(&ctx), stream)));
+                tokio::spawn(conn::HotPath::new(conn::serve(
+                    Arc::clone(&ctx),
+                    stream,
+                    slot,
+                )));
             }
             Err(e) => {
+                drop(slot);
                 // Out of descriptors, or a connection reset before it was accepted: back off
                 // briefly instead of spinning, and say so at most once a second.
                 if logged.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) {
@@ -1370,6 +1443,8 @@ pub fn metrics_text(ctx: &Ctx) -> String {
          gvfs_connections_idle {}\n\
          gvfs_connections_idle_closed_total {}\n\
          gvfs_connections_idle_overflow_total {}\n\
+         gvfs_connections_open {}\n\
+         gvfs_connections_full_total {}\n\
          gvfs_buffer_spare_bytes {}\n\
          gvfs_grown_objects {}\n",
         get(&m.prefetch),
@@ -1405,6 +1480,8 @@ pub fn metrics_text(ctx: &Ctx) -> String {
         ctx.idle.load(Ordering::Relaxed).max(0),
         get(&m.idle_closed),
         get(&m.idle_overflow),
+        get(&m.conns_open),
+        get(&m.conns_full),
         ctx.spare.left(),
         ctx.arenas.grown()
     )

@@ -81,6 +81,11 @@ pub struct Metrics {
     /// `--max-idle-conns` others were.
     pub idle_closed: AtomicU64,
     pub idle_overflow: AtomicU64,
+    /// Times every `--max-conns` slot was taken when a connection arrived (it waited).
+    pub conns_full: AtomicU64,
+    /// Connections being served (not the free slots' complement: the accept loop holds
+    /// the next connection's slot while it waits for one).
+    pub conns_open: AtomicU64,
 }
 
 fn inc(c: &AtomicU64) {

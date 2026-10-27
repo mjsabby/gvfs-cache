@@ -3,9 +3,13 @@
 //! Between requests a connection holds no buffer. Its task waits up to `--idle-secs` for
 //! the next request's bytes, then takes a head buffer and an output buffer from a
 //! [`Pool`], serves the request, and gives them back. It keeps them only while pipelined
-//! bytes are buffered. An idle client costs its parked task (about 3 KB) and a descriptor.
-//! Beyond `--max-idle-conns` idle connections, a connection that goes idle after a response
-//! is closed instead, and its client reconnects (a new connection is always served first).
+//! bytes are buffered. While a head arrives in pieces (a slow client), the output buffer
+//! (256 KiB) goes back to a pool and the connection holds only its head buffer (16 KiB). An
+//! idle client costs its parked task (about 3 KB) and a descriptor. Beyond
+//! `--max-idle-conns` idle connections, a connection that goes idle after a response is
+//! closed instead, and its client reconnects (a new connection is always served first).
+//! At most `--max-conns` connections are open: past that, new ones wait in the listen
+//! queue until one closes.
 //!
 //! A slow client parks only its own task: a response waits for the socket to drain with
 //! the worker free for other connections (REPORT.md §14: 400 slow clones beside 1.2M GETs
@@ -46,12 +50,44 @@ impl Bufs {
     }
 }
 
+/// What a [`Pool`] holds: made with the pool's size, emptied when it goes back.
+pub trait Pooled: Sized {
+    fn fresh(size: usize) -> Self;
+    fn reset(&mut self);
+}
+
+impl Pooled for Bufs {
+    fn fresh(out_bytes: usize) -> Bufs {
+        Bufs {
+            input: Input::new(),
+            out: Vec::with_capacity(out_bytes),
+            extra: 0,
+            pooled: out_bytes,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.input.filled = 0;
+    }
+}
+
+impl Pooled for Vec<u8> {
+    fn fresh(bytes: usize) -> Vec<u8> {
+        Vec::with_capacity(bytes)
+    }
+
+    fn reset(&mut self) {
+        self.clear();
+    }
+}
+
 /// Connection buffers, made at startup in per-thread shards; more are made (a cold
 /// section) while every shard is empty, e.g. for many slow downloads at once. The pool
-/// keeps at most twice its startup count: a burst's extra buffers are freed after it.
-pub struct Pool {
-    shards: Vec<Mutex<Vec<Bufs>>>,
-    out_bytes: usize,
+/// keeps at most `keep` a shard (by default twice its startup count): a burst's extra
+/// buffers are freed after it.
+pub struct Pool<T> {
+    shards: Vec<Mutex<Vec<T>>>,
+    size: usize,
 }
 
 thread_local! {
@@ -90,14 +126,13 @@ fn shard(n: usize) -> usize {
     })
 }
 
-impl Pool {
-    /// `count` sets of buffers (a head buffer and `out_bytes` of output each) in `shards`
-    /// shards, each with room to take back every one of them.
-    pub fn new(shards: usize, count: usize, out_bytes: usize) -> Pool {
+impl<T: Pooled> Pool<T> {
+    /// `count` items of `size` in `shards` shards, each with room to take back twice its
+    /// share of them (buffers go back to the thread that frees them), or `keep` if more.
+    pub fn new(shards: usize, count: usize, size: usize, keep: usize) -> Pool<T> {
         let n = shards.max(1);
-        // Room for twice a shard's share: buffers go back to the thread that frees them.
-        let keep = count.div_ceil(n).saturating_mul(2).max(2);
-        let shards: Vec<Mutex<Vec<Bufs>>> = (0..n)
+        let keep = count.div_ceil(n).saturating_mul(2).max(keep).max(2);
+        let shards: Vec<Mutex<Vec<T>>> = (0..n)
             .map(|_| Mutex::new(Vec::with_capacity(keep)))
             .collect();
         for i in 0..count {
@@ -105,13 +140,13 @@ impl Pool {
                 .get(i.checked_rem(shards.len()).unwrap_or(0))
                 .map(|s| s.lock())
             {
-                s.push(new_bufs(out_bytes));
+                s.push(T::fresh(size));
             }
         }
-        Pool { shards, out_bytes }
+        Pool { shards, size }
     }
 
-    pub fn take(&self) -> Bufs {
+    pub fn take(&self) -> T {
         let n = self.shards.len();
         let first = shard(n);
         for k in 0..n {
@@ -123,11 +158,11 @@ impl Pool {
             }
         }
         let _cold = gvfs_alloc_guard::cold_section();
-        new_bufs(self.out_bytes)
+        T::fresh(self.size)
     }
 
-    pub fn put(&self, mut b: Bufs) {
-        b.input.filled = 0;
+    pub fn put(&self, mut b: T) {
+        b.reset();
         let n = self.shards.len();
         let first = shard(n);
         for k in 0..n {
@@ -142,15 +177,6 @@ impl Pool {
         // Every shard is full (buffers made during a burst): free it.
         let _cold = gvfs_alloc_guard::cold_section();
         drop(b);
-    }
-}
-
-fn new_bufs(out_bytes: usize) -> Bufs {
-    Bufs {
-        input: Input::new(),
-        out: Vec::with_capacity(out_bytes),
-        extra: 0,
-        pooled: out_bytes,
     }
 }
 
@@ -182,29 +208,34 @@ enum Next {
 }
 
 /// Serves `stream` until its client closes, errs, idles past `--idle-secs`, or goes idle
-/// while `--max-idle-conns` others are.
-pub async fn serve(ctx: Arc<Ctx>, stream: TcpStream) {
+/// while `--max-idle-conns` others are. `slot` is its place among `--max-conns`.
+pub async fn serve(ctx: Arc<Ctx>, stream: TcpStream, slot: tokio::sync::OwnedSemaphorePermit) {
+    ctx.metrics.conns_open.fetch_add(1, Ordering::Relaxed);
     let _ = stream.set_nodelay(true);
     connection(&ctx, &stream).await;
     // Closing deregisters the socket from tokio's driver, which allocates (once per
     // connection, like accepting it; never per request).
     let _cold = gvfs_alloc_guard::cold_section();
     drop(stream);
+    drop(slot);
+    ctx.metrics.conns_open.fetch_sub(1, Ordering::Relaxed);
 }
 
 async fn connection(ctx: &Ctx, stream: &TcpStream) {
     let mut held: Option<Bufs> = None;
-    // Whether a response has gone out: until then the cap does not apply (a wake can find
-    // nothing to read, which tokio allows, so the first wake does not tell).
-    let mut served = false;
+    // Whether a response has just gone out, so the connection is going idle: the cap applies
+    // then, once (a new connection's first request is always read). A wake that finds
+    // nothing to read, which tokio allows (right after a response, the socket's readiness
+    // is still set), is no new response: checking again then closed idle connections
+    // while others merely connected.
+    let mut responded = false;
     loop {
         if held.is_none() {
-            // The cap applies to a connection going idle after a response (its client
-            // reconnects); a new connection's first request is always read.
-            if served && ctx.idle.load(Ordering::Relaxed) >= ctx.max_idle {
+            if responded && ctx.idle.load(Ordering::Relaxed) >= ctx.max_idle {
                 ctx.metrics.idle_overflow.fetch_add(1, Ordering::Relaxed);
                 return;
             }
+            responded = false;
             idle_add(ctx, 1);
             let woke = tokio::time::timeout(ctx.deadlines.idle, stream.readable()).await;
             idle_add(ctx, -1);
@@ -225,7 +256,7 @@ async fn connection(ctx: &Ctx, stream: &TcpStream) {
         b.shrink(&ctx.spare);
         match next {
             Next::Again => {
-                served = true;
+                responded = true;
                 if b.input.filled > 0 {
                     held = Some(b);
                 } else {
@@ -245,7 +276,21 @@ async fn request(ctx: &Ctx, stream: &TcpStream, b: &mut Bufs) -> Next {
     // All of the request, head and body, must arrive by then: a client that trickles bytes
     // cannot hold its buffers (or, for a POST, wait in line for an arena) for longer.
     let mut deadline = httpd::Deadline::after(ctx.deadlines.patience);
-    let req = match httpd::read_head(stream, &mut b.input, &mut deadline).await {
+    // A head that does not come whole waits without the output buffer, which goes back to
+    // a pool meanwhile and comes back (perhaps another one) when the head is in.
+    let Bufs { input, out, .. } = b;
+    let mut parked = false;
+    let head = httpd::read_head(stream, input, &mut deadline, &mut || {
+        if !parked {
+            ctx.outs.put(std::mem::take(out));
+            parked = true;
+        }
+    })
+    .await;
+    if parked {
+        *out = ctx.outs.take();
+    }
+    let req = match head {
         Ok(Head::Request(r)) => r,
         Ok(Head::Idle) => return Next::Idle,
         Ok(Head::Closed) => return Next::Close,
