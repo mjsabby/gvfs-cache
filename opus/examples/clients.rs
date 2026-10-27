@@ -182,8 +182,9 @@ impl Edge {
         if v.tip == head {
             return;
         }
-        if let Some(l0) = self.live.advance(&mut self.up, m, &self.l0, head).unwrap() {
-            self.l0.push(l0);
+        if let Some(moved) = self.live.advance(&mut self.up, m, &self.l0, head).unwrap() {
+            self.l0.truncate(moved.keep);
+            self.l0.extend(moved.slab);
             retain_l0(&mut self.l0, m.max_ts);
             self.l0_updates += 1;
             let etag = self
@@ -206,6 +207,7 @@ impl Edge {
             self.l0.clone(),
             self.supersets,
             None,
+            self.live.retracted(),
         )));
     }
 }

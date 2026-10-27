@@ -1501,3 +1501,253 @@ fn commit_expansion_is_capped() {
     server.assert_clean();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Commits `files` (path, content) on the work tree's HEAD with this committer and author
+/// time; returns its id. Not pushed.
+fn commit_dated(up: &Upstream, files: &[(&str, &str)], time: u64) -> String {
+    for (path, content) in files {
+        let p = up.work.join(path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, content).unwrap();
+    }
+    git(&up.work, &["add", "-A"]);
+    let date = format!("@{time} +0000");
+    let out = git_cmd(&up.work)
+        .env("GIT_COMMITTER_DATE", &date)
+        .env("GIT_AUTHOR_DATE", &date)
+        .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+        .args(["commit", "-q", "-m", &format!("at {time}")])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    git(&up.work, &["rev-parse", "HEAD"]).trim().to_string()
+}
+
+/// `main` of the upstream moved to `oid`, whatever it was (a forced push).
+fn force_main(up: &Upstream, oid: &str) {
+    git(&up.bare, &["update-ref", "refs/heads/main", oid]);
+}
+
+/// Forced pushes under the edge's live L0 slabs, which only the edge saw (the pipeline did
+/// not run in between): a rewind, a rewind into the middle of a slab, and a rewrite. The
+/// edge stops serving what the branch no longer reaches, stamps what follows exactly as the
+/// next pipeline run does (from the last boundary the branch still reaches, not after the
+/// abandoned commits), and answers a client whose cursor came from an abandoned slab with
+/// everything since that boundary.
+#[test]
+fn forced_pushes_under_the_live_tip() {
+    let root = tempdir("forced");
+    let up = Upstream::new(&root);
+    let t0 = 1_700_000_000u64;
+    let a = commit_dated(&up, &[("a.txt", "a\n")], t0);
+    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    pipeline(&root, &store, &up, "15m", &[]);
+    assert_eq!(manifest(&store_dir).max_ts, t0);
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--upstream",
+        up.bare.to_str().unwrap(),
+        "--poll-ms",
+        "50",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ]);
+    let served = |s: &Server, oid: &str| s.get(&format!("/gvfs/objects/{oid}")).0 == 200;
+    let cold = server.prefetch(0);
+    let client = |name: &str| {
+        let repo = fresh_repo(&root, name);
+        install_pack(&repo, &cold[0].1);
+        repo
+    };
+    let end_after = |s: &Server, since: u64| s.prefetch_interval(since).1.map(|(_, e)| e);
+
+    // B: pushed, prefetched by a client, then rewound away. Its tree shares a directory and
+    // a blob with C's, below.
+    let b = commit_dated(
+        &up,
+        &[("shared/x.txt", "shared\n"), ("b.txt", "b\n")],
+        t0 + 100,
+    );
+    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
+    server.wait_for("B in L0", |s| served(s, &b));
+    let saw_b = client("saw-b");
+    let packs = server.prefetch(t0);
+    assert_eq!((packs.len(), packs[0].0), (1, t0 + 100));
+    install_pack(&saw_b, &packs[0].1);
+    force_main(&up, &a);
+    server.wait_for("B no longer served", |s| !served(s, &b));
+    assert!(server.prefetch(t0).is_empty(), "A is the tip again");
+    assert_eq!(server.metric("gvfs_l0_slabs"), 0);
+
+    // C, on A, committed before B was (work pushed after the rewind): stamped from A, as the
+    // pipeline will stamp it, not after B.
+    git(&up.work, &["reset", "-q", "--hard", &a]);
+    let c = commit_dated(
+        &up,
+        &[("shared/x.txt", "shared\n"), ("c.txt", "c\n")],
+        t0 + 50,
+    );
+    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
+    server.wait_for("C in L0", |s| served(s, &c));
+    assert_eq!(end_after(&server, t0), Some(t0 + 50));
+    // A client that never saw B: one pack makes it complete (B's shared tree included).
+    let fresh = client("fresh");
+    let packs = server.prefetch(t0);
+    assert_eq!(packs.len(), 1);
+    install_pack(&fresh, &packs[0].1);
+    assert_complete(&fresh, &c);
+    // The client that saw B: its cursor is past C's stamp, and it lacks C.
+    let packs = server.prefetch(t0 + 100);
+    assert_eq!(
+        packs.len(),
+        1,
+        "a cursor from an abandoned slab is answered from A"
+    );
+    install_pack(&saw_b, &packs[0].1);
+    assert_complete(&saw_b, &c);
+
+    // The pipeline seals C at the stamp the edge gave it: the edge keeps its boundary.
+    pipeline(&root, &store, &up, "15m", &[]);
+    let m = manifest(&store_dir);
+    assert_eq!((m.tip.to_string(), m.max_ts), (c.clone(), t0 + 50));
+    server.wait_for("the manifest", |s| {
+        s.metric("gvfs_manifest_generation") == m.generation
+    });
+    assert!(server.prefetch(t0 + 50).is_empty());
+    assert_eq!(server.prefetch(t0 + 100).len(), 1, "still answered from A");
+
+    // D1 and D2 in one push, then a rewind to D1, inside their slab.
+    let d1 = commit_dated(&up, &[("d.txt", "1\n")], t0 + 300);
+    let d2 = commit_dated(&up, &[("d.txt", "2\n")], t0 + 400);
+    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
+    server.wait_for("D2 in L0", |s| served(s, &d2));
+    let saw_d2 = client("saw-d2");
+    for (_, pack) in server.prefetch(t0) {
+        install_pack(&saw_d2, &pack);
+    }
+    assert_complete(&saw_d2, &d2);
+    force_main(&up, &d1);
+    server.wait_for("D2 no longer served", |s| !served(s, &d2));
+    assert!(served(&server, &d1));
+    assert_eq!(end_after(&server, t0 + 50), Some(t0 + 300));
+
+    // E replaces D1 (a rewrite: a sibling, committed before it).
+    git(&up.work, &["reset", "-q", "--hard", &c]);
+    let e = commit_dated(&up, &[("e.txt", "e\n")], t0 + 60);
+    git(&up.work, &["push", "-q", "-f", "origin", "HEAD:main"]);
+    server.wait_for("E in L0", |s| served(s, &e));
+    assert!(!served(&server, &d1));
+    assert_eq!(end_after(&server, t0 + 50), Some(t0 + 60));
+    for cursor in [t0 + 300, t0 + 400] {
+        let packs = server.prefetch(cursor);
+        assert_eq!(packs.len(), 1, "cursor {cursor}");
+    }
+    let packs = server.prefetch(t0 + 400);
+    install_pack(&saw_d2, &packs[0].1);
+    assert_complete(&saw_d2, &e);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let m = manifest(&store_dir);
+    assert_eq!((m.tip.to_string(), m.max_ts), (e.clone(), t0 + 60));
+    server.wait_for("the manifest", |s| {
+        s.metric("gvfs_manifest_generation") == m.generation
+    });
+    assert!(server.prefetch(t0 + 60).is_empty());
+    server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A forced push the pipeline seals before the edge sees it: the edge's live L0 slab is not
+/// on the branch the new manifest has, so L0 starts over from it, and a client whose cursor
+/// came from the dropped slab is answered from the manifest it had before.
+#[test]
+fn a_forced_push_the_pipeline_seals_first() {
+    let root = tempdir("forced-sealed");
+    let up = Upstream::new(&root);
+    let t0 = 1_700_000_000u64;
+    let a = commit_dated(&up, &[("a.txt", "a\n")], t0);
+    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    pipeline(&root, &store, &up, "15m", &[]);
+    // The edge follows a mirror of the upstream, which the test moves (and hides) itself.
+    let mirror = root.join("edge-upstream.git");
+    let hidden = root.join("edge-upstream.hidden");
+    git(
+        &root,
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            up.bare.to_str().unwrap(),
+            mirror.to_str().unwrap(),
+        ],
+    );
+    let sync = || {
+        let main = "+refs/heads/main:refs/heads/main";
+        git(&mirror, &["fetch", "-q", up.bare.to_str().unwrap(), main]);
+    };
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--upstream",
+        mirror.to_str().unwrap(),
+        "--poll-ms",
+        "50",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ]);
+    let served = |s: &Server, oid: &str| s.get(&format!("/gvfs/objects/{oid}")).0 == 200;
+    let saw_b = fresh_repo(&root, "saw-b");
+    install_pack(&saw_b, &server.prefetch(0)[0].1);
+    let b = commit_dated(&up, &[("b.txt", "b\n")], t0 + 100);
+    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
+    sync();
+    server.wait_for("B in L0", |s| served(s, &b));
+    let packs = server.prefetch(t0);
+    assert_eq!(packs[0].0, t0 + 100);
+    install_pack(&saw_b, &packs[0].1);
+
+    // Main is forced back to A and C pushed on it; the pipeline seals C while the edge
+    // cannot see its upstream.
+    force_main(&up, &a);
+    git(&up.work, &["reset", "-q", "--hard", &a]);
+    let c = commit_dated(&up, &[("c.txt", "c\n")], t0 + 50);
+    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
+    std::fs::rename(&mirror, &hidden).unwrap();
+    pipeline(&root, &store, &up, "15m", &[]);
+    let m = manifest(&store_dir);
+    assert_eq!((m.tip.to_string(), m.max_ts), (c.clone(), t0 + 50));
+    server.wait_for("the manifest", |s| {
+        s.metric("gvfs_manifest_generation") == m.generation
+    });
+    assert!(!served(&server, &b));
+    assert_eq!(server.metric("gvfs_l0_slabs"), 0);
+    let packs = server.prefetch(t0 + 100);
+    assert_eq!(
+        packs.len(),
+        1,
+        "a cursor from the dropped slab is answered from A"
+    );
+    install_pack(&saw_b, &packs[0].1);
+    assert_complete(&saw_b, &c);
+    // The mirror catches up: nothing more to do.
+    std::fs::rename(&hidden, &mirror).unwrap();
+    sync();
+    let ingests = server.metric("gvfs_l0_ingests_total");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(server.metric("gvfs_l0_ingests_total"), ingests);
+    assert!(server.prefetch(t0 + 50).is_empty());
+    server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}

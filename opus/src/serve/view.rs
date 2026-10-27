@@ -58,6 +58,10 @@ pub struct View {
     rollups: Vec<(u64, u64)>,
     plans: Vec<OnceLock<Option<Arc<PackPlan>>>>,
     cold_plan: OnceLock<Arc<PackPlan>>,
+    /// Boundaries the edge handed out that are gone (`(from, upto]` stands for `from`, see
+    /// [`super::LiveTip::retracted`]), and every boundary this view has, ascending.
+    retracted: Vec<(u64, u64)>,
+    ends: Vec<u64>,
     /// The store's blob packs (`--blobs separate` stores; `None`: blobs are inline).
     pub blobs: Option<Arc<super::blobs::BlobSet>>,
 }
@@ -80,7 +84,9 @@ enum Slot<'a> {
 impl View {
     /// `sealed` in manifest order ([`Manifest::slabs`]: baseline, weekly deltas, pyramid,
     /// retained); `l0` oldest first. Sealed slabs of tier `supersets` and above (24h or the
-    /// weekly delta) are delivered whole to the clients inside them; `None`: never.
+    /// weekly delta) are delivered whole to the clients inside them; `None`: never. A cursor
+    /// in a `retracted` range that is not a boundary here is answered from the range's start.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         generation: u64,
         manifest: Manifest,
@@ -89,6 +95,7 @@ impl View {
         l0: Vec<Arc<Slab>>,
         supersets: Option<Tier>,
         blobs: Option<Arc<super::blobs::BlobSet>>,
+        retracted: &[(u64, u64)],
     ) -> View {
         let (nw, np) = (manifest.weekly.len(), manifest.pyramid.len());
         let weekly = sealed.get(1..nw.saturating_add(1)).unwrap_or(&[]);
@@ -142,6 +149,13 @@ impl View {
             .collect();
         let mut starts: Vec<u64> = spans.iter().map(|s| s.0).collect();
         starts.dedup();
+        let mut ends: Vec<u64> = spans
+            .iter()
+            .map(|s| s.1)
+            .chain([manifest.max_ts, manifest.baseline.end_ts])
+            .collect();
+        ends.sort_unstable();
+        ends.dedup();
         let warm_floor = manifest
             .weekly
             .first()
@@ -176,6 +190,8 @@ impl View {
             plans,
             cold_plan: OnceLock::new(),
             blobs,
+            retracted: retracted.to_vec(),
+            ends,
         }
     }
 
@@ -282,6 +298,7 @@ impl View {
 
     /// Where the plan for a client at `client_ts` lives.
     fn slot(&self, client_ts: u64) -> Slot<'_> {
+        let client_ts = self.unretracted(client_ts);
         if client_ts != 0 && client_ts >= self.tip_ts {
             return Slot::UpToDate;
         }
@@ -296,6 +313,26 @@ impl View {
             Some((cell, from)) if client_ts >= self.warm_floor => Slot::Warm(cell, from),
             _ => Slot::Cold,
         }
+    }
+
+    /// The boundary a client at `ts` holds everything up to: `ts` itself, unless it is a
+    /// boundary this edge retracted (from an L0 slab a forced push abandoned, which the
+    /// branch's later commits may be stamped below), which stands for the boundary before
+    /// it. A boundary this view has is taken as it is.
+    fn unretracted(&self, mut ts: u64) -> u64 {
+        while !self.retracted.is_empty() && self.ends.binary_search(&ts).is_err() {
+            let from = self
+                .retracted
+                .iter()
+                .filter(|&&(from, upto)| from < ts && ts <= upto)
+                .map(|&(from, _)| from)
+                .min();
+            match from {
+                Some(f) => ts = f,
+                None => break,
+            }
+        }
+        ts
     }
 
     /// The cold plan (built if needed), for warming its trailer in the background.

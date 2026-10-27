@@ -254,18 +254,28 @@ below the previous boundary + 1, which only matters after a force push. A client
 (`lastPackTimestamp`, the newest stamp it was sent) is therefore a boundary every server
 knows, whichever edge sent it.
 
-The two sides can still disagree in two cases:
+A force push the pipeline never saw (pushed and replaced between two runs) would make
+them disagree: the edge's L0 slabs hold commits the branch no longer has, and what follows
+can be stamped below the stamps they handed out (committer times are not monotonic: a
+commit made before the abandoned one, pushed after it). The edge therefore checks each
+move of the branch: a push descends from the newest live L0 tip. When one does not, the
+edge drops the live L0 slabs the new head does not reach (their objects stop being
+served), and fetches and stamps what the head has after the newest boundary it still
+reaches, exactly as the next pipeline run will. The boundaries of the dropped slabs are
+*retracted*: a client whose cursor is one of them holds commits the branch no longer has
+and may lack ones stamped below its cursor, so it is answered from the boundary before
+them (the edge remembers the last 1,024 such ranges; a cursor that is a boundary of the
+current timeline is always taken as it is).
 
-* A force push.
-* An edge still on the previous manifest stamps a push that merges a branch forked inside
-  the range the pipeline just sealed, and the commit clocks are so close that the `+1`s
-  decide.
-
-An edge whose L0 tip is sealed with a different stamp drops its L0 slabs and fetches them
-again. A client holding the edge's stamp is answered from the closest boundary at or before
-it, which is exact unless the next boundary falls between the two stamps, seconds apart.
-Prefetch is an optimization: whatever a client lacks it fetches on demand from
-`/gvfs/objects`.
+The two sides can still disagree when an edge still on the previous manifest stamps a push
+that merges a branch forked inside the range the pipeline just sealed, and the commit
+clocks are so close that the `+1`s decide. An edge whose L0 tip is sealed with a different
+stamp, or whose live L0 slabs are not on the branch a new manifest has (a force push the
+pipeline sealed before the edge saw it), drops its L0 slabs, retracts their boundaries,
+and fetches again. A cursor the edge did not retract (another edge's, or from before a
+restart) is answered from the closest boundary at or before it, which is exact unless the
+next boundary falls between the two stamps. Prefetch is an optimization: whatever a client
+lacks it fetches on demand from `/gvfs/objects`.
 
 ## The server (`src/serve/`)
 
@@ -280,7 +290,9 @@ since the last one, with one heap slab per move of the branch. The live loop run
 
 * A moved branch: `ingest_git_delta(newest boundary, HEAD)` fetches only the new commits,
   repacked into one more L0 slab and stamped from its commits. This is the same code the
-  pipeline runs, and the pipeline later stamps the same tip the same way.
+  pipeline runs, and the pipeline later stamps the same tip the same way. A forced push
+  (the new head does not descend from the newest live L0 tip) drops the live L0 slabs the
+  head does not reach and fetches again from the newest boundary it does (above).
 * A new manifest generation swaps in its slabs. L0 slabs it covers leave the live set
   (object lookups and cold plans) but stay in the timeline for 6 hours, so a client whose
   cursor is one of their boundaries is still answered exactly. If the manifest's tip falls

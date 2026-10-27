@@ -631,7 +631,15 @@ pub struct LiveTip {
     stamps: HashMap<Oid, u64>,
     /// Fetch filter (`blob:none` for `--blobs separate` stores).
     pub filter: Option<String>,
+    /// Boundaries this edge handed out that a forced push (or a manifest that stamped the
+    /// branch otherwise) took away: `(from, upto)`, a cursor in `(from, upto]` that is no
+    /// longer a boundary stands for `from` ([`View::prefetch`]). Oldest first, at most
+    /// [`RETRACTED_MAX`].
+    retracted: Vec<(u64, u64)>,
 }
+
+/// Retracted boundaries an edge remembers (a few per forced push under its live L0).
+pub const RETRACTED_MAX: usize = 1024;
 
 impl Default for LiveTip {
     fn default() -> Self {
@@ -641,31 +649,111 @@ impl Default for LiveTip {
             resolver: Resolver::default(),
             stamps: HashMap::new(),
             filter: None,
+            retracted: Vec::new(),
         }
     }
 }
 
+/// How the L0 slabs follow a move of the upstream branch ([`LiveTip::advance`]).
+pub struct Moved {
+    /// How many of the L0 slabs stay: all of them for a push that descends from the newest
+    /// one, fewer when a forced push left the branch without the newest ones.
+    pub keep: usize,
+    /// The slab for what the new head adds after them (`None`: nothing, e.g. a rewind).
+    pub slab: Option<Arc<Slab>>,
+}
+
 impl LiveTip {
-    /// The L0 slab for the upstream branch's move to `head`: the commits since the newest
-    /// boundary (the newest live L0 slab's tip, or the manifest's), fetched once, repacked,
-    /// and stamped from its commits. `None` when the upstream had nothing new.
+    /// How the L0 slabs follow the upstream branch's move to `head`. A push that descends
+    /// from the newest boundary (the newest live L0 slab's tip, or the manifest's) adds a
+    /// slab: the commits since, fetched once, repacked, and stamped from its commits. A
+    /// forced push drops the live L0 slabs the branch no longer reaches and adds what it
+    /// has after the newest one it does, stamped from that boundary, as the next pipeline
+    /// run will (it never saw what was dropped); their boundaries are retracted. `None`
+    /// when nothing changes.
     pub fn advance(
         &mut self,
         up: &mut Upstream,
         m: &Manifest,
         l0: &[Arc<Slab>],
         head: Oid,
-    ) -> Result<Option<Arc<Slab>>> {
-        let (from, from_ts) = match l0.last() {
-            Some(s) if s.meta.end_ts > m.max_ts => (s.meta.want, s.meta.end_ts),
-            _ => (m.tip, m.max_ts),
-        };
+    ) -> Result<Option<Moved>> {
+        // The live slabs (after the manifest's tip): a chain from it, each slab from the
+        // previous one's tip.
+        let first_live = l0
+            .iter()
+            .position(|s| s.meta.start_ts >= m.max_ts)
+            .unwrap_or(l0.len());
+        let live = l0.get(first_live..).unwrap_or(&[]);
+        let (from, from_ts) = live
+            .last()
+            .map_or((m.tip, m.max_ts), |s| (s.meta.want, s.meta.end_ts));
         if from == head {
             return Ok(None);
         }
+        let raw = self.fetch(up, m, (from, from_ts), head)?;
+        // Every push but a forced one descends from the newest boundary. Without live
+        // slabs that is the manifest's tip, from which the pipeline fetches too, forced or
+        // not: nothing to drop.
+        let forward = live.is_empty()
+            || match &raw {
+                Some(r) => self
+                    .reached(head, Some(&r.slab), live, from)?
+                    .contains(&from),
+                None => false,
+            };
+        if forward {
+            let Some(raw) = raw else {
+                return Ok(None);
+            };
+            let slab = self.slab(raw, m, (from, from_ts), head)?;
+            return Ok(slab.map(|s| Moved {
+                keep: l0.len(),
+                slab: Some(s),
+            }));
+        }
+        // A forced push: keep the live slabs up to the newest tip the branch still reaches.
+        let reached = self.reached(head, raw.as_ref().map(|r| &*r.slab), live, Oid::ZERO)?;
+        let kept = live
+            .iter()
+            .rposition(|s| reached.contains(&s.meta.want))
+            .map_or(0, |j| j.saturating_add(1));
+        let (fork, fork_ts) = live
+            .get(..kept)
+            .and_then(<[_]>::last)
+            .map_or((m.tip, m.max_ts), |s| (s.meta.want, s.meta.end_ts));
+        let dropped = live.get(kept..).unwrap_or(&[]);
+        if let Some(upto) = dropped.iter().map(|s| s.meta.end_ts).max() {
+            self.retract(fork_ts, upto);
+        }
+        let kept_slabs = live.get(..kept).unwrap_or(&[]);
+        self.stamps
+            .retain(|c, _| kept_slabs.iter().any(|s| s.find(c).is_some()));
+        let keep = first_live.saturating_add(kept);
+        if fork == head {
+            return Ok(Some(Moved { keep, slab: None }));
+        }
+        // What the branch has after that boundary, fetched again from it (the first fetch
+        // left out what the dropped commits reach, which the branch may share).
+        let slab = match self.fetch(up, m, (fork, fork_ts), head)? {
+            Some(raw) => self.slab(raw, m, (fork, fork_ts), head)?,
+            None => None,
+        };
+        Ok(Some(Moved { keep, slab }))
+    }
+
+    /// The commits `head` adds after boundary `from` (stamped `from_ts`), fetched once with
+    /// the manifest's boundaries as the other haves; `None` if it adds none.
+    fn fetch(
+        &mut self,
+        up: &mut Upstream,
+        m: &Manifest,
+        (from, from_ts): (Oid, u64),
+        head: Oid,
+    ) -> Result<Option<crate::ingest::Ingested>> {
         let mut haves = vec![from];
         haves.extend(m.known_tips().into_iter().filter(|t| *t != from));
-        let Some(raw) = ingest_git_delta_with(
+        ingest_git_delta_with(
             up,
             &mut self.indexer,
             &haves,
@@ -674,10 +762,75 @@ impl LiveTip {
             Tier::L0,
             (from_ts, from_ts),
             Dest::Memory,
-        )?
-        else {
-            return Ok(None);
-        };
+        )
+    }
+
+    /// The commits of the `live` L0 slabs that `head` reaches, through `raw` (the commits
+    /// a fetch of it added) and those slabs; the walk ends early at `stop`. Sealed history
+    /// is not walked: no sealed commit descends from a live one.
+    fn reached(
+        &mut self,
+        head: Oid,
+        raw: Option<&Slab>,
+        live: &[Arc<Slab>],
+        stop: Oid,
+    ) -> Result<std::collections::HashSet<Oid>> {
+        let mut reached = std::collections::HashSet::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut stack = vec![head];
+        while let Some(c) = stack.pop() {
+            if !seen.insert(c) {
+                continue;
+            }
+            let found = match raw.and_then(|r| Some((r, r.find(&c)?))) {
+                Some(hit) => Some(hit),
+                None => live
+                    .iter()
+                    .find_map(|s| Some((&**s, s.find(&c)?)))
+                    .inspect(|_| {
+                        reached.insert(c);
+                    }),
+            };
+            if c == stop && reached.contains(&c) {
+                break;
+            }
+            let Some((slab, slot)) = found else {
+                continue;
+            };
+            let (kind, commit) = self.resolver.resolve(slab, slot)?;
+            if kind == crate::pack::OBJ_COMMIT {
+                stack.extend(crate::object::commit_parents(commit));
+            }
+        }
+        Ok(reached)
+    }
+
+    /// Clients holding a boundary in `(from, upto]` are answered from `from` while that
+    /// boundary is gone (see [`LiveTip::retracted`]).
+    fn retract(&mut self, from: u64, upto: u64) {
+        if upto <= from {
+            return;
+        }
+        if self.retracted.len() >= RETRACTED_MAX {
+            self.retracted.remove(0);
+        }
+        self.retracted.push((from, upto));
+    }
+
+    /// Boundaries this edge handed out that are gone: `(from, upto]` stands for `from`.
+    pub fn retracted(&self) -> &[(u64, u64)] {
+        &self.retracted
+    }
+
+    /// The L0 slab of `raw`, the commits `head` adds after boundary `from`: stamped from
+    /// what the pipeline will know too, then repacked.
+    fn slab(
+        &mut self,
+        raw: crate::ingest::Ingested,
+        m: &Manifest,
+        (from, from_ts): (Oid, u64),
+        head: Oid,
+    ) -> Result<Option<Arc<Slab>>> {
         // Stamped from what the pipeline will know too: the manifest's boundaries and the
         // unsealed L0 commits (which the pipeline will fetch and stamp alike).
         let mut known = crate::timeline::boundaries(m);
@@ -722,7 +875,19 @@ impl LiveTip {
         m: &Manifest,
         sealed: &[Arc<Slab>],
     ) -> Result<Vec<Arc<Slab>>> {
-        let out = self.pruned(l0, old, m, sealed)?;
+        let out = match self.pruned(l0, old, m, sealed)? {
+            Some(out) => out,
+            None => {
+                // L0 starts over from the manifest (the branch was rewritten, or the
+                // pipeline stamped it otherwise): the live boundaries it handed out are
+                // retracted to the old tip, which every client holding one has.
+                let live = l0.iter().filter(|s| s.meta.start_ts >= old.max_ts);
+                if let Some(upto) = live.map(|s| s.meta.end_ts).max() {
+                    self.retract(old.max_ts, upto);
+                }
+                Vec::new()
+            }
+        };
         // Sealed commits are stamped from the manifest from now on, as the pipeline does.
         let live: Vec<&Arc<Slab>> = out.iter().filter(|s| s.meta.start_ts >= m.max_ts).collect();
         self.stamps
@@ -730,18 +895,19 @@ impl LiveTip {
         Ok(out)
     }
 
+    /// [`LiveTip::prune`]'s slabs; `None` when L0 starts over.
     fn pruned(
         &mut self,
         l0: &[Arc<Slab>],
         old: &Manifest,
         m: &Manifest,
         sealed: &[Arc<Slab>],
-    ) -> Result<Vec<Arc<Slab>>> {
+    ) -> Result<Option<Vec<Arc<Slab>>>> {
         let mut out = l0.to_vec();
         if !l0.is_empty() && m.tip != old.tip {
             if let Some(s) = l0.iter().find(|s| s.meta.want == m.tip) {
                 if s.meta.end_ts != m.max_ts {
-                    return Ok(Vec::new());
+                    return Ok(None);
                 }
             } else if l0
                 .last()
@@ -750,7 +916,7 @@ impl LiveTip {
                 // The pipeline got ahead of L0: all of it is sealed.
             } else if let Some(j) = l0.iter().position(|s| s.find(&m.tip).is_some()) {
                 let Some(s) = l0.get(j).filter(|s| s.meta.end_ts > m.max_ts) else {
-                    return Ok(Vec::new());
+                    return Ok(None);
                 };
                 let input = crate::repack::Input {
                     slabs: std::slice::from_ref(s),
@@ -773,11 +939,11 @@ impl LiveTip {
                     out.insert(j.saturating_add(1), rest.slab);
                 }
             } else {
-                return Ok(Vec::new());
+                return Ok(None);
             }
         }
         retain_l0(&mut out, m.max_ts);
-        Ok(out)
+        Ok(Some(out))
     }
 }
 
@@ -853,14 +1019,15 @@ impl Live {
         Ok(true)
     }
 
-    /// The sizes the trees of a new L0 slab introduce, asked of the upstream.
-    fn l0_sizes(&mut self, slab: &Arc<Slab>, view: &View) -> Result<()> {
+    /// The sizes the trees of a new L0 slab introduce (those `known` does not have), asked
+    /// of the upstream.
+    fn l0_sizes(&mut self, slab: &Arc<Slab>, known: &dyn Fn(&Oid) -> bool) -> Result<()> {
         let Some(up) = self.upstream.as_mut() else {
             return Ok(());
         };
         let unknown: Vec<Oid> = crate::blobcopy::referenced_blobs(slab, 1)?
             .into_iter()
-            .filter(|b| view.blob_size(b).is_none())
+            .filter(|b| !known(b))
             .collect();
         let sizes = up.object_sizes(&unknown)?;
         let mut pairs = Vec::with_capacity(unknown.len());
@@ -937,6 +1104,7 @@ impl Live {
             self.l0.clone(),
             self.supersets,
             self.blobs.clone(),
+            self.tip.retracted(),
         )
     }
 
@@ -1014,23 +1182,39 @@ impl Live {
         if head == view.tip || head == self.last_head {
             return Ok(false);
         }
-        let advanced = self.tip.advance(up, &view.manifest, &self.l0, head)?;
-        let Some(slab) = advanced else {
+        let Some(moved) = self.tip.advance(up, &view.manifest, &self.l0, head)? else {
             self.last_head = head;
             return Ok(false);
         };
-        if view.manifest.separate_blobs() {
-            self.l0_sizes(&slab, &view)?;
+        let dropped: Vec<Arc<Slab>> = self.l0.get(moved.keep..).unwrap_or(&[]).to_vec();
+        if let (Some(slab), true) = (&moved.slab, view.manifest.separate_blobs()) {
+            // Sizes the dropped slabs' tables gave are not known once they go.
+            let known = |b: &Oid| {
+                view.all
+                    .iter()
+                    .filter(|s| !dropped.iter().any(|d| Arc::ptr_eq(d, s)))
+                    .any(|s| s.sizes().is_some_and(|t| t.get(b).is_some()))
+            };
+            self.l0_sizes(slab, &known)?;
         }
         self.last_head = head;
-        crate::log!(
-            "serve: L0 {} ({} objects, {}) {}..{head}",
-            slab.meta.id,
-            slab.meta.objects,
-            crate::util::human_bytes(slab.meta.pack_len),
-            slab.meta.have
-        );
-        self.l0.push(slab);
+        if !dropped.is_empty() {
+            crate::log!(
+                "serve: forced push to {head}: dropped {} L0 slabs the branch no longer reaches",
+                dropped.len()
+            );
+        }
+        self.l0.truncate(moved.keep);
+        if let Some(slab) = moved.slab {
+            crate::log!(
+                "serve: L0 {} ({} objects, {}) {}..{head}",
+                slab.meta.id,
+                slab.meta.objects,
+                crate::util::human_bytes(slab.meta.pack_len),
+                slab.meta.have
+            );
+            self.l0.push(slab);
+        }
         retain_l0(&mut self.l0, view.manifest.max_ts);
         let next = self.snapshot(view.manifest.clone(), view.etag.clone());
         ctx.metrics.l0_ingests.fetch_add(1, Ordering::Relaxed);
