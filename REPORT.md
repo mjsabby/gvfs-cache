@@ -1210,12 +1210,12 @@ by batch, each commit with a regression test that fails on the code before it.
 | 2 | Slow clients held arenas (2 × cores of them). A trickled head or body, or an unread sizes answer, held one for up to the idle timeout per read. | 1 | fixed `1fa6555` |
 | 3 | No cap on concurrent connections; the soft FD limit is raised to the hard limit | 3 | open |
 | 4 | Amplification. A 77-byte commit POST could grow its arena without bound, on every arena at once. A garbage `lastPackTimestamp` was read as 0 (a 2.88 GB cold clone). | 1 | fixed `a6305d9`, `36a1f7d` |
-| 5 | The L0 overlay after a force-push that rewinds the branch: a phantom tip, Lamport divergence | 2 | open |
+| 5 | The L0 overlay after a force-push that rewinds the branch: a phantom tip, Lamport divergence | 2 | fixed `11d6358` |
 | 6 | Remote blob packs were read 1 MiB at a time, so the block cache's bypass and 32 MiB windows never applied, and with no cache every MiB was a ranged GET | 1 | fixed `9c7269a` |
-| 7 | `size_outside_slabs` asks the proxy, per unknown id, while holding an arena | 2 | open |
-| 8 | SAS tokens and URL userinfo can reach error strings and logs | 2 | open |
+| 7 | `size_outside_slabs` asks the proxy, per unknown id, while holding an arena | 2 | fixed `d46ffcd` |
+| 8 | SAS tokens and URL userinfo can reach error strings and logs | 2 | fixed `2ff6dff` |
 | 9 | The edge never prunes cached slabs or `.bidx` files; `--cache-dir` defaults to `/tmp` (a tmpfs on many hosts) | 3 | open |
-| 10 | Proxy cache: eviction can drop a re-fetched blob's newer entry; `Proxy.idle` is unbounded; a `BlobPack` is dropped on a hot path | 2 | open |
+| 10 | Proxy cache: eviction can drop a re-fetched blob's newer entry; `Proxy.idle` is unbounded; a `BlobPack` is dropped on a hot path | 2 | fixed `de10f8e` |
 | 11 | `BlockCache::evict` clones and sorts every block, and unlinks files, under its lock | 3 | open |
 | 12 | `repack::write_copied` lacks the delta-depth bound; a resolver chain past 4,096 grows outside a cold section; a corrupt declared size can size a buffer | 3 | open |
 | 13 | A range of a compressed blob inflates from the entry's start | later | open (by design) |
@@ -1265,6 +1265,49 @@ by batch, each commit with a regression test that fails on the code before it.
   * every request read the clock;
   * the parser scanned each line three times.
 
+**Batch 2:**
+
+* **Forced pushes under the live tip (`11d6358`).** A force push the pipeline never saw
+  (pushed and replaced between two runs) broke the edge in three ways:
+  * A rewind left the abandoned L0 slab as the tip, served in every prefetch until a later
+    manifest moved the tip, which never happens while the branch stays put.
+  * What followed was stamped after the abandoned commits, while the pipeline stamps it
+    from the manifest's tip. Commit times are not monotonic: work committed before the
+    abandoned commit can be pushed after it. So the edge could hand out cursors above the
+    pipeline's stamps, and clients holding one were told they were up to date while
+    commits went by.
+  * A rewrite was fetched relative to the abandoned tip, which left out objects the new
+    branch shares with it.
+
+  The fix:
+  * Each move of the branch is checked: a push must descend from the newest live L0 tip.
+    For a normal push this costs a walk of the pushed commits.
+  * When it does not, the edge keeps the live slabs up to the newest tip the head still
+    reaches and drops the rest. It then fetches and stamps what the head adds after that
+    boundary, exactly as the next pipeline run will.
+  * The dropped boundaries are retracted. A client holding one is answered from the
+    boundary before them: it has commits the branch no longer has, and may lack commits
+    stamped below its cursor.
+  * A manifest on which L0 starts over (a forced push the pipeline sealed first) retracts
+    the live boundaries the same way.
+  * Two e2e tests cover a rewind, a rewind inside a slab, a rewrite with backdated
+    commits, and a pipeline that seals a rewrite while the edge's upstream is hidden.
+* **Sizes (`d46ffcd`).** `POST /gvfs/sizes` now answers exactly the blobs a GET serves.
+  Before, it asked the upstream about any other id, one at a time, while holding an arena:
+  a request of made-up ids cost the upstream a lookup each. Such an id is now a 404 with
+  no upstream call, as for a GET.
+* **Credentials (`2ff6dff`).** Both HTTP clients now leave the query out of the request
+  target in their errors; a SAS token travels in that query. Upstream labels and URL errors
+  carry no userinfo. A password in an upstream URL is refused at startup: it was never
+  used (credentials come from `--token-env`), and it was visible to every local user on
+  the command line. A user name alone, as in ADO's clone URLs, is fine.
+* **Proxy (`de10f8e`).** Three fixes:
+  * Eviction no longer removes an id that a newer pack holds.
+  * The proxy keeps at most 8 upstream connections.
+  * A request lets go of its proxied packs when it ends, in a cold section. Before, the
+    arena's next request dropped them on the hot path, unlinking and unmapping evicted
+    files there, and an idle arena kept those files on disk.
+
 **Before and after** (the review's probes, against the SearchGold edge):
 
 | Probe | 529a130 | now |
@@ -1302,6 +1345,26 @@ by batch, each commit with a regression test that fails on the code before it.
 | Mixed GETs with 4,000-id POSTs | 415,356 GETs, 6,705 POSTs | 416,010 GETs, 6,788 POSTs | +0.2%, +1.2% |
 | POST, 4,000 ids | 8,613 | 8,693 | +0.9% |
 | Sizes, 4,000 ids | 19,925 | 19,834 | −0.5% |
+
+**Validation of batch 2** (`de10f8e`, the same checks):
+
+* `cargo test` passes, with eight new tests:
+  * `forced_pushes_under_the_live_tip` and `a_forced_push_the_pipeline_seals_first`;
+  * `errors_hold_no_query`, `errors_hold_no_credentials` and
+    `upstream_urls_with_passwords_are_refused`;
+  * `proxy_eviction_keeps_newer_entries`, `proxy_keeps_a_few_idle_connections` and
+    `a_lease_releases_its_proxied_packs`.
+
+  The sizes check was added to `edge_serves_blobs_from_the_store_and_l0_through_the_proxy`.
+  Each test that can fail on the old code was checked to fail there.
+* Byte identity with the threads build: 1,920, 1,920 and 2,064 responses identical, in the
+  same three modes.
+* `ab_remote.py`: 4,163 identical requests in each of the three cache configurations.
+* Conformance 918/0, including its force-push rewrite scenario. gvfs-helper 18/18, fable's
+  client 15/15.
+* Load against `c62a9ad`, median of 3 interleaved rounds: within 0.3% on every workload.
+  The hot-path changes amount to one empty-check on prefetch and one at the end of a POST
+  lease.
 
 **Lessons:**
 
