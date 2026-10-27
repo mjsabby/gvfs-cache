@@ -106,11 +106,9 @@ impl Shared {
 
     fn spill(v: &[u8]) -> std::io::Result<(std::fs::File, gvfs_mmap::Map)> {
         use std::io::Write;
-        let fd = nix::sys::memfd::memfd_create(
-            c"gvfs-plan",
-            nix::sys::memfd::MemFdCreateFlag::MFD_CLOEXEC,
-        )
-        .map_err(std::io::Error::from)?;
+        let fd =
+            nix::sys::memfd::memfd_create(c"gvfs-plan", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)
+                .map_err(std::io::Error::from)?;
         let mut file = std::fs::File::from(fd);
         file.write_all(v)?;
         let map = gvfs_mmap::Map::open(&file, false)?;
