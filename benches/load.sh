@@ -19,8 +19,11 @@ OUT=${OUT:-$(mktemp -d -t gvd-load.XXXXXX)}
 
 mkdir -p "$OUT"
 echo "results in $OUT"
+# A fixed seed keeps the sample reproducible. `--random-source=<(yes)` would too, but its
+# sample is biased (no commits at all in 400,000 ids of SearchGold).
+seeded() { openssl enc -aes-256-ctr -pass pass:"$1" -nosalt </dev/zero 2>/dev/null; }
 git --git-dir "$REPO" rev-list --objects main | cut -c1-40 \
-    | shuf -n 400000 --random-source=<(yes) > "$OUT/oids.txt"
+    | shuf -n 400000 --random-source=<(seeded gvfs-load) > "$OUT/oids.txt"
 git --git-dir "$REPO" cat-file --batch-check='%(objectname) %(objecttype)' < "$OUT/oids.txt" > "$OUT/typed.txt"
 awk '$2 == "blob" { print $1 }' "$OUT/typed.txt" > "$OUT/blobs.txt"
 awk '$2 == "tree" { print $1 }' "$OUT/typed.txt" > "$OUT/trees.txt"
