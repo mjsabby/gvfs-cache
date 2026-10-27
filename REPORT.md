@@ -22,7 +22,7 @@ opus since, each one measured and validated:
 * §13: a CPU and wait analysis with BPF and perf;
 * §14: the edge's connections moved from a thread per request to tokio;
 * §15: an independent code review, and the fixes it led to;
-* §16: ARM64, the Rust 1.99.1 toolchain, and the repository's layout.
+* §16: ARM64, the Rust 1.99.1 toolchain, and the repository's layout and name.
 
 Of the other four implementations, fable, sol and astra are kept in `alt_clients/`, each with
 its own `tests_plus_benchmarks_<name>.md`. Their clients take part in the cross-client tests,
@@ -1605,7 +1605,7 @@ test now pipelines two prefetches with different cursors.
   step had to be buffered before it was written. The tokio port kept the step after its reason
   was gone, and the cache's whole-read logic stopped seeing whole reads.
 
-## 16. ARM64, the Rust 1.99.1 toolchain, and the repository's layout
+## 16. ARM64, the Rust 1.99.1 toolchain, and the repository's layout and name
 
 **ARM64.** Nothing in opus depends on x86-64 for correctness. It does depend on Linux
 (`sendfile`, `statfs`, `/proc`). It cross-builds for `aarch64-unknown-linux-gnu`, and every
@@ -1658,6 +1658,20 @@ moved to `alt_clients/<name>`, each with its `tests_plus_benchmarks_<name>.md`; 
 workspace excludes them, and each still builds on its own. argon was deleted: it never worked
 as a server (§1), and nothing used it. The harness finds every build through
 `binary_path(name)` in `bench/impls.py`.
+
+**Name** (`853137a`). opus's crate, binary and library are now `gvfs-cache` (`gvfs_cache`),
+and the repository is `mjsabby/gvfs-cache`. The old name, `gvfs-daemon`, was the
+specification's placeholder. On Linux, the only platform opus runs on, it names GNOME's GVfs
+daemon (Ubuntu's `gvfs-daemons` installs the user unit `gvfs-daemon.service`), and only one
+of opus's three roles, `serve`, is a daemon. The edge is what GVFS clients call a cache
+server. The usage text, errors and logs follow the name, as do the `agent=` capability sent
+upstream and the default directories: an edge's `$TMPDIR/gvfs-cache` and the pipeline's
+`<work-dir>/gvfs-cache-store-cache` (caches under the old names are left behind). The store
+formats are unchanged, their magics still `GVD…`, so stores written before the rename load
+as before. fable, sol and astra keep the specification's name, as do the builds kept under
+`~/gvfs-bench` and the raw results in `bench/results/`. `binary_path` names each
+implementation's binary, and `bench/profile_bpf.py` counts frames of either crate name.
+Every suite passes (lib 72, Azure 4, e2e 14, separate 10), and clippy and rustfmt are clean.
 
 **Dead code** (`94416d6`):
 
