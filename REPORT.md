@@ -1218,9 +1218,9 @@ by batch, each commit with a regression test that fails on the code before it.
 | 10 | Proxy cache: eviction can drop a re-fetched blob's newer entry; `Proxy.idle` is unbounded; a `BlobPack` is dropped on a hot path | 2 | fixed `de10f8e` |
 | 11 | `BlockCache::evict` clones and sorts every block, and unlinks files, under its lock | 3 | fixed `9043258` |
 | 12 | `repack::write_copied` lacks the delta-depth bound; a resolver chain past 4,096 grows outside a cold section; a corrupt declared size can size a buffer | 3 | fixed `2a21a67` |
-| 13 | A range of a compressed blob inflates from the entry's start | later | open (by design) |
-| 14 | `valid_id` is not enforced on segment and pack ids | later | open |
-| 15 | CLI usage drift (`--workers`' default, undocumented flags) | 3 | fixed `69928e1` |
+| 13 | A range of a compressed blob inflates from the entry's start: CPU amplification | later | open: needs restart points in blob packs (below) |
+| 14 | `valid_id` is not enforced on segment and pack ids | 4 | fixed `f171590` |
+| 15 | CLI usage drift (`--workers`' default, undocumented flags); the sync and async upstreams duplicate their protocol logic; `prefault` is dead code | 3, 4 | fixed `69928e1`, `90aeff6`, `fe0f0d9` |
 
 **Batch 1:**
 
@@ -1423,8 +1423,81 @@ by batch, each commit with a regression test that fails on the code before it.
   Against the commit before it, the connection commit measured −0.3% on POST running second
   and −0.05% running first: within the bench's noise.
 
+**Batch 4:**
+
+* **Blob ids (`f171590`).** Segment and pack ids from `blobs.bin`, and pack ids in a
+  segment's own pack table, become store keys and file names. The edge's block cache creates
+  and deletes files named after pack ids. They were taken as read: an id like `../x` in a
+  corrupt or hostile store would have put those files outside their directories. They are
+  now checked where they are read, by the rule slab ids already followed (1 to 64 of
+  `[A-Za-z0-9_-]`). Every store written so far uses 40-hex ids.
+* **One upstream implementation (`90aeff6`).** The blocking `Upstream` (the pipeline, the
+  mirror, the edge's live loop) and `AsyncUpstream` (the blob proxy) each had their own
+  protocol detection, capability checks, GVFS probe, `fetch_objects` and `object_sizes`,
+  over two transports. `AsyncUpstream` now makes every request. `Upstream` runs them on a
+  current-thread runtime of its own and writes fetched packs to the caller's writer, the
+  pattern of `reqwest::blocking`. The blocking transport is gone, and `upstream.rs` is 183
+  lines shorter. A SearchGold genesis through it writes a byte-identical store. Its 2.42 GiB
+  fetch takes 64.9–65.3 s against 65.0–66.3 s, the time going to `git upload-pack`.
+* **Dead code (`fe0f0d9`).** `gvfs_alloc_guard::prefault` had no callers.
+* **One wake per request, not two (`8af8de8`).** Not a review finding: it showed up while
+  chasing batch 3's idle-cap flake. tokio's `try_read` keeps a socket's read readiness after
+  a read that returns data. So after every response, the wait for the next request returned
+  at once: the connection took buffers from the pool, read nothing (a `recv` that failed),
+  gave them back, and only then slept. tokio's own `poll_read` clears readiness when a read
+  leaves part of its buffer empty, which on epoll means the socket is drained. The edge's
+  reads now do the same through `TcpStream::try_io`. The readiness cleared is the one seen
+  before the read, so bytes arriving during or after it bring a new event that the clear
+  does not undo. Syscalls are from one run of each build under `perf stat`; the rest is the
+  mean of two runs, one in each slot order:
+
+| Workload | Before (`90aeff6`) | After (`8af8de8`) | Change |
+|---|---|---|---|
+| Syscalls per small GET | 3.19 (1.94 `recvfrom`) | 2.24 (0.97 `recvfrom`) | −30% |
+| GET blob, 64 connections | 1,173K/s, 3.99 µs CPU each | 1,216K/s, 3.75 µs | +3.6%, −6% CPU |
+| GET blob, 1,024 connections | 1,497K/s, 3.68 µs | 1,574K/s, 3.48 µs | +5.1%, −5% CPU |
+| Config, 64 connections | 1,249K/s, 3.48 µs | 1,296K/s, 3.27 µs | +3.8%, −6% CPU |
+| Mixed GETs with 4,000-id POSTs | 413.7K GETs, 6,752 POSTs | 417.5K GETs, 6,792 POSTs | +0.9%, +0.6% |
+| POST, 4,000 ids / sizes, 4,000 ids | 8,675 / 19,736 | 8,678 / 19,732 | none |
+
+  A large body's last read takes exactly the bytes left, which does not show that the
+  socket is drained, so POSTs keep their extra wake: about 0.25 µs (what a GET saves) of a
+  900 µs request.
+
+**Still open: #13.** Blob packs keep a compressible blob's zlib stream as the upstream wrote
+it. Only blobs of 1 MiB or more that do not compress are rewritten as stored blocks, whose
+bytes can be read in place. Deflate has no restart points, so a range inside a compressed
+blob is inflated from the entry's start: about 1.4 s of a core per GB before the range
+(zlib-rs inflates 0.71 GB/s of text here). Keeping those blobs compressed keeps full
+fetches, which are what git clients make, as small as the upstream's. The cost falls on
+range reads, which only opus's own `/gvfs/blobs/<id>?offset=` extension makes. No standard
+client calls it. Still, a sequential reader of a large compressible blob pays quadratically,
+and asking for the last byte of one is a CPU amplification. The fix is restart points made
+when a blob is copied, with their offsets recorded beside its record. Either the blob is
+deflated again with a full flush every few MiB, or the inflater's state, a 32 KiB window, is
+saved every few MiB. Either changes the store format. Meanwhile, a cap on concurrent range
+inflations would bound the amplification.
+
+**Validation of batch 4** (`8af8de8`, the same checks):
+
+* `cargo test` passes, with two new tests that fail on the code before them:
+  `ids_from_the_store_are_checked` and `a_drained_socket_sleeps_until_the_next_request`. The
+  transport test now also drives the blocking client over a local repository, smart HTTP and
+  a GVFS upstream.
+* Stability: with the read change, the e2e, separate-store and Azurite suites passed 10
+  times in a row.
+* Byte identity with the threads build: 1,920, 1,920 and 2,064 responses identical. In the
+  third mode, 8,623 blobs came through the proxy, and the live loop used the blocking client.
+* `ab_remote.py`: 4,163 identical requests in each cache configuration. The new build's
+  pipeline and mirror built the Azurite store.
+* Conformance 918/0. gvfs-helper 18/18, fable's client 15/15.
+
 **Lessons:**
 
+* **Readiness is a hint until a read fails.** tokio keeps a socket's readiness until an
+  operation returns `WouldBlock`. A loop that reads with `try_read` and then waits for
+  readiness therefore wakes once more for nothing, unless it does what tokio's own
+  `poll_read` does: treat a short read as the socket drained.
 * **A test can pass against the wrong server.** A port that is picked, released and passed
   on can be taken in between, and a readiness probe does not say whose server answered.
   Let the server bind port 0 and say which port it got.
