@@ -441,18 +441,15 @@ fn put_mapped(out: &mut Out<'_>, pack: &BlobPack, at: u64, len: u64) -> bool {
             .is_some_and(|r| out.put(r))
 }
 
-/// Bytes of a remote blob pack read per step (through the block cache or the store).
-const REMOTE_STEP: u64 = 1 << 20;
-
-/// Sends `len` bytes of a blob pack at `at` (mapped: `sendfile(2)` when large; remote: a
-/// step at a time, each read in a [`blocking`] section), hashing them into `hash` when
-/// given.
+/// Sends `len` bytes of a blob pack at `at`, hashing them into `hash` when given (mapped:
+/// `sendfile(2)` when large; remote: the whole range in one read, each piece sent as it
+/// arrives).
 async fn send_pack_range(
     out: &mut Out<'_>,
     pack: &BlobPack,
     at: u64,
     len: u64,
-    mut hash: Option<&mut Sha1>,
+    hash: Option<&mut Sha1>,
     budget: &mut Budget,
 ) -> std::io::Result<()> {
     if let Some(bytes) = pack.bytes() {
@@ -463,33 +460,123 @@ async fn send_pack_range(
         }
         return out.mapped(pack.file(), bytes, at, len).await;
     }
-    let mut buf = {
-        let _cold = gvfs_alloc_guard::cold_section();
-        vec![0u8; us(len.min(REMOTE_STEP))]
+    let mut to = ToClient {
+        out,
+        hash,
+        budget,
+        failed: None,
     };
-    let mut pos = at;
-    let end = at.saturating_add(len);
-    while pos < end {
-        let n = end.saturating_sub(pos).min(REMOTE_STEP);
-        let piece = buf.get_mut(..us(n)).unwrap_or(&mut []);
-        cold(read_pack(pack, pos, piece))
-            .await
-            .map_err(super::httpd::other)?;
-        if let Some(h) = hash.as_mut() {
-            hash_into(h, piece, budget).await;
-        }
-        out.bytes(piece).await?;
-        pos = pos.saturating_add(n);
+    let read = cold(pack.read(at, len, &mut to)).await;
+    client_or_store(read, to.failed)
+}
+
+/// What a remote read that streamed to a client ended with: the client's own error if its
+/// socket failed (kept as it was), else the store's.
+fn client_or_store(
+    read: crate::util::Result<()>,
+    failed: Option<std::io::Error>,
+) -> std::io::Result<()> {
+    match (read, failed) {
+        (Ok(()), _) => Ok(()),
+        (Err(_), Some(e)) => Err(e),
+        (Err(e), None) => Err(super::httpd::other(e)),
     }
-    let _cold = gvfs_alloc_guard::cold_section();
-    drop(buf);
-    Ok(())
+}
+
+/// A remote blob pack's bytes going to a client as they arrive, hashed on the way when the
+/// response is a pack.
+struct ToClient<'o, 'w, 'h, 'b> {
+    out: &'o mut Out<'w>,
+    hash: Option<&'h mut Sha1>,
+    budget: &'b mut Budget,
+    /// The client's socket error, if writing to it failed.
+    failed: Option<std::io::Error>,
+}
+
+impl crate::store::Sink for ToClient<'_, '_, '_, '_> {
+    async fn put(&mut self, piece: &[u8]) -> crate::util::Result<()> {
+        if let Some(h) = self.hash.as_deref_mut() {
+            hash_into(h, piece, self.budget).await;
+        }
+        match self.out.bytes(piece).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let err = crate::err!("sending to the client: {e}");
+                self.failed = Some(e);
+                Err(err)
+            }
+        }
+    }
+}
+
+/// A zlib stream's body on to `inner`, then its last four bytes (the Adler-32) kept.
+struct BodyThenTail<'a, S> {
+    inner: &'a mut S,
+    /// Body bytes, and bytes seen so far.
+    body: u64,
+    seen: u64,
+    tail: [u8; 4],
+}
+
+impl<S: crate::store::Sink> crate::store::Sink for BodyThenTail<'_, S> {
+    async fn put(&mut self, piece: &[u8]) -> crate::util::Result<()> {
+        let to_body = us(self.body.saturating_sub(self.seen)).min(piece.len());
+        let (body, tail) = piece.split_at(to_body);
+        if !body.is_empty() {
+            self.inner.put(body).await?;
+        }
+        for (i, &byte) in tail.iter().enumerate() {
+            let at = self
+                .seen
+                .saturating_add(u64_of(to_body.saturating_add(i)))
+                .saturating_sub(self.body);
+            *self
+                .tail
+                .get_mut(us(at))
+                .ok_or_else(|| crate::err!("blob entry longer than its record"))? = byte;
+        }
+        self.seen = self.seen.saturating_add(u64_of(piece.len()));
+        Ok(())
+    }
+}
+
+/// A stored blob entry's raw bytes in, its content on to `inner`: the 5-byte header before
+/// each deflate stored block is dropped.
+struct Unstored<'a, S> {
+    inner: &'a mut S,
+    /// The file offset of the next byte, and of the first block's header.
+    pos: u64,
+    blocks: u64,
+}
+
+impl<S: crate::store::Sink> crate::store::Sink for Unstored<'_, S> {
+    async fn put(&mut self, piece: &[u8]) -> crate::util::Result<()> {
+        const HEADER: u64 = 5;
+        let stride = u64_of(crate::blobs::STORED_BLOCK).saturating_add(HEADER);
+        let mut rest = piece;
+        while !rest.is_empty() {
+            let within = self
+                .pos
+                .saturating_sub(self.blocks)
+                .checked_rem(stride)
+                .unwrap_or(0);
+            let header = within < HEADER;
+            let n = if header { HEADER } else { stride }.saturating_sub(within);
+            let (now, later) = rest.split_at(us(n).min(rest.len()));
+            if !header {
+                self.inner.put(now).await?;
+            }
+            self.pos = self.pos.saturating_add(u64_of(now.len()));
+            rest = later;
+        }
+        Ok(())
+    }
 }
 
 /// Exactly `buf.len()` bytes of a blob pack at `at` (cold path for remote packs).
 async fn read_pack(pack: &BlobPack, at: u64, buf: &mut [u8]) -> crate::util::Result<()> {
     let mut n = 0usize;
-    pack.read(at, u64_of(buf.len()), &mut |chunk| {
+    pack.read(at, u64_of(buf.len()), &mut |chunk: &[u8]| {
         let end = n.saturating_add(chunk.len());
         buf.get_mut(n..end)
             .ok_or_else(|| crate::err!("blob pack read overflow"))?
@@ -505,7 +592,9 @@ async fn read_pack(pack: &BlobPack, at: u64, buf: &mut [u8]) -> crate::util::Res
 }
 
 /// A blob as a loose object: its entry's deflate blocks spliced between a stored block
-/// and the combined Adler-32, never inflated (a remote entry: only its ends are read).
+/// and the combined Adler-32, never inflated. A remote entry's zlib header is read first;
+/// its Adler-32 (the stream's last four bytes) comes with the body, in the same read, and
+/// the trailer is made from it then.
 async fn loose_blob(
     ctx: &Ctx,
     b: &mut Bufs,
@@ -515,19 +604,14 @@ async fn loose_blob(
     keep: bool,
 ) -> std::io::Result<bool> {
     let (zat, zlen) = rec.zlib();
+    let mut head = [0u8; 2];
     let plan = match pack.bytes() {
         Some(b) => crate::util::sub(b, us(zat), us(zlen))
             .and_then(|z| LooseSplice::plan(OBJ_BLOB, rec.size, z).ok()),
-        None => {
-            cold(async {
-                let (mut head, mut tail) = ([0u8; 2], [0u8; 4]);
-                read_pack(pack, zat, &mut head).await.ok()?;
-                let tail_at = zat.saturating_add(zlen).saturating_sub(4);
-                read_pack(pack, tail_at, &mut tail).await.ok()?;
-                LooseSplice::plan_ends(OBJ_BLOB, rec.size, us(zlen), head, tail).ok()
-            })
+        None => cold(read_pack(pack, zat, &mut head))
             .await
-        }
+            .ok()
+            .and_then(|()| LooseSplice::plan_ends(OBJ_BLOB, rec.size, us(zlen), head, [0; 4]).ok()),
     };
     let Some(plan) = plan else {
         inc(&ctx.metrics.errors);
@@ -544,11 +628,34 @@ async fn loose_blob(
         zat.saturating_add(u64_of(plan.body_start)),
         u64_of(plan.body_end.saturating_sub(plan.body_start)),
     );
-    if !put_mapped(&mut out, pack, at, n) {
+    let mut trailer = plan.trailer;
+    if pack.bytes().is_none() {
+        let mut to = ToClient {
+            out: &mut out,
+            hash: None,
+            budget: &mut budget,
+            failed: None,
+        };
+        let mut body = BodyThenTail {
+            inner: &mut to,
+            body: n,
+            seen: 0,
+            tail: [0; 4],
+        };
+        let read = cold(pack.read(at, n.saturating_add(4), &mut body)).await;
+        let (tail, whole) = (body.tail, body.seen == n.saturating_add(4));
+        client_or_store(read, to.failed)?;
+        if !whole {
+            return Err(super::httpd::other("blob entry read short"));
+        }
+        trailer = LooseSplice::plan_ends(OBJ_BLOB, rec.size, us(zlen), head, tail)
+            .map_err(|_| super::httpd::other("blob entry trailer"))?
+            .trailer;
+    } else if !put_mapped(&mut out, pack, at, n) {
         send_pack_range(&mut out, pack, at, n, None, &mut budget).await?;
     }
-    if !out.put(&plan.trailer) {
-        out.bytes(&plan.trailer).await?;
+    if !out.put(&trailer) {
+        out.bytes(&trailer).await?;
     }
     out.flush().await?;
     ctx.metrics.bytes_out.fetch_add(out.sent, Ordering::Relaxed);
@@ -619,7 +726,29 @@ async fn blob_range(
         keep,
         extra.get(..extra_len).unwrap_or(&[]),
     )?;
-    if rec.stored {
+    if rec.stored && pack.bytes().is_none() {
+        // One read of the raw range, its block headers dropped on the way: the block cache
+        // sees the whole range (not a read per 64 KiB block).
+        let mut pieces = rec.stored_range_iter(offset, len);
+        if let Some((first, n)) = pieces.next() {
+            let end = pieces
+                .last()
+                .map_or(first.saturating_add(n), |(at, n)| at.saturating_add(n));
+            let mut to = ToClient {
+                out: &mut out,
+                hash: None,
+                budget: &mut budget,
+                failed: None,
+            };
+            let mut content = Unstored {
+                inner: &mut to,
+                pos: first,
+                blocks: rec.zlib().0.saturating_add(2),
+            };
+            let read = cold(pack.read(first, end.saturating_sub(first), &mut content)).await;
+            client_or_store(read, to.failed)?;
+        }
+    } else if rec.stored {
         for (at, n) in rec.stored_range_iter(offset, len) {
             send_pack_range(&mut out, pack, at, n, None, &mut budget).await?;
         }
@@ -633,7 +762,9 @@ async fn blob_range(
 }
 
 /// Inflates a compressed blob entry from its start, sending content `[offset, offset+len)`
-/// (cold path: its buffers are allocated per request).
+/// (cold path: its buffers are allocated per request). A remote entry is read in windows
+/// from 1 MiB, doubling to the block cache's: a range near the start of a long entry reads
+/// little more than it needs, and a long read goes a window per fetch.
 async fn inflate_range(
     out: &mut Out<'_>,
     pack: &BlobPack,
@@ -642,67 +773,111 @@ async fn inflate_range(
     len: u64,
     budget: &mut Budget,
 ) -> std::io::Result<()> {
-    let bad = |m: &str| super::httpd::other(m);
     let (zat, zlen) = rec.zlib();
-    let (mut z, mut chunk, mut input) = {
+    let mut inf = {
         let _cold = gvfs_alloc_guard::cold_section();
-        let input = match pack.bytes() {
-            Some(_) => Vec::new(),
-            None => vec![0u8; us(zlen.min(REMOTE_STEP))],
-        };
-        (zlib_rs::Inflate::new(true, 15), vec![0u8; 64 << 10], input)
+        Inflating {
+            z: zlib_rs::Inflate::new(true, 15),
+            chunk: vec![0u8; 64 << 10],
+            produced: 0,
+            offset,
+            end: offset.saturating_add(len),
+            out,
+            budget,
+            done: false,
+            failed: None,
+        }
     };
-    let (mut produced, end) = (0u64, offset.saturating_add(len));
-    let mut pos = zat;
-    let zend = zat.saturating_add(zlen);
-    'stream: while pos < zend {
-        // The next piece of the entry: in place when mapped, else read (a blocking section).
-        let piece: &[u8] = match pack.bytes() {
-            Some(b) => crate::util::sub(b, us(pos), us(zend.saturating_sub(pos)))
-                .ok_or_else(|| bad("blob entry range"))?,
-            None => {
-                let n = zend.saturating_sub(pos).min(REMOTE_STEP);
-                let buf = input.get_mut(..us(n)).unwrap_or(&mut []);
-                cold(read_pack(pack, pos, buf))
-                    .await
-                    .map_err(super::httpd::other)?;
-                buf
-            }
-        };
-        pos = pos.saturating_add(u64_of(piece.len()));
+    if let Some(b) = pack.bytes() {
+        let entry = crate::util::sub(b, us(zat), us(zlen))
+            .ok_or_else(|| super::httpd::other("blob entry range"))?;
+        inf.feed(entry).await?;
+    } else {
+        let most = super::blobcache::WINDOW.saturating_mul(super::blobcache::BLOCK);
+        let (mut pos, zend, mut window) = (zat, zat.saturating_add(zlen), 1u64 << 20);
+        while pos < zend && !inf.done {
+            let n = zend.saturating_sub(pos).min(window);
+            let read = pack.read(pos, n, &mut inf).await;
+            client_or_store(read, inf.failed.take())?;
+            pos = pos.saturating_add(n);
+            window = window.saturating_mul(2).min(most);
+        }
+    }
+    let (produced, end) = (inf.produced, inf.end);
+    let _cold = gvfs_alloc_guard::cold_section();
+    drop(inf);
+    if produced < end {
+        return Err(super::httpd::other("blob entry ended early"));
+    }
+    Ok(())
+}
+
+/// A compressed blob entry inflated as its pieces arrive, content `[offset, end)` sent.
+struct Inflating<'o, 'w, 'b> {
+    z: zlib_rs::Inflate,
+    chunk: Vec<u8>,
+    /// Content inflated so far.
+    produced: u64,
+    offset: u64,
+    end: u64,
+    out: &'o mut Out<'w>,
+    budget: &'b mut Budget,
+    /// The stream ended, or the range is sent: later pieces are not needed.
+    done: bool,
+    /// Why the last piece failed (a corrupt entry, or the client's socket).
+    failed: Option<std::io::Error>,
+}
+
+impl Inflating<'_, '_, '_> {
+    async fn feed(&mut self, piece: &[u8]) -> std::io::Result<()> {
+        let bad = |m: &str| super::httpd::other(m);
         let mut rest = piece;
-        while !rest.is_empty() {
-            let (in0, out0) = (z.total_in(), z.total_out());
-            let status = z
-                .decompress(rest, &mut chunk, zlib_rs::InflateFlush::NoFlush)
+        while !rest.is_empty() && !self.done {
+            let (in0, out0) = (self.z.total_in(), self.z.total_out());
+            let status = self
+                .z
+                .decompress(rest, &mut self.chunk, zlib_rs::InflateFlush::NoFlush)
                 .map_err(|_| bad("corrupt blob entry"))?;
-            let used = us(z.total_in().saturating_sub(in0));
-            let made = z.total_out().saturating_sub(out0);
-            let (lo, hi) = (produced.max(offset), produced.saturating_add(made).min(end));
+            let used = us(self.z.total_in().saturating_sub(in0));
+            let made = self.z.total_out().saturating_sub(out0);
+            let produced = self.produced;
+            let (lo, hi) = (
+                produced.max(self.offset),
+                produced.saturating_add(made).min(self.end),
+            );
             if lo < hi {
-                let part = chunk
+                let part = self
+                    .chunk
                     .get(us(lo.saturating_sub(produced))..us(hi.saturating_sub(produced)))
                     .ok_or_else(|| bad("inflate range"))?;
-                out.bytes(part).await?;
+                self.out.bytes(part).await?;
             }
-            produced = produced.saturating_add(made);
+            self.produced = produced.saturating_add(made);
             rest = rest.get(used..).unwrap_or(&[]);
-            if status == zlib_rs::Status::StreamEnd || produced >= end {
-                break 'stream;
+            if status == zlib_rs::Status::StreamEnd || self.produced >= self.end {
+                self.done = true;
             } else if used == 0 && made == 0 {
                 return Err(bad("blob entry stream is stuck"));
             }
-            if budget.spend(64) {
-                budget.pause().await;
+            if self.budget.spend(64) {
+                self.budget.pause().await;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl crate::store::Sink for Inflating<'_, '_, '_> {
+    async fn put(&mut self, piece: &[u8]) -> crate::util::Result<()> {
+        match self.feed(piece).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let err = crate::err!("inflating a blob entry: {e}");
+                self.failed = Some(e);
+                Err(err)
             }
         }
     }
-    let _cold = gvfs_alloc_guard::cold_section();
-    drop((z, chunk, input));
-    if produced < end {
-        return Err(bad("blob entry ended early"));
-    }
-    Ok(())
 }
 
 /// `GPRE` + version + count, then per pack: timestamp, pack length, index length (-1 for

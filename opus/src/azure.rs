@@ -221,12 +221,12 @@ impl AzureStore {
 
     /// [`AzureStore::read_range`] on the async client: one ranged GET (retried on transient
     /// failures before any byte reached `sink`), streamed to `sink`.
-    pub async fn read_range_async(
+    pub async fn read_range_async<S: crate::store::Sink>(
         &self,
         key: &str,
         offset: u64,
         len: u64,
-        sink: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
+        sink: &mut S,
     ) -> Result<()> {
         if len == 0 {
             return Ok(());
@@ -267,7 +267,7 @@ impl AzureStore {
                 if got > len {
                     crate::bail!("ranged GET {key}: more bytes than asked for");
                 }
-                sink(&chunk)?;
+                sink.put(&chunk).await?;
                 if budget.spend(crate::serve::budget::byte_units(chunk.len())) {
                     budget.pause().await;
                 }

@@ -89,19 +89,28 @@ impl BlobPack {
         self.local.as_ref().map(|(f, _)| f)
     }
 
-    /// `len` bytes at `at`, handed to `sink` in pieces (a remote pack: ranged reads,
-    /// through the block cache when there is one).
-    pub async fn read(
-        &self,
-        at: u64,
-        len: u64,
-        sink: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
-    ) -> Result<()> {
+    /// `len` bytes at `at`, handed to `sink` in pieces as they arrive (a remote pack:
+    /// through the block cache when there is one, else a ranged GET per
+    /// [`super::blobcache::WINDOW`] blocks). Pass whole ranges: the cache decides by a read's
+    /// length, and fetches a window at a time.
+    pub async fn read<S: crate::store::Sink>(&self, at: u64, len: u64, sink: &mut S) -> Result<()> {
         if let Some(b) = self.bytes() {
-            return sink(sub(b, us(at), us(len)).ctx("blob pack range")?);
+            return sink
+                .put(sub(b, us(at), us(len)).ctx("blob pack range")?)
+                .await;
         }
         match &self.remote {
-            Some(Remote::Direct(store, key)) => store.read_range_async(key, at, len, sink).await,
+            Some(Remote::Direct(store, key)) => {
+                let window = super::blobcache::WINDOW.saturating_mul(super::blobcache::BLOCK);
+                let end = at.saturating_add(len);
+                let mut pos = at;
+                while pos < end {
+                    let n = end.saturating_sub(pos).min(window);
+                    store.read_range_async(key, pos, n, sink).await?;
+                    pos = pos.saturating_add(n);
+                }
+                Ok(())
+            }
             Some(Remote::Cached(cache, id, key)) => {
                 cache.read(id, key, self.len, at, len, sink).await
             }

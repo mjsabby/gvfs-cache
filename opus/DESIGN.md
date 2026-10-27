@@ -590,10 +590,17 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   while it streams them. Unpinned blocks are evicted least recently used beyond
   `--blob-cache-mib` (default 32 GiB), so every read finishes, whatever the budget. A read
   of more than a quarter of the budget (one huge blob) streams straight from the store,
-  32 MiB at a time, instead of evicting everything else. The mirror writes the tip's
-  blobs first, in path order, so a checkout's blobs share blocks; a block being fetched is
-  fetched once (other readers' tasks wait for it). The ranged GETs go through the async
-  client, its connections pooled per account.
+  32 MiB at a time, instead of evicting everything else (`--blob-cache-mib 0`: every read
+  does). Each read is of a whole range, its pieces handed to an async sink as they
+  arrive (a client's socket, the pack's hash, an inflater): no buffer between the store and
+  the client, and the cache sees a read's length. A loose blob reads its zlib header, then
+  its body and Adler-32 in one read; a stored blob's range is one read of its raw bytes,
+  the stored blocks' headers dropped on the way; a compressed blob's range reads windows
+  from 1 MiB, doubling to 32 MiB, so a range near the start of a long entry reads little
+  more than it needs. The mirror writes the tip's blobs first, in path order, so a
+  checkout's blobs share blocks; a block being fetched is fetched once (other readers'
+  tasks wait for it). The ranged GETs go through the async client, its connections pooled
+  per account.
 * **The proxy** serves blobs the store does not have, only for ids a sizes table names (a
   404 otherwise, without touching the upstream): the L0 overlay's, copied when the
   pipeline seals their trees, and blobs requested before the mirror has finished. A blob a

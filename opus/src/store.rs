@@ -32,6 +32,19 @@ pub struct ObjectInfo {
     pub modified: u64,
 }
 
+/// Where an async read's bytes go, a piece at a time as they arrive. A piece may be awaited
+/// (sent to a client), so a ranged GET streams through to a socket without a buffer; a
+/// closure is a sink that does not wait.
+pub trait Sink: Send {
+    fn put(&mut self, piece: &[u8]) -> impl Future<Output = Result<()>> + Send;
+}
+
+impl<F: FnMut(&[u8]) -> Result<()> + Send> Sink for F {
+    fn put(&mut self, piece: &[u8]) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(self(piece))
+    }
+}
+
 pub enum Store {
     Fs(FsStore),
     Azure(crate::azure::AzureStore),
@@ -143,15 +156,29 @@ impl Store {
 
     /// [`Store::read_range`] for the edge while it serves: object storage through the async
     /// client (the task waits, not its thread); a directory store reads its file here.
-    pub async fn read_range_async(
+    pub async fn read_range_async<S: Sink>(
         &self,
         key: &str,
         offset: u64,
         len: u64,
-        sink: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
+        sink: &mut S,
     ) -> Result<()> {
         match self {
-            Store::Fs(_) => self.read_range(key, offset, len, &mut |b| sink(b)),
+            Store::Fs(s) => {
+                use std::os::unix::fs::FileExt;
+                let f = File::open(s.path(key)?).ctx(&format!("opening {key}"))?;
+                let mut buf = vec![0u8; crate::util::us(len.min(1 << 20))];
+                let mut at = 0u64;
+                while at < len {
+                    let n = crate::util::us(len.saturating_sub(at)).min(buf.len());
+                    let piece = buf.get_mut(..n).ctx("read buffer")?;
+                    f.read_exact_at(piece, offset.saturating_add(at))
+                        .ctx(&format!("reading {key}"))?;
+                    sink.put(piece).await?;
+                    at = at.saturating_add(crate::util::u64_of(n));
+                }
+                Ok(())
+            }
             Store::Azure(a) => a.read_range_async(key, offset, len, sink).await,
         }
     }

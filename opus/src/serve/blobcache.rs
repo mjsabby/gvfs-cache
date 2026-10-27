@@ -24,13 +24,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::Notify;
 
-use crate::store::Store;
+use crate::store::{Sink, Store};
 use crate::util::{Context, Result, u64_of, us};
 
 /// Bytes per cached block.
 pub const BLOCK: u64 = 4 << 20;
 /// Most blocks one read pins (and fetches) at a time.
 pub const WINDOW: u64 = 8;
+/// Bytes of a cached block read per piece handed to a sink.
+const PIECE: u64 = 1 << 20;
 
 type Key = (Arc<str>, u64);
 
@@ -76,6 +78,24 @@ fn release(st: &mut State, id: &Arc<str>, blocks: impl Iterator<Item = u64>) {
     for b in blocks {
         if let Some(e) = st.blocks.get_mut(&(Arc::clone(id), b)) {
             e.pins = e.pins.saturating_sub(1);
+        }
+    }
+}
+
+/// Blocks a read has pinned: released, and the cache trimmed to its budget, when the read
+/// moves on, fails or is dropped.
+struct Pinned<'a> {
+    cache: &'a BlockCache,
+    id: &'a Arc<str>,
+    blocks: Vec<u64>,
+}
+
+impl Drop for Pinned<'_> {
+    fn drop(&mut self) {
+        if !self.blocks.is_empty() {
+            let mut st = lock(&self.cache.state);
+            release(&mut st, self.id, self.blocks.drain(..));
+            self.cache.evict(&mut st);
         }
     }
 }
@@ -130,15 +150,16 @@ impl BlockCache {
     }
 
     /// `len` bytes of pack `id` (`pack_len` bytes, at store key `object`) from `at`,
-    /// handed to `sink` in pieces.
-    pub async fn read(
+    /// handed to `sink` in pieces. Callers pass a whole range: its length decides whether
+    /// it streams past the cache, and its blocks are fetched a window at a time.
+    pub async fn read<S: Sink>(
         &self,
         id: &Arc<str>,
         object: &str,
         pack_len: u64,
         at: u64,
         len: u64,
-        sink: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
+        sink: &mut S,
     ) -> Result<()> {
         let Some(end) = at.checked_add(len).filter(|&e| e <= pack_len) else {
             crate::bail!("read past the end of blob pack {id}");
@@ -159,61 +180,63 @@ impl BlockCache {
             return Ok(());
         }
         let last = end.saturating_sub(1).checked_div(BLOCK).unwrap_or(0);
-        let mut buf = vec![0u8; us(BLOCK.min(len))];
+        let mut buf = vec![0u8; us(PIECE.min(len))];
         let mut pos = at;
         while pos < end {
             let b0 = pos.checked_div(BLOCK).unwrap_or(0);
             let b1 = last.min(b0.saturating_add(WINDOW).saturating_sub(1));
-            self.pin(id, object, pack_len, b0, b1).await?;
-            let streamed = self.stream(id, (b0, b1), pos, end, &mut buf, sink);
-            let mut st = lock(&self.state);
-            release(&mut st, id, b0..=b1);
-            self.evict(&mut st);
-            drop(st);
-            pos = streamed?;
+            let pinned = self.pin(id, object, pack_len, b0, b1).await?;
+            pos = self.stream(&pinned, pos, end, &mut buf, sink).await?;
         }
         Ok(())
     }
 
-    /// Streams `[pos, end)` within pinned blocks `b0..=b1`; returns where it stopped.
-    fn stream(
+    /// Streams `[pos, end)` within `pinned` blocks (ascending, consecutive); returns where
+    /// it stopped.
+    async fn stream<S: Sink>(
         &self,
-        id: &Arc<str>,
-        (b0, b1): (u64, u64),
+        pinned: &Pinned<'_>,
         mut pos: u64,
         end: u64,
         buf: &mut [u8],
-        sink: &mut (dyn FnMut(&[u8]) -> Result<()> + Send),
+        sink: &mut S,
     ) -> Result<u64> {
-        for b in b0..=b1 {
+        for &b in &pinned.blocks {
             let start = b.saturating_mul(BLOCK);
             let upto = end.min(start.saturating_add(BLOCK));
             if pos >= upto {
                 continue;
             }
-            let piece = buf
-                .get_mut(..us(upto.saturating_sub(pos)))
-                .ctx("cache read buffer")?;
-            let file = File::open(self.path(&(Arc::clone(id), b))).ctx("opening a cached block")?;
-            std::os::unix::fs::FileExt::read_exact_at(&file, piece, pos.saturating_sub(start))
-                .ctx("reading a cached block")?;
-            sink(piece)?;
-            pos = upto;
+            let file =
+                File::open(self.path(&(Arc::clone(pinned.id), b))).ctx("opening a cached block")?;
+            while pos < upto {
+                let n = upto.saturating_sub(pos).min(u64_of(buf.len()));
+                let piece = buf.get_mut(..us(n)).ctx("cache read buffer")?;
+                std::os::unix::fs::FileExt::read_exact_at(&file, piece, pos.saturating_sub(start))
+                    .ctx("reading a cached block")?;
+                sink.put(piece).await?;
+                pos = pos.saturating_add(n);
+            }
         }
         Ok(pos)
     }
 
     /// Pins blocks `b0..=b1` of the pack, fetching those not cached (or waiting for another
-    /// reader's fetch of them). On an error nothing stays pinned.
-    async fn pin(
-        &self,
-        id: &Arc<str>,
+    /// reader's fetch of them). On an error, or if the read is dropped meanwhile, nothing
+    /// stays pinned.
+    async fn pin<'a>(
+        &'a self,
+        id: &'a Arc<str>,
         object: &str,
         pack_len: u64,
         b0: u64,
         b1: u64,
-    ) -> Result<()> {
-        let mut held: Vec<u64> = Vec::new();
+    ) -> Result<Pinned<'a>> {
+        let mut held = Pinned {
+            cache: self,
+            id,
+            blocks: Vec::new(),
+        };
         let mut fetched = false;
         loop {
             let mine: Vec<u64> = loop {
@@ -225,7 +248,7 @@ impl BlockCache {
                     let mut st = lock(&self.state);
                     let (mut missing, mut waiting) = (Vec::new(), false);
                     for b in b0..=b1 {
-                        if held.contains(&b) {
+                        if held.blocks.contains(&b) {
                             continue;
                         }
                         let key: Key = (Arc::clone(id), b);
@@ -235,7 +258,7 @@ impl BlockCache {
                         if let Some(e) = st.blocks.get_mut(&key) {
                             e.used = now;
                             e.pins = e.pins.saturating_add(1);
-                            held.push(b);
+                            held.blocks.push(b);
                         } else if st.fetching.contains(&key) {
                             waiting = true;
                         } else {
@@ -245,7 +268,8 @@ impl BlockCache {
                     if missing.is_empty() && !waiting {
                         let c = if fetched { &self.misses } else { &self.hits };
                         c.fetch_add(1, Ordering::Relaxed);
-                        return Ok(());
+                        held.blocks.sort_unstable();
+                        return Ok(held);
                     }
                     if !missing.is_empty() {
                         for &b in &missing {
@@ -270,23 +294,21 @@ impl BlockCache {
             for &b in &mine {
                 st.fetching.remove(&(Arc::clone(id), b));
             }
-            match &got {
-                Ok(lens) => {
-                    for (&b, &len) in mine.iter().zip(lens) {
-                        st.clock = st.clock.wrapping_add(1);
-                        let used = st.clock;
-                        let entry = Entry { len, used, pins: 1 };
-                        if let Some(old) = st.blocks.insert((Arc::clone(id), b), entry) {
-                            st.bytes = st.bytes.saturating_sub(old.len);
-                        }
-                        st.bytes = st.bytes.saturating_add(len);
-                        held.push(b);
+            if let Ok(lens) = &got {
+                for (&b, &len) in mine.iter().zip(lens) {
+                    st.clock = st.clock.wrapping_add(1);
+                    let used = st.clock;
+                    let entry = Entry { len, used, pins: 1 };
+                    if let Some(old) = st.blocks.insert((Arc::clone(id), b), entry) {
+                        st.bytes = st.bytes.saturating_sub(old.len);
                     }
+                    st.bytes = st.bytes.saturating_add(len);
+                    held.blocks.push(b);
                 }
-                Err(_) => release(&mut st, id, held.iter().copied()),
             }
             drop(st);
             self.done.notify_waiters();
+            // On an error, dropping `held` releases what it pinned.
             got?;
         }
     }
@@ -335,7 +357,7 @@ impl BlockCache {
                     object,
                     start,
                     end.saturating_sub(start),
-                    &mut |mut chunk| {
+                    &mut |mut chunk: &[u8]| {
                         while !chunk.is_empty() {
                             let pos = start.saturating_add(written);
                             let b = pos.checked_div(BLOCK).unwrap_or(0);
@@ -435,7 +457,7 @@ mod tests {
         assert_eq!(cache.hits.load(Ordering::Relaxed), 2);
         let id: Arc<str> = Arc::from("p");
         assert!(
-            rt().block_on(cache.read(&id, "blobs/p.pack", n, n - 1, 2, &mut |_| Ok(())))
+            rt().block_on(cache.read(&id, "blobs/p.pack", n, n - 1, 2, &mut |_: &[u8]| Ok(())))
                 .is_err()
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -534,10 +556,17 @@ mod tests {
         let id: Arc<str> = Arc::from("p");
         let mut got = Vec::new();
         cache
-            .read(&id, "blobs/p.pack", data.len() as u64, at, len, &mut |b| {
-                got.extend_from_slice(b);
-                Ok(())
-            })
+            .read(
+                &id,
+                "blobs/p.pack",
+                data.len() as u64,
+                at,
+                len,
+                &mut |b: &[u8]| {
+                    got.extend_from_slice(b);
+                    Ok(())
+                },
+            )
             .await
             .unwrap();
         assert!(got == data[at as usize..(at + len) as usize], "{at}+{len}");

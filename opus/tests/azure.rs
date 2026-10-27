@@ -422,6 +422,8 @@ fn azure_separate_store() {
     let up = Upstream::new(&root);
     let upstream = up.bare.to_str().unwrap().to_string();
     let noise_bytes = noise(2 << 20, 11);
+    // Stored (incompressible) and in a pack of its own, six blocks of the edge's cache.
+    let huge = noise(20 << 20, 5);
     commit_files(
         &up,
         "c1",
@@ -429,6 +431,7 @@ fn azure_separate_store() {
             ("a/text.txt", Some(text(1))),
             ("b/noise.bin", Some(noise_bytes.clone())),
             ("big/large.bin", Some(large((16 << 20) + 9))),
+            ("big/noise.bin", Some(huge.clone())),
         ],
     );
     let g = commit_files(&up, "c2", &[("a/text.txt", Some(text(2)))]);
@@ -569,5 +572,69 @@ fn azure_separate_store() {
     );
     server.assert_clean();
     drop(server);
+
+    // A long read of a remote pack goes through the block cache a window (8 blocks) per
+    // fetch, or past the cache when longer than a quarter of it (they went a MiB at a time:
+    // a fetch per block, and never past the cache).
+    let huge_id = rev(&up.bare, &format!("{g}:big/noise.bin"));
+    let fresh_edge = |tag: &str, extra: &[&str]| -> Server {
+        let dir = root.join(format!("cache-{tag}"));
+        let dir = dir.to_str().unwrap();
+        let mut args = vec!["--store", &store, "--store-auth-env", "GVD_AZ_CS"];
+        args.extend(["--upstream", &upstream, "--cache-dir", dir]);
+        args.extend(extra);
+        Server::start_with_env(&args, &env)
+    };
+    let counts = |s: &Server| {
+        (
+            s.metric("gvfs_blob_cache_fetches_total"),
+            s.metric("gvfs_blob_cache_bypass_total"),
+        )
+    };
+    let huge_ids = std::slice::from_ref(&huge_id);
+    let edge = fresh_edge("a", &[]);
+    let (status, ct, _) = edge.get(&format!("/gvfs/objects/{huge_id}"));
+    assert_eq!((status, ct.as_str()), (200, CT_LOOSE));
+    assert_eq!(
+        counts(&edge),
+        (2, 0),
+        "the zlib header's block, then the other five in one fetch"
+    );
+    // As a pack of its own (the pack file whole): from the blocks the loose read cached.
+    let (status, _, pack) = edge.post(
+        "/gvfs/objects",
+        json_ids(huge_ids, None).as_bytes(),
+        CT_PACK,
+    );
+    assert_eq!(status, 200);
+    let one = fresh_repo(&root, "huge");
+    git_stdin(
+        &one,
+        &["index-pack", "--stdin", "--strict", "--keep=t"],
+        &pack,
+    );
+    assert_eq!(cat_batch(&one, huge_ids), cat_batch(&up.bare, huge_ids));
+    assert_eq!(counts(&edge), (2, 0));
+    edge.assert_clean();
+    drop(edge);
+    let edge = fresh_edge("b", &["--blob-cache-mib", "64"]);
+    assert_eq!(edge.get(&format!("/gvfs/objects/{huge_id}")).0, 200);
+    assert_eq!(counts(&edge), (2, 1), "20 MiB is more than a quarter of 64");
+    assert_eq!(
+        edge.metric("gvfs_blob_cache_bytes"),
+        4 << 20,
+        "the zlib header's block only"
+    );
+    edge.assert_clean();
+    drop(edge);
+    // A range of it: one read of the raw range, the stored blocks' headers dropped.
+    let edge = fresh_edge("c", &[]);
+    let (off, len) = (1000usize, 12usize << 20);
+    let (status, _, body) = edge.get(&format!("/gvfs/blobs/{huge_id}?offset={off}&length={len}"));
+    assert_eq!(status, 200);
+    assert!(body == huge[off..off + len]);
+    assert_eq!(counts(&edge), (1, 0), "one fetch of four blocks");
+    edge.assert_clean();
+    drop(edge);
     let _ = std::fs::remove_dir_all(&root);
 }
