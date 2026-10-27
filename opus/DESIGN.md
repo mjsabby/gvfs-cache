@@ -600,7 +600,10 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   (`src/serve/blobcache.rs`), at most 8 blocks per read at a time: a read fetches the
   blocks it lacks, each run of consecutive ones with a single ranged GET, and pins them
   while it streams them. Unpinned blocks are evicted least recently used beyond
-  `--blob-cache-mib` (default 32 GiB), so every read finishes, whatever the budget. A read
+  `--blob-cache-mib` (default 32 GiB), so every read finishes, whatever the budget; they are
+  kept in order of last use (an eviction is O(log n)), and evicted files are unlinked after
+  the cache's lock is let go (each file's name carries a generation, so the unlink never
+  removes a block fetched again meanwhile). A read
   of more than a quarter of the budget (one huge blob) streams straight from the store,
   32 MiB at a time, instead of evicting everything else (`--blob-cache-mib 0`: every read
   does). Each read is of a whole range, its pieces handed to an async sink as they

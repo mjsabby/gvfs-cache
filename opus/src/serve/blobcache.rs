@@ -10,13 +10,16 @@
 //! Blocks are evicted least recently used beyond the byte budget (`--blob-cache-mib`),
 //! except the blocks a read is streaming: those are pinned until it moves on, so every read
 //! finishes whatever the budget (the cache may exceed it by the pinned windows meanwhile).
+//! The unpinned blocks are kept in order of last use, so an eviction costs O(log n), and
+//! their files are unlinked after the lock is let go: each block file has a generation in
+//! its name, so the unlink never removes a block fetched again meanwhile.
 //! A read of more than a quarter of the budget (one huge blob) streams straight from the
 //! store, a window at a time: keeping it would only evict everything else.
 //!
 //! Reads are async (the edge's handlers await them): fetches go through the store's async
 //! client, and a reader waiting for another's fetch parks its task, not a thread.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,10 +44,14 @@ struct Entry {
     used: u64,
     /// Reads streaming this block now: eviction leaves it.
     pins: u32,
+    /// Its file's generation (`<pack>.<block>.<file>`).
+    file: u64,
 }
 
 struct State {
     blocks: HashMap<Key, Entry>,
+    /// The unpinned blocks by last use (`Entry::used`, unique): eviction takes the first.
+    lru: BTreeMap<u64, Key>,
     fetching: HashSet<Key>,
     bytes: u64,
     clock: u64,
@@ -64,6 +71,8 @@ pub struct BlockCache {
     pub fetches: AtomicU64,
     /// Reads too large to keep, streamed straight from the store.
     pub bypassed: AtomicU64,
+    /// Generations handed to block files.
+    files: AtomicU64,
 }
 
 fn lock(m: &Mutex<State>) -> MutexGuard<'_, State> {
@@ -73,29 +82,38 @@ fn lock(m: &Mutex<State>) -> MutexGuard<'_, State> {
     }
 }
 
-/// Drops one pin of each of `blocks`.
+/// Drops one pin of each of `blocks`; a block no read pins any more joins the LRU order.
 fn release(st: &mut State, id: &Arc<str>, blocks: impl Iterator<Item = u64>) {
+    let State {
+        blocks: all, lru, ..
+    } = st;
     for b in blocks {
-        if let Some(e) = st.blocks.get_mut(&(Arc::clone(id), b)) {
+        let key: Key = (Arc::clone(id), b);
+        if let Some(e) = all.get_mut(&key) {
             e.pins = e.pins.saturating_sub(1);
+            if e.pins == 0 {
+                lru.insert(e.used, key);
+            }
         }
     }
 }
 
-/// Blocks a read has pinned: released, and the cache trimmed to its budget, when the read
-/// moves on, fails or is dropped.
+/// Blocks a read has pinned (block, file generation), ascending: released, and the cache
+/// trimmed to its budget, when the read moves on, fails or is dropped.
 struct Pinned<'a> {
     cache: &'a BlockCache,
     id: &'a Arc<str>,
-    blocks: Vec<u64>,
+    blocks: Vec<(u64, u64)>,
 }
 
 impl Drop for Pinned<'_> {
     fn drop(&mut self) {
         if !self.blocks.is_empty() {
             let mut st = lock(&self.cache.state);
-            release(&mut st, self.id, self.blocks.drain(..));
-            self.cache.evict(&mut st);
+            release(&mut st, self.id, self.blocks.drain(..).map(|(b, _)| b));
+            let evicted = self.cache.evict(&mut st);
+            drop(st);
+            self.cache.unlink(evicted);
         }
     }
 }
@@ -133,6 +151,7 @@ impl BlockCache {
             budget,
             state: Mutex::new(State {
                 blocks: HashMap::new(),
+                lru: BTreeMap::new(),
                 fetching: HashSet::new(),
                 bytes: 0,
                 clock: 0,
@@ -142,11 +161,21 @@ impl BlockCache {
             misses: AtomicU64::new(0),
             fetches: AtomicU64::new(0),
             bypassed: AtomicU64::new(0),
+            files: AtomicU64::new(0),
         })
     }
 
-    fn path(&self, key: &Key) -> PathBuf {
-        self.dir.join(format!("{}.{}", key.0, key.1))
+    /// The file of generation `file` of block `key`.
+    fn path(&self, key: &Key, file: u64) -> PathBuf {
+        self.dir.join(format!("{}.{}.{file}", key.0, key.1))
+    }
+
+    /// Removes evicted blocks' files (after the lock is let go: a block fetched again since
+    /// has a file of another generation).
+    fn unlink(&self, evicted: Vec<(Key, u64)>) {
+        for (key, file) in evicted {
+            let _ = std::fs::remove_file(self.path(&key, file));
+        }
     }
 
     /// `len` bytes of pack `id` (`pack_len` bytes, at store key `object`) from `at`,
@@ -201,14 +230,14 @@ impl BlockCache {
         buf: &mut [u8],
         sink: &mut S,
     ) -> Result<u64> {
-        for &b in &pinned.blocks {
+        for &(b, file_gen) in &pinned.blocks {
             let start = b.saturating_mul(BLOCK);
             let upto = end.min(start.saturating_add(BLOCK));
             if pos >= upto {
                 continue;
             }
-            let file =
-                File::open(self.path(&(Arc::clone(pinned.id), b))).ctx("opening a cached block")?;
+            let file = File::open(self.path(&(Arc::clone(pinned.id), b), file_gen))
+                .ctx("opening a cached block")?;
             while pos < upto {
                 let n = upto.saturating_sub(pos).min(u64_of(buf.len()));
                 let piece = buf.get_mut(..us(n)).ctx("cache read buffer")?;
@@ -246,20 +275,30 @@ impl BlockCache {
                 ended.as_mut().enable();
                 {
                     let mut st = lock(&self.state);
+                    let State {
+                        blocks,
+                        lru,
+                        fetching,
+                        clock,
+                        ..
+                    } = &mut *st;
                     let (mut missing, mut waiting) = (Vec::new(), false);
                     for b in b0..=b1 {
-                        if held.blocks.contains(&b) {
+                        if held.blocks.iter().any(|&(x, _)| x == b) {
                             continue;
                         }
                         let key: Key = (Arc::clone(id), b);
                         // One tick per block: equal ages would make eviction arbitrary.
-                        st.clock = st.clock.wrapping_add(1);
-                        let now = st.clock;
-                        if let Some(e) = st.blocks.get_mut(&key) {
+                        *clock = clock.wrapping_add(1);
+                        let now = *clock;
+                        if let Some(e) = blocks.get_mut(&key) {
+                            if e.pins == 0 {
+                                lru.remove(&e.used);
+                            }
                             e.used = now;
                             e.pins = e.pins.saturating_add(1);
-                            held.blocks.push(b);
-                        } else if st.fetching.contains(&key) {
+                            held.blocks.push((b, e.file));
+                        } else if fetching.contains(&key) {
                             waiting = true;
                         } else {
                             missing.push(b);
@@ -273,7 +312,7 @@ impl BlockCache {
                     }
                     if !missing.is_empty() {
                         for &b in &missing {
-                            st.fetching.insert((Arc::clone(id), b));
+                            fetching.insert((Arc::clone(id), b));
                         }
                         break missing;
                     }
@@ -294,19 +333,31 @@ impl BlockCache {
             for &b in &mine {
                 st.fetching.remove(&(Arc::clone(id), b));
             }
-            if let Ok(lens) = &got {
-                for (&b, &len) in mine.iter().zip(lens) {
+            let mut replaced = Vec::new();
+            if let Ok(fetched) = &got {
+                for (&b, &(len, file)) in mine.iter().zip(fetched) {
                     st.clock = st.clock.wrapping_add(1);
                     let used = st.clock;
-                    let entry = Entry { len, used, pins: 1 };
-                    if let Some(old) = st.blocks.insert((Arc::clone(id), b), entry) {
+                    let key: Key = (Arc::clone(id), b);
+                    let entry = Entry {
+                        len,
+                        used,
+                        pins: 1,
+                        file,
+                    };
+                    if let Some(old) = st.blocks.insert(key.clone(), entry) {
                         st.bytes = st.bytes.saturating_sub(old.len);
+                        if old.pins == 0 {
+                            st.lru.remove(&old.used);
+                        }
+                        replaced.push((key, old.file));
                     }
                     st.bytes = st.bytes.saturating_add(len);
-                    held.blocks.push(b);
+                    held.blocks.push((b, file));
                 }
             }
             drop(st);
+            self.unlink(replaced);
             self.done.notify_waiters();
             // On an error, dropping `held` releases what it pinned.
             got?;
@@ -314,14 +365,15 @@ impl BlockCache {
     }
 
     /// Fetches `blocks` (ascending), one ranged GET per run of consecutive ones; returns
-    /// each block's length. On an error no block of the failed run is left on disk.
+    /// each block's length and file generation. On an error no block of the failed run is
+    /// left on disk.
     async fn fetch(
         &self,
         id: &Arc<str>,
         object: &str,
         pack_len: u64,
         blocks: &[u64],
-    ) -> Result<Vec<u64>> {
+    ) -> Result<Vec<(u64, u64)>> {
         let mut lens = Vec::with_capacity(blocks.len());
         let mut i = 0usize;
         while let Some(&b0) = blocks.get(i) {
@@ -336,20 +388,21 @@ impl BlockCache {
             let start = b0.saturating_mul(BLOCK);
             let end = b0.saturating_add(n).saturating_mul(BLOCK).min(pack_len);
             // Blocks are written as the bytes arrive, each renamed into place when whole.
-            let mut cur: Option<(u64, File, PathBuf)> = None;
-            let mut whole: Vec<u64> = Vec::new();
+            let mut cur: Option<(u64, u64, File, PathBuf)> = None;
+            let mut whole: Vec<(u64, u64)> = Vec::new();
             let mut written = 0u64;
-            let finish =
-                |cur: &mut Option<(u64, File, PathBuf)>, whole: &mut Vec<u64>| -> Result<()> {
-                    // No fsync: the cache starts empty after a restart anyway.
-                    if let Some((b, f, tmp)) = cur.take() {
-                        drop(f);
-                        std::fs::rename(&tmp, self.path(&(Arc::clone(id), b)))
-                            .ctx("caching a block")?;
-                        whole.push(b);
-                    }
-                    Ok(())
-                };
+            let finish = |cur: &mut Option<(u64, u64, File, PathBuf)>,
+                          whole: &mut Vec<(u64, u64)>|
+             -> Result<()> {
+                // No fsync: the cache starts empty after a restart anyway.
+                if let Some((b, file_gen, f, tmp)) = cur.take() {
+                    drop(f);
+                    std::fs::rename(&tmp, self.path(&(Arc::clone(id), b), file_gen))
+                        .ctx("caching a block")?;
+                    whole.push((b, file_gen));
+                }
+                Ok(())
+            };
             self.fetches.fetch_add(1, Ordering::Relaxed);
             let got = self
                 .store
@@ -363,17 +416,18 @@ impl BlockCache {
                             let b = pos.checked_div(BLOCK).unwrap_or(0);
                             if cur.as_ref().is_none_or(|c| c.0 != b) {
                                 finish(&mut cur, &mut whole)?;
-                                let tmp =
-                                    crate::fsutil::temp_path(&self.path(&(Arc::clone(id), b)));
+                                let file_gen = self.files.fetch_add(1, Ordering::Relaxed);
+                                let path = self.path(&(Arc::clone(id), b), file_gen);
+                                let tmp = crate::fsutil::temp_path(&path);
                                 let f = File::create(&tmp).ctx("creating a cache block")?;
-                                cur = Some((b, f, tmp));
+                                cur = Some((b, file_gen, f, tmp));
                             }
                             let room = us(b
                                 .saturating_add(1)
                                 .saturating_mul(BLOCK)
                                 .saturating_sub(pos));
                             let (now, rest) = chunk.split_at(room.min(chunk.len()));
-                            if let Some((_, f, _)) = cur.as_mut() {
+                            if let Some((_, _, f, _)) = cur.as_mut() {
                                 std::io::Write::write_all(f, now).ctx("writing a cache block")?;
                             }
                             written = written.saturating_add(u64_of(now.len()));
@@ -385,44 +439,40 @@ impl BlockCache {
                 .await
                 .and_then(|()| finish(&mut cur, &mut whole));
             if let Err(e) = got {
-                if let Some((_, _, tmp)) = cur.take() {
+                if let Some((_, _, _, tmp)) = cur.take() {
                     let _ = std::fs::remove_file(tmp);
                 }
-                for b in whole {
-                    let _ = std::fs::remove_file(self.path(&(Arc::clone(id), b)));
+                for (b, file_gen) in whole {
+                    let _ = std::fs::remove_file(self.path(&(Arc::clone(id), b), file_gen));
                 }
                 return Err(e);
             }
-            for k in 0..n {
-                let bs = b0.saturating_add(k).saturating_mul(BLOCK);
-                lens.push(bs.saturating_add(BLOCK).min(pack_len).saturating_sub(bs));
+            for (b, file_gen) in whole {
+                let bs = b.saturating_mul(BLOCK);
+                lens.push((
+                    bs.saturating_add(BLOCK).min(pack_len).saturating_sub(bs),
+                    file_gen,
+                ));
             }
             i = j;
         }
         Ok(lens)
     }
 
-    /// Least recently used unpinned blocks go until the cache fits its budget.
-    fn evict(&self, st: &mut State) {
-        if st.bytes <= self.budget {
-            return;
-        }
-        let mut by_age: Vec<(u64, Key)> = st
-            .blocks
-            .iter()
-            .filter(|(_, e)| e.pins == 0)
-            .map(|(k, e)| (e.used, k.clone()))
-            .collect();
-        by_age.sort_unstable_by_key(|x| x.0);
-        for (_, key) in by_age {
-            if st.bytes <= self.budget {
+    /// Least recently used unpinned blocks go until the cache fits its budget; returns
+    /// them, for their files to be unlinked once the lock is let go.
+    fn evict(&self, st: &mut State) -> Vec<(Key, u64)> {
+        let mut evicted = Vec::new();
+        while st.bytes > self.budget {
+            let Some((_, key)) = st.lru.pop_first() else {
                 break;
-            }
+            };
             if let Some(e) = st.blocks.remove(&key) {
                 st.bytes = st.bytes.saturating_sub(e.len);
-                let _ = std::fs::remove_file(self.path(&key));
+                evicted.push((key, e.file));
             }
         }
+        evicted
     }
 
     /// Bytes cached now.
@@ -460,6 +510,7 @@ mod tests {
             rt().block_on(cache.read(&id, "blobs/p.pack", n, n - 1, 2, &mut |_: &[u8]| Ok(())))
                 .is_err()
         );
+        consistent(&cache);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -487,6 +538,7 @@ mod tests {
         );
         read_all(&cache, &data, BLOCK, 10);
         assert_eq!(cache.fetches.load(Ordering::Relaxed), 7);
+        consistent(&cache);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -522,8 +574,34 @@ mod tests {
             }
         });
         assert!(cache.bytes() <= BLOCK * 2, "back within budget once idle");
+        consistent(&cache);
         assert!(cache.bypassed.load(Ordering::Relaxed) > 0);
+        consistent(&cache);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Once no read is running: every block is in the LRU order, the bytes add up, and the
+    /// directory holds exactly the cached blocks' files (none leaked, none missing).
+    fn consistent(cache: &BlockCache) {
+        let st = lock(&cache.state);
+        assert!(st.blocks.values().all(|e| e.pins == 0));
+        assert_eq!(st.lru.len(), st.blocks.len());
+        for (used, key) in &st.lru {
+            assert_eq!(st.blocks.get(key).map(|e| e.used), Some(*used));
+        }
+        assert_eq!(st.bytes, st.blocks.values().map(|e| e.len).sum::<u64>());
+        let mut want: Vec<PathBuf> = st
+            .blocks
+            .iter()
+            .map(|(k, e)| cache.path(k, e.file))
+            .collect();
+        let mut have: Vec<PathBuf> = std::fs::read_dir(&cache.dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        want.sort();
+        have.sort();
+        assert_eq!(have, want);
     }
 
     fn cache_over(tag: &str, budget: u64) -> (std::path::PathBuf, BlockCache, Vec<u8>) {
@@ -579,6 +657,7 @@ mod tests {
         read_all(&cache, &data, 0, data.len() as u64);
         assert_eq!(cache.bypassed.load(Ordering::Relaxed), 1);
         assert_eq!(cache.bytes(), 0, "streamed past the cache");
+        consistent(&cache);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -589,6 +668,7 @@ mod tests {
         read_all(&cache, &data, BLOCK - 10, 20);
         read_all(&cache, &data, BLOCK * 3 - 7, 9);
         assert!(cache.bytes() <= BLOCK);
+        consistent(&cache);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
