@@ -252,7 +252,7 @@ pub async fn read_head(
         if input.filled >= input.buf.len() {
             return Err(bad("request head too large"));
         }
-        match stream.try_read(input.buf.get_mut(input.filled..).unwrap_or(&mut [])) {
+        match read_now(stream, input.buf.get_mut(input.filled..).unwrap_or(&mut [])) {
             Ok(0) if input.filled == 0 => return Ok(Head::Closed),
             Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => input.filled = input.filled.saturating_add(n),
@@ -590,7 +590,7 @@ async fn read_some(
     deadline: &mut Deadline,
 ) -> std::io::Result<usize> {
     loop {
-        match stream.try_read(buf) {
+        match read_now(stream, buf) {
             Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => return Ok(n),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -640,7 +640,7 @@ async fn read_some_buf<B: bytes::BufMut>(
     deadline: &mut Deadline,
 ) -> std::io::Result<usize> {
     loop {
-        match stream.try_read_buf(buf) {
+        match read_now_buf(stream, buf) {
             Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => return Ok(n),
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -649,6 +649,46 @@ async fn read_some_buf<B: bytes::BufMut>(
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// What has arrived, read into `buf` (`WouldBlock` if nothing has). A read that leaves part
+/// of `buf` empty has drained the socket, and its read readiness is cleared then, as tokio's
+/// own `poll_read` does on epoll (`try_read` keeps it): waiting for the next request then
+/// sleeps until bytes arrive. Kept, the readiness woke each connection once after every
+/// response, to find nothing (a `recv` that failed, and a pass through the connection loop).
+fn read_now(stream: &TcpStream, buf: &mut [u8]) -> std::io::Result<usize> {
+    let len = buf.len();
+    drained_read(stream, len, || stream.try_read(buf))
+}
+
+/// [`read_now`] into a buffer's spare capacity.
+fn read_now_buf<B: bytes::BufMut>(stream: &TcpStream, buf: &mut B) -> std::io::Result<usize> {
+    let len = buf.chunk_mut().len();
+    drained_read(stream, len, || stream.try_read_buf(buf))
+}
+
+/// Runs `read` (of at most `len` bytes) under the read readiness seen before it, which is
+/// cleared if the read comes up short. Bytes that arrive during or after the read bring a
+/// new readiness event, which the clear does not undo: no wake-up is lost.
+fn drained_read(
+    stream: &TcpStream,
+    len: usize,
+    read: impl FnOnce() -> std::io::Result<usize>,
+) -> std::io::Result<usize> {
+    let mut got = 0;
+    let r = stream.try_io(tokio::io::Interest::READABLE, || {
+        got = read()?;
+        if got > 0 && got < len {
+            // `try_io` clears the readiness it saw on `WouldBlock`.
+            Err(std::io::ErrorKind::WouldBlock.into())
+        } else {
+            Ok(got)
+        }
+    });
+    match r {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && got > 0 => Ok(got),
+        r => r,
     }
 }
 
@@ -954,6 +994,44 @@ pub async fn sendfile_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A head read that drains the socket leaves no read readiness behind, so the wait for
+    /// the next request sleeps (it used to wake at once, to read nothing), and the next
+    /// request's bytes wake it.
+    #[test]
+    fn a_drained_socket_sleeps_until_the_next_request() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use tokio::io::AsyncWriteExt;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let mut input = Input::new();
+            let quiet = Duration::from_millis(100);
+            for path in ["/a", "/b", "/c"] {
+                let req = format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
+                client.write_all(req.as_bytes()).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(5), server.readable())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let mut deadline = Deadline::after(Duration::from_secs(5));
+                let Ok(Head::Request(r)) =
+                    read_head(&server, &mut input, &mut deadline, &mut || {}).await
+                else {
+                    panic!("no request {path}");
+                };
+                assert_eq!(input.bytes(r.path), path.as_bytes());
+                input.consume(r.head_len);
+                let woke = tokio::time::timeout(quiet, server.readable()).await;
+                assert!(woke.is_err(), "woke with nothing to read after {path}");
+            }
+        });
+    }
 
     #[test]
     fn parses_heads() {

@@ -418,9 +418,12 @@ Any path prefix before `/gvfs/` is accepted.
 backlog is raised to `net.core.somaxconn` (std's 128 overflows when a fleet connects at
 once). Between requests a connection holds no buffer, only its parked task (about 3 KB) and
 a descriptor: when its next request's bytes arrive it takes a 16 KiB head buffer and a
-256 KiB output buffer from a pool, and gives them back once the response is out. A head
-that arrives in pieces waits with the head buffer only: the output buffer goes back to a
-pool meanwhile (5,000 slow heads took 62 MiB of memory, 1,278 MiB before). A connection is
+256 KiB output buffer from a pool, and gives them back once the response is out. A read
+that leaves room in its buffer has drained the socket and clears its read readiness, as
+tokio's own `poll_read` does on epoll, so a connection sleeps until its next request
+instead of waking after each response to read nothing. A head that arrives in pieces waits
+with the head buffer only: the output buffer goes back to a pool meanwhile (5,000 slow
+heads took 62 MiB of memory, 1,278 MiB before). A connection is
 closed after `--idle-secs` (30) without a request, or when it goes idle after a response
 while `--max-idle-conns` (65,536) others are (its client reconnects; a new connection is
 always served first). At most `--max-conns` connections are open at once (default: twice
