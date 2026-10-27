@@ -53,7 +53,8 @@ STORES (--store):
                                AZURE_STORAGE_CONNECTION_STRING): account key or SAS
 
 UPSTREAM (--upstream):
-    https://dev.azure.com/<org>/<project>/_git/<repo>  (or any smart-HTTP git server)
+    https://dev.azure.com/<org>/<project>/_git/<repo>  (or any smart-HTTP git server;
+                               a password in the URL is refused: use --token-env)
     <PATH>                     a local repository (runs git upload-pack)
     --branch <NAME>            branch to follow (default: main)
     --token-env <VAR>          env var with a PAT / token, sent as HTTP Basic auth

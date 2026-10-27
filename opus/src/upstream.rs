@@ -55,6 +55,20 @@ pub struct Upstream {
 /// Ids per `object-info` / `/gvfs/sizes` request, and per blob batch.
 pub const BATCH: usize = 4000;
 
+/// A password in the upstream URL would not be used (credentials come from the
+/// environment), yet would be on the command line for every local user to read: refused.
+/// A user name alone (ADO's clone URLs: `https://org@dev.azure.com/...`) is fine.
+fn refuse_password(spec: &str) -> Result<()> {
+    if crate::http::has_password(spec) {
+        crate::bail!(
+            "upstream {}: the URL holds a password, which is not used: pass the token in an \
+             environment variable named by --token-env (and --token-user), or --auth-header-env",
+            crate::http::redacted(spec)
+        );
+    }
+    Ok(())
+}
+
 /// Credentials for an HTTP upstream.
 #[derive(Clone, Default)]
 pub struct Auth {
@@ -65,6 +79,7 @@ pub struct Auth {
 impl Upstream {
     /// `spec` is an http(s) URL or a local repository path.
     pub fn open(spec: &str, branch: &str, auth: &Auth) -> Result<Upstream> {
+        refuse_password(spec)?;
         let branch_ref = if branch.starts_with("refs/") {
             branch.to_string()
         } else {
@@ -81,7 +96,10 @@ impl Upstream {
         } else {
             let p = PathBuf::from(spec.strip_prefix("file://").unwrap_or(spec));
             if !p.exists() {
-                crate::bail!("upstream {spec}: no such repository");
+                crate::bail!(
+                    "upstream {}: no such repository",
+                    crate::http::redacted(spec)
+                );
             }
             Transport::Local { git_dir: p }
         };
@@ -93,7 +111,7 @@ impl Upstream {
             detected: is_local,
             caps: Vec::new(),
             gvfs: if is_local { Some(false) } else { None },
-            label: spec.to_string(),
+            label: crate::http::redacted(spec),
         })
     }
 
@@ -870,6 +888,7 @@ impl AsyncBody {
 impl AsyncUpstream {
     /// `spec` is an http(s) URL or a local repository path.
     pub fn open(spec: &str, auth: &Auth) -> Result<AsyncUpstream> {
+        refuse_password(spec)?;
         let transport = if spec.starts_with("http://") || spec.starts_with("https://") {
             let mut client =
                 crate::aclient::AClient::new(Url::parse(spec)?, Duration::from_secs(300));
@@ -882,7 +901,10 @@ impl AsyncUpstream {
         } else {
             let p = PathBuf::from(spec.strip_prefix("file://").unwrap_or(spec));
             if !p.exists() {
-                crate::bail!("upstream {spec}: no such repository");
+                crate::bail!(
+                    "upstream {}: no such repository",
+                    crate::http::redacted(spec)
+                );
             }
             AsyncTransport::Local { git_dir: p }
         };
@@ -893,7 +915,7 @@ impl AsyncUpstream {
             detected: is_local,
             caps: Vec::new(),
             gvfs: if is_local { Some(false) } else { None },
-            label: spec.to_string(),
+            label: crate::http::redacted(spec),
         })
     }
 
@@ -1120,6 +1142,27 @@ impl AsyncUpstream {
 )]
 mod tests {
     use super::*;
+
+    /// A password in the upstream URL is refused (and not repeated); a user name alone is
+    /// fine, and labels (which errors and logs print) hold no userinfo.
+    #[test]
+    fn upstream_urls_with_passwords_are_refused() {
+        let auth = Auth::default();
+        for spec in [
+            "https://me:s3cret@dev.azure.com/o/p/_git/r",
+            "http://u:s3cret@127.0.0.1:1/r",
+        ] {
+            let e = Upstream::open(spec, "main", &auth)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(e.contains("--token-env") && !e.contains("s3cret"), "{e}");
+            let e = AsyncUpstream::open(spec, &auth).err().unwrap().to_string();
+            assert!(!e.contains("s3cret"), "{e}");
+        }
+        let u = Upstream::open("https://org@dev.azure.com/org/p/_git/r", "main", &auth).unwrap();
+        assert_eq!(u.label, "https://dev.azure.com/org/p/_git/r");
+    }
 
     fn git(dir: &std::path::Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
         let mut cmd = Command::new("git");

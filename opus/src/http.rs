@@ -28,7 +28,7 @@ impl Url {
         } else if let Some(r) = s.strip_prefix("http://") {
             (false, r)
         } else {
-            crate::bail!("not an http(s) URL: {s}");
+            crate::bail!("not an http(s) URL: {}", redacted(s));
         };
         let (authority, path) = match rest.find('/') {
             Some(i) => (rest.get(..i).unwrap_or(""), rest.get(i..).unwrap_or("")),
@@ -38,12 +38,13 @@ impl Url {
         let (host, port) = match authority.rsplit_once(':') {
             Some((h, p)) if !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => (
                 h.to_string(),
-                p.parse().map_err(|_| crate::err!("bad port in {s}"))?,
+                p.parse()
+                    .map_err(|_| crate::err!("bad port in {}", redacted(s)))?,
             ),
             _ => (authority.to_string(), if https { 443 } else { 80 }),
         };
         if host.is_empty() {
-            crate::bail!("no host in URL {s}");
+            crate::bail!("no host in URL {}", redacted(s));
         }
         Ok(Url {
             https,
@@ -239,15 +240,16 @@ impl Client {
                     self.conn = None;
                     if fresh || attempt == 1 {
                         return Err(e).ctx(&format!(
-                            "{method} {}{}{path}",
+                            "{method} {}{}{}",
                             self.url.origin(),
-                            self.url.path
+                            self.url.path,
+                            without_query(path)
                         ));
                     }
                 }
             }
         }
-        crate::bail!("{method} {path}: request failed")
+        crate::bail!("{method} {}: request failed", without_query(path))
     }
 
     fn read_head(&mut self, method: &str) -> Result<Head> {
@@ -440,6 +442,38 @@ impl Drop for Response<'_> {
     }
 }
 
+/// A request target fit for errors and logs: without its query, which may carry a
+/// credential (an Azure SAS).
+pub fn without_query(target: &str) -> &str {
+    target.split(['?', '#']).next().unwrap_or("")
+}
+
+/// The userinfo of a URL (`user[:password]` before `@`), if it has one.
+fn userinfo(spec: &str) -> Option<&str> {
+    let (_, rest) = spec.split_once("://")?;
+    let authority = rest.get(..rest.find(['/', '?', '#']).unwrap_or(rest.len()))?;
+    Some(authority.rsplit_once('@')?.0)
+}
+
+/// Whether a URL holds a password (`user:password@host`).
+pub fn has_password(spec: &str) -> bool {
+    userinfo(spec)
+        .and_then(|u| u.split_once(':'))
+        .is_some_and(|(_, password)| !password.is_empty())
+}
+
+/// `spec` fit for errors and logs: a URL without its userinfo (credentials) or query (an
+/// Azure SAS); anything else (a local path) as it is.
+pub fn redacted(spec: &str) -> String {
+    let Some((scheme, rest)) = spec.split_once("://") else {
+        return spec.to_string();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, path) = rest.split_at(end);
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    format!("{scheme}://{host}{}", without_query(path))
+}
+
 /// `Basic base64(user:password)`.
 pub fn basic_auth(user: &str, password: &str) -> String {
     format!(
@@ -451,6 +485,45 @@ pub fn basic_auth(user: &str, password: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Credentials in a URL (its userinfo, an Azure SAS in its query) never reach an error.
+    #[test]
+    fn errors_hold_no_credentials() {
+        assert_eq!(
+            redacted("https://me:s3cret@dev.azure.com/org/_git/repo?x=1"),
+            "https://dev.azure.com/org/_git/repo"
+        );
+        assert_eq!(
+            redacted("https://org@dev.azure.com/org"),
+            "https://dev.azure.com/org"
+        );
+        assert_eq!(redacted("/srv/repo.git"), "/srv/repo.git");
+        assert!(has_password("https://me:s3cret@host/x"));
+        assert!(!has_password("https://org@dev.azure.com/org/_git/r"));
+        assert!(!has_password("https://me:@host/x"));
+        assert!(!has_password("https://host/a:b@c"));
+        let e = Url::parse("https://me:s3cret@host:99999/x").unwrap_err();
+        assert!(!e.to_string().contains("s3cret"), "{e}");
+        // A request that fails (the server closes before answering) names its target
+        // without the query.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // One connection: a request on a fresh one is not retried.
+        let server = std::thread::spawn(move || drop(listener.accept().unwrap()));
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/acct")).unwrap();
+        let mut c = Client::new(url, Duration::from_secs(5));
+        let e = c
+            .request("GET", "/c/key?sv=2021&sig=s3cret", &[], b"")
+            .err()
+            .unwrap();
+        let text = format!("{e:#}");
+        assert!(
+            text.contains("/acct/c/key") && !text.contains("s3cret"),
+            "{text}"
+        );
+        drop(c);
+        let _ = server.join();
+    }
 
     #[test]
     fn url_parsing() {

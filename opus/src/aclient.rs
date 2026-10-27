@@ -124,7 +124,15 @@ impl AClient {
         headers: &[(&str, &str)],
         body: Bytes,
     ) -> Result<AResponse> {
-        let what = || format!("{method} {}{}{path}", self.url.origin(), self.url.path);
+        // Without the query: an Azure SAS travels in it.
+        let what = || {
+            format!(
+                "{method} {}{}{}",
+                self.url.origin(),
+                self.url.path,
+                crate::http::without_query(path)
+            )
+        };
         for _ in 0..2 {
             let (mut sender, fresh) = match self.pooled() {
                 Some(s) => (s, false),
@@ -224,5 +232,30 @@ impl AResponse {
             .trim()
             .to_string();
         crate::bail!("{what}: HTTP {status}: {text}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A failed request names its target without the query (where an Azure SAS travels).
+    #[test]
+    fn errors_hold_no_query() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let url = Url::parse("http://127.0.0.1:1/acct").unwrap();
+        let c = AClient::new(url, Duration::from_secs(5));
+        let e = rt
+            .block_on(c.request("GET", "/c/key?sv=2021&sig=s3cret", &[], Bytes::new()))
+            .err()
+            .unwrap();
+        let text = format!("{e:#}");
+        assert!(
+            text.contains("/acct/c/key") && !text.contains("s3cret"),
+            "{text}"
+        );
     }
 }
