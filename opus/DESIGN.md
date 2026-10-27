@@ -431,8 +431,14 @@ arena. A sizes answer is built in that buffer too, and a resolved loose object t
 copied there, so the arena is free before the client reads. A pack answer streams from its
 plan in the arena, which a slow reader therefore still holds (put a load balancer that
 buffers responses in front of an edge). A commit closure larger than its arena grows it in a
-`cold_section`; `reset` shrinks it back. The server speaks plain HTTP/1.1: put TLS and HTTP/2 on the load balancer in
-front of an edge. The localhost proxy needs neither.
+`cold_section`, by doubling, up to `--max-request-objects` (default 2^22; beyond: 413). Grown
+arenas share a budget (`--grow-objects`, default as much again as all arenas hold, about 250
+bytes an object; the `gvfs_grown_objects` gauge), charged as their room doubles. An
+expansion past it gets a 503 at once rather than wait holding its arena, so expansions never
+queue behind each other and never park arenas that blob batches need; a SearchGold tip
+(431k objects) takes 2^18, so every arena can expand one at once. The lease's end shrinks
+what grew, then returns its charge. The server speaks plain HTTP/1.1: put TLS and HTTP/2 on
+the load balancer in front of an edge. The localhost proxy needs neither.
 
 ## Stores with real blobs (`--blobs separate`)
 

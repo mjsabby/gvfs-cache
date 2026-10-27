@@ -1440,3 +1440,64 @@ fn slow_clients_hold_no_arena() {
     server.assert_clean();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The object count in a pack's header.
+fn pack_object_count(pack: &[u8]) -> usize {
+    assert_eq!(&pack[..4], b"PACK");
+    u32::from_be_bytes(pack[8..12].try_into().unwrap()) as usize
+}
+
+/// A commit's expansion may grow its arena only up to `--max-request-objects` objects (413
+/// beyond); requests that do not expand commits are not affected; the default allows it.
+#[test]
+fn commit_expansion_is_capped() {
+    let root = tempdir("capped");
+    let mut up = Upstream::new(&root);
+    for _ in 0..3 {
+        up.commit(4);
+    }
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let tip = up.tip();
+    let objects = up.objects(&tip);
+    let blobs: Vec<String> = types(&up.bare, &objects)
+        .into_iter()
+        .filter(|(_, t)| t == "blob")
+        .map(|(id, _)| id)
+        .take(8)
+        .collect();
+    assert_eq!(blobs.len(), 8);
+    let pack = "application/x-git-packfile";
+    let cache = root.join("cache");
+    let capped = Server::start(&[
+        "--store",
+        &store,
+        "--cache-dir",
+        cache.to_str().unwrap(),
+        "--max-request-objects",
+        "5",
+    ]);
+    let commit = json_ids(std::slice::from_ref(&tip), Some(3));
+    let (status, _, body) = capped.post("/gvfs/objects", commit.as_bytes(), pack);
+    assert_eq!(status, 413, "{}", String::from_utf8_lossy(&body));
+    let (status, _, body) = capped.post("/gvfs/objects", json_ids(&blobs, None).as_bytes(), pack);
+    assert_eq!(status, 200);
+    assert_eq!(pack_object_count(&body), 8);
+    // Again after the refused one: its arena is back to its size and its permit free.
+    let (status, _, _) = capped.post("/gvfs/objects", commit.as_bytes(), pack);
+    assert_eq!(status, 413);
+    capped.assert_clean();
+    drop(capped);
+
+    let server = Server::start(&["--store", &store, "--cache-dir", cache.to_str().unwrap()]);
+    let (status, _, body) = server.post("/gvfs/objects", commit.as_bytes(), pack);
+    assert_eq!(status, 200);
+    let trees_and_commits = types(&up.bare, &objects)
+        .iter()
+        .filter(|(_, t)| t != "blob")
+        .count();
+    assert_eq!(pack_object_count(&body), trees_and_commits);
+    server.assert_clean();
+    let _ = std::fs::remove_dir_all(&root);
+}

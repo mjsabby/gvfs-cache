@@ -8,6 +8,7 @@
 //! allocation.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Semaphore, SemaphorePermit};
@@ -184,10 +185,30 @@ pub struct Arena {
     /// share an id) and sized for a blob batch, not the arena's whole object capacity, so
     /// it stays in cache.
     pub blob_seen: OidSet,
-    /// Commit expansion may outgrow the arena: allow its structures to grow (counted as
-    /// cold allocations) for this request; `reset` shrinks them back.
+    /// Commit expansion may outgrow the arena: its structures may grow (counted as cold
+    /// allocations) for this request, as far as [`ArenaPool::charge`] allows;
+    /// [`Arena::shrink`] takes them back when the lease ends.
     pub grow: bool,
+    pub growth: Growth,
     objects: usize,
+    bytes: usize,
+}
+
+/// What a commit expansion has taken from its pool's growth budget ([`ArenaPool::charge`]).
+pub struct Growth {
+    /// Objects the arena plans without growing (at most `--max-request-objects`).
+    base: usize,
+    /// Room beyond `base` charged to the pool.
+    charged: usize,
+}
+
+/// Why [`ArenaPool::charge`] refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refused {
+    /// Past `--max-request-objects`: the request is never served (413).
+    TooLarge,
+    /// Grown arenas hold the whole `--grow-objects` budget: retry later (503).
+    Busy,
 }
 
 /// Where a blob entry of a response is.
@@ -229,7 +250,12 @@ impl Arena {
             proxied: Vec::with_capacity(PROXIED),
             blob_seen: OidSet::with_capacity(BLOBS),
             grow: false,
+            growth: Growth {
+                base: objects,
+                charged: 0,
+            },
             objects,
+            bytes,
         };
         // Touch every page now so requests never take first-touch faults.
         a.out.resize(a.out.capacity(), 0);
@@ -238,14 +264,6 @@ impl Arena {
     }
 
     pub fn reset(&mut self) {
-        if self.grow {
-            let n = self.objects;
-            self.seen.shrink(n);
-            self.visited.shrink(n);
-            shrink(&mut self.work, n);
-            self.splice.shrink(n);
-            self.grow = false;
-        }
         self.oids.clear();
         self.oid_at.clear();
         self.found.clear();
@@ -259,23 +277,47 @@ impl Arena {
         self.blobs.clear();
         self.proxied.clear();
         self.blob_seen.clear();
+    }
+
+    /// Every structure back to its size at startup if a request grew it far beyond (a commit
+    /// closure, a large object, a large blob batch): grown memory lasts one request (cold
+    /// path).
+    pub fn shrink(&mut self) {
+        let (n, quarter) = (self.objects, self.bytes / 4);
+        self.seen.shrink(n);
+        self.visited.shrink(n);
+        shrink(&mut self.work, n);
+        let few = n.min(1 << 16);
+        shrink(&mut self.commits, few);
+        shrink(&mut self.next_commits, few);
+        self.splice.shrink(n, quarter);
+        self.resolver.shrink(quarter.min(4 << 20));
+        if self.out.capacity() > quarter.saturating_mul(4) {
+            let _cold = gvfs_alloc_guard::cold_section();
+            self.out.clear();
+            self.out.shrink_to(quarter.saturating_mul(2));
+            self.out.resize(quarter.saturating_mul(2), 0);
+        }
         self.blob_seen.shrink(BLOBS);
         shrink(&mut self.proxied, PROXIED);
-        if self.blobs.capacity() > BLOBS.saturating_mul(2) {
-            let _cold = gvfs_alloc_guard::cold_section();
-            self.blobs.shrink_to(BLOBS);
-        }
+        shrink(&mut self.blobs, BLOBS);
+        self.grow = false;
     }
 }
 
-/// A fixed set of arenas leased by requests. Each is boxed: a lease, held across a
-/// request's awaits, is then a pointer in the connection's task, not the arena itself.
+/// A fixed set of arenas leased by requests.
 pub struct ArenaPool {
     // Boxed on purpose: a lease moves its box out of the pool.
     #[allow(clippy::vec_box)]
     free: Mutex<Vec<Box<Arena>>>,
     /// One permit per arena in `free`: a request waits for one without holding a thread.
     permits: Semaphore,
+    /// Room for objects that grown arenas have beyond their size, together, and the most
+    /// they may have.
+    grown: AtomicUsize,
+    grow_budget: usize,
+    /// The most objects one commit expansion may plan.
+    max_objects: usize,
 }
 
 /// A leased arena; returned to the pool on drop.
@@ -287,14 +329,30 @@ pub struct Lease<'a> {
 }
 
 impl ArenaPool {
-    pub fn new(count: usize, bytes: usize, objects: usize) -> ArenaPool {
+    /// `count` arenas of `bytes` and `objects`. Commit expansions may grow them: each to at
+    /// most `max_objects`, all together by at most `grow_budget` objects beyond their size.
+    pub fn new(
+        count: usize,
+        bytes: usize,
+        objects: usize,
+        grow_budget: usize,
+        max_objects: usize,
+    ) -> ArenaPool {
+        // One that could never fit the budget is refused as too large, not as busy (which a
+        // client retries).
+        let max_objects = max_objects.min(objects.saturating_add(grow_budget));
         let mut free = Vec::with_capacity(count);
         for _ in 0..count {
-            free.push(Box::new(Arena::new(bytes, objects)));
+            let mut a = Box::new(Arena::new(bytes, objects));
+            a.growth.base = objects.min(max_objects);
+            free.push(a);
         }
         ArenaPool {
             free: Mutex::new(free),
             permits: Semaphore::new(count),
+            grown: AtomicUsize::new(0),
+            grow_budget,
+            max_objects,
         }
     }
 
@@ -314,6 +372,44 @@ impl ArenaPool {
             _permit: permit,
         })
     }
+
+    /// Lets a commit expansion plan `objects` objects in all: what grown arenas hold
+    /// together stays within the budget, without making expansions wait for each other.
+    #[inline]
+    pub fn charge(&self, g: &mut Growth, objects: usize) -> std::result::Result<(), Refused> {
+        if objects <= g.base.saturating_add(g.charged) {
+            return Ok(());
+        }
+        self.charge_more(g, objects)
+    }
+
+    #[cold]
+    fn charge_more(&self, g: &mut Growth, objects: usize) -> std::result::Result<(), Refused> {
+        if objects > self.max_objects {
+            return Err(Refused::TooLarge);
+        }
+        // Its structures grow by doubling: charge the room they grow to.
+        let mut room = g.base.max(1);
+        while room < objects {
+            room = room.saturating_mul(2);
+        }
+        let want = room
+            .saturating_sub(g.base)
+            .min(self.max_objects.saturating_sub(g.base));
+        let more = want.saturating_sub(g.charged);
+        self.grown
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |t| {
+                t.checked_add(more).filter(|&n| n <= self.grow_budget)
+            })
+            .map_err(|_| Refused::Busy)?;
+        g.charged = want;
+        Ok(())
+    }
+
+    /// Room for objects that grown arenas have beyond their size now.
+    pub fn grown(&self) -> usize {
+        self.grown.load(Ordering::Relaxed)
+    }
 }
 
 impl Lease<'_> {
@@ -324,7 +420,14 @@ impl Lease<'_> {
 
 impl Drop for Lease<'_> {
     fn drop(&mut self) {
-        if let Some(a) = self.arena.take() {
+        if let Some(mut a) = self.arena.take() {
+            // Grown memory goes before its charge does: what grown arenas hold stays within
+            // the budget.
+            a.shrink();
+            let charged = std::mem::take(&mut a.growth.charged);
+            if charged > 0 {
+                self.pool.grown.fetch_sub(charged, Ordering::Relaxed);
+            }
             if let Ok(mut free) = self.pool.free.lock() {
                 // Capacity was reserved for every arena at startup: never reallocates.
                 free.push(a);
@@ -361,11 +464,62 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let pool = ArenaPool::new(1, 4096, 16);
+            let pool = ArenaPool::new(1, 4096, 16, 0, 16);
             let l = pool.lease(Duration::from_millis(10)).await.unwrap();
             assert!(pool.lease(Duration::from_millis(10)).await.is_none());
             drop(l);
             assert!(pool.lease(Duration::from_millis(10)).await.is_some());
+        });
+    }
+
+    /// Commit expansions grow arenas within a shared budget, each up to its own cap; a
+    /// grown arena is back to its size, and its charge back in the budget, when its lease
+    /// ends.
+    #[test]
+    fn growth_is_bounded_and_ends_with_the_lease() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let wait = Duration::from_millis(10);
+            // Base 16 objects, a budget of 48, each request at most 56.
+            let pool = ArenaPool::new(2, 4096, 16, 48, 56);
+            let mut a = pool.lease(wait).await.unwrap();
+            let mut b = pool.lease(wait).await.unwrap();
+            let ga = &mut a.arena().unwrap().growth;
+            assert_eq!(pool.charge(ga, 16), Ok(()));
+            assert_eq!(pool.grown(), 0);
+            assert_eq!(pool.charge(ga, 17), Ok(()));
+            assert_eq!(pool.grown(), 16, "room doubles");
+            assert_eq!(pool.charge(ga, 32), Ok(()));
+            assert_eq!(pool.grown(), 16);
+            assert_eq!(pool.charge(ga, 33), Ok(()));
+            assert_eq!(pool.grown(), 40, "never past the request's own cap");
+            assert_eq!(pool.charge(ga, 57), Err(Refused::TooLarge));
+            let gb = &mut b.arena().unwrap().growth;
+            assert_eq!(pool.charge(gb, 17), Err(Refused::Busy));
+            let grown = a.arena().unwrap();
+            grown.grow = true;
+            for i in 0..1000u32 {
+                let mut id = Oid::ZERO;
+                id.0[..4].copy_from_slice(&(i + 1).to_le_bytes());
+                assert!(grown.seen.insert_grow(&id, true).unwrap());
+                assert!(push(&mut grown.work, id, true));
+            }
+            assert!(grown.seen.len() == 1000 && grown.work.capacity() >= 1000);
+            drop(a);
+            assert_eq!(pool.grown(), 0);
+            assert_eq!(pool.charge(&mut b.arena().unwrap().growth, 17), Ok(()));
+            drop(b);
+            assert_eq!(pool.grown(), 0);
+            for _ in 0..2 {
+                let mut l = pool.lease(wait).await.unwrap();
+                let arena = l.arena().unwrap();
+                assert!(!arena.grow);
+                assert!(arena.work.capacity() <= 32, "{}", arena.work.capacity());
+                assert!(arena.seen.is_empty());
+            }
         });
     }
 }

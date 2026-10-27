@@ -1138,10 +1138,12 @@ async fn objects_post(
             }
             Miss::NotFound => not_found(ctx, stream, keep).await,
             Miss::Broken => unavailable(ctx, stream, keep).await,
+            Miss::Busy => busy(ctx, stream).await,
         };
     }
-    match plan_objects(&view, arena, depth, &mut budget).await {
+    match plan_objects(ctx, &view, arena, depth, &mut budget).await {
         Ok(()) => {}
+        Err(Miss::Busy) => return busy(ctx, stream).await,
         Err(Miss::NotFound) => return not_found(ctx, stream, keep).await,
         Err(Miss::Capacity) => {
             respond(ctx, stream, 413, "request expands beyond the arena\n", keep).await?;
@@ -1161,6 +1163,7 @@ async fn objects_post(
             return Ok(keep);
         }
         Err(Miss::Broken) => return unavailable(ctx, stream, keep).await,
+        Err(Miss::Busy) => return busy(ctx, stream).await,
     }
     let count = match lay_out(&view, arena, &mut budget).await {
         Some(n) => n,
@@ -1295,6 +1298,43 @@ enum Miss {
     NotFound,
     Capacity,
     Broken,
+    /// Grown arenas hold the whole growth budget (commit expansions).
+    Busy,
+}
+
+/// 503 for a request that could not get what it needs now (clients retry).
+async fn busy(ctx: &Ctx, stream: &TcpStream) -> std::io::Result<bool> {
+    inc(&ctx.metrics.busy);
+    respond(ctx, stream, 503, "busy\n", false).await?;
+    Ok(false)
+}
+
+/// Looks up the requested ids, keeping the answers (as many as `found` holds) for
+/// [`plan_objects`]. True if one is a commit, whose expansion may grow the arena; that
+/// settles it, so lookups stop once `found` is full.
+async fn find_ids(view: &View, arena: &mut Arena, budget: &mut Budget) -> bool {
+    let Arena { oids, found, .. } = arena;
+    found.clear();
+    let mut commit = false;
+    for (i, o) in oids.iter().enumerate() {
+        if commit && i >= found.capacity() {
+            break;
+        }
+        if let Some(next) = oids.get(i.saturating_add(AHEAD)) {
+            view.preload(next);
+        }
+        let hit = view.find(o);
+        commit |= hit
+            .and_then(|(k, s)| view.all.get(usize::from(k)).and_then(|sl| sl.rec(s)))
+            .is_some_and(|r| r.kind == OBJ_COMMIT);
+        if i < found.capacity() {
+            found.push(hit);
+        }
+        if budget.due() {
+            budget.pause().await;
+        }
+    }
+    commit
 }
 
 /// Adds the requested objects to the arena's splice; commits bring `depth - 1` levels of
@@ -1302,11 +1342,16 @@ enum Miss {
 /// In a separate-blob store, leaves in `arena.oids` only the ids no slab has, for
 /// [`plan_blobs`].
 async fn plan_objects(
+    ctx: &Ctx,
     view: &View,
     arena: &mut Arena,
     depth: u64,
     budget: &mut Budget,
 ) -> Result<(), Miss> {
+    // Commit expansion can name hundreds of thousands of trees: the arena may grow for it,
+    // up to `--max-request-objects`, within the `--grow-objects` budget all arenas share.
+    arena.grow = find_ids(view, arena, budget).await;
+    let pool = &ctx.arenas;
     let Arena {
         oids,
         oid_at,
@@ -1319,32 +1364,20 @@ async fn plan_objects(
         splice,
         resolver,
         grow,
+        growth,
         ..
     } = arena;
-    // Commit expansion can name hundreds of thousands of trees: let it grow the arena. The
-    // lookups that tell are kept for the loop below (as many as `found` holds), and stop
-    // where they did before once a commit settles it.
-    found.clear();
-    *grow = false;
-    for (i, o) in oids.iter().enumerate() {
-        if *grow && i >= found.capacity() {
-            break;
-        }
-        if let Some(next) = oids.get(i.saturating_add(AHEAD)) {
-            view.preload(next);
-        }
-        let hit = view.find(o);
-        *grow |= hit
-            .and_then(|(k, s)| view.all.get(usize::from(k)).and_then(|sl| sl.rec(s)))
-            .is_some_and(|r| r.kind == OBJ_COMMIT);
-        if i < found.capacity() {
-            found.push(hit);
-        }
-        if budget.due() {
-            budget.pause().await;
-        }
-    }
     let grow = *grow;
+    // What a grown arena holds, charged to the budget.
+    let charge = |splice: &crate::splice::ObjectSplice, growth: &mut crate::arena::Growth| {
+        if !grow {
+            return Ok(());
+        }
+        pool.charge(growth, splice.refs.len()).map_err(|r| match r {
+            crate::arena::Refused::TooLarge => Miss::Capacity,
+            crate::arena::Refused::Busy => Miss::Busy,
+        })
+    };
     let mut rest = 0usize;
     for i in 0..oids.len() {
         if budget.due() {
@@ -1380,6 +1413,7 @@ async fn plan_objects(
             splice
                 .add(&view.all, ObjRef { slab: k, slot }, seen, grow)
                 .map_err(|_| Miss::Capacity)?;
+            charge(splice, growth)?;
             continue;
         }
         commits.clear();
@@ -1408,6 +1442,7 @@ async fn plan_objects(
                         grow,
                     )
                     .map_err(|_| Miss::Capacity)?;
+                charge(splice, growth)?;
                 let slab = view.all.get(usize::from(ck)).ok_or(Miss::Broken)?;
                 let (_, content) = resolver.resolve(slab, cslot).map_err(|_| Miss::Broken)?;
                 let tree = crate::object::commit_tree(content).ok_or(Miss::Broken)?;
@@ -1440,6 +1475,7 @@ async fn plan_objects(
                         grow,
                     )
                     .map_err(|_| Miss::Capacity)?;
+                charge(splice, growth)?;
                 let slab = view.all.get(usize::from(tk)).ok_or(Miss::Broken)?;
                 let (kind, content) = resolver.resolve(slab, tslot).map_err(|_| Miss::Broken)?;
                 if kind != OBJ_TREE {

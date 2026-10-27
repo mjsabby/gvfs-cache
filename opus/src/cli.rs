@@ -92,6 +92,12 @@ SERVE OPTIONS:
     --workers <N>              connection threads (default: 256)
     --arenas <N>               request scratch arenas (default: 2 x cores)
     --arena-mib <N>            size of each arena (default: 8)
+    --arena-objects <N>        ids each arena plans without growing (default: 262144)
+    --max-request-objects <N>  objects one commit expansion may plan (default: 4194304);
+                               beyond: 413
+    --grow-objects <N>         room commit expansions may grow their arenas by, together, in
+                               objects (default: arenas x arena-objects, i.e. as much again
+                               as the arenas hold; ~250 bytes each); beyond: 503
     --cache-server <NAME=URL>  advertised in /gvfs/config (repeatable)
     --alloc-guard <count|strict|trace>   hot-path allocation policy (default: count)
     --prefetch-idx <auto|always|never>   send each prefetch pack's .idx; auto (default):

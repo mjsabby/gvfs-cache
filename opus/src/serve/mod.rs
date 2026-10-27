@@ -143,6 +143,10 @@ pub struct Options {
     pub arenas: usize,
     pub arena_bytes: usize,
     pub arena_objects: usize,
+    /// Objects commit expansions may plan beyond their arenas' size, together
+    /// (`--grow-objects`), and the most one may plan (`--max-request-objects`).
+    pub grow_objects: usize,
+    pub max_request_objects: usize,
     pub cache_servers: Vec<(String, String)>,
     pub idle_timeout: Duration,
     pub write_timeout: Duration,
@@ -174,6 +178,8 @@ pub fn main(args: &[String]) -> Result<()> {
             "arenas",
             "arena-mib",
             "arena-objects",
+            "grow-objects",
+            "max-request-objects",
             "cache-server",
             "alloc-guard",
             "idle-secs",
@@ -225,6 +231,8 @@ pub fn main(args: &[String]) -> Result<()> {
         other => crate::bail!("--superset-tier must be 24h, 168h or never, not {other:?}"),
     };
     let cores = crate::util::default_threads();
+    let arenas = f.num("arenas", cores.saturating_mul(2))?;
+    let arena_objects = f.num("arena-objects", 1usize << 18)?;
     let opts = Options {
         store: Store::open(
             f.require("store")?,
@@ -242,9 +250,12 @@ pub fn main(args: &[String]) -> Result<()> {
             .unwrap_or_else(|| std::env::temp_dir().join("gvfs-daemon-cache")),
         poll: Duration::from_millis(f.num("poll-ms", 2000u64)?),
         workers: f.num("workers", cores)?,
-        arenas: f.num("arenas", cores.saturating_mul(2))?,
+        arenas,
         arena_bytes: f.num("arena-mib", 8usize)?.saturating_mul(1 << 20),
-        arena_objects: f.num("arena-objects", 1usize << 18)?,
+        arena_objects,
+        // As much again as the arenas hold.
+        grow_objects: f.num("grow-objects", arenas.saturating_mul(arena_objects))?,
+        max_request_objects: f.num("max-request-objects", 1usize << 22)?,
         cache_servers,
         // At most a year: deadlines are instants, which must not overflow.
         idle_timeout: Duration::from_secs(f.num("idle-secs", 30u64)?.min(365 * 86400)),
@@ -290,6 +301,8 @@ pub fn run(o: Options) -> Result<()> {
         arenas,
         arena_bytes,
         arena_objects,
+        grow_objects,
+        max_request_objects,
         cache_servers,
         idle_timeout,
         write_timeout,
@@ -382,7 +395,13 @@ pub fn run(o: Options) -> Result<()> {
         .unwrap_or(1)
         .clamp(1, 64),
         max_idle: i64::try_from(max_idle_conns).unwrap_or(i64::MAX),
-        arenas: ArenaPool::new(arenas.max(1), arena_bytes, arena_objects),
+        arenas: ArenaPool::new(
+            arenas.max(1),
+            arena_bytes,
+            arena_objects,
+            grow_objects,
+            max_request_objects,
+        ),
         arena_wait: Duration::from_secs(10),
         config_json: config_json(&cache_servers),
         metrics: Metrics::default(),
@@ -1076,7 +1095,8 @@ pub fn metrics_text(ctx: &Ctx) -> String {
          gvfs_connections_idle {}\n\
          gvfs_connections_idle_closed_total {}\n\
          gvfs_connections_idle_overflow_total {}\n\
-         gvfs_buffer_spare_bytes {}\n",
+         gvfs_buffer_spare_bytes {}\n\
+         gvfs_grown_objects {}\n",
         get(&m.prefetch),
         get(&m.object_get),
         get(&m.object_post),
@@ -1110,7 +1130,8 @@ pub fn metrics_text(ctx: &Ctx) -> String {
         ctx.idle.load(Ordering::Relaxed).max(0),
         get(&m.idle_closed),
         get(&m.idle_overflow),
-        ctx.spare.left()
+        ctx.spare.left(),
+        ctx.arenas.grown()
     )
 }
 

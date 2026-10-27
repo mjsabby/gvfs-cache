@@ -279,9 +279,14 @@ impl ObjectSplice {
         self.out_at.clear();
     }
 
-    /// Back to `n` entries of capacity after a request that grew it (cold path).
-    pub fn shrink(&mut self, n: usize) {
+    /// Back to `n` entries and `bytes` header bytes of capacity after a request that grew it
+    /// (cold path).
+    pub fn shrink(&mut self, n: usize, bytes: usize) {
         let _cold = gvfs_alloc_guard::cold_section();
+        if self.bytes.capacity() > bytes.saturating_mul(2) {
+            self.bytes.clear();
+            self.bytes.shrink_to(bytes);
+        }
         for v in [&mut self.out_at] {
             if v.capacity() > n.saturating_mul(2) {
                 v.clear();
@@ -470,6 +475,24 @@ pub struct Resolver {
 }
 
 impl Resolver {
+    /// Back to buffers of `bytes` (as [`Resolver::with_capacity`] made them) after an object
+    /// far larger grew them (cold path).
+    pub fn shrink(&mut self, bytes: usize) {
+        for buf in [&mut self.a, &mut self.b, &mut self.delta] {
+            if buf.capacity() > bytes.saturating_mul(2) {
+                let _cold = gvfs_alloc_guard::cold_section();
+                buf.clear();
+                buf.shrink_to(bytes);
+                buf.resize(bytes, 0);
+            }
+        }
+        if self.chain.capacity() > 8192 {
+            let _cold = gvfs_alloc_guard::cold_section();
+            self.chain.clear();
+            self.chain.shrink_to(4096);
+        }
+    }
+
     /// Buffers sized for objects up to `bytes` (larger ones grow them once, off the hot
     /// path's books), with the inflate state warmed up.
     pub fn with_capacity(bytes: usize) -> Resolver {
