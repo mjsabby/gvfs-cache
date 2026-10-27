@@ -491,9 +491,24 @@ store/
 **Blob packs** (`src/blobs.rs`) hold whole entries only, so any entry is served by
 splicing its own bytes. An entry keeps the upstream's zlib stream untouched, unless the
 blob is at least 1 MiB and its first MiB compresses by less than 5%: then it is rewritten
-as deflate *stored* blocks (65,535 content bytes each, 5-byte headers, 0.008% overhead),
-which clients inflate at the speed of a copy. A **segment** record is `id | pack u32 | offset (48 bits) | header length (8) | stored (1) |
+as deflate *stored* blocks (65,535 content bytes each, 5-byte headers, 0.008% overhead). A
+**segment** record is `id | pack u32 | offset (48 bits) | header length (8) | stored (1) |
 entry length u64 | size u64`: 64-bit lengths, so entries beyond 4 GiB are ordinary.
+
+The stored encoding is **optional**: an optimization for clients, not part of the format.
+Readers take either encoding, the edge serves both alike (it inflates neither), and a store
+may mix them. The copier could stop writing it, or move its threshold, without migrating a
+store or changing a client. What it buys is decoding: git inflates stored blocks at the
+speed of a copy. A 256 MiB blob that compresses by about 3% reads 5× faster with git 2.53
+(`cat-file` 0.60 s → 0.12 s, `index-pack` 1.29 s → 0.81 s), which saves about 1.9 s of CPU
+per GiB each time a checkout, diff or index pass reads it. The cost is 3% more bytes in
+storage, on the wire and on the client's disk. Content that does not compress at all
+(archives, video, encrypted files) gains nothing: git's own zlib already writes it as
+stored blocks. The saving lasts only where the client keeps the entry as sent: in packs
+(POST batches, and a POST for one blob of 16 MiB or more, answered with that blob's own
+pack file). Scalar's maintenance recompresses loose objects. The encoding was first chosen
+so that byte ranges could be read in place, through an endpoint since removed (REPORT.md
+§15, #13).
 
 ### The consistency rule
 
@@ -547,7 +562,8 @@ upstream, protocol v2 `want`s otherwise). It parses packs as they arrive and wri
 whole-blob pack:
 
 * a whole entry streams through in fixed memory: inflated once in 64 KiB pieces to verify
-  its id (SHA-1 of `blob <size>\0` + content) and size, then written raw or stored;
+  its id (SHA-1 of `blob <size>\0` + content) and size, then written raw or, optionally,
+  stored (see Blob packs);
 * a delta is inflated in memory and applied to its base, read back from the output (a REF
   base may come later: the delta waits);
 * the output declares as many entries as blobs were asked for; any other object, a blob
