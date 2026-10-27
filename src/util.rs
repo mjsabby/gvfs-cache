@@ -191,16 +191,21 @@ pub fn hex_value(c: u8) -> u8 {
 
 /// Decodes `2 * out.len()` hex digits. Returns false on a length mismatch or any non-hex byte.
 #[inline]
+// `chunks_exact`, not the `as_chunks` clippy prefers: with `as_chunks` here and in
+// `encode_hex`, a 4,000-id sizes request costs the edge 3% more CPU (REPORT.md §16).
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub fn decode_hex(hex: &[u8], out: &mut [u8]) -> bool {
     if Some(hex.len()) != out.len().checked_mul(2) {
         return false;
     }
     let mut bad = 0u8;
-    for (o, &[h, l]) in out.iter_mut().zip(hex.as_chunks::<2>().0) {
-        let hi = hex_value(h);
-        let lo = hex_value(l);
-        bad |= hi | lo;
-        *o = hi.wrapping_shl(4) | (lo & 0x0F);
+    for (o, pair) in out.iter_mut().zip(hex.chunks_exact(2)) {
+        if let [h, l] = *pair {
+            let hi = hex_value(h);
+            let lo = hex_value(l);
+            bad |= hi | lo;
+            *o = hi.wrapping_shl(4) | (lo & 0x0F);
+        }
     }
     bad & 0xF0 == 0
 }
@@ -215,10 +220,15 @@ fn hex_digit(nibble: u8) -> u8 {
 
 /// Lowercase hex of `bytes` into `out` (`out.len() == 2 * bytes.len()`).
 #[inline]
+// `chunks_exact_mut`, as in `decode_hex`: LLVM vectorizes this form better (5.1 ns per id
+// instead of 6.0 with `as_chunks_mut`).
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub fn encode_hex(bytes: &[u8], out: &mut [u8]) {
-    for ([h, l], &b) in out.as_chunks_mut::<2>().0.iter_mut().zip(bytes) {
-        *h = hex_digit(b.wrapping_shr(4));
-        *l = hex_digit(b);
+    for (pair, &b) in out.chunks_exact_mut(2).zip(bytes) {
+        if let [h, l] = pair {
+            *h = hex_digit(b.wrapping_shr(4));
+            *l = hex_digit(b);
+        }
     }
 }
 
