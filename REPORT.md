@@ -6,7 +6,8 @@ fastest or near-fastest on every workload that moves real bytes. Section 1 expla
 and its trade-offs; sections 3–8 are the evidence; section 9 lists every defect found, per
 implementation, including the opus defects this comparison found and fixed. Section 11
 studies client-side pack lifecycles; section 12 adds a store mode for real blobs in their own
-packs (`--blobs separate`), with sizes travelling beside the trees.
+packs (`--blobs separate`), with sizes travelling beside the trees. Section 15 reports an
+independent code review of opus and the fixes it led to.
 
 All numbers: AMD Ryzen 9 9950X (16C/32T), 89 GiB, Linux 7.3, rustc 1.97.1, git 2.53, loopback.
 Each implementation built as shipped (`cargo build --release`, its own profile). The harness is
@@ -1192,3 +1193,122 @@ connections of POSTs or sizes):
   * one malformed request able to abort the edge;
   * the idle cap resetting new connections;
   * a TLS handshake without a deadline.
+
+## 15. Independent code review, and the first fixes
+
+**Method.** Three models were each asked for a principal engineer's review of opus: code
+smells, performance, and what an attacker or a misbehaving client could do (gpt-6-astra at
+max effort, gemini-4-argon at high, claude-fable-5.1 at max). Astra returned nothing: a
+content filter refused the first prompt, then its API failed four times. Argon reported 15
+findings and Fable 9. Each headline finding was reproduced against a running edge, and each
+finding only one reviewer made was traced in the code, before it was ranked. The fixes went in
+by batch, each commit with a regression test that fails on the code before it.
+
+| # | Finding | Batch | Status |
+|---|---|---|---|
+| 1 | HTTP framing: a GET's body was read as the next request; a duplicate `Content-Length`, and `Content-Length` with `Transfer-Encoding`, were accepted; HEAD answered with a body. Behind a load balancer that shares connections, that is request smuggling. | 1 | fixed `36a1f7d` |
+| 2 | Slow clients held arenas (2 × cores of them). A trickled head or body, or an unread sizes answer, held one for up to the idle timeout per read. | 1 | fixed `1fa6555` |
+| 3 | No cap on concurrent connections; the soft FD limit is raised to the hard limit | 3 | open |
+| 4 | Amplification. A 77-byte commit POST could grow its arena without bound, on every arena at once. A garbage `lastPackTimestamp` was read as 0 (a 2.88 GB cold clone). | 1 | fixed `a6305d9`, `36a1f7d` |
+| 5 | The L0 overlay after a force-push that rewinds the branch: a phantom tip, Lamport divergence | 2 | open |
+| 6 | Remote blob packs were read 1 MiB at a time, so the block cache's bypass and 32 MiB windows never applied, and with no cache every MiB was a ranged GET | 1 | fixed `9c7269a` |
+| 7 | `size_outside_slabs` asks the proxy, per unknown id, while holding an arena | 2 | open |
+| 8 | SAS tokens and URL userinfo can reach error strings and logs | 2 | open |
+| 9 | The edge never prunes cached slabs or `.bidx` files; `--cache-dir` defaults to `/tmp` (a tmpfs on many hosts) | 3 | open |
+| 10 | Proxy cache: eviction can drop a re-fetched blob's newer entry; `Proxy.idle` is unbounded; a `BlobPack` is dropped on a hot path | 2 | open |
+| 11 | `BlockCache::evict` clones and sorts every block, and unlinks files, under its lock | 3 | open |
+| 12 | `repack::write_copied` lacks the delta-depth bound; a resolver chain past 4,096 grows outside a cold section; a corrupt declared size can size a buffer | 3 | open |
+| 13 | A range of a compressed blob inflates from the entry's start | later | open (by design) |
+| 14 | `valid_id` is not enforced on segment and pack ids | later | open |
+| 15 | CLI usage drift (`--workers`' default, undocumented flags) | later | `--arena-objects` documented |
+
+**Batch 1:**
+
+* **Framing (`36a1f7d`).**
+  * A strict head parser: CRLF only, an exact request line, token field names, no folded
+    lines, no control characters in values.
+  * `Content-Length` must be digits, given once. `Transfer-Encoding` must be `chunked` alone,
+    given once, never beside a `Content-Length`. Only POST carries a body.
+  * Anything else gets a 400, then the connection closes. A deadline miss gets a 408, and a
+    body over the limit gets a 413 before `100 Continue`.
+  * HEAD answers carry no body. An unparseable number in a query is a 400, not 0.
+* **Slow clients (`1fa6555`).**
+  * A request has one deadline for its head and body together, not one per read.
+  * The body is read into the connection's own buffer, so an arena is leased only once the
+    whole request is in.
+  * A sizes answer is built in that same buffer, and a resolved loose object that fits is
+    copied there, so the arena is free before the client starts reading.
+  * Buffers larger than the pooled size come from one shared budget (`gvfs_buffer_spare_bytes`).
+  * Residual: a slow reader of a large POST pack still holds its arena, because the pack
+    streams from a plan kept in the arena. Put a buffering load balancer in front of the edge.
+* **Commit expansion (`a6305d9`).**
+  * `--max-request-objects` (default 2^22) caps what one expansion may plan; beyond it, 413.
+  * Grown arenas share a budget, `--grow-objects` (default: as much again as all arenas hold).
+    The budget is charged as an arena's room doubles. A request past the budget gets a 503 at
+    once rather than waiting while it holds its arena.
+  * When a lease ends, everything that grew shrinks back. Before, some structures never
+    shrank, and the rest only shrank when the arena was next leased.
+  * On SearchGold, 1, 32 and 64 concurrent tip expansions give the same packs, times and peak
+    RSS as before.
+* **Remote packs (`9c7269a`).**
+  * Reads take an async sink, so a whole range streams from Azure, or from the block cache,
+    to the socket and the pack's hash as it arrives, with no buffer in between.
+  * A loose blob reads its body and Adler-32 together. A stored blob's range is one read with
+    the deflate block headers dropped on the way. A compressed blob's range reads windows that
+    start at 1 MiB and double.
+  * Pinned cache blocks are released by a guard, so a dropped read no longer leaks its pins.
+  * Fetching a 20 MiB blob from a fresh edge: 6 fetches before, 2 now. With a 64 MiB cache it
+    now streams past the cache.
+* **The cost, won back (`c62a9ad`).** The hardening had cost small GETs 8% more instructions
+  and 4,000-id sizes requests 1.7%. Profiling per request found three causes, all now fixed:
+  * every body was zeroed before being read into;
+  * every request read the clock;
+  * the parser scanned each line three times.
+
+**Before and after** (the review's probes, against the SearchGold edge):
+
+| Probe | 529a130 | now |
+|---|---|---|
+| GET whose body is a second request | 200 (body ignored) | 400, closed |
+| HEAD of a missing object | 404 with a 10-byte body | 405 (`Allow: GET`), no body |
+| Two `Content-Length` lines | no answer | 400 |
+| `Content-Length` and `Transfer-Encoding` | 200 | 400 |
+| `lastPackTimestamp=abcdefg` | 200, 2.88 GB | 400 |
+| 77-byte commit POST (431K objects) | 137 MB, memory unbounded | 137 MB, within `--grow-objects` (gauge back to 0) |
+
+**Validation of the final build:**
+
+* `cargo test`: unit, e2e, Azurite and separate-store suites all pass. Six tests are new:
+  `refuses_ambiguous_framing`, `chunk_sizes_are_hex_digits_only`, `http_framing_is_strict`,
+  `slow_clients_hold_no_arena`, `growth_is_bounded_and_ends_with_the_lease` and
+  `commit_expansion_is_capped`. The 20 MiB remote reads were added to `azure_separate_store`.
+* Byte identity with the threads build (`bench/ab_responses.py`): all responses are
+  identical on the week-old SearchGold store, inline and separate, and on the separate store
+  with a live upstream. The responses include 4,000-blob batches, closures, sizes, GETs and
+  prefetches.
+* The new `bench/ab_remote.py` builds a store in Azurite: small text, random binaries around
+  the 1 MiB and 16 MiB thresholds, and long compressed text. It A/Bs two builds with the cache
+  at its default size, at 48 MiB, and off: 4,163 requests per configuration (loose GETs,
+  batches, single-blob POSTs under each Accept, sizes and ranges). All are byte-identical, and
+  3,791 are also checked against git. Cache fetches fall from 47 to 27 at the default size, and
+  from 203 to 103 at 48 MiB.
+* Conformance: 918 of 918. Cross-client: gvfs-helper 18/18, fable's client 15/15. astra-sync's
+  2/15 is unchanged; it needs astra's own ETag extension.
+* Load, median of 3 interleaved rounds against 529a130:
+
+| Workload | 529a130 (req/s) | now (req/s) | Change |
+|---|---|---|---|
+| GET blob, 64 connections | 1,186,417 | 1,183,006 | −0.3% |
+| Mixed GETs with 4,000-id POSTs | 415,356 GETs, 6,705 POSTs | 416,010 GETs, 6,788 POSTs | +0.2%, +1.2% |
+| POST, 4,000 ids | 8,613 | 8,693 | +0.9% |
+| Sizes, 4,000 ids | 19,925 | 19,834 | −0.5% |
+
+**Lessons:**
+
+* **Hardening was not free until it was measured.** A strict parser, a deadline per request and
+  a buffer owned by the connection each looked free. Together they cost 2% CPU on the hottest
+  path, and `perf stat` per request found where.
+* **The 1 MiB step was left over from the old design.** With threads, a write blocked, so each
+  step had to be buffered before it was written. The tokio port kept the step after its reason
+  was gone, and the cache's whole-read logic stopped seeing whole reads.
+
