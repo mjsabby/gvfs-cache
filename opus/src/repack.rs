@@ -25,7 +25,9 @@
 //!    spends 20 bytes per entry on the base id); one whose base is not in the output, or
 //!    which is at most [`WHOLE_MAX`] bytes (pointer blobs, commits), is stored whole: a
 //!    request for it is then a splice of its own bytes, not an inflate of its whole chain
-//!    (ADO's chains run 50 deep), and a pack of it needs no bases.
+//!    (ADO's chains run 50 deep), and a pack of it needs no bases. So is one whose chain
+//!    would pass [`MAX_DEPTH`]: a delta against a frozen or earlier object adds a level
+//!    to that object's chain, which would otherwise grow with every repack.
 //! 5. **Verification:** the output is indexed by the same indexer as an upstream pack,
 //!    which recomputes every id from content, and must hold exactly the expected objects.
 //!
@@ -959,7 +961,7 @@ impl Repacker {
                 sink.put(entry)?;
                 self.stats.copied = self.stats.copied.saturating_add(1);
             }
-            Some((at, d)) if at < out_at && !stored_whole(&rec) => {
+            Some((at, d)) if at < out_at && d < MAX_DEPTH && !stored_whole(&rec) => {
                 let h = parse_entry_header(entry).ctx("entry header")?;
                 sink.put(HeaderBytes::ofs_delta(h.size, out_at.saturating_sub(at)).as_slice())?;
                 sink.put(entry.get(h.header_len..).ctx("entry")?)?;
@@ -967,7 +969,8 @@ impl Repacker {
                 self.stats.copied = self.stats.copied.saturating_add(1);
             }
             _ => {
-                // The base is not in the output: store the object whole.
+                // The base is not in the output (or its chain is as deep as allowed):
+                // store the object whole.
                 let (kind, content) = self.resolver.resolve(slab, o.slot)?;
                 let z = deflate(&mut self.deflater, &mut self.zbuf, content)?;
                 sink.put(HeaderBytes::whole(kind, u64_of(content.len())).as_slice())?;
@@ -1428,6 +1431,139 @@ mod tests {
         let want = slab(&mut ix, fetch(&dir, Some(&c[10]), &c[20], true));
         assert_eq!(ids(&rest), ids(&want));
         git_accepts(&dir, rest.pack());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deltas copied as they are (a seed in `Mode::Copy`, whose upstream packed a file's
+    /// versions in a chain deeper than git's default) stop at `MAX_DEPTH`: past it, an
+    /// object is stored whole and a new chain starts from it.
+    #[test]
+    fn copied_delta_chains_stop_at_max_depth() {
+        let dir = tempdir("depth");
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"], None);
+        // Each version edits one more line: its nearest version is the best base.
+        let mut lines: Vec<String> = (0..300)
+            .map(|i| format!("line {i} of a file edited a line at a time"))
+            .collect();
+        for c in 0..70 {
+            lines[c] = format!("line {c} edited in commit {c}");
+            std::fs::write(dir.join("f.txt"), lines.join("\n")).unwrap();
+            git(&dir, &["add", "-A"], None);
+            let msg = format!("c{c}");
+            let who = ["-c", "user.name=t", "-c", "user.email=t@t"];
+            git(
+                &dir,
+                &[&who[..], &["commit", "-q", "-m", &msg]].concat(),
+                None,
+            );
+        }
+        let args = [
+            "pack-objects",
+            "--revs",
+            "--stdout",
+            "-q",
+            "--delta-base-offset",
+        ];
+        let deep = ["--depth=100", "--window=100"];
+        let pack = git(&dir, &[&args[..], &deep].concat(), Some(b"main\n"));
+        let mut ix = Indexer::new(2);
+        let seed = slab(&mut ix, pack);
+        let deepest = seed.records().map(|r| r.depth).max().unwrap();
+        assert!(
+            deepest > MAX_DEPTH,
+            "the upstream's chains run {deepest} deep"
+        );
+        let mut rp = Repacker::new();
+        let input = Input {
+            slabs: std::slice::from_ref(&seed),
+            frozen: None,
+            exclude: &[],
+            mode: Mode::Copy,
+        };
+        let out = repack_mem(&mut ix, &mut rp, &input);
+        assert_eq!(ids(&out), ids(&seed));
+        let depth = out.records().map(|r| r.depth).max().unwrap();
+        assert_eq!(depth, MAX_DEPTH, "chains as deep as allowed, no deeper");
+        git_accepts(&dir, out.pack());
+        let mut r = Resolver::with_capacity(4096);
+        for rec in out.records() {
+            let want = r
+                .resolve(&seed, seed.find(&rec.oid).unwrap())
+                .unwrap()
+                .1
+                .to_vec();
+            assert!(r.resolve(&out, out.find(&rec.oid).unwrap()).unwrap().1 == want);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What an entry declares is checked before a buffer is sized for it: a header that
+    /// claims more than its zlib stream can hold, and a delta that disagrees with the
+    /// index's size, are errors (they were allocations of whatever they said).
+    #[test]
+    fn the_resolver_refuses_corrupt_sizes() {
+        let dir = tempdir("corrupt");
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "-b", "main"], None);
+        let text: String = (0..200).map(|i| format!("line {i} of a text\n")).collect();
+        let edited = text.replace("line 7 of", "line 7 (edited) of");
+        let mut blobs = Vec::new();
+        for t in [&text, &edited] {
+            let id = git(&dir, &["hash-object", "-w", "--stdin"], Some(t.as_bytes()));
+            blobs.push(String::from_utf8(id).unwrap().trim().to_string());
+        }
+        let list = format!("{}\n{}\n", blobs[0], blobs[1]);
+        let args = ["pack-objects", "--stdout", "-q", "--delta-base-offset"];
+        let pack = git(&dir, &args, Some(list.as_bytes()));
+        let mut ix = Indexer::new(1);
+        let s = slab(&mut ix, pack);
+        let delta = s.records().position(|r| r.is_delta()).expect("a delta") as u32;
+        let whole = 1 - delta;
+        let mut r = Resolver::with_capacity(4096);
+        assert!(r.resolve(&s, whole).is_ok() && r.resolve(&s, delta).is_ok());
+        let le = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        let records_at = le(s.index_bytes(), 80) as usize;
+        let rec_at = |slot: u32| records_at + slot as usize * crate::slab::REC_LEN;
+
+        // The whole object's header says 2^56 bytes: same stream, longer header.
+        let w = s.rec(whole).unwrap();
+        let entry = s.entry(&w).unwrap();
+        let h = parse_entry_header(entry).unwrap();
+        let huge = HeaderBytes::whole(OBJ_BLOB, 1 << 56);
+        let grow = huge.as_slice().len() - h.header_len;
+        let mut pack = s.pack()[..w.offset as usize].to_vec();
+        pack.extend_from_slice(huge.as_slice());
+        pack.extend_from_slice(&entry[h.header_len..]);
+        let rest = (w.offset + u64::from(w.entry_len)) as usize;
+        pack.extend_from_slice(&s.pack()[rest..]);
+        let mut index = s.index_bytes().to_vec();
+        index[32..40].copy_from_slice(&(pack.len() as u64).to_le_bytes());
+        index[40..60].copy_from_slice(&pack[pack.len() - 20..]);
+        for slot in 0..s.count() {
+            let rec = s.rec(slot).unwrap();
+            let at = rec_at(slot);
+            if slot == whole {
+                let len = rec.entry_len + grow as u32;
+                index[at + 28..at + 32].copy_from_slice(&len.to_le_bytes());
+            } else if rec.offset > w.offset {
+                // Its offset (the low 40 bits of the record's second word) moves too.
+                let word = le(&index, at + 20) + grow as u64;
+                index[at + 20..at + 28].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        let bad = Slab::from_heap(s.meta.clone(), pack, index).unwrap();
+        let e = r.resolve(&bad, whole).expect_err("refused");
+        assert!(e.to_string().contains("declares"), "{e}");
+
+        // The delta's record says one byte more than the delta makes.
+        let mut index = s.index_bytes().to_vec();
+        let at = rec_at(delta) + 32;
+        let size = u32::from_le_bytes(index[at..at + 4].try_into().unwrap()) + 1;
+        index[at..at + 4].copy_from_slice(&size.to_le_bytes());
+        let bad = Slab::from_heap(s.meta.clone(), s.pack().to_vec(), index).unwrap();
+        let e = r.resolve(&bad, delta).expect_err("refused");
+        assert!(e.to_string().contains("the index says"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -521,7 +521,8 @@ impl Resolver {
         let mut cur = slot;
         loop {
             let rec = slab.rec(cur).ctx("record")?;
-            self.chain.push(cur);
+            // Past the chains repack writes, only a corrupt index (a cycle) grows it.
+            crate::arena::push(&mut self.chain, cur, true);
             if rec.base == NO_BASE {
                 break;
             }
@@ -532,12 +533,21 @@ impl Resolver {
         }
         let root = slab.rec(*self.chain.last().ctx("chain")?).ctx("record")?;
         let kind = root.kind;
-        let mut cur_len = inflate_rec(slab, &root, inflater, &mut self.a)?;
+        let mut cur_len = inflate_rec(slab, &root, inflater, &mut self.a, true)?;
         for &d in self.chain.iter().rev().skip(1) {
             let rec = slab.rec(d).ctx("record")?;
-            let dlen = inflate_rec(slab, &rec, inflater, &mut self.delta)?;
+            let dlen = inflate_rec(slab, &rec, inflater, &mut self.delta, false)?;
             let delta = self.delta.get(..dlen).ctx("delta")?;
             let (_, rsz, _) = crate::delta::delta_sizes(delta).ctx("bad delta")?;
+            // The index has every object's size: a delta that disagrees is corrupt (and
+            // must not size a buffer).
+            if rsz != rec.size {
+                crate::bail!(
+                    "object {}: its delta makes {rsz} bytes, the index says {}",
+                    rec.oid,
+                    rec.size
+                );
+            }
             if self.b.len() < us(rsz) {
                 let _cold = gvfs_alloc_guard::cold_section();
                 self.b.resize(us(rsz), 0);
@@ -551,23 +561,40 @@ impl Resolver {
     }
 }
 
-/// Inflates a record's entry data (object or delta) into `buf`; returns its length.
+/// Most bytes deflate makes of one compressed byte (a 258-byte match in about two bits).
+const INFLATE_RATIO_MAX: u64 = 1032;
+
+/// Inflates a record's entry data (an object if `whole`, else a delta) into `buf`; returns
+/// its length. The length its header declares is checked before a buffer is sized for it:
+/// no more than its compressed bytes can inflate to, and (an object) the size the index
+/// has for it. Corrupt data is an error, not an allocation of whatever it says.
 fn inflate_rec(
     slab: &Slab,
     rec: &Rec,
     inflater: &mut crate::zlib::Inflater,
     buf: &mut Vec<u8>,
+    whole: bool,
 ) -> Result<usize> {
     let entry = slab.entry(rec).ctx("entry")?;
     let h = parse_entry_header(entry).ctx("entry header")?;
+    let data = entry.get(h.header_len..).ctx("entry")?;
+    let most = u64_of(data.len())
+        .saturating_mul(INFLATE_RATIO_MAX)
+        .saturating_add(64);
+    if h.size > most || (whole && h.size != rec.size) {
+        crate::bail!(
+            "object {}: its entry declares {} bytes (index: {}, {} compressed)",
+            rec.oid,
+            h.size,
+            rec.size,
+            data.len()
+        );
+    }
     let n = us(h.size);
     if buf.len() < n {
         let _cold = gvfs_alloc_guard::cold_section();
         buf.resize(n, 0);
     }
-    inflater.inflate_exact(
-        entry.get(h.header_len..).ctx("entry")?,
-        buf.get_mut(..n).ctx("buffer")?,
-    )?;
+    inflater.inflate_exact(data, buf.get_mut(..n).ctx("buffer")?)?;
     Ok(n)
 }
