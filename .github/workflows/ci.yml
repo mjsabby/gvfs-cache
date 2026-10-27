@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A newer push to a pull request supersedes its run; every commit on main keeps its own.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash # -eo pipefail: a failing `cargo test | tee` fails its step
+
+env:
+  CARGO_TERM_COLOR: always
+  # Tools some tests need, pinned. Without them those tests skip, which CI does not allow.
+  AZURITE_VERSION: 3.37.0
+  MSGIT_VERSION: 2.56.0.vfs.0.4
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: Bench scripts parse
+        run: |
+          python3 -m compileall -q bench
+          for f in benches/*.sh; do bash -n "$f"; done
+
+  test:
+    name: Test (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86-64
+            runner: ubuntu-24.04
+            deb: amd64
+            msgit-sha256: 9ec560f3dd96c7dfb00bf32cae96576beeb4797a8161e20c940dfa2251a635e2
+          - arch: ARM64
+            runner: ubuntu-24.04-arm
+            deb: arm64
+            msgit-sha256: 711a6d9b7cd26fc397d56f902e3ad72a83402de502edbfd2a82f36c8da9c1d98
+    steps:
+      - uses: actions/checkout@v7
+      - name: Toolchain (rust-toolchain.toml)
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Azurite, for tests/azure.rs
+        run: |
+          npm install -g "azurite@$AZURITE_VERSION"
+          azurite-blob --version
+      - name: Microsoft git with gvfs-helper, beside stock git
+        env:
+          DEB: microsoft-git_${{ env.MSGIT_VERSION }}_linux_${{ matrix.deb }}.deb
+          SHA256: ${{ matrix.msgit-sha256 }}
+        run: |
+          dir="$RUNNER_TEMP/msgit"
+          curl -fsSL -o "$RUNNER_TEMP/$DEB" \
+            "https://github.com/microsoft/git/releases/download/v$MSGIT_VERSION/$DEB"
+          echo "$SHA256  $RUNNER_TEMP/$DEB" | sha256sum -c -
+          dpkg -x "$RUNNER_TEMP/$DEB" "$dir"
+          # Its exec path is compiled in, and installed it would be `git` on PATH. A wrapper
+          # runs it from here instead, so that stock git stays the judge in every test.
+          cat > "$dir/git" <<EOF
+          #!/bin/sh
+          export GIT_EXEC_PATH="$dir/usr/local/lib/git-core"
+          export GIT_TEMPLATE_DIR="$dir/usr/local/share/git-core/templates"
+          exec "$dir/usr/local/bin/git" "\$@"
+          EOF
+          chmod +x "$dir/git"
+          "$dir/git" gvfs-helper --help > /dev/null
+          echo "GVFS_TEST_MSGIT=$dir/git" >> "$GITHUB_ENV"
+      - name: Tests
+        run: |
+          git --version
+          "$GVFS_TEST_MSGIT" --version
+          cargo test --locked --workspace --release -- --show-output 2>&1 | tee "$RUNNER_TEMP/test.log"
+          if grep 'skipping:' "$RUNNER_TEMP/test.log"; then
+            echo "::error::a test skipped: CI runs every test"
+            exit 1
+          fi

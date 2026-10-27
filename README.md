@@ -86,6 +86,12 @@ Some tests also use extra tools when present and skip otherwise:
 | `tests/separate.rs` `blob_over_4gib_end_to_end` | `#[ignore]`d: writes ~13 GB under `target/`; run with `cargo test --release --test separate -- --ignored blob_over_4gib` |
 | `tests/azure.rs` | the Azurite emulator (`azurite-blob` on PATH via `npm install -g azurite`, or `GVFS_TEST_AZURITE`), or a real account: `GVFS_TEST_AZURE_CS_FILE` (file holding a connection string) + `GVFS_TEST_AZURE_CONTAINER` (existing container; the tests use and delete a unique prefix) |
 
+CI (`.github/workflows/ci.yml`) checks every push to `main` and every pull request: rustfmt
+and the bench scripts' syntax, then clippy (warnings are errors) and every test, natively on
+x86-64 and ARM64 runners. It installs pinned releases of Azurite and of Microsoft git (beside
+stock git, which stays the judge), and fails a run in which any test skips; only the
+`#[ignore]`d 4 GiB test stays out.
+
 ## Usage
 
 ```sh
@@ -331,6 +337,7 @@ benches/load.sh            the load table above
 benches/rollup.sh          the rollup table above (any repository, any week)
 examples/clients.rs        the client traffic table above (simulated clock, any window)
 rust-toolchain.toml        the pinned toolchain (Rust 1.99.1; x86-64 and ARM64 Linux targets)
+.github/workflows/ci.yml   CI: rustfmt, clippy and every test, on x86-64 and on ARM64
 DESIGN.md, REPORT.md       the design, and the evidence: the comparison and every change since
 bench/                     the harness behind REPORT.md (conformance, cross-client, replays,
                            load, profiles, byte-identity A/Bs of two builds)
