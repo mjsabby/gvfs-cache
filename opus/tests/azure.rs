@@ -476,7 +476,7 @@ fn azure_separate_store() {
             ("a/text.txt", Some(text(1))),
             ("b/noise.bin", Some(noise_bytes.clone())),
             ("big/large.bin", Some(large((16 << 20) + 9))),
-            ("big/noise.bin", Some(huge.clone())),
+            ("big/noise.bin", Some(huge)),
         ],
     );
     let g = commit_files(&up, "c2", &[("a/text.txt", Some(text(2)))]);
@@ -505,7 +505,7 @@ fn azure_separate_store() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let t = commit_files(
+    commit_files(
         &up,
         "c3",
         &[
@@ -599,18 +599,6 @@ fn azure_separate_store() {
     );
     assert_eq!(cat_batch(&posted, &ids), cat_batch(&up.bare, &ids));
     assert_eq!(server.metric("gvfs_blob_cache_fetches_total"), fetches);
-    // Ranges of a stored and of a compressed blob.
-    let noise_id = rev(&up.bare, &format!("{g}:b/noise.bin"));
-    let text_id = rev(&up.bare, &format!("{t}:a/text.txt"));
-    for (id, content) in [(noise_id, noise_bytes), (text_id, text(3))] {
-        let n = content.len();
-        for (off, len) in [(0usize, 7usize), (65_533, 9), (n - 2, 2), (3, n - 6)] {
-            let (status, _, body) =
-                server.get(&format!("/gvfs/blobs/{id}?offset={off}&length={len}"));
-            assert_eq!(status, 200);
-            assert!(body == content[off..off + len], "{id} {off}+{len}");
-        }
-    }
     // Blob packs stay in the store: the edge holds their indexes only, those blobs.bin
     // lists.
     let mut local: Vec<String> = std::fs::read_dir(cache.join("blobs"))
@@ -680,15 +668,6 @@ fn azure_separate_store() {
         4 << 20,
         "the zlib header's block only"
     );
-    edge.assert_clean();
-    drop(edge);
-    // A range of it: one read of the raw range, the stored blocks' headers dropped.
-    let edge = fresh_edge("c", &[]);
-    let (off, len) = (1000usize, 12usize << 20);
-    let (status, _, body) = edge.get(&format!("/gvfs/blobs/{huge_id}?offset={off}&length={len}"));
-    assert_eq!(status, 200);
-    assert!(body == huge[off..off + len]);
-    assert_eq!(counts(&edge), (1, 0), "one fetch of four blocks");
     edge.assert_clean();
     drop(edge);
     let _ = std::fs::remove_dir_all(&root);

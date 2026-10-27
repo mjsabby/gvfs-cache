@@ -281,10 +281,9 @@ WORKLOADS = {
     # VFS for Git (not a git user agent): the pack's .idx comes after it.
     "prefetch_cold_idx": (["--workload", "prefetch", "--ts", "0", "--header", "User-Agent: GVFS/1.0"], 8),
     # Large blobs (a store whose id list is its blobs of 16 MiB or more): whole, as loose
-    # objects; one per POST (a pack: the blob's own pack file); 1 MiB ranges.
+    # objects; one per POST (a pack: the blob's own pack file).
     "get_large": (["--workload", "get-object", "--oids", "{oids}"], 16),
     "post_large_1": (["--workload", "post-objects", "--oids", "{oids}", "--batch", "1"], 16),
-    "range_1m": (["--workload", "get-paths", "--paths", "{ranges}"], 32),
 }
 # name: (store, blob ids)
 STORES = {
@@ -300,8 +299,7 @@ STORES = {
 
 def args_for(work, store):
     args, conns = WORKLOADS[work]
-    ranges = os.path.join(os.path.dirname(STORES[store][1]), "ranges.txt")
-    return [a.replace("{oids}", STORES[store][1]).replace("{ranges}", ranges) for a in args], conns
+    return [a.replace("{oids}", STORES[store][1]) for a in args], conns
 
 
 def cpu_seconds(pid):

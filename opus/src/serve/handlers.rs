@@ -7,7 +7,6 @@
 //! | `GET /gvfs/objects/<oid>` | loose object: spliced from a whole entry (no zlib work), or resolved |
 //! | `POST /gvfs/objects` | one pack of the objects (+ delta bases); commits expand to parents and trees |
 //! | `POST /gvfs/sizes` | `[{"Id":..,"Size":..}]` from the slab records |
-//! | `GET /gvfs/blobs/<oid>?offset=&length=` | a byte range of a blob's content (`--blobs separate`) |
 //! | `GET /healthz`, `GET /metrics` | readiness and counters |
 //!
 //! In a `--blobs separate` store, blobs come from the blob packs (spliced whole, like
@@ -51,7 +50,6 @@ const CT_PREFETCH: &str = "application/x-gvfs-timestamped-packfiles-indexes";
 const CT_PACK: &str = "application/x-git-packfile";
 const CT_LOOSE: &str = "application/x-git-loose-object";
 const CT_JSON: &str = "application/json";
-const CT_BYTES: &str = "application/octet-stream";
 const CT_TEXT: &str = "text/plain";
 
 /// Request counters exposed at `/metrics`.
@@ -99,9 +97,6 @@ pub enum Route {
     ObjectGet(Oid),
     ObjectsPost,
     SizesPost,
-    /// A blob's content from `offset`, `length` bytes (to its end without one). Parsed with
-    /// the route: once the head is consumed its buffer may hold the next request.
-    BlobRange(Oid, u64, Option<u64>),
     Health,
     Metrics,
     NotFound,
@@ -126,20 +121,6 @@ pub fn route(method: Method, path: &[u8], query: &[u8]) -> Route {
             .and_then(Oid::from_hex)
             .map(Route::ObjectGet)
             .unwrap_or(Route::NotFound),
-        (Method::Get, Some(rest)) if rest.starts_with(b"blobs/") => {
-            let oid = rest.get(6..).and_then(Oid::from_hex);
-            match (
-                oid,
-                query_number(query, b"offset"),
-                query_number(query, b"length"),
-            ) {
-                (None, _, _) => Route::NotFound,
-                (Some(oid), Ok(offset), Ok(length)) => {
-                    Route::BlobRange(oid, offset.unwrap_or(0), length)
-                }
-                _ => Route::BadRequest,
-            }
-        }
         (Method::Post, Some(b"objects")) => Route::ObjectsPost,
         (Method::Post, Some(b"sizes")) => Route::SizesPost,
         (Method::Get, None) if path == b"/healthz" => Route::Health,
@@ -227,17 +208,6 @@ pub async fn handle(
                     Blob::Unknown => not_found(ctx, stream, keep).await,
                     Blob::Failed => unavailable(ctx, stream, keep).await,
                 },
-            }
-        }
-        Route::BlobRange(oid, offset, length) => {
-            inc(&ctx.metrics.object_get);
-            let view = ctx.view();
-            match find_blob(ctx, &view, &oid).await {
-                Blob::Found(pack, rec) => {
-                    blob_range(ctx, b, stream, &pack, &rec, offset, length, keep).await
-                }
-                Blob::Unknown => not_found(ctx, stream, keep).await,
-                Blob::Failed => unavailable(ctx, stream, keep).await,
             }
         }
         Route::ObjectsPost | Route::SizesPost => {
@@ -545,39 +515,6 @@ impl<S: crate::store::Sink> crate::store::Sink for BodyThenTail<'_, S> {
     }
 }
 
-/// A stored blob entry's raw bytes in, its content on to `inner`: the 5-byte header before
-/// each deflate stored block is dropped.
-struct Unstored<'a, S> {
-    inner: &'a mut S,
-    /// The file offset of the next byte, and of the first block's header.
-    pos: u64,
-    blocks: u64,
-}
-
-impl<S: crate::store::Sink> crate::store::Sink for Unstored<'_, S> {
-    async fn put(&mut self, piece: &[u8]) -> crate::util::Result<()> {
-        const HEADER: u64 = 5;
-        let stride = u64_of(crate::blobs::STORED_BLOCK).saturating_add(HEADER);
-        let mut rest = piece;
-        while !rest.is_empty() {
-            let within = self
-                .pos
-                .saturating_sub(self.blocks)
-                .checked_rem(stride)
-                .unwrap_or(0);
-            let header = within < HEADER;
-            let n = if header { HEADER } else { stride }.saturating_sub(within);
-            let (now, later) = rest.split_at(us(n).min(rest.len()));
-            if !header {
-                self.inner.put(now).await?;
-            }
-            self.pos = self.pos.saturating_add(u64_of(now.len()));
-            rest = later;
-        }
-        Ok(())
-    }
-}
-
 /// Exactly `buf.len()` bytes of a blob pack at `at` (cold path for remote packs).
 async fn read_pack(pack: &BlobPack, at: u64, buf: &mut [u8]) -> crate::util::Result<()> {
     let mut n = 0usize;
@@ -693,196 +630,6 @@ async fn whole_pack(
     ctx.metrics.bytes_out.fetch_add(out.sent, Ordering::Relaxed);
     inc(&ctx.metrics.objects_out);
     Ok(keep)
-}
-
-/// Bytes `[offset, offset + length)` of a blob's content (to its end without `length`).
-/// Stored entries are read in place; compressed ones are inflated from their start (cold
-/// path). `X-GVFS-Blob-Size` gives the blob's size.
-#[allow(clippy::too_many_arguments)]
-async fn blob_range(
-    ctx: &Ctx,
-    b: &mut Bufs,
-    stream: &TcpStream,
-    pack: &BlobPack,
-    rec: &BlobRec,
-    offset: u64,
-    length: Option<u64>,
-    keep: bool,
-) -> std::io::Result<bool> {
-    if offset > rec.size {
-        respond(ctx, stream, 416, "offset beyond the blob\n", keep).await?;
-        return Ok(keep);
-    }
-    let len = length
-        .unwrap_or(u64::MAX)
-        .min(rec.size.saturating_sub(offset));
-    let mut extra = [0u8; 48];
-    let extra_len = {
-        let mut cur = std::io::Cursor::new(extra.as_mut_slice());
-        let _ = write!(cur, "X-GVFS-Blob-Size: {}\r\n", rec.size);
-        usize::try_from(cur.position()).unwrap_or(0)
-    };
-    let mut budget = Budget::new();
-    let mut out = Out::new(stream, &mut b.out, ctx.deadlines.write);
-    out.head_with(
-        200,
-        CT_BYTES,
-        len,
-        keep,
-        extra.get(..extra_len).unwrap_or(&[]),
-    )?;
-    if rec.stored && pack.bytes().is_none() {
-        // One read of the raw range, its block headers dropped on the way: the block cache
-        // sees the whole range (not a read per 64 KiB block).
-        let mut pieces = rec.stored_range_iter(offset, len);
-        if let Some((first, n)) = pieces.next() {
-            let end = pieces
-                .last()
-                .map_or(first.saturating_add(n), |(at, n)| at.saturating_add(n));
-            let mut to = ToClient {
-                out: &mut out,
-                hash: None,
-                budget: &mut budget,
-                failed: None,
-            };
-            let mut content = Unstored {
-                inner: &mut to,
-                pos: first,
-                blocks: rec.zlib().0.saturating_add(2),
-            };
-            let read = cold(pack.read(first, end.saturating_sub(first), &mut content)).await;
-            client_or_store(read, to.failed)?;
-        }
-    } else if rec.stored {
-        for (at, n) in rec.stored_range_iter(offset, len) {
-            send_pack_range(&mut out, pack, at, n, None, &mut budget).await?;
-        }
-    } else {
-        // Rare (a compressed blob read by range): its state lives on the heap.
-        cold(inflate_range(&mut out, pack, rec, offset, len, &mut budget)).await?;
-    }
-    out.flush().await?;
-    ctx.metrics.bytes_out.fetch_add(out.sent, Ordering::Relaxed);
-    Ok(keep)
-}
-
-/// Inflates a compressed blob entry from its start, sending content `[offset, offset+len)`
-/// (cold path: its buffers are allocated per request). A remote entry is read in windows
-/// from 1 MiB, doubling to the block cache's: a range near the start of a long entry reads
-/// little more than it needs, and a long read goes a window per fetch.
-async fn inflate_range(
-    out: &mut Out<'_>,
-    pack: &BlobPack,
-    rec: &BlobRec,
-    offset: u64,
-    len: u64,
-    budget: &mut Budget,
-) -> std::io::Result<()> {
-    let (zat, zlen) = rec.zlib();
-    let mut inf = {
-        let _cold = gvfs_alloc_guard::cold_section();
-        Inflating {
-            z: zlib_rs::Inflate::new(true, 15),
-            chunk: vec![0u8; 64 << 10],
-            produced: 0,
-            offset,
-            end: offset.saturating_add(len),
-            out,
-            budget,
-            done: false,
-            failed: None,
-        }
-    };
-    if let Some(b) = pack.bytes() {
-        let entry = crate::util::sub(b, us(zat), us(zlen))
-            .ok_or_else(|| super::httpd::other("blob entry range"))?;
-        inf.feed(entry).await?;
-    } else {
-        let most = super::blobcache::WINDOW.saturating_mul(super::blobcache::BLOCK);
-        let (mut pos, zend, mut window) = (zat, zat.saturating_add(zlen), 1u64 << 20);
-        while pos < zend && !inf.done {
-            let n = zend.saturating_sub(pos).min(window);
-            let read = pack.read(pos, n, &mut inf).await;
-            client_or_store(read, inf.failed.take())?;
-            pos = pos.saturating_add(n);
-            window = window.saturating_mul(2).min(most);
-        }
-    }
-    let (produced, end) = (inf.produced, inf.end);
-    let _cold = gvfs_alloc_guard::cold_section();
-    drop(inf);
-    if produced < end {
-        return Err(super::httpd::other("blob entry ended early"));
-    }
-    Ok(())
-}
-
-/// A compressed blob entry inflated as its pieces arrive, content `[offset, end)` sent.
-struct Inflating<'o, 'w, 'b> {
-    z: zlib_rs::Inflate,
-    chunk: Vec<u8>,
-    /// Content inflated so far.
-    produced: u64,
-    offset: u64,
-    end: u64,
-    out: &'o mut Out<'w>,
-    budget: &'b mut Budget,
-    /// The stream ended, or the range is sent: later pieces are not needed.
-    done: bool,
-    /// Why the last piece failed (a corrupt entry, or the client's socket).
-    failed: Option<std::io::Error>,
-}
-
-impl Inflating<'_, '_, '_> {
-    async fn feed(&mut self, piece: &[u8]) -> std::io::Result<()> {
-        let bad = |m: &str| super::httpd::other(m);
-        let mut rest = piece;
-        while !rest.is_empty() && !self.done {
-            let (in0, out0) = (self.z.total_in(), self.z.total_out());
-            let status = self
-                .z
-                .decompress(rest, &mut self.chunk, zlib_rs::InflateFlush::NoFlush)
-                .map_err(|_| bad("corrupt blob entry"))?;
-            let used = us(self.z.total_in().saturating_sub(in0));
-            let made = self.z.total_out().saturating_sub(out0);
-            let produced = self.produced;
-            let (lo, hi) = (
-                produced.max(self.offset),
-                produced.saturating_add(made).min(self.end),
-            );
-            if lo < hi {
-                let part = self
-                    .chunk
-                    .get(us(lo.saturating_sub(produced))..us(hi.saturating_sub(produced)))
-                    .ok_or_else(|| bad("inflate range"))?;
-                self.out.bytes(part).await?;
-            }
-            self.produced = produced.saturating_add(made);
-            rest = rest.get(used..).unwrap_or(&[]);
-            if status == zlib_rs::Status::StreamEnd || self.produced >= self.end {
-                self.done = true;
-            } else if used == 0 && made == 0 {
-                return Err(bad("blob entry stream is stuck"));
-            }
-            if self.budget.spend(64) {
-                self.budget.pause().await;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl crate::store::Sink for Inflating<'_, '_, '_> {
-    async fn put(&mut self, piece: &[u8]) -> crate::util::Result<()> {
-        match self.feed(piece).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let err = crate::err!("inflating a blob entry: {e}");
-                self.failed = Some(e);
-                Err(err)
-            }
-        }
-    }
 }
 
 /// `GPRE` + version + count, then per pack: timestamp, pack length, index length (-1 for
@@ -2018,17 +1765,14 @@ mod tests {
             Route::ObjectsPost
         );
         assert_eq!(route(Method::Post, b"/gvfs/sizes", b""), Route::SizesPost);
+        // The byte-range extension was removed.
         assert_eq!(
             route(
                 Method::Get,
                 format!("/gvfs/blobs/{oid}").as_bytes(),
-                b"length=7&offset=5"
+                b"offset=5&length=7"
             ),
-            Route::BlobRange(Oid([0xaa; 20]), 5, Some(7))
-        );
-        assert_eq!(
-            route(Method::Get, format!("/gvfs/blobs/{oid}").as_bytes(), b""),
-            Route::BlobRange(Oid([0xaa; 20]), 0, None)
+            Route::NotFound
         );
         assert_eq!(
             route(Method::Get, b"/gvfs/objects/zz", b""),
@@ -2047,14 +1791,6 @@ mod tests {
         assert_eq!(
             route(Method::Get, b"/gvfs/prefetch", b"x=1&lastPackTimestamp=7"),
             Route::Prefetch(7)
-        );
-        assert_eq!(
-            route(
-                Method::Get,
-                format!("/gvfs/blobs/{oid}").as_bytes(),
-                b"offset=x"
-            ),
-            Route::BadRequest
         );
         let body = format!(
             "{{\"objectIds\":[\"{oid}\", \"{}\"],\"commitDepth\" : 3}}",

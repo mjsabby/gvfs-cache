@@ -435,8 +435,8 @@ fn parse_sizes_json(body: &[u8]) -> BTreeMap<String, u64> {
 
 /// An edge of a separate-blob store: unready until the mirror is done (blobs it is asked
 /// for meanwhile come through the proxy), then every blob of the history from the store
-/// as loose objects, packs, sizes and ranges; a push's blobs through the proxy until the
-/// pipeline seals them.
+/// as loose objects, packs and sizes; a push's blobs through the proxy until the pipeline
+/// seals them.
 #[test]
 fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
     let root = tempdir("sep-edge");
@@ -622,48 +622,12 @@ fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
     assert!(!in_pack.contains("blob"), "prefetch packs carry no blobs");
     let cold_ts = packs[0].0;
 
-    // Byte ranges: in place for stored (incompressible) blobs, inflated for compressed ones.
-    let noise_id = rev(&up.bare, &format!("{g}:b/noise.bin"));
-    for (id, content) in [
-        (noise_id.clone(), noise_bytes.clone()),
-        (text2.clone(), text(2)),
-    ] {
-        let n = content.len() as u64;
-        for (off, len) in [(0u64, 10u64), (65_530, 20), (n - 3, 3), (1, n - 2), (n, 5)] {
-            let (status, h, body) = server.get_with(
-                &format!("/gvfs/blobs/{id}?offset={off}&length={len}"),
-                &[],
-                &["x-gvfs-blob-size"],
-            );
-            assert_eq!(
-                (status, h[0].clone()),
-                (200, Some(n.to_string())),
-                "{id} {off}+{len}"
-            );
-            let end = (off + len).min(n) as usize;
-            assert!(body == content[off as usize..end], "{id} {off}+{len}");
-        }
-        let (_, _, rest) = server.get_with(&format!("/gvfs/blobs/{id}?offset=7"), &[], &[]);
-        assert!(rest == content[7..]);
-        assert_eq!(
-            server.get(&format!("/gvfs/blobs/{id}?offset={}", n + 1)).0,
-            416
-        );
-    }
-
     // Pipelined requests (two in one write): each is answered from its own query.
-    let bodies = pipelined(
-        server.port,
-        &[
-            format!("/gvfs/blobs/{noise_id}?offset=0&length=100"),
-            format!("/gvfs/blobs/{noise_id}?offset=4096&length=100"),
-        ],
-    );
-    assert!(bodies[0] == noise_bytes[..100], "first pipelined range");
-    assert!(
-        bodies[1] == noise_bytes[4096..4196],
-        "second pipelined range"
-    );
+    let since = |ts: u64| format!("/gvfs/prefetch?lastPackTimestamp={ts}");
+    let bodies = pipelined(server.port, &[since(cold_ts), since(0)]);
+    assert!(bodies[0] == server.get(&since(cold_ts)).2, "up to date");
+    assert!(bodies[1] == server.get(&since(0)).2, "cold");
+    assert!(bodies[0] != bodies[1]);
 
     // A push is served at once (L0): its blobs through the proxy, its sizes with the warm
     // prefetch.
@@ -940,20 +904,9 @@ fn write_noise_file(path: &Path, n: u64, seed: u64) -> Oid {
     Oid(h.finalize().into())
 }
 
-/// Reads `len` bytes of `path` at `at`.
-fn file_range(path: &Path, at: u64, len: usize) -> Vec<u8> {
-    use std::os::unix::fs::FileExt;
-    let mut b = vec![0u8; len];
-    std::fs::File::open(path)
-        .unwrap()
-        .read_exact_at(&mut b, at)
-        .unwrap();
-    b
-}
-
 /// A blob over 4 GiB, end to end: the pipeline streams it into a blob pack with memory
-/// bounded by its buffers; the edge sends it loose and in a pack (git verifies both) and
-/// serves ranges beyond 4 GiB. Writes ~13 GB under the target directory:
+/// bounded by its buffers; the edge sends it loose and in a pack (git verifies both).
+/// Writes ~13 GB under the target directory:
 /// `cargo test --release --test separate -- --ignored blob_over_4gib`.
 #[test]
 #[ignore = "writes ~13 GB; run explicitly"]
@@ -1122,18 +1075,6 @@ fn blob_over_4gib_end_to_end() {
         t0.elapsed().as_secs_f64()
     );
 
-    // Ranges beyond 4 GiB, in place.
-    for (off, len) in [
-        (0u64, 100usize),
-        ((4 << 30) - 50, 100),
-        (n - 777, 777),
-        (3 << 30, 65_536 * 3),
-    ] {
-        let (status, _, body) =
-            server.get(&format!("/gvfs/blobs/{blob}?offset={off}&length={len}"));
-        assert_eq!(status, 200);
-        assert!(body == file_range(&src, off, len), "range {off}+{len}");
-    }
     server.assert_clean();
     drop(server);
     let _ = std::fs::remove_dir_all(&root);

@@ -17,8 +17,7 @@ Two runs, each judged by stock git:
          one against a bitmap upstream). Afterwards every blob of main is listed (copies
          counted: a window and the mirror may both copy an old version a revert brings back
          while the mirror is in flight) and an edge with no upstream returns every blob of
-         main byte for byte (POST batches through `index-pack --strict`, ranges of a large
-         blob).
+         main byte for byte (POST batches through `index-pack --strict`).
 
     python3 bench/separate_history.py sg [--jobs 8]
     python3 bench/separate_history.py synth [--small 20000 --medium 200 --large 8 --history 30]
@@ -513,14 +512,6 @@ def run_synth(a):
                  input="\n".join(ids).encode()).stdout.decode().split("\n")
         back = dict(line.split() for line in got if line and "missing" not in line)
         assert {o: int(s) for o, s in back.items()} == want, "an edge POST lost or changed a blob"
-        big = ids[-1]
-        content = sh(["git", "--git-dir", up, "cat-file", "blob", big]).stdout
-        r2 = random.Random(3)
-        for _ in range(8):
-            off = r2.randrange(0, len(content))
-            ln = r2.randint(1, 8 << 20)
-            r = request(port, "GET", f"/gvfs/blobs/{big}?offset={off}&length={ln}")
-            assert r.status == 200 and r.body == content[off:off + ln], (off, ln, r.status)
         counters = edge_counters(port)
     finally:
         stop(p)

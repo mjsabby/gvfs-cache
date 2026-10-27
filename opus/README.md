@@ -123,7 +123,7 @@ gvfs-daemon mirror --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT \
 # Then schedule the pipeline as below: every run copies its window's new blobs before
 # publishing the trees that reference them (keep --work-dir, or --cache-dir, on a
 # persistent disk: a run reuses the store objects the previous one downloaded). Edges
-# serve blobs from the blob packs (read in place, or by range from Azure) and proxy only
+# serve blobs from the blob packs (mapped, or read by range from Azure) and proxy only
 # the blobs of the commits the pipeline has not sealed yet.
 gvfs-daemon serve --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT ...
 ```
@@ -131,8 +131,7 @@ gvfs-daemon serve --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT ...
 An edge of such a store reports ready (`/healthz`) once the mirror has copied the whole
 history. Stock gvfs-helper works unchanged: it prefetches commits and trees and faults
 blobs in (`GET`/`POST /gvfs/objects`). Clients that want sizes without blobs send
-`X-GVFS-Sizes: 1` with a prefetch and get a `GSZ1` section after the packs; large files
-can be read piecewise with `GET /gvfs/blobs/<oid>?offset=&length=`.
+`X-GVFS-Sizes: 1` with a prefetch and get a `GSZ1` section after the packs.
 
 Nothing repairs such a store by itself, and nothing should need to. If storage loses a
 blob pack or a segment index, edges and pipeline runs carry on (they log a warning, and

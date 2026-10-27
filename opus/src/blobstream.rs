@@ -8,8 +8,8 @@
 //! * **Whole entries stream through** in fixed memory, whatever their size: inflated once
 //!   in 64 KiB pieces to verify the id (SHA-1 of `blob <size>\0` + content) and the size,
 //!   and written either as the upstream's zlib bytes untouched or, for a blob of at least
-//!   [`STORED_MIN`] whose first MiB compresses by less than 5%, as stored blocks (every
-//!   content byte then has a fixed place in the pack, so ranges are served in place).
+//!   [`STORED_MIN`] whose first MiB compresses by less than 5%, as stored blocks (which
+//!   inflate at the speed of a copy).
 //! * **Deltas** (OFS or REF) are inflated in memory and applied to their base, read back
 //!   from the output (the output must be a [`Spool`] that can do that, like a local file),
 //!   and the result is written whole. A REF base may arrive after its delta: the delta
@@ -876,22 +876,6 @@ mod tests {
             let used = inf.inflate_exact(&entry[h.header_len..], &mut buf).unwrap();
             assert_eq!(used, entry.len() - h.header_len);
             assert_eq!(&buf, content);
-            if rec.stored {
-                let mut ranges = Vec::new();
-                for (from, len) in [
-                    (0u64, 10u64),
-                    (65_530, 20),
-                    (rec.size - 3, 3),
-                    (1, rec.size - 2),
-                ] {
-                    rec.stored_ranges(from, len, &mut ranges);
-                    let mut got = Vec::new();
-                    for (at, n) in &ranges {
-                        got.extend_from_slice(&f.out[us(*at)..us(at + n)]);
-                    }
-                    assert_eq!(got, content[us(from)..us(from + len)]);
-                }
-            }
         }
     }
 

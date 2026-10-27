@@ -492,8 +492,7 @@ store/
 splicing its own bytes. An entry keeps the upstream's zlib stream untouched, unless the
 blob is at least 1 MiB and its first MiB compresses by less than 5%: then it is rewritten
 as deflate *stored* blocks (65,535 content bytes each, 5-byte headers, 0.008% overhead),
-so every content byte has a computable offset and byte ranges are read in place. A
-**segment** record is `id | pack u32 | offset (48 bits) | header length (8) | stored (1) |
+which clients inflate at the speed of a copy. A **segment** record is `id | pack u32 | offset (48 bits) | header length (8) | stored (1) |
 entry length u64 | size u64`: 64-bit lengths, so entries beyond 4 GiB are ordinary.
 
 ### The consistency rule
@@ -624,10 +623,7 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   does). Each read is of a whole range, its pieces handed to an async sink as they
   arrive (a client's socket, the pack's hash, an inflater): no buffer between the store and
   the client, and the cache sees a read's length. A loose blob reads its zlib header, then
-  its body and Adler-32 in one read; a stored blob's range is one read of its raw bytes,
-  the stored blocks' headers dropped on the way; a compressed blob's range reads windows
-  from 1 MiB, doubling to 32 MiB, so a range near the start of a long entry reads little
-  more than it needs. The mirror writes the tip's blobs first, in path order, so a
+  its body and Adler-32 in one read. The mirror writes the tip's blobs first, in path order, so a
   checkout's blobs share blocks; a block being fetched is fetched once (other readers'
   tasks wait for it). The ranged GETs go through the async client, its connections pooled
   per account.
@@ -666,9 +662,6 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   history's; a warm prefetch: what its window introduced). The section is built once per
   plan, and the response says `X-GVFS-Sizes: 1`. Without the header the stream is
   unchanged.
-* **Ranges.** `GET /gvfs/blobs/<oid>?offset=&length=` returns content bytes with
-  `X-GVFS-Blob-Size`: read in place for stored entries, inflated from the start
-  otherwise. This is for clients that read large files piecewise.
 * **Consistency at the edge.** `blobs.bin` is polled with the manifest. A manifest is
   applied only once the `blobs.bin` generation it names is loaded. `/healthz` stays 503
   until `blobs.bin` is complete (the history mirrored). L0 fetches are `blob:none`, with

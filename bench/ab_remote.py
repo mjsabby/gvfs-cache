@@ -1,8 +1,8 @@
 """Two builds' edges on one store in object storage, the same requests to both: every
 response must be byte-identical, and right by git. It covers what reads a blob pack that
-stays in the store: loose blobs, packs (batches, and a large blob's pack of its own),
-ranges of stored and of compressed blobs. Each runs with the edge's block cache at its
-default size, at a size that long reads stream past, and off.
+stays in the store: loose blobs, packs (batches, and a large blob's pack of its own), and
+sizes. Each runs with the edge's block cache at its default size, at a size that long
+reads stream past, and off.
 
 It builds its store in Azurite (`azurite-blob` on PATH) from a generated upstream: small
 text, random binaries around the stored-block (1 MiB) and own-pack (16 MiB) thresholds,
@@ -199,20 +199,6 @@ def main():
                 assert r.status == 200
             r = both("POST", "/gvfs/sizes", body=ids)
             assert {e["Id"]: e["Size"] for e in json.loads(r.body)} == {i: len(blobs[i]) for i in ids}
-            for i in ids:
-                size = len(blobs[i])
-                cuts = {(0, 1), (0, min(size, 100)), (size // 2, 4096), (size - 1, 1), (65530, 20),
-                        (65535, 65535), (1000, 12 * MIB), (0, size), (size, 0)}
-                cuts |= {(rnd.randrange(size), rnd.randrange(1, 3 * MIB)) for _ in range(3)}
-                for off, length in sorted(cuts):
-                    if off > size:
-                        continue
-                    q = f"/gvfs/blobs/{i}?offset={off}&length={length}"
-                    r = both("GET", q)
-                    assert r.status == 200 and r.body == blobs[i][off:off + length], (name, q, r.status)
-                    n["judged"] += 1
-                r = both("GET", f"/gvfs/blobs/{i}?offset={size // 3}")
-                assert r.body == blobs[i][size // 3:], i
             keys = ("gvfs_blob_cache_fetches_total", "gvfs_blob_cache_bypass_total",
                     "gvfs_blob_cache_hits_total", "gvfs_blob_cache_misses_total",
                     "gvfs_alloc_hot_path_total", "gvfs_errors_total")

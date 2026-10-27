@@ -2,8 +2,8 @@
 //!
 //! * **Blob packs** (`blobs/<id>.pack`) are stock git packs holding whole blobs only, never
 //!   deltas. Any entry is served by splicing its own bytes, with no inflate and no base.
-//!   Entries whose content does not compress are written as deflate *stored* blocks: every
-//!   content byte then sits at a computable file offset, so byte ranges are read in place.
+//!   Entries whose content does not compress are written as deflate *stored* blocks, which
+//!   inflate at the speed of a copy.
 //! * **Segments** (`blobs/<id>.bidx`) index one or more blob packs: a minimal perfect hash
 //!   and one 48-byte record per blob (64-bit offsets, lengths and sizes). Each pipeline run
 //!   or mirror batch adds a segment, and folds merge the small ones (a geometric
@@ -43,7 +43,7 @@ pub const STORED_BLOCK: usize = 65535;
 /// zlib header of a stream of stored blocks: deflate, 32K window, "fastest" level.
 const ZLIB_STORED_HEADER: [u8; 2] = [0x78, 0x01];
 /// Blobs at least this big whose upstream compression saves under 5% are re-encoded as
-/// stored blocks (seekable).
+/// stored blocks.
 pub const STORED_MIN: u64 = 1 << 20;
 
 pub fn pack_key(id: &str) -> String {
@@ -67,7 +67,7 @@ pub struct BlobRec {
     pub size: u64,
     /// Bytes of the entry header before the zlib stream.
     pub hdr_len: u8,
-    /// The zlib stream is stored blocks: content is addressable in place.
+    /// The zlib stream is deflate stored blocks ([`Encoding::Stored`]).
     pub stored: bool,
 }
 
@@ -79,35 +79,6 @@ impl BlobRec {
             self.offset.saturating_add(h),
             self.entry_len.saturating_sub(h),
         )
-    }
-
-    /// For a stored entry, the pack ranges holding content bytes `[from, from + len)`, in
-    /// order (each at most one block).
-    pub fn stored_ranges(&self, from: u64, len: u64, out: &mut Vec<(u64, u64)>) {
-        out.clear();
-        out.extend(self.stored_range_iter(from, len));
-    }
-
-    /// [`BlobRec::stored_ranges`] without a buffer.
-    pub fn stored_range_iter(&self, from: u64, len: u64) -> impl Iterator<Item = (u64, u64)> {
-        let block = u64_of(STORED_BLOCK);
-        let end = from.saturating_add(len).min(self.size);
-        let zlib = self.zlib().0.saturating_add(2);
-        let mut at = from;
-        std::iter::from_fn(move || {
-            if at >= end {
-                return None;
-            }
-            let k = at.checked_div(block).unwrap_or(0);
-            let within = at.checked_rem(block).unwrap_or(0);
-            let take = block.saturating_sub(within).min(end.saturating_sub(at));
-            let file = zlib
-                .saturating_add(k.saturating_mul(block.saturating_add(5)))
-                .saturating_add(5)
-                .saturating_add(within);
-            at = at.saturating_add(take);
-            Some((file, take))
-        })
     }
 }
 
@@ -812,10 +783,10 @@ mod tests {
             .collect()
     }
 
-    /// A pack of raw and stored entries is a valid git pack with exactly those blobs, and
-    /// stored ranges address content in place.
+    /// A pack of raw and stored entries is a valid git pack with exactly those blobs, which
+    /// its segment finds.
     #[test]
-    fn blob_pack_segment_and_ranges() {
+    fn blob_pack_and_segment() {
         let small = b"hello, blob\n".to_vec();
         let text: Vec<u8> = (0..200_000u32)
             .flat_map(|i| format!("line {i}\n").into_bytes())
@@ -898,24 +869,7 @@ mod tests {
         }
         assert_eq!(seg.find(&blob_oid(b"absent")), None);
 
-        // Stored ranges read content in place.
-        let r = recs[2];
-        assert!(r.stored);
-        let mut ranges = Vec::new();
-        for (from, n) in [
-            (0u64, 10u64),
-            (65_530, 20),
-            (100_000, 140_000),
-            (196_000, 9_999),
-        ] {
-            r.stored_ranges(from, n, &mut ranges);
-            let mut got = Vec::new();
-            for &(at, len) in &ranges {
-                got.extend_from_slice(&pack[us(at)..us(at + len)]);
-            }
-            let end = (from + n).min(r.size);
-            assert_eq!(got, &big[us(from)..us(end)], "range {from}+{n}");
-        }
+        assert!(recs[2].stored && !recs[1].stored);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
