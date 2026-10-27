@@ -1208,19 +1208,19 @@ by batch, each commit with a regression test that fails on the code before it.
 |---|---|---|---|
 | 1 | HTTP framing: a GET's body was read as the next request; a duplicate `Content-Length`, and `Content-Length` with `Transfer-Encoding`, were accepted; HEAD answered with a body. Behind a load balancer that shares connections, that is request smuggling. | 1 | fixed `36a1f7d` |
 | 2 | Slow clients held arenas (2 × cores of them). A trickled head or body, or an unread sizes answer, held one for up to the idle timeout per read. | 1 | fixed `1fa6555` |
-| 3 | No cap on concurrent connections; the soft FD limit is raised to the hard limit | 3 | open |
+| 3 | No cap on concurrent connections; the soft FD limit is raised to the hard limit | 3 | fixed `69928e1` |
 | 4 | Amplification. A 77-byte commit POST could grow its arena without bound, on every arena at once. A garbage `lastPackTimestamp` was read as 0 (a 2.88 GB cold clone). | 1 | fixed `a6305d9`, `36a1f7d` |
 | 5 | The L0 overlay after a force-push that rewinds the branch: a phantom tip, Lamport divergence | 2 | fixed `11d6358` |
 | 6 | Remote blob packs were read 1 MiB at a time, so the block cache's bypass and 32 MiB windows never applied, and with no cache every MiB was a ranged GET | 1 | fixed `9c7269a` |
 | 7 | `size_outside_slabs` asks the proxy, per unknown id, while holding an arena | 2 | fixed `d46ffcd` |
 | 8 | SAS tokens and URL userinfo can reach error strings and logs | 2 | fixed `2ff6dff` |
-| 9 | The edge never prunes cached slabs or `.bidx` files; `--cache-dir` defaults to `/tmp` (a tmpfs on many hosts) | 3 | open |
+| 9 | The edge never prunes cached slabs or `.bidx` files; `--cache-dir` defaults to `/tmp` (a tmpfs on many hosts) | 3 | fixed `f4068e5` |
 | 10 | Proxy cache: eviction can drop a re-fetched blob's newer entry; `Proxy.idle` is unbounded; a `BlobPack` is dropped on a hot path | 2 | fixed `de10f8e` |
-| 11 | `BlockCache::evict` clones and sorts every block, and unlinks files, under its lock | 3 | open |
-| 12 | `repack::write_copied` lacks the delta-depth bound; a resolver chain past 4,096 grows outside a cold section; a corrupt declared size can size a buffer | 3 | open |
+| 11 | `BlockCache::evict` clones and sorts every block, and unlinks files, under its lock | 3 | fixed `9043258` |
+| 12 | `repack::write_copied` lacks the delta-depth bound; a resolver chain past 4,096 grows outside a cold section; a corrupt declared size can size a buffer | 3 | fixed `2a21a67` |
 | 13 | A range of a compressed blob inflates from the entry's start | later | open (by design) |
 | 14 | `valid_id` is not enforced on segment and pack ids | later | open |
-| 15 | CLI usage drift (`--workers`' default, undocumented flags) | later | `--arena-objects` documented |
+| 15 | CLI usage drift (`--workers`' default, undocumented flags) | 3 | fixed `69928e1` |
 
 **Batch 1:**
 
@@ -1366,8 +1366,72 @@ by batch, each commit with a regression test that fails on the code before it.
   The hot-path changes amount to one empty-check on prefetch and one at the end of a POST
   lease.
 
+**Batch 3:**
+
+* **Delta depth and corrupt sizes (`2a21a67`).**
+  * Repacking now stops copied delta chains at the depth bound: a 69-deep chain comes out 50
+    deep, as git's own chains do. Before, copying could extend them.
+  * A resolver chain past 4,096 entries grows in a cold section, as the allocator guard
+    requires.
+  * A declared size is checked before it sizes a buffer: at most deflate's ratio (1,032×)
+    of the compressed bytes, and equal to the slab's record. On the old code a corrupt
+    2^56-byte header aborted the edge.
+* **Block cache (`9043258`).** Unpinned blocks are kept in an LRU ordered by last use, so
+  eviction pops the oldest instead of cloning and sorting every block under the lock. Files
+  are unlinked after the lock is released. A block fetched again gets a new file name, so a
+  late unlink cannot remove it.
+* **Cache directory (`f4068e5`).** An object-store edge must be given `--cache-dir`. It
+  defaulted to `/tmp`, a tmpfs on many hosts, which put every cached slab in memory. The edge
+  also warns when the cache is on tmpfs or ramfs. At boot and after each new manifest, it
+  deletes slabs the manifest no longer lists, `.bidx` files of segments the store no longer
+  lists, and downloads that dead processes left half-written.
+* **Connections (`69928e1`).**
+  * At most `--max-conns` connections are open (default: twice `--max-idle-conns`, within
+    the descriptor limit less a reserve). Past that, the edge stops accepting, and new
+    clients wait in the listen queue.
+  * A head that arrives in pieces waits without its 256 KiB output buffer: 5,000 slow heads
+    took 62 MiB, 1,278 MiB before.
+  * The idle cap is checked once after each response. tokio may wake a connection with
+    nothing to read right after a response, and checking again then closed idle connections
+    while others had merely connected.
+  * The usage text now describes `--workers` correctly and documents `--max-conns`,
+    `--max-idle-conns`, `--idle-secs` and `--quantum-us` (#15).
+* **Tests (`6ca469c`).** The harness picked a free port, released it, and gave it to the
+  server. Another test's server could bind it first: this test's server then failed to
+  start, the other one answered the readiness probe, and the test ran against another
+  store. It showed up twice: as objects missing from a fetch in a full-suite run, and once in
+  about 2,300 runs of one test under load. Servers and Azurite now bind port 0 and report
+  the port they got.
+
+**Validation of batch 3** (`6ca469c`, the same checks):
+
+* `cargo test` passes, with six new tests: `copied_delta_chains_stop_at_max_depth`,
+  `the_resolver_refuses_corrupt_sizes`, `an_object_store_edge_needs_a_cache_dir`,
+  `pruning_leaves_what_is_still_used`, `memory_filesystems_are_recognised` and
+  `connections_past_max_conns_wait_for_a_slot`. The block-cache tests check the LRU against
+  the blocks after every step. Two Azurite tests plant stale files and check that the cache
+  then holds exactly what the store still lists. The idle-cap test no longer depends on timing.
+* Stability: the e2e, separate-store and Azurite suites passed 25 times in a row while the
+  live-L0 test ran 960 times, 16 at a time, beside them.
+* Byte identity with the threads build: 1,920, 1,920 and 2,064 responses identical, with
+  4.8 to 5.5 GB of prefetch each. The depth bound changes no SearchGold bytes.
+* `ab_remote.py`: 4,163 identical requests in each cache configuration. The cache's fetch,
+  hit, miss and bypass counts equal batch 2's, so the new eviction picks the same blocks.
+* Conformance 918/0. gvfs-helper 18/18, fable's client 15/15.
+* Load against `de10f8e`, 2 interleaved rounds: GET blob −0.4% at the same CPU per request
+  (3.95 µs against 3.97), mixed −0.2%, sizes −0.1%, POST −0.5% (six more rounds agree).
+  Against the commit before it, the connection commit measured −0.3% on POST running second
+  and −0.05% running first: within the bench's noise.
+
 **Lessons:**
 
+* **A test can pass against the wrong server.** A port that is picked, released and passed
+  on can be taken in between, and a readiness probe does not say whose server answered.
+  Let the server bind port 0 and say which port it got.
+* **A count must mean what it says.** Open connections, computed as the slots in use, also
+  counted the slot the accept loop holds for the next connection, so the gauge read one too
+  many. The idle count still includes a client that has closed until the edge reads the
+  close: the harness's readiness probe made the idle-cap test fail about twice in 25 runs.
 * **Hardening was not free until it was measured.** A strict parser, a deadline per request and
   a buffer owned by the connection each looked free. Together they cost 2% CPU on the hottest
   path, and `perf stat` per request found where.
