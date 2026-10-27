@@ -346,7 +346,13 @@ fn azure_pipeline_and_serve() {
     let log = run("1h", t0 + 1800, &[]);
     assert!(log.contains("repack: 2 slabs"), "{log}");
 
+    // What an earlier run left: a slab the store has since dropped, and a download that
+    // died with its process (no process has that id).
     let cache = root.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    for stale in ["gone.pack", "gone.mphf", ".old.pack.tmp-999999999-0"] {
+        std::fs::write(cache.join(stale), b"stale").unwrap();
+    }
     let server = Server::start_with_env(
         &[
             "--store",
@@ -360,6 +366,28 @@ fn azure_pipeline_and_serve() {
         ],
         &env,
     );
+    // The edge's cache holds the files of the slabs its manifest lists, and nothing else.
+    let cached = || {
+        let mut v: Vec<String> = std::fs::read_dir(&cache)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_type().unwrap().is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    let listed = || {
+        let (bytes, _) = backend.store("").get("manifest.bin").unwrap().unwrap();
+        let m = gvfs_daemon::manifest::Manifest::decode(&bytes).unwrap();
+        let mut v: Vec<String> = m
+            .slabs()
+            .flat_map(|x| [format!("{}.pack", x.id), format!("{}.mphf", x.id)])
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(cached(), listed());
     let packs = server.prefetch(0);
     assert_eq!(packs.len(), 1);
     let client = fresh_repo(&root, "client");
@@ -385,6 +413,8 @@ fn azure_pipeline_and_serve() {
         !cache.join("blob-blocks").exists(),
         "an inline store's edge keeps no blob blocks"
     );
+    // The weekly run replaced every slab: the old ones' files went with them.
+    assert_eq!(cached(), listed());
 
     // GC removed the slabs the rollups and the weekly rebuild replaced.
     let s = backend.store("");
@@ -495,7 +525,12 @@ fn azure_separate_store() {
     );
     assert!(cached.iter().all(|f| listed.contains(f)), "{cached:?}");
 
+    // A segment index blobs.bin no longer lists, and a dead download of one.
     let cache = root.join("cache");
+    std::fs::create_dir_all(cache.join("blobs")).unwrap();
+    for stale in ["gone.bidx", ".x.bidx.tmp-999999999-0"] {
+        std::fs::write(cache.join("blobs").join(stale), b"stale").unwrap();
+    }
     let server = Server::start_with_env(
         &[
             "--store",
@@ -561,15 +596,20 @@ fn azure_separate_store() {
             assert!(body == content[off..off + len], "{id} {off}+{len}");
         }
     }
-    // Blob packs stay in the store: the edge holds their indexes only.
-    let local: Vec<String> = std::fs::read_dir(cache.join("blobs"))
+    // Blob packs stay in the store: the edge holds their indexes only, those blobs.bin
+    // lists.
+    let mut local: Vec<String> = std::fs::read_dir(cache.join("blobs"))
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert!(
-        !local.is_empty() && local.iter().all(|f| f.ends_with(".bidx")),
-        "{local:?}"
-    );
+    local.sort();
+    let mut segments: Vec<String> = bm
+        .segments
+        .iter()
+        .map(|g| format!("{}.bidx", g.id))
+        .collect();
+    segments.sort();
+    assert_eq!(local, segments);
     server.assert_clean();
     drop(server);
 
@@ -637,4 +677,28 @@ fn azure_separate_store() {
     edge.assert_clean();
     drop(edge);
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An edge of an object store keeps gigabytes in its cache directory: one is required (the
+/// system's temp directory, the default for a directory store, is memory on many hosts).
+#[test]
+fn an_object_store_edge_needs_a_cache_dir() {
+    let cs = "DefaultEndpointsProtocol=http;AccountName=a;AccountKey=AAAA;\
+              BlobEndpoint=http://127.0.0.1:1/a";
+    let out = Command::new(env!("CARGO_BIN_EXE_gvfs-daemon"))
+        .args([
+            "serve",
+            "--store",
+            "azure:gvfs/x",
+            "--store-auth-env",
+            "GVD_NO_CS",
+        ])
+        .env("GVD_NO_CS", cs)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("--cache-dir"),
+        "{err}"
+    );
 }

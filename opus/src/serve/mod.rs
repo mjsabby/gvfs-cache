@@ -233,21 +233,28 @@ pub fn main(args: &[String]) -> Result<()> {
     let cores = crate::util::default_threads();
     let arenas = f.num("arenas", cores.saturating_mul(2))?;
     let arena_objects = f.num("arena-objects", 1usize << 18)?;
+    let store = Store::open(
+        f.require("store")?,
+        f.get("store-auth-env")
+            .unwrap_or("AZURE_STORAGE_CONNECTION_STRING"),
+    )?;
+    let cache_dir = match f.get("cache-dir") {
+        Some(d) => PathBuf::from(d),
+        // The system's temp directory is memory on many hosts.
+        None if store.local_path(MANIFEST_KEY).is_none() => crate::bail!(
+            "an edge of an object store keeps its slabs (gigabytes) and its caches of blob \
+             packs in --cache-dir: give it a directory on local disk"
+        ),
+        None => std::env::temp_dir().join("gvfs-daemon-cache"),
+    };
     let opts = Options {
-        store: Store::open(
-            f.require("store")?,
-            f.get("store-auth-env")
-                .unwrap_or("AZURE_STORAGE_CONNECTION_STRING"),
-        )?,
+        store,
         upstream,
         upstream_spec,
         proxy_cache_bytes: f.num("proxy-cache-mib", 10240u64)?.saturating_mul(1 << 20),
         blob_cache_bytes: f.num("blob-cache-mib", 32768u64)?.saturating_mul(1 << 20),
         bind: f.get("bind").unwrap_or("127.0.0.1:8080").to_string(),
-        cache_dir: f
-            .get("cache-dir")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join("gvfs-daemon-cache")),
+        cache_dir,
         poll: Duration::from_millis(f.num("poll-ms", 2000u64)?),
         workers: f.num("workers", cores)?,
         arenas,
@@ -330,6 +337,19 @@ pub fn run(o: Options) -> Result<()> {
     // 1-3. Manifest, slabs, live tip.
     let (manifest, etag) = live.wait_for_manifest()?;
     let separate = manifest.separate_blobs();
+    let remote = live.store.local_path(MANIFEST_KEY).is_none();
+    if remote || (separate && upstream_spec.is_some()) {
+        std::fs::create_dir_all(&live.cache_dir)
+            .ctx(&format!("creating {}", live.cache_dir.display()))?;
+        if let Some(kind) = in_memory(&live.cache_dir) {
+            crate::log!(
+                "serve: warning: --cache-dir {} is in memory ({kind}); it holds {}up to \
+                 --blob-cache-mib and --proxy-cache-mib of blobs: give it a directory on disk",
+                live.cache_dir.display(),
+                if remote { "the store's slabs and " } else { "" }
+            );
+        }
+    }
     if separate {
         // Blob packs in object storage are read in blocks kept on local disk.
         if live.store.local_path(crate::blobs::BLOBS_KEY).is_none() && blob_cache_bytes > 0 {
@@ -355,6 +375,7 @@ pub fn run(o: Options) -> Result<()> {
         }
     }
     live.open_manifest(&manifest)?;
+    live.prune_slabs(&manifest);
     let first = live.snapshot(manifest, etag);
     let proxy = match (&upstream_spec, separate) {
         (Some((u, _, auth)), true) => Some(blobs::Proxy::new(
@@ -1016,7 +1037,32 @@ impl Live {
             }
         );
         self.blobs = Some(Arc::new(set));
+        // Views on the previous set keep the segments they mapped.
+        let keep: std::collections::HashSet<&str> =
+            bm.segments.iter().map(|s| s.id.as_str()).collect();
+        let removed = prune_dir(&self.cache_dir.join("blobs"), |id, ext| {
+            ext == "bidx" && !keep.contains(id)
+        });
+        if removed > 0 {
+            crate::log!("serve: pruned {removed} segment indexes blobs.bin no longer lists");
+        }
         Ok(true)
+    }
+
+    /// Removes the cached files of slabs `m` does not list (a request on an older view keeps
+    /// what it mapped). Without this, an edge of an object store kept every slab it ever
+    /// downloaded: each 15m slab, each rollup, a new baseline every week.
+    fn prune_slabs(&self, m: &Manifest) {
+        let keep: std::collections::HashSet<&str> = m.slabs().map(|s| s.id.as_str()).collect();
+        let removed = prune_dir(&self.cache_dir, |id, ext| {
+            matches!(ext, "pack" | "mphf" | "sizes") && !keep.contains(id)
+        });
+        if removed > 0 {
+            crate::log!(
+                "serve: pruned {removed} files of slabs manifest generation {} does not list",
+                m.generation
+            );
+        }
     }
 
     /// The sizes the trees of a new L0 slab introduce (those `known` does not have), asked
@@ -1149,6 +1195,7 @@ impl Live {
                 }
                 if m.generation > view.manifest.generation && !blobs_behind {
                     self.open_manifest(&m)?;
+                    self.prune_slabs(&m);
                     self.l0 = self.tip.prune(&self.l0, &view.manifest, &m, &self.sealed)?;
                     let next = self.snapshot(m, etag);
                     crate::log!(
@@ -1220,6 +1267,50 @@ impl Live {
         ctx.metrics.l0_ingests.fetch_add(1, Ordering::Relaxed);
         ctx.publish(Arc::new(next));
         Ok(true)
+    }
+}
+
+/// Removes the files of `dir` (not its directories) named `<id>.<ext>` that `doomed` picks,
+/// and downloads in progress (`.<name>.tmp-<pid>-<n>`) of processes no longer running.
+/// Returns how many went.
+fn prune_dir(dir: &Path, doomed: impl Fn(&str, &str) -> bool) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let gone = match name.strip_prefix('.') {
+            Some(temp) => temp
+                .rsplit_once(".tmp-")
+                .and_then(|(_, tail)| tail.split('-').next()?.parse::<u32>().ok())
+                .is_some_and(|pid| {
+                    pid != std::process::id() && !Path::new(&format!("/proc/{pid}")).exists()
+                }),
+            None => name
+                .rsplit_once('.')
+                .is_some_and(|(id, ext)| doomed(id, ext)),
+        };
+        if gone && std::fs::remove_file(entry.path()).is_ok() {
+            removed = removed.saturating_add(1);
+        }
+    }
+    removed
+}
+
+/// The kind of memory filesystem `path` is on (`tmpfs`, `ramfs`), if it is on one.
+fn in_memory(path: &Path) -> Option<&'static str> {
+    const RAMFS_MAGIC: i64 = 0x8584_58f6;
+    let kind = nix::sys::statfs::statfs(path).ok()?.filesystem_type();
+    if kind == nix::sys::statfs::TMPFS_MAGIC {
+        Some("tmpfs")
+    } else if kind.0 == RAMFS_MAGIC {
+        Some("ramfs")
+    } else {
+        None
     }
 }
 
@@ -1322,6 +1413,52 @@ pub fn metrics_text(ctx: &Ctx) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Memory filesystems are told apart from the rest (`/dev/shm` is tmpfs on Linux).
+    #[test]
+    fn memory_filesystems_are_recognised() {
+        if Path::new("/dev/shm").is_dir() {
+            assert_eq!(in_memory(Path::new("/dev/shm")), Some("tmpfs"));
+        }
+        assert_eq!(in_memory(Path::new("/proc")), None);
+    }
+
+    /// Pruning removes the files `doomed` picks and downloads of dead processes, and leaves
+    /// directories, other names, and downloads still running (this process's).
+    #[test]
+    fn pruning_leaves_what_is_still_used() {
+        let dir = std::env::temp_dir().join(format!("gvd-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("blobs")).unwrap();
+        let me = std::process::id();
+        let files = [
+            "kept.pack".to_string(),
+            "gone.pack".to_string(),
+            "gone.sizes".to_string(),
+            "notes.txt".to_string(),
+            ".dead.pack.tmp-999999999-3".to_string(),
+            format!(".live.pack.tmp-{me}-4"),
+        ];
+        for f in &files {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        let removed = prune_dir(&dir, |id, ext| id == "gone" && ext != "txt");
+        assert_eq!(removed, 3);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let mut want = vec![
+            "blobs".to_string(),
+            "kept.pack".to_string(),
+            "notes.txt".to_string(),
+            format!(".live.pack.tmp-{me}-4"),
+        ];
+        want.sort();
+        assert_eq!(left, want);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn only_sealed_l0_slabs_age_out() {

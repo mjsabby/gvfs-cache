@@ -88,7 +88,9 @@ MIRROR OPTIONS:
 
 SERVE OPTIONS:
     --bind <ADDR>              listen address (default: 127.0.0.1:8080)
-    --cache-dir <DIR>          local copies of remote slabs (default: system temp)
+    --cache-dir <DIR>          local copies of remote slabs, blocks of blob packs, proxied
+                               blobs: a directory on local disk (required for an object
+                               store; default: system temp); what the store drops goes
     --poll-ms <N>              upstream + manifest poll interval (default: 2000)
     --workers <N>              connection threads (default: 256)
     --arenas <N>               request scratch arenas (default: 2 x cores)
