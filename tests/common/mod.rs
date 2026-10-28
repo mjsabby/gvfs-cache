@@ -582,9 +582,11 @@ pub fn msgit() -> Option<PathBuf> {
 
 /// A smart-HTTP git server for `repo` at `http://127.0.0.1:<port>/org/proj/_git/repo`, like
 /// Azure DevOps: one accepted `Authorization` header (Basic auth with password `token`
-/// until [`SmartHttp::set_auth`] changes it; anything else gets 401), keep-alive
-/// connections, and chunked `git-upload-pack` responses. With `v2` false it ignores
-/// `Git-Protocol` and speaks only protocol v0, like an old server.
+/// until [`SmartHttp::set_auth`] changes it); anything else gets 401 if the request asks for
+/// it (`X-TFS-FedAuthRedirect: Suppress`), else a 302 to a sign-in page, as Azure DevOps
+/// answers clients other than git. Keep-alive connections, and chunked `git-upload-pack`
+/// responses. With `v2` false it ignores `Git-Protocol` and speaks only protocol v0, like an
+/// old server.
 pub struct SmartHttp {
     pub port: u16,
     pub url: String,
@@ -646,7 +648,7 @@ impl SmartHttp {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Requests answered 401.
+    /// Requests whose credentials were rejected.
     pub fn unauthorized(&self) -> usize {
         self.state
             .unauthorized
@@ -715,7 +717,11 @@ fn smart_http_connection(
         let accepted = state.auth.lock().unwrap().clone();
         if header("authorization") != Some(accepted.as_str()) {
             state.unauthorized.fetch_add(1, Ordering::Relaxed);
-            out.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"test\"\r\nContent-Length: 0\r\n\r\n")?;
+            if header("x-tfs-fedauthredirect") == Some("Suppress") {
+                out.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"test\"\r\nContent-Length: 0\r\n\r\n")?;
+            } else {
+                out.write_all(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/_signin\r\nContent-Length: 0\r\n\r\n")?;
+            }
             continue;
         }
         let v2 = allow_v2 && header("git-protocol").is_some_and(|v| v.contains("version=2"));

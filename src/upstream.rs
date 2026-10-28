@@ -9,7 +9,9 @@
 //!
 //! Every HTTP request carries the upstream's credentials ([`Auth`]): a fixed `Authorization`
 //! header, or the answer of `--auth-command`, which runs again whenever the upstream answers
-//! 401 (its token expired), so that the edge and the mirror outlive their tokens.
+//! 401 (its token expired), so that the edge and the mirror outlive their tokens. Every
+//! request also asks Azure DevOps for that 401, which it would otherwise replace with a
+//! redirect to its sign-in page.
 //!
 //! Packs are always requested non-thin (every delta base is inside the pack), so each
 //! fetched pack is a self-contained slab.
@@ -58,6 +60,12 @@ fn refuse_password(spec: &str) -> Result<()> {
 
 /// How long `--auth-command` may take to answer.
 const AUTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Sent with every HTTP request. Azure DevOps answers credentials it rejects (an expired
+/// token) with a 302 to its sign-in page, not 401, unless the client looks like git, and on
+/// the GVFS endpoints even then; asked this way, it answers 401 (gvfs-helper asks too).
+/// Other servers ignore it.
+const NO_SIGN_IN_REDIRECT: (&str, &str) = ("X-TFS-FedAuthRedirect", "Suppress");
 
 /// Credentials for an HTTP upstream: a fixed `Authorization` header value, or the answer
 /// of a command (`--auth-command`), which runs again when the upstream answers 401. Clones
@@ -740,7 +748,8 @@ impl Http {
         headers: &[(&str, &str)],
         body: bytes::Bytes,
     ) -> Result<crate::aclient::AResponse> {
-        let mut all = Vec::with_capacity(headers.len().saturating_add(1));
+        let mut all = Vec::with_capacity(headers.len().saturating_add(2));
+        all.push(NO_SIGN_IN_REDIRECT);
         if let Some((value, _)) = auth {
             all.push(("Authorization", &**value));
         }
