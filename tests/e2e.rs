@@ -1066,6 +1066,48 @@ fn auth_command_runs_again_after_401() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Rate limits (Azure DevOps answers an identity that uses too much 429, with a
+/// `Retry-After`): the pipeline waits them out as asked and seeds the store; the edge's blob
+/// proxy (`AsyncUpstream`), which a client waits on, fails at once.
+#[test]
+fn rate_limits_are_waited_out_by_jobs_not_by_the_proxy() {
+    use gvfs_cache::upstream::{AsyncUpstream, Auth};
+
+    let root = tempdir("rate-limit");
+    let mut up = Upstream::new(&root);
+    up.commit(5);
+    let http = SmartHttp::start(&up.bare, "secret", true);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    let token = [("GVD_TEST_TOKEN", "secret")];
+    let auth = ["--token-env", "GVD_TEST_TOKEN"];
+
+    http.rate_limit(2);
+    let log = pipeline_at(&root, &store, &http.url, "15m", &auth, &token).unwrap();
+    assert_eq!(http.rate_limited(), 2);
+    assert_eq!(
+        log.matches("HTTP 429 (rate limited): waiting 1 s").count(),
+        2,
+        "{log}"
+    );
+    assert_eq!(manifest(&store_dir).tip.to_string(), up.tip());
+
+    http.rate_limit(1);
+    let basic = Auth::header(gvfs_cache::http::basic_auth("", "secret"));
+    let mut proxy = AsyncUpstream::open(&http.url, &basic).unwrap();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let err = rt
+        .block_on(proxy.head("refs/heads/main"))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("HTTP 429"), "{err}");
+    assert_eq!(http.rate_limited(), 3);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// More continuously busy keep-alive clients than runtime threads (`--workers 2`): each
 /// client keeps being answered while the others stay busy (a connection is a task, not a
 /// thread), and every response is the right one for its connection.

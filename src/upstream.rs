@@ -11,7 +11,9 @@
 //! header, or the answer of `--auth-command`, which runs again whenever the upstream answers
 //! 401 (its token expired), so that the edge and the mirror outlive their tokens. Every
 //! request also asks Azure DevOps for that 401, which it would otherwise replace with a
-//! redirect to its sign-in page.
+//! redirect to its sign-in page. Azure DevOps also rate-limits each identity, answering 429
+//! with a `Retry-After`: the pipeline, the mirror and the edge's live loop ([`Upstream`])
+//! wait as asked and go on; the edge's blob proxy, which a client waits on, fails at once.
 //!
 //! Packs are always requested non-thin (every delta base is inside the pack), so each
 //! fetched pack is a self-contained slab.
@@ -66,6 +68,22 @@ fn refuse_password(spec: &str) -> Result<()> {
 
 /// How long `--auth-command` may take to answer.
 const AUTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Most 429s a request of a job that can wait waits out before the 429 is its answer.
+pub const RATE_LIMIT_TRIES: u32 = 20;
+/// Longest wait one 429 can ask for.
+const RATE_LIMIT_WAIT_MAX: Duration = Duration::from_secs(15 * 60);
+/// The wait of a 429 without a `Retry-After` in seconds.
+const RATE_LIMIT_WAIT_DEFAULT: Duration = Duration::from_secs(60);
+
+/// The wait a 429's `Retry-After` asks for, within 1 s and [`RATE_LIMIT_WAIT_MAX`].
+fn retry_after(value: Option<&str>) -> Duration {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(RATE_LIMIT_WAIT_DEFAULT, |s| {
+            Duration::from_secs(s.clamp(1, RATE_LIMIT_WAIT_MAX.as_secs()))
+        })
+}
 
 /// Sent with every HTTP request. Azure DevOps answers credentials it rejects (an expired
 /// token) with a 302 to its sign-in page, not 401, unless the client looks like git, and on
@@ -199,7 +217,8 @@ fn auth_header(answer: &[u8]) -> Option<Arc<str>> {
 }
 
 /// The upstream for threads that block: [`AsyncUpstream`]'s requests, each run to its end on
-/// a runtime of this upstream's own (on the calling thread). Not for use inside a runtime.
+/// a runtime of this upstream's own (on the calling thread), waiting out rate limits
+/// ([`AsyncUpstream::wait_out_rate_limits`]). Not for use inside a runtime.
 pub struct Upstream {
     inner: AsyncUpstream,
     rt: tokio::runtime::Runtime,
@@ -210,7 +229,8 @@ pub struct Upstream {
 impl Upstream {
     /// `spec` is an http(s) URL or a local repository path.
     pub fn open(spec: &str, branch: &str, auth: &Auth) -> Result<Upstream> {
-        let inner = AsyncUpstream::open(spec, auth)?;
+        let mut inner = AsyncUpstream::open(spec, auth)?;
+        inner.wait_out_rate_limits();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -914,13 +934,43 @@ enum AsyncTransport {
 struct Http {
     client: crate::aclient::AClient,
     auth: Auth,
+    /// How many 429s a request waits out before the 429 is its answer.
+    patience: u32,
 }
 
 impl Http {
+    /// One request, with the credentials. A 429 (a rate limit: Azure DevOps blocks an
+    /// identity that uses too much) is waited out as its `Retry-After` asks, up to
+    /// `patience` times, and the request sent again.
+    async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: bytes::Bytes,
+    ) -> Result<crate::aclient::AResponse> {
+        let mut waited = 0u32;
+        loop {
+            let resp = self.authorized(method, path, headers, body.clone()).await?;
+            if resp.status != 429 || waited >= self.patience {
+                return Ok(resp);
+            }
+            let wait = retry_after(resp.header("Retry-After"));
+            drop(resp);
+            waited = waited.saturating_add(1);
+            crate::log!(
+                "upstream: HTTP 429 (rate limited): waiting {} s as asked ({waited} of {})",
+                wait.as_secs(),
+                self.patience
+            );
+            tokio::time::sleep(wait).await;
+        }
+    }
+
     /// One request, with the credentials. A 401 to an `--auth-command` answer (its token
     /// expired) has the command run again, once for all the requests rejected with that
     /// answer, and the request is sent again with the new one.
-    async fn request(
+    async fn authorized(
         &self,
         method: &str,
         path: &str,
@@ -1035,6 +1085,7 @@ impl AsyncUpstream {
             AsyncTransport::Http(Http {
                 client: crate::aclient::AClient::new(Url::parse(spec)?, Duration::from_secs(300)),
                 auth: auth.clone(),
+                patience: 0,
             })
         } else {
             let p = PathBuf::from(spec.strip_prefix("file://").unwrap_or(spec));
@@ -1055,6 +1106,15 @@ impl AsyncUpstream {
             gvfs: if is_local { Some(false) } else { None },
             label: crate::http::redacted(spec),
         })
+    }
+
+    /// Has every HTTP request wait out up to [`RATE_LIMIT_TRIES`] 429s, as their
+    /// `Retry-After` asks, instead of failing on the first: for jobs that can wait (the
+    /// pipeline, the mirror, the edge's live loop), not for requests a client waits on.
+    pub fn wait_out_rate_limits(&mut self) {
+        if let AsyncTransport::Http(http) = &mut self.transport {
+            http.patience = RATE_LIMIT_TRIES;
+        }
     }
 
     /// Starts one stateless request.

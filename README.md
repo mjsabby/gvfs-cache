@@ -189,6 +189,12 @@ An edge of such a store:
 * sends sizes without blobs to clients that ask: a prefetch with `X-GVFS-Sizes: 1` gets a
   `GSZ1` section after the packs.
 
+Azure DevOps rate-limits each identity: one that uses too much is first slowed, then
+answered 429 with a `Retry-After`, for every request it makes. The pipeline and the mirror
+wait as asked and carry on, so a large mirror goes at the pace Azure DevOps allows its
+identity. Give the mirror an identity of its own, not a person's, whose requests it would
+block. An edge's blob proxy fails at once instead (a client is waiting).
+
 Nothing repairs such a store by itself, and nothing should need to:
 
 * If storage loses a blob pack or a segment index, edges and pipeline runs carry on. They

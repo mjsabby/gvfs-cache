@@ -696,7 +696,11 @@ not the hot path's).
 * Mirroring the whole history costs what the history weighs (SearchGold's main: 3.34M
   pointers standing for 256 TiB, per `inspect slab`), once, before edges serve; the
   mirror is resumable, parallel and rate-capped, and ADO's serving rate decides how long
-  it takes.
+  it takes. ADO also caps the server CPU each identity may use: mirroring
+  Networking-Metadata (small XML files, which ADO deltifies per batch request), 4 copies
+  were slowed after 5 minutes and answered 429 (resource `ATCPU`) after 20, every
+  request of that identity then blocked for minutes. Jobs that can wait (the pipeline,
+  the mirror, the edge's live loop) wait out a 429 as its `Retry-After` asks.
 * Azure DevOps speaks only protocol v0 (measured on dev.azure.com: it ignores
   `Git-Protocol: version=2`) and advertises `filter` there, so `blob:none` fetches go over
   v0. Without v2 there is no `object-info` and no blob `want`s: blobs by id and sizes come

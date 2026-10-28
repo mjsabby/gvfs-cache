@@ -603,6 +603,9 @@ struct SmartHttpState {
     v2_posts: std::sync::atomic::AtomicUsize,
     unauthorized: std::sync::atomic::AtomicUsize,
     loose: std::sync::atomic::AtomicUsize,
+    /// Requests still to be answered 429 ([`SmartHttp::rate_limit`]), and those that were.
+    limited: std::sync::atomic::AtomicUsize,
+    rate_limited: std::sync::atomic::AtomicUsize,
 }
 
 pub const SMART_HTTP_PREFIX: &str = "/org/proj/_git/repo";
@@ -631,6 +634,8 @@ impl SmartHttp {
             v2_posts: AtomicUsize::new(0),
             unauthorized: AtomicUsize::new(0),
             loose: AtomicUsize::new(0),
+            limited: AtomicUsize::new(0),
+            rate_limited: AtomicUsize::new(0),
         });
         let (repo, shared) = (repo.to_path_buf(), state.clone());
         std::thread::spawn(move || {
@@ -674,6 +679,21 @@ impl SmartHttp {
     /// `POST /gvfs/objects` requests answered with a loose object.
     pub fn loose(&self) -> usize {
         self.state.loose.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Answers the next `n` authorized requests 429 with `Retry-After: 1`, as Azure DevOps
+    /// blocks an identity that uses too much.
+    pub fn rate_limit(&self, n: usize) {
+        self.state
+            .limited
+            .store(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Requests answered 429.
+    pub fn rate_limited(&self) -> usize {
+        self.state
+            .rate_limited
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -743,6 +763,17 @@ fn smart_http_connection(
             } else {
                 out.write_all(b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/_signin\r\nContent-Length: 0\r\n\r\n")?;
             }
+            continue;
+        }
+        if state
+            .limited
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            state.rate_limited.fetch_add(1, Ordering::Relaxed);
+            out.write_all(
+                b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\n\r\n",
+            )?;
             continue;
         }
         let v2 = allow_v2 && header("git-protocol").is_some_and(|v| v.contains("version=2"));
