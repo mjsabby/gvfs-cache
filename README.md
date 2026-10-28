@@ -97,11 +97,11 @@ stock git, which stays the judge), and fails a run in which any test skips; only
 ```sh
 # First run on an empty store is the one-time seed: the whole branch becomes the baseline.
 gvfs-cache pipeline --store azure:gvfs/searchgold --tier 15m \
-    --upstream https://dev.azure.com/org/proj/_git/SearchGold --token-env ADO_PAT
+    --upstream https://dev.azure.com/org/proj/_git/SearchGold --auth-command ~/get_token
 
 # The edge (or, with --bind 127.0.0.1:8080, the localhost proxy on an agent VM).
 gvfs-cache serve --store azure:gvfs/searchgold --bind 0.0.0.0:8080 \
-    --upstream https://dev.azure.com/org/proj/_git/SearchGold --token-env ADO_PAT \
+    --upstream https://dev.azure.com/org/proj/_git/SearchGold --auth-command ~/get_token \
     --cache-dir /nvme/gvfs-cache
 
 # Clients: point VFS for Git / gvfs-helper at http://edge:8080/<anything>/
@@ -114,6 +114,20 @@ git gvfs-helper --cache-server=disable prefetch
 * `fs:<dir>`, or a plain path;
 * `azure:<container>[/<prefix>]`, with credentials (an account key or a SAS connection
   string) in `AZURE_STORAGE_CONNECTION_STRING`, or in the variable `--store-auth-env` names.
+
+The upstream's credentials come from `--auth-command`, a shell command that prints the
+lines `authtype=Bearer` and `credential=<token>`, as a git credential helper answers (other
+lines are ignored). It runs at startup and again whenever the upstream answers 401, so a
+token that expires is replaced without a restart. For Azure DevOps the token is a Microsoft
+Entra token, from the machine's managed identity for example. With git 2.46 or later, the
+credential helper git uses for `dev.azure.com` can answer:
+
+```sh
+#!/bin/sh
+# ~/get_token
+printf 'capability[]=authtype\nprotocol=https\nhost=dev.azure.com\n\n' |
+    GIT_TERMINAL_PROMPT=0 git credential fill
+```
 
 ### Scheduling the pipeline
 
@@ -135,7 +149,8 @@ tier=15m
 [ "$m" = 00 ] && [ $((10#$h % 12)) = 0 ] && tier=12h
 [ "$m" = 00 ] && [ "$h" = 00 ] && tier=24h
 [ "$m" = 00 ] && [ "$h" = 00 ] && [ "$dow" = 7 ] && tier=168h
-gvfs-cache pipeline --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT --tier $tier
+gvfs-cache pipeline --store "$STORE" --upstream "$ADO_URL" --auth-command ~/get_token \
+    --tier $tier
 ```
 
 A crashed or skipped run only makes the next 15m slab wider. Slab files that no manifest
@@ -150,12 +165,12 @@ Prefetch and cold clones then carry no blobs at all. See [DESIGN.md](DESIGN.md#s
 
 ```sh
 # Genesis: the history's commits and trees, and every blob's size, from the upstream.
-gvfs-cache pipeline --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT \
+gvfs-cache pipeline --store "$STORE" --upstream "$ADO_URL" --auth-command ~/get_token \
     --tier 15m --blobs separate
 
 # The seed of the blobs: every blob of the history (the tip's first), resumable,
 # verified by id and size, published as it goes; edges report ready once it is done.
-gvfs-cache mirror --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT \
+gvfs-cache mirror --store "$STORE" --upstream "$ADO_URL" --auth-command ~/get_token \
     --jobs 16 [--rate-mbps 4000] [--max-items N]
 
 # Then schedule the pipeline as below: every run copies its window's new blobs before
@@ -163,7 +178,7 @@ gvfs-cache mirror --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT \
 # persistent disk: a run reuses the store objects the previous one downloaded). Edges
 # serve blobs from the blob packs (mapped, or read by range from Azure) and proxy only
 # the blobs of the commits the pipeline has not sealed yet.
-gvfs-cache serve --store "$STORE" --upstream "$ADO_URL" --token-env ADO_PAT ...
+gvfs-cache serve --store "$STORE" --upstream "$ADO_URL" --auth-command ~/get_token ...
 ```
 
 An edge of such a store:

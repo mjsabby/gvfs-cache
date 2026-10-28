@@ -581,52 +581,76 @@ pub fn msgit() -> Option<PathBuf> {
 }
 
 /// A smart-HTTP git server for `repo` at `http://127.0.0.1:<port>/org/proj/_git/repo`, like
-/// Azure DevOps: HTTP Basic auth (any user, password `token`), keep-alive connections, and
-/// chunked `git-upload-pack` responses. With `v2` false it ignores `Git-Protocol` and
-/// speaks only protocol v0, like an old server.
+/// Azure DevOps: one accepted `Authorization` header (Basic auth with password `token`
+/// until [`SmartHttp::set_auth`] changes it; anything else gets 401), keep-alive
+/// connections, and chunked `git-upload-pack` responses. With `v2` false it ignores
+/// `Git-Protocol` and speaks only protocol v0, like an old server.
 pub struct SmartHttp {
     pub port: u16,
     pub url: String,
-    posts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    v2_posts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    state: std::sync::Arc<SmartHttpState>,
+}
+
+/// What a [`SmartHttp`]'s connections share.
+struct SmartHttpState {
+    /// The `Authorization` header value accepted.
+    auth: std::sync::Mutex<String>,
+    posts: std::sync::atomic::AtomicUsize,
+    v2_posts: std::sync::atomic::AtomicUsize,
+    unauthorized: std::sync::atomic::AtomicUsize,
 }
 
 pub const SMART_HTTP_PREFIX: &str = "/org/proj/_git/repo";
 
 impl SmartHttp {
     pub fn start(repo: &Path, token: &str, v2: bool) -> SmartHttp {
-        use std::sync::Arc;
         use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Mutex};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        let posts = Arc::new(AtomicUsize::new(0));
-        let v2_posts = Arc::new(AtomicUsize::new(0));
-        let expected_auth = gvfs_cache::http::basic_auth("", token);
-        let (repo, p, p2) = (repo.to_path_buf(), posts.clone(), v2_posts.clone());
+        let state = Arc::new(SmartHttpState {
+            auth: Mutex::new(gvfs_cache::http::basic_auth("", token)),
+            posts: AtomicUsize::new(0),
+            v2_posts: AtomicUsize::new(0),
+            unauthorized: AtomicUsize::new(0),
+        });
+        let (repo, shared) = (repo.to_path_buf(), state.clone());
         std::thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(conn) = conn else { continue };
-                let (repo, auth, p, p2) =
-                    (repo.clone(), expected_auth.clone(), p.clone(), p2.clone());
+                let (repo, shared) = (repo.clone(), shared.clone());
                 std::thread::spawn(move || {
-                    let _ = smart_http_connection(conn, &repo, &auth, v2, &p, &p2);
+                    let _ = smart_http_connection(conn, &repo, v2, &shared);
                 });
             }
         });
         SmartHttp {
             port,
             url: format!("http://127.0.0.1:{port}{SMART_HTTP_PREFIX}"),
-            posts,
-            v2_posts,
+            state,
         }
     }
 
+    /// From now on, accepts only `Authorization: <value>`.
+    pub fn set_auth(&self, value: &str) {
+        *self.state.auth.lock().unwrap() = value.to_string();
+    }
+
     pub fn posts(&self) -> usize {
-        self.posts.load(std::sync::atomic::Ordering::Relaxed)
+        self.state.posts.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn v2_posts(&self) -> usize {
-        self.v2_posts.load(std::sync::atomic::Ordering::Relaxed)
+        self.state
+            .v2_posts
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Requests answered 401.
+    pub fn unauthorized(&self) -> usize {
+        self.state
+            .unauthorized
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -646,10 +670,8 @@ fn upload_pack(repo: &Path, v2: bool, advertise: bool) -> Command {
 fn smart_http_connection(
     conn: std::net::TcpStream,
     repo: &Path,
-    expected_auth: &str,
     allow_v2: bool,
-    posts: &std::sync::atomic::AtomicUsize,
-    v2_posts: &std::sync::atomic::AtomicUsize,
+    state: &SmartHttpState,
 ) -> std::io::Result<()> {
     use std::io::{BufRead, BufReader, Read};
     use std::sync::atomic::Ordering;
@@ -690,7 +712,9 @@ fn smart_http_connection(
                 .unwrap_or(0)
         ];
         reader.read_exact(&mut body)?;
-        if header("authorization") != Some(expected_auth) {
+        let accepted = state.auth.lock().unwrap().clone();
+        if header("authorization") != Some(accepted.as_str()) {
+            state.unauthorized.fetch_add(1, Ordering::Relaxed);
             out.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"test\"\r\nContent-Length: 0\r\n\r\n")?;
             continue;
         }
@@ -716,9 +740,9 @@ fn smart_http_connection(
             )?;
             out.write_all(&body)?;
         } else if method == "POST" && target == format!("{SMART_HTTP_PREFIX}/git-upload-pack") {
-            posts.fetch_add(1, Ordering::Relaxed);
+            state.posts.fetch_add(1, Ordering::Relaxed);
             if v2 {
-                v2_posts.fetch_add(1, Ordering::Relaxed);
+                state.v2_posts.fetch_add(1, Ordering::Relaxed);
             }
             let mut child = upload_pack(repo, v2, false)
                 .stdin(Stdio::piped())

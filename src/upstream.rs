@@ -7,6 +7,10 @@
 //! * smart HTTP(S): `POST <url>/git-upload-pack` (Azure DevOps, GitHub, any git server);
 //! * a local repository: `git upload-pack --stateless-rpc <path>` (mirrors, tests).
 //!
+//! Every HTTP request carries the upstream's credentials ([`Auth`]): a fixed `Authorization`
+//! header, or the answer of `--auth-command`, which runs again whenever the upstream answers
+//! 401 (its token expired), so that the edge and the mirror outlive their tokens.
+//!
 //! Packs are always requested non-thin (every delta base is inside the pack), so each
 //! fetched pack is a self-contained slab.
 //!
@@ -25,6 +29,7 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::http::Url;
@@ -42,19 +47,141 @@ pub const BATCH: usize = 4000;
 fn refuse_password(spec: &str) -> Result<()> {
     if crate::http::has_password(spec) {
         crate::bail!(
-            "upstream {}: the URL holds a password, which is not used: pass the token in an \
-             environment variable named by --token-env (and --token-user), or --auth-header-env",
+            "upstream {}: the URL holds a password, which is not used: give the credentials \
+             with --auth-command, or in an environment variable named by --token-env (and \
+             --token-user) or --auth-header-env",
             crate::http::redacted(spec)
         );
     }
     Ok(())
 }
 
-/// Credentials for an HTTP upstream.
+/// How long `--auth-command` may take to answer.
+const AUTH_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Credentials for an HTTP upstream: a fixed `Authorization` header value, or the answer
+/// of a command (`--auth-command`), which runs again when the upstream answers 401. Clones
+/// share the credentials, and so a renewal.
 #[derive(Clone, Default)]
-pub struct Auth {
-    /// Full `Authorization` header value.
-    pub header: Option<String>,
+pub struct Auth(Option<Arc<Credentials>>);
+
+struct Credentials {
+    /// `--auth-command`; `None`: the header is fixed.
+    command: Option<String>,
+    /// The header value, and how many times the command has run again.
+    current: Mutex<(Arc<str>, u64)>,
+    /// Held while the command runs again: the requests rejected meanwhile wait for it.
+    renewing: tokio::sync::Mutex<()>,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
+impl Auth {
+    /// A fixed `Authorization` header value.
+    pub fn header(value: String) -> Auth {
+        Auth::with(None, value.into())
+    }
+
+    /// The credentials `command` (run by `sh -c`) prints: the lines `authtype=<scheme>` and
+    /// `credential=<value>`, as a git credential helper answers (other lines are ignored),
+    /// sent as `Authorization: <scheme> <value>`. It runs now, so that a command that fails
+    /// stops the caller before it starts. Not for use inside a runtime.
+    pub fn command(command: &str) -> Result<Auth> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ctx("starting the runtime for --auth-command")?;
+        let header = rt.block_on(run_auth_command(command))?;
+        Ok(Auth::with(Some(command.to_string()), header))
+    }
+
+    fn with(command: Option<String>, header: Arc<str>) -> Auth {
+        Auth(Some(Arc::new(Credentials {
+            command,
+            current: Mutex::new((header, 0)),
+            renewing: tokio::sync::Mutex::new(()),
+        })))
+    }
+
+    /// The header value to send now, and its generation.
+    fn current(&self) -> Option<(Arc<str>, u64)> {
+        self.0.as_ref().map(|c| lock(&c.current).clone())
+    }
+
+    /// Whether a 401 can be answered with new credentials.
+    fn renews(&self) -> bool {
+        self.0.as_ref().is_some_and(|c| c.command.is_some())
+    }
+
+    /// After a 401 to a request sent with generation `sent`: runs the command again, unless
+    /// a request rejected with the same answer has had it run meanwhile.
+    async fn renew(&self, sent: u64) -> Result<()> {
+        let Some(c) = &self.0 else { return Ok(()) };
+        let Some(command) = &c.command else {
+            return Ok(());
+        };
+        let _one = c.renewing.lock().await;
+        if lock(&c.current).1 != sent {
+            return Ok(());
+        }
+        crate::log!("upstream: HTTP 401: running --auth-command again");
+        let header = run_auth_command(command).await?;
+        let mut current = lock(&c.current);
+        let generation = current.1.wrapping_add(1);
+        *current = (header, generation);
+        Ok(())
+    }
+}
+
+/// Runs `--auth-command`; returns the `Authorization` header value of its answer. Errors
+/// hold the command's stderr, never its stdout (the credential).
+async fn run_auth_command(command: &str) -> Result<Arc<str>> {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(command).stdin(Stdio::null());
+    let out = tokio::time::timeout(
+        AUTH_COMMAND_TIMEOUT,
+        tokio::process::Command::from(cmd)
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        crate::err!(
+            "--auth-command: no answer in {} s",
+            AUTH_COMMAND_TIMEOUT.as_secs()
+        )
+    })?
+    .ctx("running --auth-command")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        crate::bail!("--auth-command failed ({}): {}", out.status, stderr.trim());
+    }
+    auth_header(&out.stdout).ok_or_else(|| {
+        crate::err!(
+            "--auth-command must print the lines authtype=<scheme> and credential=<value> \
+             (e.g. authtype=Bearer and a token)"
+        )
+    })
+}
+
+/// `<scheme> <value>` from the lines `authtype=<scheme>` and `credential=<value>`.
+fn auth_header(answer: &[u8]) -> Option<Arc<str>> {
+    let (mut scheme, mut value) = (None, None);
+    for line in std::str::from_utf8(answer).ok()?.lines() {
+        if let Some(v) = line.strip_prefix("authtype=") {
+            scheme = Some(v);
+        } else if let Some(v) = line.strip_prefix("credential=") {
+            value = Some(v);
+        }
+    }
+    let (scheme, value) = (scheme?, value?);
+    let printable = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_graphic());
+    (printable(scheme) && printable(value)).then(|| format!("{scheme} {value}").into())
 }
 
 /// The upstream for threads that block: [`AsyncUpstream`]'s requests, each run to its end on
@@ -568,7 +695,58 @@ pub struct AsyncUpstream {
 
 enum AsyncTransport {
     Local { git_dir: PathBuf },
-    Http { client: crate::aclient::AClient },
+    Http(Http),
+}
+
+/// An HTTP upstream: its client and credentials.
+struct Http {
+    client: crate::aclient::AClient,
+    auth: Auth,
+}
+
+impl Http {
+    /// One request, with the credentials. A 401 to an `--auth-command` answer (its token
+    /// expired) has the command run again, once for all the requests rejected with that
+    /// answer, and the request is sent again with the new one.
+    async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: bytes::Bytes,
+    ) -> Result<crate::aclient::AResponse> {
+        let sent = self.auth.current();
+        let resp = self
+            .send(sent.as_ref(), method, path, headers, body.clone())
+            .await?;
+        let Some((_, generation)) = sent else {
+            return Ok(resp);
+        };
+        if resp.status != 401 || !self.auth.renews() {
+            return Ok(resp);
+        }
+        drop(resp);
+        self.auth.renew(generation).await?;
+        let renewed = self.auth.current();
+        self.send(renewed.as_ref(), method, path, headers, body)
+            .await
+    }
+
+    async fn send(
+        &self,
+        auth: Option<&(Arc<str>, u64)>,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: bytes::Bytes,
+    ) -> Result<crate::aclient::AResponse> {
+        let mut all = Vec::with_capacity(headers.len().saturating_add(1));
+        if let Some((value, _)) = auth {
+            all.push(("Authorization", &**value));
+        }
+        all.extend_from_slice(headers);
+        self.client.request(method, path, &all, body).await
+    }
 }
 
 /// A response being read: an HTTP body, or `git upload-pack`'s output.
@@ -641,14 +819,10 @@ impl AsyncUpstream {
     pub fn open(spec: &str, auth: &Auth) -> Result<AsyncUpstream> {
         refuse_password(spec)?;
         let transport = if spec.starts_with("http://") || spec.starts_with("https://") {
-            let mut client =
-                crate::aclient::AClient::new(Url::parse(spec)?, Duration::from_secs(300));
-            if let Some(h) = &auth.header {
-                client
-                    .default_headers
-                    .push(("Authorization".into(), h.clone()));
-            }
-            AsyncTransport::Http { client }
+            AsyncTransport::Http(Http {
+                client: crate::aclient::AClient::new(Url::parse(spec)?, Duration::from_secs(300)),
+                auth: auth.clone(),
+            })
         } else {
             let p = PathBuf::from(spec.strip_prefix("file://").unwrap_or(spec));
             if !p.exists() {
@@ -711,7 +885,7 @@ impl AsyncUpstream {
                     buf: vec![0u8; 64 << 10],
                 })
             }
-            AsyncTransport::Http { client } => {
+            AsyncTransport::Http(http) => {
                 let mut headers = vec![
                     ("Content-Type", "application/x-git-upload-pack-request"),
                     ("Accept", "application/x-git-upload-pack-result"),
@@ -720,7 +894,7 @@ impl AsyncUpstream {
                     headers.push(("Git-Protocol", "version=2"));
                 }
                 let body = bytes::Bytes::copy_from_slice(request);
-                let resp = client
+                let resp = http
                     .request("POST", "/git-upload-pack", &headers, body)
                     .await?
                     .ensure_ok("git-upload-pack")
@@ -735,8 +909,8 @@ impl AsyncUpstream {
         if self.detected {
             return Ok(());
         }
-        if let AsyncTransport::Http { client } = &self.transport {
-            let mut resp = client
+        if let AsyncTransport::Http(http) = &self.transport {
+            let mut resp = http
                 .request(
                     "GET",
                     "/info/refs?service=git-upload-pack",
@@ -770,8 +944,8 @@ impl AsyncUpstream {
             return g;
         }
         let g = match &self.transport {
-            AsyncTransport::Http { client } => {
-                match client
+            AsyncTransport::Http(http) => {
+                match http
                     .request("GET", "/gvfs/config", &[], bytes::Bytes::new())
                     .await
                 {
@@ -804,10 +978,10 @@ impl AsyncUpstream {
             let found = read.and_then(|b| ls_refs_tip(&b, branch_ref));
             body.finish(found).await?
         } else {
-            let AsyncTransport::Http { client } = &self.transport else {
+            let AsyncTransport::Http(http) = &self.transport else {
                 crate::bail!("v0 is only used over HTTP");
             };
-            let mut resp = client
+            let mut resp = http
                 .request(
                     "GET",
                     "/info/refs?service=git-upload-pack",
@@ -850,10 +1024,10 @@ impl AsyncUpstream {
     pub async fn fetch_objects<P: PackPieces>(&mut self, oids: &[Oid], out: &mut P) -> Result<u64> {
         if self.is_gvfs().await {
             let body = gvfs_objects_body(oids);
-            let AsyncTransport::Http { client } = &self.transport else {
+            let AsyncTransport::Http(http) = &self.transport else {
                 crate::bail!("GVFS upstreams are HTTP");
             };
-            let mut resp = client
+            let mut resp = http
                 .request(
                     "POST",
                     "/gvfs/objects",
@@ -915,10 +1089,10 @@ impl AsyncUpstream {
         let mut out = Vec::with_capacity(oids.len());
         for batch in oids.chunks(BATCH) {
             if self.is_gvfs().await {
-                let AsyncTransport::Http { client } = &self.transport else {
+                let AsyncTransport::Http(http) = &self.transport else {
                     crate::bail!("GVFS upstreams are HTTP");
                 };
-                let mut resp = client
+                let mut resp = http
                     .request(
                         "POST",
                         "/gvfs/sizes",
@@ -979,6 +1153,54 @@ mod tests {
         }
         let u = Upstream::open("https://org@dev.azure.com/org/p/_git/r", "main", &auth).unwrap();
         assert_eq!(u.label(), "https://dev.azure.com/org/p/_git/r");
+    }
+
+    /// `--auth-command`: its `authtype=` and `credential=` lines make the header (a git
+    /// credential helper's other lines are ignored); any other answer, or a failure, is an
+    /// error that holds its stderr but never its stdout; requests rejected with the same
+    /// answer have it run again once.
+    #[test]
+    fn auth_command_answers_and_renewals() {
+        let header = |a: &Auth| a.current().unwrap().0.to_string();
+        let a = Auth::command(
+            "printf 'capability[]=authtype\\nauthtype=Bearer\\ncredential=t0\\nephemeral=true\\n'",
+        )
+        .unwrap();
+        assert_eq!(header(&a), "Bearer t0");
+        let error = |cmd: &str| Auth::command(cmd).err().unwrap().to_string();
+        for bad in [
+            "printf 'credential=s3cret\\n'",
+            "printf 'authtype=Bearer\\ncredential=s3 cret\\n'",
+            "echo s3cret",
+        ] {
+            let e = error(bad);
+            assert!(e.contains("must print") && !e.contains("s3cret"), "{e}");
+        }
+        let e = error("echo s3cret; echo no identity >&2; exit 3");
+        assert!(e.contains("no identity") && !e.contains("s3cret"), "{e}");
+
+        let dir = std::env::temp_dir().join(format!("gvfs-auth-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let runs = dir.join("runs");
+        let a = Auth::command(&format!(
+            "echo >> '{0}'; printf 'authtype=Bearer\\ncredential=t%s\\n' $(wc -l < '{0}')",
+            runs.display()
+        ))
+        .unwrap();
+        assert_eq!(header(&a), "Bearer t1");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            a.renew(0).await.unwrap();
+            a.renew(0).await.unwrap();
+        });
+        assert_eq!(header(&a), "Bearer t2");
+        rt.block_on(a.renew(1)).unwrap();
+        assert_eq!(header(&a), "Bearer t3");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn git(dir: &std::path::Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {

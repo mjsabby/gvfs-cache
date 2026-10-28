@@ -32,8 +32,6 @@ const IDLE_MAX: usize = 16;
 pub struct AClient {
     pub url: Url,
     timeout: Duration,
-    /// Request headers added to every request (e.g. Authorization).
-    pub default_headers: Vec<(String, String)>,
     idle: Arc<Mutex<Vec<Sender>>>,
 }
 
@@ -60,7 +58,6 @@ impl AClient {
         AClient {
             url,
             timeout,
-            default_headers: Vec::new(),
             idle: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -144,9 +141,6 @@ impl AClient {
                 .method(method)
                 .uri(format!("{}{path}", self.url.path))
                 .header("Host", self.url.host.as_str());
-            for (k, v) in &self.default_headers {
-                req = req.header(k.as_str(), v.as_str());
-            }
             for (k, v) in headers {
                 req = req.header(*k, *v);
             }

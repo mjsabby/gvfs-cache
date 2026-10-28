@@ -1667,9 +1667,7 @@ fn async_upstream_fetches_blobs_and_sizes_over_every_transport() {
         .enable_all()
         .build()
         .unwrap();
-    let basic = Auth {
-        header: Some(gvfs_cache::http::basic_auth("", "secret")),
-    };
+    let basic = Auth::header(gvfs_cache::http::basic_auth("", "secret"));
     let transports = [
         (
             "local",

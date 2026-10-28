@@ -1037,6 +1037,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "want",
             "have",
             "branch",
+            "auth-command",
             "token-env",
             "token-user",
             "auth-header-env",
@@ -1114,24 +1115,30 @@ pub fn main(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Upstream credentials from `--token-env` / `--token-user` / `--auth-header-env`.
+/// Upstream credentials: `--auth-command`, `--token-env` (and `--token-user`) or
+/// `--auth-header-env`, at most one of them.
 pub fn auth_from_flags(f: &crate::cli::Flags) -> Result<crate::upstream::Auth> {
+    use crate::upstream::Auth;
+    let sources = ["auth-command", "token-env", "auth-header-env"];
+    if sources.iter().filter(|s| f.get(s).is_some()).count() > 1 {
+        crate::bail!("give only one of --auth-command, --token-env and --auth-header-env");
+    }
+    let env = |var: &str| {
+        std::env::var(var).map_err(|_| crate::err!("environment variable {var} is not set"))
+    };
+    if let Some(command) = f.get("auth-command") {
+        return Auth::command(command);
+    }
     if let Some(var) = f.get("auth-header-env") {
-        let v =
-            std::env::var(var).map_err(|_| crate::err!("environment variable {var} is not set"))?;
-        return Ok(crate::upstream::Auth { header: Some(v) });
+        return Ok(Auth::header(env(var)?));
     }
     if let Some(var) = f.get("token-env") {
-        let v =
-            std::env::var(var).map_err(|_| crate::err!("environment variable {var} is not set"))?;
-        return Ok(crate::upstream::Auth {
-            header: Some(crate::http::basic_auth(
-                f.get("token-user").unwrap_or(""),
-                &v,
-            )),
-        });
+        return Ok(Auth::header(crate::http::basic_auth(
+            f.get("token-user").unwrap_or(""),
+            &env(var)?,
+        )));
     }
-    Ok(crate::upstream::Auth::default())
+    Ok(Auth::default())
 }
 
 /// `GVFS_DEBUG_INGEST=1`: log indexing phase timings and entry statistics.

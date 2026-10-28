@@ -1004,6 +1004,68 @@ fn smart_http_upstream_v2_and_v0() {
     }
 }
 
+/// `--auth-command`: a command that fails stops the pipeline before it starts; its answer
+/// (`authtype=Bearer`, `credential=<token>`) seeds the store; and an edge following the
+/// upstream with it, once the upstream wants another token, gets 401, runs the command
+/// again and keeps following.
+#[test]
+fn auth_command_runs_again_after_401() {
+    let root = tempdir("auth-command");
+    let mut up = Upstream::new(&root);
+    up.commit(5);
+    let http = SmartHttp::start(&up.bare, "unused", true);
+    http.set_auth("Bearer t1");
+    let token = root.join("token");
+    std::fs::write(&token, "t1").unwrap();
+    let auth = format!(
+        "printf 'authtype=Bearer\\ncredential=%s\\n' \"$(cat '{}')\"",
+        token.display()
+    );
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+
+    let failing = ["--auth-command", "echo no identity >&2; exit 1"];
+    let err = pipeline_at(&root, &store, &http.url, "15m", &failing, &[]).unwrap_err();
+    assert!(
+        err.contains("--auth-command failed") && err.contains("no identity"),
+        "{err}"
+    );
+    pipeline_at(
+        &root,
+        &store,
+        &http.url,
+        "15m",
+        &["--auth-command", &auth],
+        &[],
+    )
+    .unwrap();
+    assert_eq!(manifest(&store_dir).tip.to_string(), up.tip());
+
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--upstream",
+        &http.url,
+        "--auth-command",
+        &auth,
+        "--poll-ms",
+        "100",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ]);
+    std::fs::write(&token, "t2").unwrap();
+    http.set_auth("Bearer t2");
+    let tip = up.commit(5);
+    server.wait_for("the new tip in L0", |s| {
+        s.get(&format!("/gvfs/objects/{tip}")).0 == 200
+    });
+    assert!(http.unauthorized() > 0);
+    server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// More continuously busy keep-alive clients than runtime threads (`--workers 2`): each
 /// client keeps being answered while the others stay busy (a connection is a task, not a
 /// thread), and every response is the right one for its connection.

@@ -55,10 +55,15 @@ STORES (--store):
 
 UPSTREAM (--upstream):
     https://dev.azure.com/<org>/<project>/_git/<repo>  (or any smart-HTTP git server;
-                               a password in the URL is refused: use --token-env)
+                               a password in the URL is refused: use --auth-command)
     <PATH>                     a local repository (runs git upload-pack)
     --branch <NAME>            branch to follow (default: main)
-    --token-env <VAR>          env var with a PAT / token, sent as HTTP Basic auth
+    --auth-command <CMD>       shell command printing the lines authtype=<scheme> and
+                               credential=<value>, as a git credential helper answers
+                               (e.g. authtype=Bearer and a Microsoft Entra token), sent as
+                               Authorization: <scheme> <value>; it runs at start and again
+                               whenever the upstream answers 401 (the token expired)
+    --token-env <VAR>          env var with a token, sent as HTTP Basic auth
     --token-user <USER>        Basic auth user for --token-env (default: empty)
     --auth-header-env <VAR>    env var with a full Authorization header value
 

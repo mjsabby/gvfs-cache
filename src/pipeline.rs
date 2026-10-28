@@ -98,6 +98,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "store-auth-env",
             "upstream",
             "branch",
+            "auth-command",
             "token-env",
             "token-user",
             "auth-header-env",
