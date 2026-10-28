@@ -701,7 +701,9 @@ not the hot path's).
   `Git-Protocol: version=2`) and advertises `filter` there, so `blob:none` fetches go over
   v0. Without v2 there is no `object-info` and no blob `want`s: blobs by id and sizes come
   through its GVFS endpoints (`/gvfs/objects`, `/gvfs/sizes`), used wherever an upstream
-  offers them.
+  offers them. `/gvfs/objects` sends one object asked for alone (each large blob) loose,
+  whatever the request accepts; the client inflates it and deflates its content again as
+  a pack of one.
 * The edge's block cache lives in memory and on local disk and starts empty after a
   restart. Hot small-blob packs are not prefetched whole.
 * A window run reads every segment index (48 B per blob) and the manifest's sizes tables:

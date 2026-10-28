@@ -268,14 +268,25 @@ fn separate_store_pipeline_copies_blobs_before_trees() {
 
 /// Runs `gvfs-cache mirror`; `Err` holds the log of a failure.
 fn mirror(root: &Path, store: &str, up: &Upstream, extra: &[&str]) -> Result<String, String> {
+    mirror_at(root, store, up.bare.to_str().unwrap(), extra, &[])
+}
+
+/// Runs `gvfs-cache mirror` against any upstream spec, with `env`.
+fn mirror_at(
+    root: &Path,
+    store: &str,
+    upstream: &str,
+    extra: &[&str],
+    env: &[(&str, &str)],
+) -> Result<String, String> {
     let work = root.join("mirror-work");
     std::fs::create_dir_all(&work).unwrap();
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-cache"));
-    cmd.args(["mirror", "--store", store, "--upstream"])
-        .arg(&up.bare)
+    cmd.args(["mirror", "--store", store, "--upstream", upstream])
         .args(["--work-dir", work.to_str().unwrap(), "--threads", "2"])
         .args(["--jobs", "3", "--publish-secs", "0"])
-        .args(extra);
+        .args(extra)
+        .envs(env.iter().copied());
     gvfs_cache::upstream::hermetic_git_env(&mut cmd);
     let out = cmd.output().unwrap();
     let log = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -1811,5 +1822,56 @@ fn filtered_fetch_over_smart_http_v2_and_v0() {
             "{label}: {err}"
         );
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A separate store seeded and mirrored from an upstream that answers as Azure DevOps does:
+/// protocol v0 alone (commits and trees through `filter blob:none`), sizes and blobs through
+/// the GVFS endpoints, and one object asked for alone (each large blob) sent loose. Every
+/// blob of the history reaches the store, byte for byte.
+#[test]
+fn separate_store_from_an_azure_devops_like_upstream() {
+    let root = tempdir("sep-ado");
+    let up = Upstream::new(&root);
+    commit_files(
+        &up,
+        "c1",
+        &[
+            ("a/one.txt", Some(text(1))),
+            (
+                "big/large.bin",
+                Some(large(blobcopy::LARGE_MIN as usize + 4096)),
+            ),
+        ],
+    );
+    commit_files(
+        &up,
+        "c2",
+        &[
+            ("a/one.txt", Some(text(2))),
+            ("c/two.txt", Some(b"two\n".to_vec())),
+        ],
+    );
+    git(&up.bare, &["config", "uploadpack.allowFilter", "true"]);
+    let http = SmartHttp::azure_devops(&up.bare, "secret");
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    let token = [("GVD_TEST_TOKEN", "secret")];
+    let auth = ["--token-env", "GVD_TEST_TOKEN"];
+
+    let extra = [&auth[..], &["--blobs", "separate"]].concat();
+    pipeline_at(&root, &store, &http.url, "15m", &extra, &token).unwrap();
+    let want = git_blobs(&up.bare, &["--all"]);
+    assert_eq!(all_sizes(&store_dir, &manifest(&store_dir)), want);
+    let log = mirror_at(&root, &store, &http.url, &auth, &token).unwrap();
+    assert!(http.loose() > 0, "no object was sent loose:\n{log}");
+    let got = store_blobs(&root, &store_dir);
+    assert_eq!(got.len(), want.len());
+    for id in want.keys() {
+        assert!(got[id] == cat_blob(&up.bare, id), "blob {id}");
+    }
+    let s = Store::open(&store, "").unwrap();
+    assert!(blobcopy::load(&s).unwrap().0.complete());
+    assert_eq!(http.v2_posts(), 0);
     let _ = std::fs::remove_dir_all(&root);
 }

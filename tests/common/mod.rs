@@ -586,7 +586,7 @@ pub fn msgit() -> Option<PathBuf> {
 /// it (`X-TFS-FedAuthRedirect: Suppress`), else a 302 to a sign-in page, as Azure DevOps
 /// answers clients other than git. Keep-alive connections, and chunked `git-upload-pack`
 /// responses. With `v2` false it ignores `Git-Protocol` and speaks only protocol v0, like an
-/// old server.
+/// old server. [`SmartHttp::azure_devops`] adds the GVFS endpoints.
 pub struct SmartHttp {
     pub port: u16,
     pub url: String,
@@ -597,24 +597,40 @@ pub struct SmartHttp {
 struct SmartHttpState {
     /// The `Authorization` header value accepted.
     auth: std::sync::Mutex<String>,
+    /// `GET /gvfs/config`, `POST /gvfs/sizes` and `POST /gvfs/objects`.
+    gvfs: bool,
     posts: std::sync::atomic::AtomicUsize,
     v2_posts: std::sync::atomic::AtomicUsize,
     unauthorized: std::sync::atomic::AtomicUsize,
+    loose: std::sync::atomic::AtomicUsize,
 }
 
 pub const SMART_HTTP_PREFIX: &str = "/org/proj/_git/repo";
 
 impl SmartHttp {
     pub fn start(repo: &Path, token: &str, v2: bool) -> SmartHttp {
+        SmartHttp::start_with(repo, token, v2, false)
+    }
+
+    /// As Azure DevOps answers: protocol v0 alone, and the GVFS endpoints `GET /gvfs/config`,
+    /// `POST /gvfs/sizes` and `POST /gvfs/objects`, which sends one object asked for alone
+    /// loose, whatever the request accepts.
+    pub fn azure_devops(repo: &Path, token: &str) -> SmartHttp {
+        SmartHttp::start_with(repo, token, false, true)
+    }
+
+    fn start_with(repo: &Path, token: &str, v2: bool, gvfs: bool) -> SmartHttp {
         use std::sync::atomic::AtomicUsize;
         use std::sync::{Arc, Mutex};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let state = Arc::new(SmartHttpState {
             auth: Mutex::new(gvfs_cache::http::basic_auth("", token)),
+            gvfs,
             posts: AtomicUsize::new(0),
             v2_posts: AtomicUsize::new(0),
             unauthorized: AtomicUsize::new(0),
+            loose: AtomicUsize::new(0),
         });
         let (repo, shared) = (repo.to_path_buf(), state.clone());
         std::thread::spawn(move || {
@@ -653,6 +669,11 @@ impl SmartHttp {
         self.state
             .unauthorized
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `POST /gvfs/objects` requests answered with a loose object.
+    pub fn loose(&self) -> usize {
+        self.state.loose.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -771,10 +792,82 @@ fn smart_http_connection(
             out.write_all(b"0\r\n\r\n")?;
             let _ = writer.join();
             child.wait()?;
+        } else if state.gvfs
+            && method == "GET"
+            && target == format!("{SMART_HTTP_PREFIX}/gvfs/config")
+        {
+            reply(&mut out, "application/json", b"{}")?;
+        } else if state.gvfs
+            && method == "POST"
+            && target == format!("{SMART_HTTP_PREFIX}/gvfs/sizes")
+        {
+            let found = git_stdin(
+                repo,
+                &["cat-file", "--batch-check=%(objectname) %(objectsize)"],
+                hex_ids(&body).join("\n").as_bytes(),
+            );
+            let sizes: Vec<String> = String::from_utf8(found)
+                .unwrap()
+                .lines()
+                .filter_map(|l| {
+                    let (id, size) = l.split_once(' ')?;
+                    let size: u64 = size.parse().ok()?;
+                    Some(format!("{{\"Id\":\"{id}\",\"Size\":{size}}}"))
+                })
+                .collect();
+            reply(
+                &mut out,
+                "application/json",
+                format!("[{}]", sizes.join(",")).as_bytes(),
+            )?;
+        } else if state.gvfs
+            && method == "POST"
+            && target == format!("{SMART_HTTP_PREFIX}/gvfs/objects")
+        {
+            let ids = hex_ids(&body);
+            if let [id] = ids.as_slice() {
+                state.loose.fetch_add(1, Ordering::Relaxed);
+                let kind = git(repo, &["cat-file", "-t", id]);
+                let content = git_cmd(repo)
+                    .args(["cat-file", kind.trim(), id])
+                    .output()?
+                    .stdout;
+                let head = format!("{} {}\0", kind.trim(), content.len());
+                let mut z = vec![0u8; gvfs_cache::zlib::compress_bound(head.len() + content.len())];
+                let n = gvfs_cache::zlib::Deflater::new(6)
+                    .deflate_parts(&[head.as_bytes(), &content], &mut z)
+                    .unwrap();
+                reply(&mut out, "application/x-git-loose-object", &z[..n])?;
+            } else {
+                let pack = git_stdin(
+                    repo,
+                    &["pack-objects", "--stdout", "-q"],
+                    ids.join("\n").as_bytes(),
+                );
+                reply(&mut out, "application/x-git-packfile", &pack)?;
+            }
         } else {
             out.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")?;
         }
     }
+}
+
+fn reply(out: &mut std::net::TcpStream, content_type: &str, body: &[u8]) -> std::io::Result<()> {
+    write!(
+        out,
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )?;
+    out.write_all(body)
+}
+
+/// The object ids in a GVFS request body.
+fn hex_ids(body: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(body)
+        .split(|c: char| !c.is_ascii_hexdigit())
+        .filter(|t| t.len() == 40)
+        .map(str::to_string)
+        .collect()
 }
 
 // Separate-blob store helpers (real blob content).
