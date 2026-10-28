@@ -697,9 +697,11 @@ not the hot path's).
   pointers standing for 256 TiB, per `inspect slab`), once, before edges serve; the
   mirror is resumable, parallel and rate-capped, and ADO's serving rate decides how long
   it takes.
-* ADO supports protocol v2 `filter blob:none`, `object-info` and fetching blobs by id
-  (confirmed; every test here uses a local git upstream). GVFS endpoints are used where the
-  upstream offers them (`/gvfs/objects`, `/gvfs/sizes`).
+* Azure DevOps speaks only protocol v0 (measured on dev.azure.com: it ignores
+  `Git-Protocol: version=2`) and advertises `filter` there, so `blob:none` fetches go over
+  v0. Without v2 there is no `object-info` and no blob `want`s: blobs by id and sizes come
+  through its GVFS endpoints (`/gvfs/objects`, `/gvfs/sizes`), used wherever an upstream
+  offers them.
 * The edge's block cache lives in memory and on local disk and starts empty after a
   restart. Hot small-blob packs are not prefetched whole.
 * A window run reads every segment index (48 B per blob) and the manifest's sizes tables:

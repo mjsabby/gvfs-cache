@@ -1723,3 +1723,93 @@ fn async_upstream_fetches_blobs_and_sizes_over_every_transport() {
     edge.assert_clean();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The commits and trees of a separate store's slabs (`filter blob:none`) over smart HTTP,
+/// with protocol v2 and with v0 alone (as Azure DevOps speaks it): the whole history, and
+/// the commits past a `have`, each exactly git's commits and trees, without a blob. An
+/// upstream that does not advertise filters is refused rather than asked for every blob.
+#[test]
+fn filtered_fetch_over_smart_http_v2_and_v0() {
+    use gvfs_cache::upstream::{Auth, Upstream as Client};
+
+    let root = tempdir("sep-filter");
+    let up = Upstream::new(&root);
+    let first = commit_files(
+        &up,
+        "c1",
+        &[
+            ("a/one.txt", Some(text(1))),
+            ("b/noise.bin", Some(noise(1 << 16, 3))),
+        ],
+    );
+    let tip = commit_files(
+        &up,
+        "c2",
+        &[
+            ("a/one.txt", Some(text(2))),
+            ("c/two.txt", Some(b"two\n".to_vec())),
+        ],
+    );
+    let oid = |hex: &str| Oid::from_hex(hex.as_bytes()).unwrap();
+    let sorted = |mut v: Vec<(String, String)>| {
+        v.sort();
+        v
+    };
+    let auth = Auth::header(gvfs_cache::http::basic_auth("", "secret"));
+    for v2 in [true, false] {
+        let label = if v2 { "v2" } else { "v0" };
+        let http = SmartHttp::start(&up.bare, "secret", v2);
+        git(&up.bare, &["config", "uploadpack.allowFilter", "true"]);
+        let mut client = Client::open(&http.url, "main", &auth).unwrap();
+        for (haves, range) in [
+            (Vec::new(), tip.clone()),
+            (vec![oid(&first)], format!("{first}..{tip}")),
+        ] {
+            let mut pack = Vec::new();
+            client
+                .fetch_filtered(&haves, &oid(&tip), "blob:none", &mut pack)
+                .unwrap();
+            let repo = fresh_repo(&root, &format!("{label}-{}", haves.len()));
+            install_pack(&repo, &pack);
+            let got = git(
+                &repo,
+                &[
+                    "cat-file",
+                    "--batch-all-objects",
+                    "--batch-check=%(objectname) %(objecttype)",
+                ],
+            )
+            .lines()
+            .map(|l| {
+                let (o, t) = l.split_once(' ').unwrap();
+                (o.to_string(), t.to_string())
+            })
+            .collect();
+            let ids: Vec<String> = git(
+                &up.bare,
+                &["rev-list", "--objects", "--filter=blob:none", &range],
+            )
+            .lines()
+            .map(|l| l[..40].to_string())
+            .collect();
+            assert_eq!(
+                sorted(got),
+                sorted(types(&up.bare, &ids)),
+                "{label} {range}"
+            );
+        }
+        assert!(http.posts() > 0 && (http.v2_posts() > 0) == v2, "{label}");
+
+        git(&up.bare, &["config", "uploadpack.allowFilter", "false"]);
+        let mut refused = Client::open(&http.url, "main", &auth).unwrap();
+        let err = refused
+            .fetch_filtered(&[], &oid(&tip), "blob:none", &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not support fetch filters"),
+            "{label}: {err}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

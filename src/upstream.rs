@@ -18,10 +18,11 @@
 //!
 //! Stores that keep blobs apart (`--blobs separate`) also need: commits and trees without
 //! blobs (`filter blob:none`), blobs by id, and blob sizes. A local repository serves them
-//! through `upload-pack` (allowed here with `-c`); an HTTP upstream that speaks the GVFS
-//! protocol (Azure DevOps, another gvfs-cache) through `POST /gvfs/objects` and
-//! `POST /gvfs/sizes`, otherwise through protocol v2 (`filter`, `want <id>`, `object-info`)
-//! where the server advertises it.
+//! through `upload-pack` (allowed here with `-c`). Over HTTP, the filter goes with the fetch
+//! in either protocol, where the server advertises it (Azure DevOps speaks only v0); blobs
+//! and sizes come through `POST /gvfs/objects` and `POST /gvfs/sizes` from an upstream that
+//! speaks the GVFS protocol (Azure DevOps, another gvfs-cache), otherwise through protocol
+//! v2 (`want <id>`, `object-info`) where the server advertises it.
 //!
 //! [`AsyncUpstream`] makes every request, on the async client or an async `git upload-pack`,
 //! so that a fetch parks its task, not a thread: the edge's blob proxy uses it while it
@@ -277,8 +278,8 @@ impl PackPieces for ToWriter<'_> {
     }
 }
 
-/// Whether an upstream offers protocol v2 capability `name` (`fetch` features are matched
-/// as `fetch:<feature>`). Local repositories offer everything we ask for.
+/// Whether an upstream offers capability `name`: protocol v2's (`fetch` features are matched
+/// as `fetch:<feature>`), or v0's. Local repositories offer everything we ask for.
 fn has_cap(local: bool, caps: &[String], name: &str) -> bool {
     if local {
         return true;
@@ -367,7 +368,7 @@ fn parse_object_info(r: &mut dyn Read, n: usize) -> Result<std::collections::Has
 }
 
 /// A one-round-trip fetch request: protocol v2 `fetch` with `done`, or v0 `want`s with
-/// `side-band-64k`; never thin, no progress.
+/// `side-band-64k`; never thin, no progress; filtered by `filter` in either.
 fn fetch_request(v2: bool, haves: &[Oid], wants: &[Oid], filter: Option<&str>) -> Result<Vec<u8>> {
     let want = wants.first().copied().ctx("fetch without a want")?;
     let mut req = Vec::new();
@@ -389,13 +390,18 @@ fn fetch_request(v2: bool, haves: &[Oid], wants: &[Oid], filter: Option<&str>) -
         pktline::put_str(&mut req, "done\n");
         pktline::flush(&mut req);
     } else {
+        // v0: the filter is a capability of the first `want`, then a line after the wants.
         pktline::put_str(
             &mut req,
             &format!(
-                "want {want} multi_ack_detailed side-band-64k ofs-delta no-progress {}",
+                "want {want} multi_ack_detailed side-band-64k ofs-delta no-progress{} {}",
+                if filter.is_some() { " filter" } else { "" },
                 AGENT.trim_end()
             ),
         );
+        if let Some(f) = filter {
+            pktline::put_str(&mut req, &format!("filter {f}\n"));
+        }
         pktline::flush(&mut req);
         for have in haves.iter().filter(|h| !h.is_zero()) {
             pktline::put_str(&mut req, &format!("have {have}\n"));
@@ -442,6 +448,28 @@ fn advertised_caps(body: &[u8]) -> Result<Vec<String>> {
             }
             Pkt::Flush if !started => continue,
             _ => return Ok(caps),
+        }
+    }
+}
+
+/// The capabilities of a v0 ref advertisement (after the NUL of its first ref line).
+fn v0_caps(body: &[u8]) -> Result<Vec<String>> {
+    let mut rd = pktline::Reader::new(body);
+    loop {
+        match rd.read()? {
+            Pkt::Data(n) => {
+                let line = rd.line(n);
+                if line.starts_with(b"# service=") {
+                    continue;
+                }
+                let caps = line.split(|&b| b == 0).nth(1).unwrap_or_default();
+                return Ok(String::from_utf8_lossy(caps)
+                    .split_ascii_whitespace()
+                    .map(str::to_string)
+                    .collect());
+            }
+            Pkt::Flush => continue,
+            _ => return Ok(Vec::new()),
         }
     }
 }
@@ -913,7 +941,8 @@ impl AsyncUpstream {
         }
     }
 
-    /// Detects protocol v2 from the HTTP capability advertisement (once).
+    /// Detects the protocol (v2, else v0) and its capabilities from the HTTP advertisement
+    /// (once).
     async fn detect(&mut self) -> Result<()> {
         if self.detected {
             return Ok(());
@@ -931,9 +960,11 @@ impl AsyncUpstream {
                 .await?;
             let body = resp.body_vec(64 << 20).await?;
             self.v2 = advertisement_is_v2(&body)?;
-            if self.v2 {
-                self.caps = advertised_caps(&body)?;
-            }
+            self.caps = if self.v2 {
+                advertised_caps(&body)?
+            } else {
+                v0_caps(&body)?
+            };
         }
         self.detected = true;
         Ok(())
@@ -1006,9 +1037,10 @@ impl AsyncUpstream {
     }
 
     /// The objects reachable from `want` but not from any of `haves` (none = everything),
-    /// filtered by `filter` if given (`blob:none`: commits and trees only), as one non-thin
-    /// pack handed to `out` in pieces. Returns the pack length. Haves the upstream does not
-    /// know (history rewritten) are ignored by it.
+    /// filtered by `filter` if given (`blob:none`: commits and trees only; in protocol v2 or
+    /// v0, where the upstream advertises filters), as one non-thin pack handed to `out` in
+    /// pieces. Returns the pack length. Haves the upstream does not know (history rewritten)
+    /// are ignored by it.
     pub async fn fetch<P: PackPieces>(
         &mut self,
         haves: &[Oid],
@@ -1017,7 +1049,12 @@ impl AsyncUpstream {
         out: &mut P,
     ) -> Result<u64> {
         self.detect().await?;
-        if filter.is_some() && (!self.v2 || !self.has_cap("fetch:filter")) {
+        let filters = if self.v2 {
+            self.has_cap("fetch:filter")
+        } else {
+            self.has_cap("filter")
+        };
+        if filter.is_some() && !filters {
             crate::bail!(
                 "{}: the upstream does not support fetch filters",
                 self.label
