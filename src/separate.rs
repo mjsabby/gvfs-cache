@@ -273,7 +273,7 @@ fn object<'r>(
 }
 
 /// The blobs of commit `commit`'s tree, distinct, depth first in name order.
-fn tree_blobs(slabs: &[Arc<Slab>], commit: &Oid) -> Result<Vec<Oid>> {
+pub fn tree_blobs(slabs: &[Arc<Slab>], commit: &Oid) -> Result<Vec<Oid>> {
     let mut resolver = Resolver::default();
     let c = object(slabs, &mut resolver, commit, OBJ_COMMIT)?;
     let Some(root) = commit_tree(c) else {

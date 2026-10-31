@@ -548,10 +548,17 @@ the mirror.
   would race the mirror a whole directory at a time (measured: one window copied 1.7 GiB of
   untouched large files the mirror was copying). Every blob in a sizes table is then either
   in the plan of the mirror, whose last run checks them all, or new in the window that
-  introduced it, which copied it. A run that dies in between leaves blobs no tree
-  references yet, never a tree without its blobs. Pipeline runners keep the store objects
-  a run reads (sizes tables, segment indexes) in `--cache-dir` across runs, pruned to what
-  the store lists.
+  introduced it, which copied it. The new tip is the exception: the blobs of its tree the
+  store lacks (an old version brought back) are copied too when they fit in one blob
+  pack's bytes (`--blob-pack-mib`), so a tip the mirror has copied stays whole and a
+  checkout of it never waits on the upstream. More than that is a tip the mirror has not
+  copied yet, which stays in its plan. (Measured on Networking-Metadata, a store with its
+  tip mirrored and the rest of the history not: after two windows, 59 of the tip's 523K
+  blobs were old versions the store lacked; walking that tip's tree takes 1.25 s.) A run
+  that dies in between leaves blobs no tree references yet, never a tree without its
+  blobs. Pipeline runners keep the store objects a run reads (sizes tables, segment
+  indexes, and the slabs the tip's tree is walked through) in `--cache-dir` across runs,
+  pruned to what the store lists.
 * **The manifest names the `blobs.bin` generation** the run computed its copies against,
   or the one it published if newer, even when it copied nothing: a run that died after
   publishing `blobs.bin` left the blobs the next run's trees rely on.

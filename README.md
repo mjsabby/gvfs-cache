@@ -174,7 +174,8 @@ gvfs-cache mirror --store "$STORE" --upstream "$ADO_URL" --auth-command ~/get_to
     --jobs 16 [--rate-mbps 4000] [--max-items N]
 
 # Then schedule the pipeline as below: every run copies its window's new blobs before
-# publishing the trees that reference them (keep --work-dir, or --cache-dir, on a
+# publishing the trees that reference them, and, until the mirror has finished, what the
+# new tip lacks if it fits in one blob pack (keep --work-dir, or --cache-dir, on a
 # persistent disk: a run reuses the store objects the previous one downloaded). Edges
 # serve blobs from the blob packs (mapped, or read by range from Azure) and proxy only
 # the blobs of the commits the pipeline has not sealed yet.

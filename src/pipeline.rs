@@ -42,7 +42,9 @@
 //!   the ones `blobs.bin` lacks (verified by id as they stream through), publishes them in
 //!   `blobs.bin`, and only then publishes its slab, recording the `blobs.bin` generation
 //!   it needs. A run that dies in between leaves unreferenced blobs, never trees without
-//!   their blobs.
+//!   their blobs. Until the mirror has finished, old versions are the mirror's to copy,
+//!   except those the new tip has, within one blob pack's bytes, so that a tip the mirror
+//!   has copied stays whole.
 //! * Rollups and weekly rebuilds union their parts' sizes tables.
 
 use std::path::{Path, PathBuf};
@@ -418,8 +420,9 @@ fn genesis_separate(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) ->
 }
 
 /// A 15m run of a `--blobs separate` store, blobs first: the window's commits and trees
-/// (`blob:none`); the blobs their trees reference that `blobs.bin` lacks, copied and
-/// published; then the slab with its sizes table.
+/// (`blob:none`); the blobs their trees reference that `blobs.bin` lacks (and, until the
+/// mirror has finished, those the new tip lacks: [`tip_gaps`]), copied and published; then
+/// the slab with its sizes table.
 fn window_separate(
     o: &mut Options,
     e: &mut Engines,
@@ -451,7 +454,8 @@ fn window_separate(
     // reach, so they and their blobs are in the store already (`crate::separate`). Until the
     // mirror has finished, a blob an earlier tree names (an unchanged file of a changed
     // directory, an old version) is the mirror's to copy: copying it here too would race the
-    // mirror, a whole directory of large files at a time.
+    // mirror, a whole directory of large files at a time. The new tip's are the exception,
+    // within one blob pack's bytes (`tip_gaps`).
     let referenced = crate::blobcopy::referenced_blobs(&raw.slab, o.threads)?;
     let cache = o.cache_dir.clone();
     std::fs::create_dir_all(&cache).ctx(&format!("creating {}", cache.display()))?;
@@ -459,11 +463,15 @@ fn window_separate(
     let (bm, _) = crate::blobcopy::load(&o.store)?;
     let index = crate::separate::BlobIndex::load(&o.store, &cache, &bm)?;
     let mirrored = bm.complete();
-    let need: Vec<Oid> = referenced
+    let mut need: Vec<Oid> = referenced
         .iter()
         .filter(|b| index.find(b).is_none() && (mirrored || known.get(b).is_none()))
         .copied()
         .collect();
+    if !mirrored {
+        let gaps = tip_gaps(o, m, &raw.slab, head, &index, &known, &need)?;
+        need.extend(gaps);
+    }
     let (published, copied) = crate::separate::copy_needed(
         &mut o.upstream,
         &o.store,
@@ -519,6 +527,54 @@ fn window_separate(
         m.blobs_generation = m.blobs_generation.max(p.generation);
     }
     Ok(())
+}
+
+/// While the mirror has not finished: the blobs of the new tip's tree that the store lacks
+/// and `need` does not have yet (a file back at an old version, which an earlier tree
+/// names), so that a checkout of the tip is served from the store. Only if they fit in one
+/// blob pack's bytes: more is a tip the mirror has not copied yet, which stays the mirror's.
+fn tip_gaps(
+    o: &Options,
+    m: &Manifest,
+    window: &Arc<Slab>,
+    head: Oid,
+    index: &crate::separate::BlobIndex,
+    known: &crate::separate::KnownSizes,
+    need: &[Oid],
+) -> Result<Vec<Oid>> {
+    let t0 = std::time::Instant::now();
+    let metas: Vec<SlabMeta> = std::iter::once(&m.baseline)
+        .chain(&m.pyramid)
+        .cloned()
+        .collect();
+    // Downloads stay in the cache directory for the next run (it keeps listed slabs).
+    let mut slabs = open_slabs(&o.store, &o.cache_dir, &metas)?;
+    slabs.push(Arc::clone(window));
+    let queued: std::collections::HashSet<&Oid> = need.iter().collect();
+    let gaps: Vec<Oid> = crate::separate::tree_blobs(&slabs, &head)?
+        .into_iter()
+        .filter(|b| !queued.contains(b) && index.find(b).is_none())
+        .collect();
+    if gaps.is_empty() {
+        return Ok(gaps);
+    }
+    let bytes = gaps
+        .iter()
+        .filter_map(|b| known.get(b))
+        .fold(0u64, u64::saturating_add);
+    let fits = bytes <= o.blob_pack_bytes;
+    crate::log!(
+        "the tip lacks {} blobs ({}) that earlier trees name: {} ({:.2}s)",
+        gaps.len(),
+        crate::util::human_bytes(bytes),
+        if fits {
+            "copying them too"
+        } else {
+            "more than --blob-pack-mib, left to the mirror"
+        },
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(if fits { gaps } else { Vec::new() })
 }
 
 /// Repacks `slabs` (onto `frozen`) into a slab in `work`.

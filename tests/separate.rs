@@ -170,15 +170,28 @@ fn separate_store_pipeline_copies_blobs_before_trees() {
         .collect();
     assert_eq!(sizes_of(&store_dir, window), expect);
     assert_eq!(expect.len(), 3, "text v4, large.bin, noise.bin");
-    // Before the mirror has finished, the window copies exactly those: the old versions it
-    // reuses (text v1, copy.dat's content) are in the mirror's plan.
+    // Before the mirror has finished, the window copies those and the blobs its tip has that
+    // the store lacks (copy.dat's content, the empty file), so the tip is served from the
+    // store; text v1, an old version only c4 had, is in the mirror's plan.
     let stored = store_blobs(&root, &store_dir);
     let mut copied: Vec<&String> = stored.keys().collect();
     copied.sort();
-    assert_eq!(copied, expect.keys().collect::<Vec<_>>(), "{log}");
+    let mut want: Vec<String> = git(&up.bare, &["ls-tree", "-r", &t])
+        .lines()
+        .map(|l| l.split_whitespace().nth(2).unwrap().to_string())
+        .chain(expect.keys().cloned())
+        .collect();
+    want.sort();
+    want.dedup();
+    assert_eq!(copied, want.iter().collect::<Vec<_>>(), "{log}");
+    assert!(log.contains("the tip lacks 2 blobs"), "{log}");
+    let v1 = git(&up.bare, &["rev-parse", &format!("{t}~1:a/text.txt")]);
+    assert!(!stored.contains_key(v1.trim()));
+    for (id, content) in &stored {
+        assert!(*content == cat_blob(&up.bare, id), "blob {id} differs");
+    }
     for (id, size) in &expect {
         assert_eq!(stored[id].len() as u64, *size);
-        assert!(stored[id] == cat_blob(&up.bare, id), "blob {id} differs");
     }
     // The mirror copies the history, those versions with it.
     let log = mirror(&root, &store, &up, &[]).unwrap();
@@ -271,6 +284,64 @@ fn mirror(root: &Path, store: &str, up: &Upstream, extra: &[&str]) -> Result<Str
     mirror_at(root, store, up.bare.to_str().unwrap(), extra, &[])
 }
 
+/// While the mirror has not finished, a window also copies the blobs its tip has that the
+/// store lacks (here a file back at an old version, which an earlier tree names), so that a
+/// checkout of the tip is served from the store; unless they come to more than one blob
+/// pack's bytes (a tip the mirror has not copied yet), which stay the mirror's.
+#[test]
+fn a_window_copies_the_old_versions_its_tip_needs() {
+    let root = tempdir("sep-tip-gaps");
+    let up = Upstream::new(&root);
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    commit_files(
+        &up,
+        "c1",
+        &[
+            ("a/f.txt", Some(text(1))),
+            ("b/old.bin", Some(noise(1_500_000, 2))),
+        ],
+    );
+    commit_files(
+        &up,
+        "c2",
+        &[("a/f.txt", Some(text(2))), ("b/old.bin", None)],
+    );
+    pipeline(&root, &store, &up, "15m", &["--blobs", "separate"]);
+    assert!(store_blobs(&root, &store_dir).is_empty());
+
+    // a/f.txt goes back to its first version: the window copies it with its new file.
+    let t = commit_files(
+        &up,
+        "c3",
+        &[
+            ("a/f.txt", Some(text(1))),
+            ("c/new.txt", Some(b"new\n".to_vec())),
+        ],
+    );
+    let log = pipeline(&root, &store, &up, "15m", &[]);
+    assert!(
+        log.contains("the tip lacks 1 blobs") && log.contains("copying them too"),
+        "{log}"
+    );
+    let stored = store_blobs(&root, &store_dir);
+    for line in git(&up.bare, &["ls-tree", "-r", &t]).lines() {
+        let id = line.split_whitespace().nth(2).unwrap();
+        assert!(
+            stored.get(id).is_some_and(|c| *c == cat_blob(&up.bare, id)),
+            "{line}"
+        );
+    }
+
+    // b/old.bin comes back too, but 1.5 MB is more than a 1 MiB blob pack: the mirror's.
+    let t2 = commit_files(&up, "c4", &[("b/old.bin", Some(noise(1_500_000, 2)))]);
+    let log = pipeline(&root, &store, &up, "15m", &["--blob-pack-mib", "1"]);
+    assert!(log.contains("left to the mirror"), "{log}");
+    let old = git(&up.bare, &["rev-parse", &format!("{t2}:b/old.bin")]);
+    assert!(!store_blobs(&root, &store_dir).contains_key(old.trim()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Runs `gvfs-cache mirror` against any upstream spec, with `env`.
 fn mirror_at(
     root: &Path,
@@ -339,7 +410,9 @@ fn mirror_copies_the_whole_history_and_resumes() {
             ("n/new.txt".into(), Some(b"new\n".to_vec())),
         ],
     );
-    pipeline(&root, &store, &up, "15m", &[]);
+    // With 1 MiB blob packs, the tip's 17 MiB the store lacks is the mirror's to copy.
+    let log = pipeline(&root, &store, &up, "15m", &["--blob-pack-mib", "1"]);
+    assert!(log.contains("left to the mirror"), "{log}");
     let s = Store::open(&store, "").unwrap();
     assert!(!blobcopy::load(&s).unwrap().0.complete());
 
@@ -1249,28 +1322,41 @@ fn reused_old_versions_are_in_the_store() {
         &["merge", "-q", "--no-ff", "-m", "merge topic", "topic"],
     );
     work_git(&up, &["push", "-q", "origin", "HEAD:main"]);
+    let merged = rev(&up.bare, "main");
     for (_, spec) in &stores {
         pipeline(&root, spec, &up, "15m", &[]);
     }
     // A revert of X restores lib/foo from before genesis (a v1).
     work_git(&up, &["revert", "--no-edit", &x]);
     work_git(&up, &["push", "-q", "origin", "HEAD:main"]);
+    let reverted = rev(&up.bare, "main");
     git(&up.bare, &["repack", "-adbq"]);
     for (_, spec) in &stores {
         pipeline(&root, spec, &up, "15m", &[]);
     }
-    // Store B's windows ran before its mirror: they copied only blobs no earlier tree
-    // references (the reused versions are the mirror's).
+    // Store B's windows ran before its mirror: they copied the blobs no earlier tree
+    // references and those their tips have (each tip is then served from the store, the
+    // version the revert brings back included), and nothing else of the history.
     let (dir_b, _) = &stores[1];
     let genesis_sizes = sizes_of(dir_b, &manifest(dir_b).baseline);
+    let tips: std::collections::HashSet<String> = [&merged, &reverted]
+        .iter()
+        .flat_map(|c| {
+            git(&up.bare, &["ls-tree", "-r", c])
+                .lines()
+                .map(|l| l.split_whitespace().nth(2).unwrap().to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect();
     let early = store_blobs(&root, dir_b);
     assert!(!early.is_empty());
     for id in early.keys() {
         assert!(
-            !genesis_sizes.contains_key(id),
+            !genesis_sizes.contains_key(id) || tips.contains(id),
             "{id}: a window copied the mirror's blob"
         );
     }
+    assert!(early.contains_key(&rev(&up.bare, &format!("{x}^:lib/foo/a.c"))));
     let log = mirror(&root, store_b, &up, &[]).unwrap();
 
     let history = git_blobs(&up.bare, &["--all"]);
