@@ -564,9 +564,13 @@ impl Indexer {
         } else {
             (*threads).min(roots.len())
         };
+        // Every scratch's results are merged below, so none may hold an earlier pack's:
+        // fewer workers than last time leave some scratches unused.
+        for scratch in resolve.iter_mut() {
+            scratch.out.clear();
+        }
         let roots: &[u32] = roots;
         let run = |scratch: &mut ResolveScratch| -> Result<()> {
-            scratch.out.clear();
             loop {
                 let r = next.fetch_add(1, Ordering::Relaxed);
                 let Some(&root) = roots.get(r) else { break };
@@ -1427,6 +1431,109 @@ pub(crate) mod tests {
         let mid = bad.len() / 2;
         bad[mid] ^= 0x55;
         assert!(Indexer::new(1).index(&bad).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The pipeline indexes two packs with one indexer: the upstream's, then its repack's.
+    /// A first pack resolved by several workers, then one small enough for one worker,
+    /// gives the second pack exactly the facts a fresh indexer gives it (the unused
+    /// workers' results from the first pack once overwrote a third of its ids).
+    #[test]
+    fn a_reused_indexer_keeps_no_earlier_results() {
+        let dir = std::env::temp_dir().join(format!("gvfs-reuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let pack_of =
+            |repo: &str, count: u32, files: &dyn Fn(u32, u32) -> Vec<u8>, versions: u32| {
+                let wd = dir.join(repo);
+                let git = |args: &[&str], stdin: &[u8]| {
+                    let mut child = Command::new("git")
+                        .args(args)
+                        .current_dir(&wd)
+                        .env("GIT_CONFIG_NOSYSTEM", "1")
+                        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                        .stdin(std::process::Stdio::piped())
+                        .stdout(std::process::Stdio::piped())
+                        .spawn()
+                        .unwrap();
+                    use std::io::Write;
+                    child.stdin.take().unwrap().write_all(stdin).unwrap();
+                    let out = child.wait_with_output().unwrap();
+                    assert!(out.status.success(), "git {args:?}");
+                    out.stdout
+                };
+                std::fs::create_dir_all(&wd).unwrap();
+                git(&["init", "-q", "-b", "main"], b"");
+                for v in 0..versions {
+                    for i in 0..count {
+                        std::fs::write(wd.join(format!("f{i}")), files(i, v)).unwrap();
+                    }
+                    git(&["add", "-A"], b"");
+                    let who = ["-c", "user.name=t", "-c", "user.email=t@t"];
+                    git(&[&who[..], &["commit", "-q", "-m", "v"]].concat(), b"");
+                }
+                let pack = [
+                    "pack-objects",
+                    "--revs",
+                    "--stdout",
+                    "-q",
+                    "--delta-base-offset",
+                ];
+                git(&pack, b"main\n")
+            };
+        // 150 files changed once: 150 delta families, resolved by several workers, the
+        // deltas (after the newer versions) at entries 150 to 300 or so.
+        let families = pack_of(
+            "families",
+            150,
+            &|i, v| {
+                (0..100)
+                    .map(|l| format!("file {i} line {l}{}\n", if l == 7 { v } else { 0 }))
+                    .collect::<String>()
+                    .into_bytes()
+            },
+            2,
+        );
+        // 600 files of noise: whole objects only, which one worker resolves, at entry
+        // numbers the first pack's deltas had too.
+        let whole = pack_of(
+            "whole",
+            600,
+            &|i, _| {
+                let mut x = u64::from(i).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                (0..300)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        x as u8
+                    })
+                    .collect()
+            },
+            1,
+        );
+        let facts = |f: &[Facts]| -> Vec<(Oid, u32, u8, u8, u64)> {
+            f.iter()
+                .map(|f| (f.oid, f.base, f.kind, f.depth, f.size))
+                .collect()
+        };
+        let want = facts(Indexer::new(4).index(&whole).unwrap());
+
+        let mut ix = Indexer::new(4);
+        let mut spread = false;
+        for _ in 0..50 {
+            ix.index(&families).unwrap();
+            assert!(ix.roots.len() >= 64, "{} families", ix.roots.len());
+            if ix.resolve.iter().filter(|s| !s.out.is_empty()).count() > 1 {
+                spread = true;
+                break;
+            }
+        }
+        assert!(
+            spread,
+            "the first pack was never resolved by more than one worker"
+        );
+        assert_eq!(facts(ix.index(&whole).unwrap()), want);
+        assert!(ix.roots.len() < 64);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
