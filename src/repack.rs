@@ -1436,43 +1436,67 @@ mod tests {
 
     /// Deltas copied as they are (a seed in `Mode::Copy`, whose upstream packed a file's
     /// versions in a chain deeper than git's default) stop at `MAX_DEPTH`: past it, an
-    /// object is stored whole and a new chain starts from it.
+    /// object is stored whole and a new chain starts from it. The input, 70 versions of a
+    /// file each a delta of the one before, is built here: how deep git chains a history
+    /// is its delta search's choice (git 2.53 chained this one 69 deep, CI's 2.55 only 30).
     #[test]
     fn copied_delta_chains_stop_at_max_depth() {
         let dir = tempdir("depth");
         std::fs::create_dir_all(&dir).unwrap();
-        git(&dir, &["init", "-q", "-b", "main"], None);
-        // Each version edits one more line: its nearest version is the best base.
+        // Each version edits one more line.
         let mut lines: Vec<String> = (0..300)
             .map(|i| format!("line {i} of a file edited a line at a time"))
             .collect();
+        let mut versions: Vec<Vec<u8>> = Vec::new();
         for c in 0..70 {
             lines[c] = format!("line {c} edited in commit {c}");
-            std::fs::write(dir.join("f.txt"), lines.join("\n")).unwrap();
-            git(&dir, &["add", "-A"], None);
-            let msg = format!("c{c}");
-            let who = ["-c", "user.name=t", "-c", "user.email=t@t"];
-            git(
-                &dir,
-                &[&who[..], &["commit", "-q", "-m", &msg]].concat(),
-                None,
-            );
+            versions.push(lines.join("\n").into_bytes());
         }
-        let args = [
-            "pack-objects",
-            "--revs",
-            "--stdout",
-            "-q",
-            "--delta-base-offset",
-        ];
-        let deep = ["--depth=100", "--window=100"];
-        let pack = git(&dir, &[&args[..], &deep].concat(), Some(b"main\n"));
+        let zlib = |data: &[u8]| {
+            let mut z = vec![0u8; crate::zlib::compress_bound(data.len())];
+            let n = crate::zlib::Deflater::new(6)
+                .deflate_parts(&[data], &mut z)
+                .unwrap();
+            z.truncate(n);
+            z
+        };
+        let mut pack = crate::pack::pack_header(70).to_vec();
+        let mut at: Vec<u64> = Vec::new();
+        for (i, v) in versions.iter().enumerate() {
+            at.push(pack.len() as u64);
+            if i == 0 {
+                pack.extend_from_slice(HeaderBytes::whole(OBJ_BLOB, v.len() as u64).as_slice());
+                pack.extend(zlib(v));
+                continue;
+            }
+            // Copy the common prefix and suffix of the version before, insert the rest.
+            let base = &versions[i - 1];
+            let p = base.iter().zip(v).take_while(|(a, b)| a == b).count();
+            let s = base[p..]
+                .iter()
+                .rev()
+                .zip(v[p..].iter().rev())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let mut d = Vec::new();
+            crate::delta::put_varint(&mut d, base.len() as u64);
+            crate::delta::put_varint(&mut d, v.len() as u64);
+            crate::delta::put_copy(&mut d, 0, p);
+            crate::delta::put_insert(&mut d, &v[p..v.len() - s]);
+            crate::delta::put_copy(&mut d, base.len() - s, s);
+            let header = HeaderBytes::ofs_delta(d.len() as u64, at[i] - at[i - 1]);
+            pack.extend_from_slice(header.as_slice());
+            pack.extend(zlib(&d));
+        }
+        let trailer: [u8; 20] = Sha1::digest(&pack).into();
+        pack.extend_from_slice(&trailer);
+        git_accepts(&dir, &pack);
         let mut ix = Indexer::new(2);
         let seed = slab(&mut ix, pack);
         let deepest = seed.records().map(|r| r.depth).max().unwrap();
         assert!(
-            deepest > MAX_DEPTH,
-            "the upstream's chains run {deepest} deep"
+            usize::from(deepest) == versions.len() - 1 && deepest > MAX_DEPTH,
+            "the input's chain runs {deepest} deep"
         );
         let mut rp = Repacker::new();
         let input = Input {

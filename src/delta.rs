@@ -133,7 +133,7 @@ pub fn apply_delta(base: &[u8], delta: &[u8], out: &mut [u8]) -> Result<(), Delt
 const MAX_COPY: usize = 0x10000;
 const MAX_INSERT: usize = 0x7F;
 
-fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+pub(crate) fn put_varint(out: &mut Vec<u8>, mut v: u64) {
     while v >= 0x80 {
         out.push((v & 0x7F) as u8 | 0x80);
         v = v.wrapping_shr(7);
@@ -142,7 +142,7 @@ fn put_varint(out: &mut Vec<u8>, mut v: u64) {
 }
 
 /// `base[off .. off + len]`, as copy ops of at most 64 KiB.
-fn put_copy(out: &mut Vec<u8>, mut off: usize, mut len: usize) {
+pub(crate) fn put_copy(out: &mut Vec<u8>, mut off: usize, mut len: usize) {
     while len > 0 {
         let n = len.min(MAX_COPY);
         let mut op = 0x80u8;
@@ -179,7 +179,7 @@ fn put_copy(out: &mut Vec<u8>, mut off: usize, mut len: usize) {
     }
 }
 
-fn put_insert(out: &mut Vec<u8>, data: &[u8]) {
+pub(crate) fn put_insert(out: &mut Vec<u8>, data: &[u8]) {
     for chunk in data.chunks(MAX_INSERT) {
         out.push(chunk.len() as u8);
         out.extend_from_slice(chunk);
