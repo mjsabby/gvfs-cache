@@ -368,6 +368,7 @@ fn main() {
         work_dir: work.join("pipeline"),
         now: t0,
         keep_weeks: 8,
+        weekly_always: false,
         gc_grace: 7200,
         threads,
         blobs: None,

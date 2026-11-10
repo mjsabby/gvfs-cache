@@ -23,7 +23,7 @@
 //! 4. **Weekly** (`--tier 168h`): the pyramid is repacked into the week's delta (kept for
 //!    warm clients; the pyramid's slabs are retained). The new baseline is the old one byte
 //!    for byte plus the delta's objects, with each directory's newest version stored as a
-//!    delta against the old baseline's version.
+//!    delta against the old baseline's version. It waits for its week ([`weekly_wait`]).
 //! 5. Publish with `If-Match` (lost race: start over), then delete unreferenced slab files
 //!    older than the grace period (a crashed run's uploads; slabs no longer listed). A run
 //!    that changed nothing (no new commits, no rollup due) publishes nothing: the manifest
@@ -70,9 +70,13 @@ pub struct Options {
     pub upstream: Upstream,
     pub tier: Tier,
     pub work_dir: PathBuf,
-    /// The clock (seconds), for garbage collection.
+    /// The clock (seconds): for garbage collection, for retention when stamps are ahead of
+    /// it, and for whether a weekly rebuild is due.
     pub now: u64,
     pub keep_weeks: usize,
+    /// `--weekly always`: a `--tier 168h` run rebuilds the baseline whenever it is asked
+    /// to, not only when one is due ([`weekly_due`]).
+    pub weekly_always: bool,
     pub gc_grace: u64,
     pub threads: usize,
     /// `--blobs separate` / `inline`: the store mode, chosen at genesis (later runs follow
@@ -84,6 +88,30 @@ pub struct Options {
     /// and segment indexes a window run reads), kept across runs and pruned to what the
     /// store lists. Other files in the directory are left alone.
     pub cache_dir: PathBuf,
+}
+
+/// How long after a week's end the next weekly rebuild is due: a day less than a week, so
+/// that a run a little early, or after a quiet day, is not put off by a week.
+const WEEKLY_DUE: u64 = 6 * DAY;
+
+/// How long a `--tier 168h` run has to wait before it may rebuild the baseline (`None`:
+/// it is due). A week is the pyramid since the last week's end, whatever it holds, and
+/// each rebuild rewrites the baseline (which every edge then downloads) and drops the
+/// oldest week beyond `--keep-weeks`. Asked for twice (a run retried after an error, a
+/// trigger that fired twice, a job run by hand), the second rebuild made a "week" of a
+/// few minutes: with `--keep-weeks 2`, two such runs left two weeks of three objects
+/// each, and every client older than that was sent the cold pack. So a rebuild waits
+/// until the last week's end is six days old by the run's clock. Nothing waits for the
+/// first week, for an empty pyramid (the rebuild then says so and does nothing), or
+/// when the stamps are ahead of the clock (a commit dated in the future), which then
+/// says nothing of when a week ended.
+fn weekly_wait(m: &Manifest, now: u64) -> Option<u64> {
+    let last = m.weekly.last()?;
+    if m.pyramid.is_empty() || last.end_ts > now {
+        return None;
+    }
+    let wait = WEEKLY_DUE.saturating_sub(now.saturating_sub(last.end_ts));
+    (wait > 0).then_some(wait)
 }
 
 /// How long a slab a rollup replaced stays listed for warm clients, by its tier.
@@ -171,6 +199,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "work-dir",
             "now",
             "keep-weeks",
+            "weekly",
             "gc-grace-secs",
             "threads",
             "blobs",
@@ -200,6 +229,11 @@ pub fn main(args: &[String]) -> Result<()> {
         work_dir: work_dir.clone(),
         now: f.num("now", crate::util::now_secs())?,
         keep_weeks: f.num("keep-weeks", 8usize)?,
+        weekly_always: match f.get("weekly").unwrap_or("due") {
+            "due" => false,
+            "always" => true,
+            other => crate::bail!("--weekly must be due or always, not {other:?}"),
+        },
         gc_grace: f.num("gc-grace-secs", 7200u64)?,
         threads: f.num("threads", crate::util::default_threads())?,
         blobs: match f.get("blobs") {
@@ -339,7 +373,15 @@ fn step(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<(Man
         }
     }
     if o.tier == Tier::Week {
-        weekly(o, e, work, &mut m)?;
+        match weekly_wait(&m, o.now).filter(|_| !o.weekly_always) {
+            None => weekly(o, e, work, &mut m)?,
+            Some(wait) => crate::log!(
+                "weekly: the last week ended {:.1} days ago: no rebuild for {:.1} days more \
+                 (--weekly always rebuilds whenever asked)",
+                (WEEKLY_DUE.saturating_sub(wait)) as f64 / DAY as f64,
+                wait as f64 / DAY as f64
+            ),
+        }
     }
     if m.separate_blobs() {
         // A rollup of slabs whose blobs a run copied needs no more than they did.
@@ -941,6 +983,32 @@ mod tests {
             .filter(|s| s.tier == tier)
             .map(|s| s.end_ts)
             .collect()
+    }
+
+    /// A weekly rebuild waits until the last week's end is six days old; not the first
+    /// week's, not for an empty pyramid, not when the stamps are ahead of the clock.
+    #[test]
+    fn a_weekly_rebuild_waits_for_the_week() {
+        let now = 1_800_000_000;
+        let manifest = |weeks: &[u64], pyramid: &[u64]| Manifest {
+            generation: 1,
+            tip: Oid::ZERO,
+            max_ts: pyramid.last().or(weeks.last()).copied().unwrap_or(100),
+            baseline: meta(Tier::Base, 100),
+            weekly: weeks.iter().map(|&end| meta(Tier::Week, end)).collect(),
+            pyramid: pyramid.iter().map(|&end| meta(Tier::M15, end)).collect(),
+            retained: Vec::new(),
+            flags: 0,
+            blobs_generation: 0,
+        };
+        assert_eq!(weekly_wait(&manifest(&[], &[now - 60]), now), None);
+        let day_old = manifest(&[now - 30 * DAY, now - DAY], &[now - 60]);
+        assert_eq!(weekly_wait(&day_old, now), Some(5 * DAY));
+        assert_eq!(weekly_wait(&day_old, now + 5 * DAY - 1), Some(1));
+        assert_eq!(weekly_wait(&day_old, now + 5 * DAY), None);
+        assert_eq!(weekly_wait(&manifest(&[now - DAY], &[]), now), None);
+        let ahead = now + 3650 * DAY;
+        assert_eq!(weekly_wait(&manifest(&[ahead], &[ahead + 5]), now), None);
     }
 
     /// Retained slabs age by stamps while the stamps are not ahead of the clock.
