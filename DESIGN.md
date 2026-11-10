@@ -162,7 +162,20 @@ bases are named by id. So:
 * **Loose objects** (`GET /gvfs/objects/<id>`): for a whole entry, the loose object is
   assembled without recompression. It is a zlib header, a stored block holding
   `"<type> <size>\0"`, the entry's original deflate blocks, and an Adler-32 combined from
-  the two parts. A deltified object is resolved, then deflated at level 1.
+  the two parts. A deltified object is resolved, then deflated at level 1. Deflating is
+  the larger part of such a request and buys little for a tree, which is mostly ids:
+  `--loose-deltas stored-trees` sends rebuilt trees as they are, in stored blocks written
+  by hand (zlib at level 0 still clears its 128 KB hash table per stream), and `stored`
+  everything, for clients on the same host. Per request on SearchGold, CPU and answer:
+
+  | | deflate (default) | stored |
+  |---|---|---|
+  | Deltified tree | 101 µs, 5.8 KB | 55 µs (−45%), 9.8 KB |
+  | Any tree | 68 µs, 4.0 KB | 39 µs (−43%), 6.4 KB |
+  | Deltified blob (text) | 117 µs, 3.6 KB | 95 µs (−19%), 56 KB |
+
+  A stored tree costs 4 KB more to save 46 µs: it pays on links faster than about
+  0.7 Gbit/s per core, a stored blob never over a network.
 
 Duplicates across slabs (rare: an object re-introduced after the `have`) stay in
 concatenated packs. Duplicate entries are valid in a pack and in its `.idx`.

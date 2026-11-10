@@ -77,6 +77,22 @@ pub enum IdxPolicy {
     Never,
 }
 
+/// How an object the store keeps as a delta is sent loose, once rebuilt
+/// (`--loose-deltas`). Deflating it again is the larger part of the request: on
+/// SearchGold a deltified tree costs 102 µs of CPU deflated (5.8 KB) and 55 µs in stored
+/// blocks (9.8 KB), since a tree is mostly ids, which do not compress. A deltified blob
+/// is text: 118 µs and 3.6 KB deflated, 95 µs and 56 KB stored.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LooseDeltas {
+    /// Deflated at level 1.
+    Deflate,
+    /// Trees in stored blocks, the rest deflated: for clients on a fast link.
+    StoredTrees,
+    /// Everything in stored blocks: for clients on the same host (the localhost proxy),
+    /// which inflate at once what was deflated for them.
+    Stored,
+}
+
 /// Shared by every connection.
 pub struct Ctx {
     view: RwLock<Arc<View>>,
@@ -104,6 +120,8 @@ pub struct Ctx {
     pub arena_wait: Duration,
     /// The most levels of parents a commit's expansion follows (`--max-commit-depth`).
     pub max_commit_depth: u64,
+    /// How an object rebuilt from a delta is sent loose (`--loose-deltas`).
+    pub loose_deltas: LooseDeltas,
     pub config_json: Vec<u8>,
     pub metrics: Metrics,
     pub ready: AtomicBool,
@@ -175,6 +193,8 @@ pub struct Options {
     /// Sealed rollups of this tier and above (24h, or the weekly delta) are delivered whole
     /// to the warm clients inside them, once ([`view`]); `None`: exact covers only.
     pub supersets: Option<Tier>,
+    /// `--loose-deltas`.
+    pub loose_deltas: LooseDeltas,
 }
 
 /// `gvfs-cache serve ...`
@@ -208,6 +228,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "quantum-us",
             "prefetch-idx",
             "superset-tier",
+            "loose-deltas",
             "proxy-cache-mib",
             "proxy-cache-packs",
             "blob-cache-mib",
@@ -251,6 +272,14 @@ pub fn main(args: &[String]) -> Result<()> {
         "168h" => Some(Tier::Week),
         "never" => None,
         other => crate::bail!("--superset-tier must be 24h, 168h or never, not {other:?}"),
+    };
+    let loose_deltas = match f.get("loose-deltas").unwrap_or("deflate") {
+        "deflate" => LooseDeltas::Deflate,
+        "stored-trees" => LooseDeltas::StoredTrees,
+        "stored" => LooseDeltas::Stored,
+        other => {
+            crate::bail!("--loose-deltas must be deflate, stored-trees or stored, not {other:?}")
+        }
     };
     let cores = crate::util::default_threads();
     let arenas = f.num("arenas", cores.saturating_mul(2))?;
@@ -301,6 +330,7 @@ pub fn main(args: &[String]) -> Result<()> {
             .map(|_| f.num("max-conns", 0usize))
             .transpose()?,
         supersets,
+        loose_deltas,
     };
     run(opts)
 }
@@ -350,6 +380,7 @@ pub fn run(o: Options) -> Result<()> {
         max_idle_conns,
         max_conns,
         supersets,
+        loose_deltas,
     } = o;
     let store = Arc::new(store);
     let mut sync = StoreSync {
@@ -499,6 +530,7 @@ pub fn run(o: Options) -> Result<()> {
         ),
         arena_wait: Duration::from_secs(10),
         max_commit_depth,
+        loose_deltas,
         config_json: config_json(&cache_servers),
         metrics: Metrics::default(),
         ready: AtomicBool::new(false),

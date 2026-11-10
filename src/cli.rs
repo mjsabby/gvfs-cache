@@ -137,6 +137,12 @@ SERVE OPTIONS:
     --superset-tier <24h|168h|never>     send each sealed day and week (24h, default) or
                                week (168h) to a warm client whole, once, so that client
                                maintenance can expire its smaller packs; never: exact covers
+    --loose-deltas <deflate|stored-trees|stored>   an object the store keeps as a delta
+                               is rebuilt to be sent loose: deflate (default) compresses
+                               it again; stored-trees sends trees as they are (about
+                               45% less CPU and 70% more bytes for such a tree: for
+                               clients on a fast link); stored sends everything so
+                               (clients on the same host: the localhost proxy)
 
 ENVIRONMENT:
     GVFS_DEBUG_INGEST=1        log pack indexing phase timings and entry statistics
