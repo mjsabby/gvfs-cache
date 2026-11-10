@@ -341,22 +341,22 @@ pub fn build_segment(packs: &[PackRef], recs: &[BlobRec], threads: usize) -> Res
             dst.copy_from_slice(bytes);
         }
     }
+    // `chunks_exact_mut`, not the `as_chunks_mut` clippy prefers
+    // (https://github.com/rust-lang/rust/issues/165050).
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for (chunk, v) in out
         .get_mut(offsets_at..pilots_at)
         .unwrap_or(&mut [])
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
+        .chunks_exact_mut(4)
         .zip(&built.offsets)
     {
         chunk.copy_from_slice(&v.to_le_bytes());
     }
+    #[allow(clippy::chunks_exact_to_as_chunks)]
     for (chunk, v) in out
         .get_mut(pilots_at..records_at)
         .unwrap_or(&mut [])
-        .as_chunks_mut::<2>()
-        .0
-        .iter_mut()
+        .chunks_exact_mut(2)
         .zip(&built.pilots)
     {
         chunk.copy_from_slice(&v.to_le_bytes());
