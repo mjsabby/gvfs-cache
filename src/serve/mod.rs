@@ -142,6 +142,8 @@ pub struct Options {
     pub upstream_spec: Option<(String, String, crate::upstream::Auth)>,
     /// Bytes of proxied blobs kept on local disk (`--proxy-cache-mib`).
     pub proxy_cache_bytes: u64,
+    /// Proxied packs (one per fetch from the upstream) kept at once (`--proxy-cache-packs`).
+    pub proxy_cache_packs: usize,
     /// Bytes of remote blob-pack blocks kept on local disk (`--blob-cache-mib`).
     pub blob_cache_bytes: u64,
     pub bind: String,
@@ -204,6 +206,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "prefetch-idx",
             "superset-tier",
             "proxy-cache-mib",
+            "proxy-cache-packs",
             "blob-cache-mib",
         ],
     )?;
@@ -268,6 +271,7 @@ pub fn main(args: &[String]) -> Result<()> {
         upstream,
         upstream_spec,
         proxy_cache_bytes: f.num("proxy-cache-mib", 10240u64)?.saturating_mul(1 << 20),
+        proxy_cache_packs: f.num("proxy-cache-packs", PROXY_CACHE_PACKS)?,
         blob_cache_bytes: f.num("blob-cache-mib", 32768u64)?.saturating_mul(1 << 20),
         bind: f.get("bind").unwrap_or("127.0.0.1:8080").to_string(),
         cache_dir,
@@ -321,6 +325,7 @@ pub fn run(o: Options) -> Result<()> {
         upstream,
         upstream_spec,
         proxy_cache_bytes,
+        proxy_cache_packs,
         blob_cache_bytes,
         bind,
         cache_dir,
@@ -424,6 +429,7 @@ pub fn run(o: Options) -> Result<()> {
             auth,
             &sync.cache_dir.join("proxy"),
             proxy_cache_bytes,
+            proxy_cache_packs,
         )?),
         _ => None,
     };
@@ -598,6 +604,12 @@ pub fn default_max_conns(fds: usize, max_idle: usize) -> usize {
 const CONN_BUFS: usize = 256;
 /// Bytes of each connection's output buffer (the batch a response coalesces).
 const OUT_BYTES: usize = 256 << 10;
+/// `--proxy-cache-packs` by default. A cached pack holds a descriptor and a mapping
+/// whatever its size, and a pack of one small blob is a few hundred bytes: the byte budget
+/// alone let the proxy take every descriptor the edge has. 256 leaves three quarters of a
+/// 1,024-descriptor limit to the 64 connections served under it ([`default_max_conns`]),
+/// the slabs and a directory store's blob packs.
+pub const PROXY_CACHE_PACKS: usize = 256;
 
 /// Accepts connections for the life of the process: one task each, at most `--max-conns`
 /// at once (past that, new ones wait in the listen queue until one closes).
@@ -1573,10 +1585,19 @@ impl Live {
         while let Ok(change) = self.changes.try_recv() {
             match change {
                 StoreChange::Blobs(set) => {
-                    self.blobs = Some(set);
+                    self.blobs = Some(Arc::clone(&set));
                     let view = ctx.view();
                     let next = self.snapshot(view.manifest.clone(), view.etag.clone());
                     ctx.publish(Arc::new(next));
+                    // Requests find these blobs in the store from here on.
+                    let released = ctx.proxy.as_ref().map_or(0, |p| p.release_stored(&set));
+                    if released > 0 {
+                        crate::log!(
+                            "serve: dropped {released} proxied packs whose blobs blobs.bin \
+                             generation {} lists",
+                            set.generation
+                        );
+                    }
                 }
                 StoreChange::Manifest(opened) => self.pending = Some(opened),
             }

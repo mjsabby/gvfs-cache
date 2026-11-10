@@ -720,12 +720,17 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   sealed tree names that a complete store lacks is a fault: still proxied (a 503 without
   an upstream), but counted in `gvfs_blobs_missing_total` and logged. The proxy fetches
   each blob once per edge (requests for a blob being fetched wait for that fetch),
-  verifies it as it streams in, and keeps it on local disk up to `--proxy-cache-mib`
-  (oldest fetches go first; the newest stays even past the budget, since the requests that
-  waited for it read its blobs from the cache). A request keeps the packs it already
-  holds, so eviction never makes it start over, and lets go of them when it ends: an
-  evicted pack's file goes with its last request. The proxy keeps 8 upstream connections
-  for its next fetches. An
+  verifies it as it streams in, and keeps it on local disk, one pack per fetch, up to
+  `--proxy-cache-mib` and `--proxy-cache-packs` (oldest fetches go first; the newest stays
+  even past the bounds, since the requests that waited for it read its blobs from the
+  cache). A cached pack holds a descriptor and a mapping whatever its size, and a pack of
+  one small blob is a few hundred bytes, so the bytes alone bound neither: 256 packs by
+  default, which fits a 1,024-descriptor limit beside the edge's connections and slabs.
+  When a new `blobs.bin` is loaded, the packs whose blobs it all lists go too (the
+  pipeline has copied what a window sealed, and requests look in the store first). A
+  request keeps the packs it already holds, so eviction never makes it start over, and
+  lets go of them when it ends: an evicted pack's file goes with its last request. The
+  proxy keeps 8 upstream connections for its next fetches. An
   upstream failure is a 503, which clients retry; gvfs-helper treats a 404 as fatal. Its
   requests are async (`AsyncUpstream`: the async client for smart HTTP and GVFS
   upstreams, `tokio::process` for a local `git upload-pack`); what arrives is verified

@@ -126,6 +126,10 @@ SERVE OPTIONS:
     --proxy-cache-mib <N>      --blobs separate: blobs proxied from the upstream kept on
                                local disk (default: 10240; the newest fetch stays even
                                if larger)
+    --proxy-cache-packs <N>    --blobs separate: fetches from the upstream kept at once,
+                               each a pack with a file descriptor and a mapping of its
+                               own (default: 256); the oldest go first, and a pack goes
+                               once the store has its blobs
     --blob-cache-mib <N>       --blobs separate: 4 MiB blocks of blob packs in object
                                storage kept on local disk (default: 32768)
     --superset-tier <24h|168h|never>     send each sealed day and week (24h, default) or
