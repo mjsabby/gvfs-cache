@@ -1583,6 +1583,69 @@ fn http_framing_is_strict() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A connection is closed once it has asked nothing for `--idle-secs`, counted from its
+/// last response: not from when its timer was last set, which is once per `--idle-secs`
+/// and not once per request.
+#[test]
+fn a_connection_is_closed_after_idle_secs_of_silence() {
+    use std::io::Write;
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    let root = tempdir("idle-secs");
+    let mut up = Upstream::new(&root);
+    up.commit(2);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--cache-dir",
+        cache.to_str().unwrap(),
+        "--idle-secs",
+        "1",
+    ]);
+    let connect = || {
+        let s = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        s
+    };
+    // A request every 0.6 s: the timer set for the first wait fires during the second
+    // and the third, which are not over.
+    let mut busy = connect();
+    for _ in 0..5 {
+        busy.write_all(b"GET /gvfs/config HTTP/1.1\r\nHost: x\r\n\r\n")
+            .unwrap();
+        let (head, _) = raw_response(&mut busy, false);
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        std::thread::sleep(Duration::from_millis(600));
+    }
+    assert_eq!(server.metric("gvfs_connections_idle_closed_total"), 0);
+    // Then nothing: closed a second after its last response (0.6 s ago), not before.
+    let t0 = Instant::now();
+    assert!(rest_until_close(&mut busy).is_empty());
+    let waited = t0.elapsed();
+    assert!(
+        waited > Duration::from_millis(200) && waited < Duration::from_secs(3),
+        "{waited:?}"
+    );
+    // A connection that never asks anything goes after a second too.
+    let t0 = Instant::now();
+    let mut silent = connect();
+    assert!(rest_until_close(&mut silent).is_empty());
+    let waited = t0.elapsed();
+    assert!(
+        waited > Duration::from_millis(800) && waited < Duration::from_secs(3),
+        "{waited:?}"
+    );
+    assert_eq!(server.metric("gvfs_connections_idle_closed_total"), 2);
+    server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Slow clients hold no arena (`--arenas 1` here): a POST body that stalls is read into the
 /// connection's own buffer, and a sizes answer the client does not read sits there too, so
 /// other POSTs are answered at once (they used to wait 10 s for the arena, then get 503).
