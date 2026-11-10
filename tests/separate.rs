@@ -783,6 +783,88 @@ fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A single blob answered from a blob pack, the proxy's cache or the upstream holds no
+/// arena (`--arenas 1` here): while a client that posted for a 24 MiB blob does not read
+/// its answer, another client's POST is answered at once. (It used to wait 10 s for the
+/// arena, then get 503.)
+#[test]
+fn single_blob_answers_hold_no_arena() {
+    use std::io::Write;
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    let root = tempdir("sep-slow-blob");
+    let up = Upstream::new(&root);
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    let c1 = commit_files(
+        &up,
+        "c1",
+        &[
+            ("a/small.txt", Some(b"small\n".to_vec())),
+            ("big/stored.bin", Some(noise(24 << 20, 7))),
+        ],
+    );
+    pipeline(&root, &store, &up, "15m", &["--blobs", "separate"]);
+    mirror(&root, &store, &up, &[]).unwrap();
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--upstream",
+        up.bare.to_str().unwrap(),
+        "--poll-ms",
+        "100",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+        "--arenas",
+        "1",
+    ]);
+    // A blob the pipeline has not sealed: only the upstream has it.
+    let c2 = commit_files(&up, "c2", &[("big/live.bin", Some(noise(24 << 20, 9)))]);
+    server.wait_for("the push in L0", |s| {
+        s.get(&format!("/gvfs/objects/{c2}")).0 == 200
+    });
+    let stored = rev(&up.bare, &format!("{c1}:big/stored.bin"));
+    let live = rev(&up.bare, &format!("{c2}:big/live.bin"));
+    let small = rev(&up.bare, &format!("{c1}:a/small.txt"));
+    let cases = [
+        ("the blob's own pack", &stored, CT_PACK),
+        ("a loose blob from the store", &stored, CT_LOOSE),
+        ("a loose blob from the upstream", &live, CT_LOOSE),
+        ("a loose blob from the proxy's cache", &live, CT_LOOSE),
+    ];
+    for (what, id, accept) in cases {
+        let body = json_ids(std::slice::from_ref(id), None);
+        let mut slow = TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+        write!(
+            slow,
+            "POST /gvfs/objects HTTP/1.1\r\nHost: x\r\nAccept: {accept}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        // Its answer is more than the socket's buffers hold: it waits for a reader.
+        std::thread::sleep(Duration::from_millis(500));
+        let t0 = Instant::now();
+        let (status, _, sizes) = server.post(
+            "/gvfs/sizes",
+            json_ids(std::slice::from_ref(&small), None).as_bytes(),
+            "application/json",
+        );
+        assert_eq!(status, 200, "{what}");
+        assert_eq!(parse_sizes_json(&sizes)[&small], 6, "{what}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "{what}: {:?}",
+            t0.elapsed()
+        );
+        drop(slow);
+    }
+    assert_eq!(server.metric("gvfs_busy_total"), 0);
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Stock microsoft/git against an edge of a separate-blob store: gvfs-helper prefetches
 /// commits and trees, and a checkout faults the blobs in (GET singles, POST batches),
 /// byte for byte git's, old versions too, all from the store; a sparse cone fetches only
