@@ -263,16 +263,65 @@ fn separate_store_pipeline_copies_blobs_before_trees() {
         vec![OBJ_COMMIT, OBJ_TREE]
     );
 
-    // GC keeps everything listed (sizes tables, blob packs, segments) and drops the rest.
-    std::fs::write(store_dir.join("blobs/orphan.pack"), b"x").unwrap();
-    let far = (gvfs_cache::util::now_secs() + 86_400 * 30).to_string();
-    pipeline(
-        &root,
-        &store,
-        &up,
-        "15m",
-        &["--now", &far, "--gc-grace-secs", "60"],
+    // GC keeps everything listed (sizes tables, blob packs, segments), and what the
+    // listings drop, or never had, for a grace period after a run first sees it so. A
+    // pack no `blobs.bin` ever listed is noted by the first run here.
+    let orphan = store_dir.join("blobs/orphan.pack");
+    std::fs::write(&orphan, b"x").unwrap();
+    let far = gvfs_cache::util::now_secs() + 86_400 * 30;
+    let run = |now: u64| {
+        let now = now.to_string();
+        pipeline(
+            &root,
+            &store,
+            &up,
+            "15m",
+            &["--now", &now, "--gc-grace-secs", "60"],
+        )
+    };
+    run(far);
+    // Windows of one new blob each, 30 s later, until one's publish folds segments that
+    // `blobs.bin` listed: readers of that `blobs.bin` still look blobs up in them, so
+    // they stay. (Written long before by the run's clock, they went with the run that
+    // folded them.)
+    let mut folded = Vec::new();
+    let mut windows = 0;
+    while folded.is_empty() && windows < 2 {
+        let (before, _) = blobcopy::load(&s).unwrap();
+        let path = format!("n/window{windows}.txt");
+        let content = format!("the blob of window {windows}\n").into_bytes();
+        commit_files(&up, "a window", &[(&path, Some(content))]);
+        let log = run(far + 30);
+        windows += 1;
+        let (after, _) = blobcopy::load(&s).unwrap();
+        folded = before
+            .segments
+            .iter()
+            .filter(|g| !after.segments.iter().any(|x| x.id == g.id))
+            .map(|g| gvfs_cache::blobs::segment_key(&g.id))
+            .collect();
+        assert_eq!(
+            !folded.is_empty(),
+            log.contains("blobs.bin: folded"),
+            "{log}"
+        );
+    }
+    assert!(!folded.is_empty(), "two windows of one blob fold");
+    let there = |keys: &[String]| keys.iter().filter(|k| store_dir.join(k).exists()).count();
+    assert_eq!(
+        there(&folded),
+        folded.len(),
+        "segments went with their fold"
     );
+    assert!(orphan.exists());
+    // The orphan's grace period ends 30 s before the folded segments'.
+    run(far + 60);
+    assert!(!orphan.exists());
+    assert_eq!(there(&folded), folded.len());
+    run(far + 89);
+    assert_eq!(there(&folded), folded.len());
+    run(far + 90);
+    assert_eq!(there(&folded), 0);
     let m5 = manifest(&store_dir);
     for meta in m5.slabs() {
         assert!(
@@ -281,8 +330,27 @@ fn separate_store_pipeline_copies_blobs_before_trees() {
             meta.id
         );
     }
-    assert!(!store_dir.join("blobs/orphan.pack").exists());
-    assert_eq!(store_blobs(&root, &store_dir).len(), stored.len());
+    // What `blobs.bin` lists is there, and nothing else.
+    let (bm, _) = blobcopy::load(&s).unwrap();
+    let mut listed: Vec<String> = bm
+        .packs
+        .iter()
+        .map(|p| gvfs_cache::blobs::pack_key(&p.id))
+        .chain(
+            bm.segments
+                .iter()
+                .map(|g| gvfs_cache::blobs::segment_key(&g.id)),
+        )
+        .collect();
+    listed.sort();
+    let on_disk: Vec<String> = s
+        .list("blobs/")
+        .unwrap()
+        .into_iter()
+        .map(|o| o.key)
+        .collect();
+    assert_eq!(on_disk, listed);
+    assert_eq!(store_blobs(&root, &store_dir).len(), stored.len() + windows);
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1373,14 +1441,23 @@ fn mirror_survives_being_killed() {
             .map(|o| o.key)
             .collect()
     };
-    let far = (gvfs_cache::util::now_secs() + 86_400).to_string();
-    pipeline(
-        &root,
-        &store,
-        &up,
-        "15m",
-        &["--now", &far, "--gc-grace-secs", "60"],
-    );
+    let far = gvfs_cache::util::now_secs() + 86_400;
+    let run = |now: u64| {
+        let now = now.to_string();
+        pipeline(
+            &root,
+            &store,
+            &up,
+            "15m",
+            &["--now", &now, "--gc-grace-secs", "60"],
+        )
+    };
+    // The first run to see them notes them; a run a grace period later removes them.
+    let unpublished = on_disk();
+    assert!(unpublished.len() > listed.len());
+    run(far);
+    assert_eq!(on_disk(), unpublished);
+    run(far + 60);
     let mut left = on_disk();
     left.sort();
     let mut want: Vec<String> = listed.into_iter().collect();

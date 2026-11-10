@@ -453,9 +453,34 @@ fn azure_pipeline_and_serve() {
     install_pack(&client, &packs[0].1);
     assert_complete(&client, &up.tip());
 
+    let s = backend.store("");
+    let published = || {
+        let (bytes, _) = s.get("manifest.bin").unwrap().unwrap();
+        gvfs_cache::manifest::Manifest::decode(&bytes).unwrap()
+    };
+    let slab_files = |m: &gvfs_cache::manifest::Manifest| {
+        let mut files: Vec<String> = m
+            .slabs()
+            .flat_map(|x| [x.pack_key(), x.index_key()])
+            .collect();
+        files.sort();
+        files
+    };
+    let in_store = || {
+        let mut keys: Vec<String> = s
+            .list("slabs/")
+            .unwrap()
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        keys.sort();
+        keys
+    };
     up.commit(5);
-    let before = manifest_of(&backend);
-    run("168h", t0 + 2700, &["--gc-grace-secs", "0"]);
+    let before = published();
+    // A day later by the runs' clock: what the weekly run drops was written long before.
+    let weekly_at = t0 + 86_400;
+    run("168h", weekly_at, &[]);
     server.wait_for("the weekly manifest", |s| {
         s.metric("gvfs_manifest_generation") == 4
     });
@@ -495,24 +520,47 @@ fn azure_pipeline_and_serve() {
     assert_eq!(cached(), listed());
     assert!(other.exists());
 
-    // GC removed the slabs the rollups and the weekly rebuild replaced.
-    let s = backend.store("");
-    let (bytes, _) = s.get("manifest.bin").unwrap().unwrap();
-    let m = gvfs_cache::manifest::Manifest::decode(&bytes).unwrap();
-    let mut keys: Vec<String> = s
-        .list("slabs/")
-        .unwrap()
-        .into_iter()
-        .map(|o| o.key)
-        .collect();
-    keys.sort();
-    let mut referenced: Vec<String> = m
-        .slabs()
-        .flat_map(|x| [x.pack_key(), x.index_key()])
-        .chain([m.baseline.tail_key()])
-        .collect();
-    referenced.sort();
-    assert_eq!(keys, referenced);
+    // The baseline the weekly run replaced is in the store still, noted in `gc.bin`: an
+    // edge that reads the manifest before finds every file it lists. (It went with the
+    // run that replaced it.)
+    let m = published();
+    let dropped = [before.baseline.index_key(), before.baseline.pack_key()];
+    for file in slab_files(&before) {
+        assert!(in_store().contains(&file), "{file} went with its manifest");
+    }
+    let noted = |s: &Store| -> Vec<(String, u64)> {
+        let entries = gvfs_cache::gc::load(s).unwrap();
+        entries.into_iter().map(|e| (e.key, e.since)).collect()
+    };
+    assert_eq!(noted(&s), dropped.clone().map(|key| (key, weekly_at)));
+    // What the manifest lists: its slabs' files, and the new baseline's tail.
+    let mut listed_files = slab_files(&m);
+    listed_files.push(m.baseline.tail_key());
+    listed_files.sort();
+    // A grace period later a collection finds both files due. The index is uploaded
+    // again between its listing and its deletes (a run that makes the same slab): the
+    // service refuses that delete, and the index stays.
+    let pass = gvfs_cache::gc::Pass::survey(&s, &m, weekly_at + 7200, 7200).unwrap();
+    assert_eq!(pass.due().collect::<Vec<_>>(), dropped);
+    let again = root.join("again.mphf");
+    s.download_file(&dropped[0], &again).unwrap();
+    s.upload_file(&dropped[0], &again).unwrap();
+    let swept = pass.sweep(&s).unwrap();
+    assert_eq!((swept.noted, swept.deleted, swept.replaced), (0, 1, 1));
+    let mut left = listed_files.clone();
+    left.push(dropped[0].clone());
+    left.sort();
+    assert_eq!(in_store(), left);
+    // The next run notes the index anew, and a run a grace period after that one
+    // deletes it: the store holds what the manifest lists.
+    run("15m", weekly_at + 7200, &[]);
+    assert_eq!(noted(&s), [(dropped[0].clone(), weekly_at + 7200)]);
+    run("15m", weekly_at + 2 * 7200 - 1, &[]);
+    assert_eq!(in_store(), left);
+    run("15m", weekly_at + 2 * 7200, &[]);
+    assert_eq!(in_store(), listed_files);
+    assert_eq!(noted(&s), []);
+    assert_eq!(published(), m);
     drop(server);
     drop(backend);
     let _ = std::fs::remove_dir_all(&root);

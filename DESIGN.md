@@ -52,10 +52,11 @@ hierarchies or generic plumbing.
 
 ```text
 store/
-  manifest.bin                  the only mutable object (compare-and-swap)
+  manifest.bin                  the one object readers follow (compare-and-swap)
   slabs/<tier>-<end_ts>-<sha16>.pack     a pack written by repack (src/repack.rs)
   slabs/<tier>-<end_ts>-<sha16>.mphf     its index
   slabs/base-<end_ts>-<sha16>.tail       a weekly baseline's bytes after the one before it
+  gc.bin                        the pipeline's own: files no manifest lists, and since when
 ```
 
 **Manifest** (`src/manifest.rs`): `generation`, the `tip` commit all sealed slabs reach,
@@ -284,32 +285,76 @@ Each run is at most one compare-and-swap of `manifest.bin`:
    (the tail, the week's delta slab and the indexes); SearchGold's baseline is 2.6 GB a
    week, for every edge and every agent VM's proxy. The index is still downloaded
    (375 MB there). `gvfs_baselines_grown_total` counts the baselines an edge made so.
-5. Publish with `If-Match` (a lost race starts over, up to 3 times), then delete slab
-   files no manifest references once they are older than `--gc-grace-secs`. A run that
-   changed nothing (no new commits, no rollup due) publishes nothing: the manifest keeps
-   its generation, so no edge builds a new view and hashes its cold pack again (1.3 s on
-   SearchGold, its `.idx` beside it: the runs of a quiet branch would cost that 96
-   times a day). What counts as a change is everything but the generation, the `blobs.bin`
-   generation the manifest names included. Such a run still collects garbage. Once its
-   manifest is the store's, a run has succeeded: garbage collection that fails is logged,
-   with the first file it could not delete (it goes on to the others) or the listing it
-   could not make, and the run exits 0 (after an error exit a
-   scheduler runs it again, a weekly a second time); a later run collects what it left.
+5. Publish with `If-Match` (a lost race starts over, up to 3 times), then collect
+   garbage (below). A run that changed nothing (no new commits, no rollup due) publishes
+   nothing: the manifest keeps its generation, so no edge builds a new view and hashes
+   its cold pack again (1.3 s on SearchGold, its `.idx` beside it: the runs of a quiet
+   branch would cost that 96 times a day). What counts as a change is everything but the
+   generation, the `blobs.bin` generation the manifest names included. Such a run still
+   collects garbage. Once its manifest is the store's, a run has succeeded: garbage
+   collection that fails is logged, with the first file it could not delete (it goes on
+   to the others) or the listing it could not make, and the run exits 0 (after an error
+   exit a scheduler runs it again, a weekly a second time); a later run collects what
+   it left.
 
 Crash recovery needs nothing: unpublished uploads are garbage, and the next run's range
 starts at the manifest tip. The fs store implements CAS with `flock`; Azure uses ETags.
 
-Garbage collection (`src/gc.rs`) lists the store and then deletes, and another run may
-work in between. A rollup that a run uploaded before it died is in the store, unlisted;
-a later run that makes the same rollup makes the same id (ids are content-addressed),
-uploads it and publishes it. So each delete is conditional on the object still being the
-one that was listed: on Azure `If-Match` with the listing's ETag, in a directory the
-file's inode, length and time of last write, looked at again under the lock that uploads
-are renamed into place under. And an upload always makes a new object, also where the
-key has one: a directory store renames the new file over the old, which readers that
-have it mapped keep. (An upload to a directory left a file of that name as it was, and a
-collection deleted by name: a slab uploaded again between another run's listing and its
-deletes was deleted, listed, and both runs exited 0.)
+**Garbage collection** (`src/gc.rs`). Runs take files out of the manifest: a retained
+slab that has aged out on most runs, the old baseline every week. Readers of the
+manifest before may still be fetching them: an edge that is hydrating, a run that
+started from it. And a run that died left uploads that no manifest ever listed. Such a
+file goes a grace period (`--gc-grace-secs`, default 2 h) after a run first found it
+unlisted. Each run ends with a pass:
+
+* It lists the store. A file that no manifest lists and that `gc.bin` does not have is
+  noted there, with the run's clock and the file's version in the listing (an object
+  store's ETag; in a directory the file's inode, length and time of last write). It
+  stays.
+* A file noted at least a grace period ago is deleted, if it is still the file that was
+  noted: the listing gives it the noted version, and the delete is conditional on that
+  version (Azure: `If-Match`, a 412 leaves the blob; a directory: the file is opened,
+  looked at again and unlinked under the lock that uploads are renamed into place
+  under, so far as the file system's locks reach).
+* A file that is listed again, or gone, loses its note. One uploaded again since it was
+  noted is another file, noted anew: its grace period starts over.
+
+So a file goes with the first pass at least a grace period after the pass that first
+saw it unlisted: with a run every 15 minutes, 2 h to 2 h 15 min after the manifest that
+dropped it was replaced, and for a crashed run's upload that long after the next run.
+Until then a reader of that manifest finds every file it lists. (The grace period was
+the file's age since it was written. What a run dropped was older, and was deleted by
+that run, seconds after the manifest that listed it was replaced: an edge still
+hydrating did not start, and a run that had read that manifest failed.)
+
+The grace period is also what a run has from an upload to the manifest that lists it
+(a mirror, from a blob pack to its `blobs.bin`), counted from the first pass that sees
+the upload, and it covers the seconds by which the manifest a pass goes by, the one its
+run read or published, may be behind the store's: it must be longer than a run takes.
+A pass's clock is read when it runs, not when its run started (`--now` fixes it for the
+run); a note whose clock is ahead of the pass's counts from the pass.
+
+The versions close a race between two runs. A rollup that a run uploaded before it died
+is in the store, unlisted, and noted. A later run that makes the same rollup makes the
+same id (ids are content-addressed), uploads it and publishes it. Another run's pass
+meanwhile either listed the files before that upload and deletes after it, or finds
+them, due, between the upload and the publication. An upload always makes a new object,
+also where the key has one (a directory store renames the new file over the old, which
+readers that have it mapped keep), so in the first case the delete is refused and in
+the second the note is not this file's. (An upload to a directory left a file of that
+name as it was, and a pass deleted by name: the slab was deleted, the manifest listed
+it, and both runs had exited 0.)
+
+`gc.bin` is `"GVDGCOL1" | version u32 | count u32 | (since u64 | key_len u16 | key |
+version_len u16 | version)* | SHA-256`, about 100 bytes a file, for the files that are
+unlisted and not yet deleted (`gvfs-cache inspect manifest` says how many). A pass costs
+one read of it, one listing (two for a store with separate blobs), the deletes, and one
+write if it is to hold something else: a compare-and-swap. A pass that loses the swap to
+another run's, or cannot write, has deleted only what was due, and what it noted the
+next pass notes: later, never sooner. A pass that cannot read `gc.bin` deletes nothing;
+a `gc.bin` that does not decode counts as absent, and what is unlisted is noted anew. A
+store from before `gc.bin` gets one at its first pass, which deletes nothing. Edges
+never read it.
 
 **Timestamps come from commits** (`src/timeline.rs`). A slab covers `(start_ts, end_ts]`:
 the stamps of the commits it was fetched between. Commits are stamped like a Lamport clock
@@ -660,6 +705,7 @@ store/
                           genesis commit, whether the history is mirrored
   blobs/<id>.pack         whole blobs (a stock git pack, never deltas)
   blobs/<id>.bidx         segment: PTHash MPHF + 48-byte records over one or more packs
+  gc.bin                  as for every store: also what `blobs.bin` no longer lists
 ```
 
 **Blob packs** (`src/blobs.rs`) hold whole entries only, so any entry is served by
@@ -740,8 +786,11 @@ the mirror.
   or the one it published if newer, even when it copied nothing: a run that died after
   publishing `blobs.bin` left the blobs the next run's trees rely on.
 * **Rollups and the weekly rebuild** union their parts' tables. **GC** keeps the sizes
-  tables of listed slabs and the packs and segments `blobs.bin` lists; anything else in
-  `blobs/` older than `--gc-grace-secs` (a crashed copy's upload) is deleted.
+  tables of listed slabs and the packs and segments `blobs.bin` lists. Anything else in
+  `slabs/` and `blobs/` (a crashed copy's upload, the segments a fold merged, the table
+  of a slab the manifest dropped) is noted in `gc.bin` by the first run that finds it
+  so, and deleted `--gc-grace-secs` later, as slab files are: an edge that has read the
+  `blobs.bin` from before a fold still finds its segments.
 
 ### Copying blobs (`src/blobstream.rs`, `src/blobcopy.rs`)
 
@@ -941,6 +990,11 @@ not the hot path's).
   files.
 * A blob request first misses every metadata slab's index, then probes the segments.
 * No reachability GC of blob packs (blobs of force-pushed-away commits stay).
+* A copy has `--gc-grace-secs` from the first garbage collection that sees one of its
+  packs unlisted to the `blobs.bin` that lists it. A window publishes after its last
+  item: if it takes longer than that while other runs collect garbage, its first packs
+  are deleted, and the `blobs.bin` it publishes lists packs the store lacks (edges
+  proxy their blobs; `mirror` repairs). The mirror publishes every `--publish-secs`.
 
 ## Departures from the PDF
 
