@@ -67,5 +67,6 @@ pub mod serve;
 pub mod sizes;
 pub mod slab;
 pub mod splice;
+pub mod tail;
 pub mod timeline;
 pub mod zlib;

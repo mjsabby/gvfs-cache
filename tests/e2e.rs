@@ -575,7 +575,8 @@ fn pyramid_rollups_and_weekly_rebuilds() {
         m.baseline.objects as usize
     );
 
-    // GC left exactly the referenced slab files.
+    // GC left exactly the referenced slab files (the baseline's tail on the one before it
+    // among them: the first week's tail went with its baseline).
     let mut files: Vec<String> = std::fs::read_dir(store_dir.join("slabs"))
         .unwrap()
         .map(|e| format!("slabs/{}", e.unwrap().file_name().to_string_lossy()))
@@ -584,6 +585,7 @@ fn pyramid_rollups_and_weekly_rebuilds() {
     let mut referenced: Vec<String> = m
         .slabs()
         .flat_map(|s| [s.pack_key(), s.index_key()])
+        .chain([m.baseline.tail_key()])
         .collect();
     referenced.sort();
     assert_eq!(files, referenced);

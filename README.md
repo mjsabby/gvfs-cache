@@ -240,8 +240,10 @@ Two more tools work on slabs directly:
   (`gvfs_not_found_total`), 503s for want of an arena or growth budget (`gvfs_busy_total`),
   errors, and the bytes and objects sent;
 * **the store:** slabs, L0 slabs, L0 ingests, manifest loads and the manifest's generation,
-  and the failures to follow the store or the upstream (`gvfs_live_failures_total`: an
-  edge whose count keeps rising is falling behind);
+  the failures to follow the store or the upstream (`gvfs_live_failures_total`: an
+  edge whose count keeps rising is falling behind), and the weekly baselines the edge
+  made of the one it had and a tail instead of downloading them
+  (`gvfs_baselines_grown_total`);
 * **indexes:** the bytes lookups read (`gvfs_index_bytes`) and how much of them lies on
   2 MiB pages (`gvfs_index_huge_bytes`): where it is little, `--index-pages huge` reads the
   indexes into memory that asks for such pages (`gvfs_index_copied_bytes`), and requests

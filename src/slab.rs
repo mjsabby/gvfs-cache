@@ -151,6 +151,12 @@ impl SlabMeta {
     pub fn sizes_key(&self) -> String {
         format!("slabs/{}.sizes", self.id)
     }
+
+    /// A baseline's tail on the baseline before it ([`crate::tail`]), if the weekly run
+    /// that made it published one.
+    pub fn tail_key(&self) -> String {
+        format!("slabs/{}.tail", self.id)
+    }
 }
 
 /// Per-object facts the ingester hands to the index builder (indexed by entry number).

@@ -55,6 +55,7 @@ store/
   manifest.bin                  the only mutable object (compare-and-swap)
   slabs/<tier>-<end_ts>-<sha16>.pack     a pack written by repack (src/repack.rs)
   slabs/<tier>-<end_ts>-<sha16>.mphf     its index
+  slabs/base-<end_ts>-<sha16>.tail       a weekly baseline's bytes after the one before it
 ```
 
 **Manifest** (`src/manifest.rs`): `generation`, the `tip` commit all sealed slabs reach,
@@ -272,6 +273,17 @@ Each run is at most one compare-and-swap of `manifest.bin`:
    two such runs with `--keep-weeks 2` left two weeks of three objects each, and every
    client older than that was sent the cold pack. `--weekly always` rebuilds whenever
    asked.
+   The new baseline's pack is the old one's with another count in its header, the week's
+   entries after the old ones, and a new trailer; the run publishes those entries and the
+   trailer beside it as its tail (`slabs/<id>.tail`, `src/tail.rs`: the old baseline's id,
+   length and trailer, then the bytes). An edge of an object store that has the old pack
+   makes the new one of the two, locally, and checks it as it checks a pack it downloads
+   (its SHA-1 against the manifest's, which proves it byte for byte); if that fails, or
+   it lacks the old pack, or the store has no tail, it downloads the pack. On a 512 MiB
+   baseline in Azurite, a week of 2 MiB cost an edge 516 MiB before and 4.0 MiB after
+   (the tail, the week's delta slab and the indexes); SearchGold's baseline is 2.6 GB a
+   week, for every edge and every agent VM's proxy. The index is still downloaded
+   (375 MB there). `gvfs_baselines_grown_total` counts the baselines an edge made so.
 5. Publish with `If-Match` (a lost race starts over, up to 3 times), then delete slab
    files no manifest references once they are older than `--gc-grace-secs`. A run that
    changed nothing (no new commits, no rollup due) publishes nothing: the manifest keeps
