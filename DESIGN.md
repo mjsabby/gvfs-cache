@@ -361,7 +361,10 @@ an older manifest for a moment does not. Ignored, it left the edge serving the s
 that was gone, its L0 slabs growing.
 
 Every change publishes a new immutable `View`; requests hold an `Arc` to the view they
-started with. Object lookups go through the live L0 slabs, the pyramid, the weekly deltas
+started with. A view that differs from the last only in its `blobs.bin` (a running mirror
+publishes one after another) keeps that view's slabs, filter and plans: its cold pack is
+the same pack, and is not hashed again (`gvfs_prefetch_plans_total` counts the packs
+that are). Object lookups go through the live L0 slabs, the pyramid, the weekly deltas
 and the baseline, newest first; retained slabs hold nothing those do not. Most ids clients
 ask for are only in the baseline, which comes last, so each view carries a blocked Bloom
 filter of the ids of every slab before it (`src/idfilter.rs`, 16 bits per id, one cache

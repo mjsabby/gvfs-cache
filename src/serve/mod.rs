@@ -1597,8 +1597,12 @@ impl Live {
             match change {
                 StoreChange::Blobs(set) => {
                     self.blobs = Some(Arc::clone(&set));
-                    let view = ctx.view();
-                    let next = self.snapshot(view.manifest.clone(), view.etag.clone());
+                    // The view's slabs are this thread's own: the view is the same but for
+                    // its blobs, plans included.
+                    self.generation = self.generation.saturating_add(1);
+                    let next = ctx
+                        .view()
+                        .with_blobs(self.generation, Some(Arc::clone(&set)));
                     ctx.publish(Arc::new(next));
                     // Requests find these blobs in the store from here on.
                     let released = ctx.proxy.as_ref().map_or(0, |p| p.release_stored(&set));
@@ -1837,6 +1841,7 @@ pub fn metrics_text(ctx: &Ctx) -> String {
          gvfs_requests_total{{endpoint=\"sizes\"}} {}\n\
          gvfs_requests_total{{endpoint=\"config\"}} {}\n\
          gvfs_prefetch_packs_total {}\n\
+         gvfs_prefetch_plans_total {}\n\
          gvfs_not_found_total {}\n\
          gvfs_busy_total {}\n\
          gvfs_errors_total {}\n\
@@ -1878,6 +1883,7 @@ pub fn metrics_text(ctx: &Ctx) -> String {
         get(&m.sizes),
         get(&m.config),
         get(&m.prefetch_packs),
+        get(&crate::splice::TRAILERS),
         get(&m.not_found),
         get(&m.busy),
         get(&m.errors),

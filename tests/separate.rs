@@ -580,11 +580,19 @@ fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
     assert_eq!(server.metric("gvfs_blobs_proxied_total"), 1);
     assert_eq!(server.metric("gvfs_blobs_missing_total"), 0);
     assert_eq!((proxied_packs(), proxied_files()), (1, 0));
+    // The cold plan is made once, by the warmer at start, and a cold prefetch sends it.
+    let cold_before = server.get("/gvfs/prefetch").2;
+    assert_eq!(server.metric("gvfs_prefetch_plans_total"), 1);
 
     mirror(&root, &store, &up, &[]).unwrap();
     server.wait_for("complete", |s| s.get("/healthz").0 == 200);
     // The store has that blob now: the proxy lets go of its pack.
     server.wait_for("the proxied pack to go", |_| proxied_packs() == 0);
+    // The views the new `blobs.bin` made hold the same slabs, and so the same plans: the
+    // cold pack is not hashed again for them.
+    assert!(server.metric("gvfs_blobs_generation") > 0);
+    assert!(server.get("/gvfs/prefetch").2 == cold_before);
+    assert_eq!(server.metric("gvfs_prefetch_plans_total"), 1);
 
     // Every blob of history as a loose object, from the store. git re-hashes each one.
     let history = git_blobs(&up.bare, &["--all"]);

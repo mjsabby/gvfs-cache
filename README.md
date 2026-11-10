@@ -229,7 +229,8 @@ Two more tools work on slabs directly:
 
 `curl http://edge:8080/metrics` reports, in Prometheus text format:
 
-* **requests:** `gvfs_requests_total` by endpoint, prefetch packs sent, 404s
+* **requests:** `gvfs_requests_total` by endpoint, prefetch packs sent and the distinct
+  ones made and hashed for them (`gvfs_prefetch_plans_total`), 404s
   (`gvfs_not_found_total`), 503s for want of an arena or growth budget (`gvfs_busy_total`),
   errors, and the bytes and objects sent;
 * **the store:** slabs, L0 slabs, L0 ingests, manifest loads and the manifest's generation,

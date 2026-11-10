@@ -45,7 +45,7 @@ pub struct View {
     baseline: usize,
     /// The ids of every slab before the baseline in `all`: a lookup it rules out goes
     /// straight to the baseline (see [`crate::idfilter`]).
-    recent: crate::idfilter::IdFilter,
+    recent: Arc<crate::idfilter::IdFilter>,
     /// What plans are made of: weekly deltas, pyramid, retained slabs and every L0 slab,
     /// sorted by `(start_ts, end_ts)`; `spans` are their bounds.
     warm: Vec<Arc<Slab>>,
@@ -125,13 +125,13 @@ impl View {
         for s in before {
             s.prepare_filter();
         }
-        let recent = crate::idfilter::IdFilter::new(
+        let recent = Arc::new(crate::idfilter::IdFilter::new(
             before
                 .iter()
                 .map(|s| crate::util::us(u64::from(s.count())))
                 .sum(),
             before.iter().flat_map(|s| s.ids()),
-        );
+        ));
 
         // L0 slabs first: the sort is stable and covers take the last of equal spans, so a
         // sealed slab wins over an L0 slab with the same bounds.
@@ -192,6 +192,35 @@ impl View {
             blobs,
             retracted: retracted.to_vec(),
             ends,
+        }
+    }
+
+    /// This view with the store's blob packs as `blobs` now, and nothing else changed: the
+    /// same slabs, and the plans made of them so far, which a `blobs.bin` has no part in.
+    /// (A view made anew starts without plans, and its cold pack is hashed again: 1.2 s
+    /// on SearchGold, 3.5 s on RepoC, at every `blobs.bin` a running mirror publishes.)
+    pub fn with_blobs(&self, generation: u64, blobs: Option<Arc<super::blobs::BlobSet>>) -> View {
+        View {
+            generation,
+            manifest: self.manifest.clone(),
+            etag: self.etag.clone(),
+            tip: self.tip,
+            tip_ts: self.tip_ts,
+            all: self.all.clone(),
+            l0_len: self.l0_len,
+            baseline: self.baseline,
+            recent: Arc::clone(&self.recent),
+            warm: self.warm.clone(),
+            spans: self.spans.clone(),
+            starts: self.starts.clone(),
+            warm_floor: self.warm_floor,
+            rollups: self.rollups.clone(),
+            // A cell being filled as it is cloned comes out empty: that plan is made again.
+            plans: self.plans.clone(),
+            cold_plan: self.cold_plan.clone(),
+            retracted: self.retracted.clone(),
+            ends: self.ends.clone(),
+            blobs,
         }
     }
 
