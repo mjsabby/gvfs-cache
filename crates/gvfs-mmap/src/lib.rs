@@ -4,17 +4,19 @@
 //! renamed into place; they are never modified, truncated or reused afterwards (a new
 //! slab always gets a new content-addressed name). That immutability is the invariant
 //! that makes a shared read-only mapping sound, and it is the caller's obligation:
-//! [`Map::open`] must only ever be given such files.
+//! [`Map::open`] must only ever be given such files. ([`Map::open_huge`] maps no file: it
+//! reads one into anonymous memory, in safe code.)
 
 use std::fs::File;
 use std::io;
 
 pub use memmap2::Advice;
 
-/// A read-only, shared mapping of a whole immutable file.
+/// A read-only, shared mapping of a whole immutable file, or a copy of one in memory.
 #[derive(Debug)]
 pub struct Map {
     inner: Option<memmap2::Mmap>,
+    copied: bool,
 }
 
 impl Map {
@@ -25,7 +27,10 @@ impl Map {
     pub fn open(file: &File, populate: bool) -> io::Result<Map> {
         if file.metadata()?.len() == 0 {
             // mmap(2) rejects zero-length maps; an empty slice needs no mapping.
-            return Ok(Map { inner: None });
+            return Ok(Map {
+                inner: None,
+                copied: false,
+            });
         }
         let mut opts = memmap2::MmapOptions::new();
         if populate {
@@ -38,7 +43,44 @@ impl Map {
         // crate-level contract every caller upholds). No `&mut` to the bytes is ever
         // created, so Rust's aliasing rules hold for the lifetime of the map.
         let map = unsafe { opts.map(file)? };
-        Ok(Map { inner: Some(map) })
+        Ok(Map {
+            inner: Some(map),
+            copied: false,
+        })
+    }
+
+    /// The bytes of `file`, read once into anonymous memory that asks for huge pages
+    /// (`MADV_HUGEPAGE`), then made read-only.
+    ///
+    /// The kernel maps a file from the page cache with 2 MiB entries only where the cache
+    /// happens to hold 2 MiB folios, which depends on how fragmented memory was when the
+    /// file was written or read. Anonymous memory it backs with 2 MiB pages wherever it
+    /// has them free (and transparent huge pages are `always` or `madvise`). The copy is
+    /// not shared with the page cache and cannot be evicted. No `unsafe`: nothing here
+    /// maps a file.
+    pub fn open_huge(file: &File) -> io::Result<Map> {
+        use std::io::Read;
+        let len = usize::try_from(file.metadata()?.len()).map_err(io::Error::other)?;
+        if len == 0 {
+            return Ok(Map {
+                inner: None,
+                copied: true,
+            });
+        }
+        let mut map = memmap2::MmapMut::map_anon(len)?;
+        // Asked before the first touch: pages are given huge as the read faults them in.
+        let _ = map.advise(Advice::HugePage);
+        let mut file = file;
+        file.read_exact(&mut map)?;
+        Ok(Map {
+            inner: Some(map.make_read_only()?),
+            copied: true,
+        })
+    }
+
+    /// Whether the bytes are a copy in memory ([`Map::open_huge`]), not the file's pages.
+    pub fn copied(&self) -> bool {
+        self.copied
     }
 
     #[inline]
@@ -78,6 +120,16 @@ mod tests {
             Map::open(&File::open(&e).unwrap(), false).unwrap().bytes(),
             b""
         );
+        // A copy in memory holds the file's bytes too (5 MiB: more than a huge page),
+        // and says what it is.
+        let big: Vec<u8> = (0..5u32 << 20).map(|i| (i % 251) as u8).collect();
+        let b = dir.join("big");
+        File::create(&b).unwrap().write_all(&big).unwrap();
+        let copy = Map::open_huge(&File::open(&b).unwrap()).unwrap();
+        assert!(copy.bytes() == big && copy.copied() && !m.copied());
+        copy.advise(Advice::Random).unwrap();
+        let none = Map::open_huge(&File::open(&e).unwrap()).unwrap();
+        assert!(none.bytes().is_empty() && none.copied());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

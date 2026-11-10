@@ -325,6 +325,11 @@ impl BlobSet {
         self.segments.len()
     }
 
+    /// The segments' indexes, biggest first.
+    pub fn indexes(&self) -> impl Iterator<Item = &Segment> {
+        self.segments.iter().map(|(s, _)| &**s)
+    }
+
     /// Distinct packs.
     pub fn packs(&self) -> usize {
         let mut ids = HashSet::new();

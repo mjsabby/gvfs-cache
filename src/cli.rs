@@ -143,6 +143,13 @@ SERVE OPTIONS:
                                45% less CPU and 70% more bytes for such a tree: for
                                clients on a fast link); stored sends everything so
                                (clients on the same host: the localhost proxy)
+    --index-pages <file|huge>  file (default): indexes are mapped from their files, on
+                               2 MiB pages only where the kernel happens to hold them
+                               so; huge: indexes of 2 MiB or more are read into memory
+                               that asks for huge pages (a lookup is then 34 ns, not 51;
+                               that memory is the edge's own: not shared with the page
+                               cache, not evictable). The edge logs, and reports as
+                               gvfs_index_huge_bytes, how much is on 2 MiB pages
 
 ENVIRONMENT:
     GVFS_DEBUG_INGEST=1        log pack indexing phase timings and entry statistics

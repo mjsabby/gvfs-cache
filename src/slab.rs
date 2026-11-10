@@ -449,6 +449,45 @@ impl Region {
             Region::Heap(v) => v,
         }
     }
+
+    /// Whether the bytes are a file's read into memory ([`map_index`], huge pages asked).
+    pub fn copied(&self) -> bool {
+        matches!(self, Region::Map(m) if m.copied())
+    }
+}
+
+/// Index files at least this long are read into memory that asks for huge pages when
+/// they are opened (`serve --index-pages huge`); none, by default.
+static HUGE_INDEX_MIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// From now on, an index of `min` bytes or more is read into memory that asks for huge
+/// pages when it is opened ([`map_index`]).
+pub fn huge_indexes(min: u64) {
+    HUGE_INDEX_MIN.store(min, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The bytes of an index file (a slab's `.mphf`, a blob segment), for lookups: every
+/// page present, and no read-ahead (lookups touch records at random).
+///
+/// Mapped from the page cache, an index is on 2 MiB pages only where the kernel happened
+/// to have 2 MiB folios when the file was written: nearly all of SearchGold's here, none
+/// of RepoB's, and a lookup is then a TLB miss too (51 ns against 34). With
+/// `--index-pages huge` the larger indexes are read into anonymous memory that asks for
+/// huge pages ([`gvfs_mmap::Map::open_huge`]).
+pub fn map_index(file: &File) -> std::io::Result<gvfs_mmap::Map> {
+    let huge = HUGE_INDEX_MIN.load(std::sync::atomic::Ordering::Relaxed);
+    if file.metadata()?.len() >= huge {
+        match gvfs_mmap::Map::open_huge(file) {
+            Ok(map) => return Ok(map),
+            Err(e) => crate::log!(
+                "warning: an index could not be read into memory ({e}); it is mapped from \
+                 its file"
+            ),
+        }
+    }
+    let map = gvfs_mmap::Map::open(file, true)?;
+    let _ = map.advise(gvfs_mmap::Advice::Random);
+    Ok(map)
 }
 
 /// `bytes` in an anonymous file (a memfd named `name`), mapped: what `sendfile(2)` can
@@ -530,9 +569,7 @@ impl Slab {
         let pack = gvfs_mmap::Map::open(&pack_file, false).ctx("mapping pack")?;
         let index_file =
             File::open(index_path).ctx(&format!("opening {}", index_path.display()))?;
-        let index = gvfs_mmap::Map::open(&index_file, true).ctx("mapping index")?;
-        // Lookups touch records at random; packs are mostly streamed.
-        let _ = index.advise(gvfs_mmap::Advice::Random);
+        let index = map_index(&index_file).ctx("mapping index")?;
         Ok(Arc::new(Slab::new(
             meta,
             Region::Map(pack),
@@ -671,6 +708,11 @@ impl Slab {
 
     pub fn index_bytes(&self) -> &[u8] {
         self.index.bytes()
+    }
+
+    /// Whether the index is a copy in memory ([`map_index`]).
+    pub fn index_copied(&self) -> bool {
+        self.index.copied()
     }
 
     /// Distinct objects indexed.

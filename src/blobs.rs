@@ -425,8 +425,7 @@ pub struct Segment {
 impl Segment {
     pub fn open(path: &Path, id: &str) -> Result<Segment> {
         let file = File::open(path).ctx(&format!("opening {}", path.display()))?;
-        let map = gvfs_mmap::Map::open(&file, true).ctx("mapping segment")?;
-        let _ = map.advise(gvfs_mmap::Advice::Random);
+        let map = crate::slab::map_index(&file).ctx("mapping segment")?;
         Segment::new(id, Region::Map(map))
     }
 
@@ -499,6 +498,11 @@ impl Segment {
 
     pub fn bytes(&self) -> &[u8] {
         self.region.bytes()
+    }
+
+    /// Whether the index is a copy in memory ([`crate::slab::map_index`]).
+    pub fn copied(&self) -> bool {
+        self.region.copied()
     }
 
     pub fn count(&self) -> u32 {
