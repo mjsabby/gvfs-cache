@@ -1690,6 +1690,60 @@ fn force_main(up: &Upstream, oid: &str) {
     git(&up.bare, &["update-ref", "refs/heads/main", oid]);
 }
 
+/// A push the edge cannot ingest (here the upstream itself lacks one of its trees) is not
+/// fetched again at every poll: the wait doubles from the poll interval. Once the upstream
+/// can serve it, the next attempt ingests it.
+#[test]
+fn a_failing_ingest_is_retried_less_and_less_often() {
+    let root = tempdir("retry");
+    let up = Upstream::new(&root);
+    let t0 = 1_700_000_000u64;
+    commit_dated(&up, &[("a.txt", "a\n")], t0);
+    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    pipeline(&root, &store, &up, "15m", &[]);
+    // B reaches the upstream on another branch, and loses its tree there.
+    let b = commit_dated(&up, &[("b.txt", "b\n")], t0 + 100);
+    git(
+        &up.work,
+        &["push", "-q", "origin", "HEAD:refs/heads/staged"],
+    );
+    let tree = rev(&up.bare, &format!("{b}^{{tree}}"));
+    let loose = up.bare.join("objects").join(&tree[..2]).join(&tree[2..]);
+    let hidden = root.join("hidden-tree");
+    std::fs::rename(&loose, &hidden).unwrap();
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--upstream",
+        up.bare.to_str().unwrap(),
+        "--poll-ms",
+        "20",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ]);
+    let served = |s: &Server| s.get(&format!("/gvfs/objects/{b}")).0 == 200;
+    assert_eq!(server.metric("gvfs_live_failures_total"), 0);
+    force_main(&up, &b);
+    server.wait_for("a failed ingest", |s| {
+        s.metric("gvfs_live_failures_total") > 0
+    });
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // Waits of 20, 40, 80 ms and so on: the seventh attempt is 1.3 s in, the eighth 2.5 s.
+    // One per poll would be 75 by now.
+    let failures = server.metric("gvfs_live_failures_total");
+    assert!((2..=9).contains(&failures), "{failures} attempts");
+    assert!(!served(&server));
+    std::fs::rename(&hidden, &loose).unwrap();
+    server.wait_for("B in L0", served);
+    assert_eq!(server.metric("gvfs_l0_ingests_total"), 1);
+    server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Forced pushes under the edge's live L0 slabs, which only the edge saw (the pipeline did
 /// not run in between): a rewind, a rewind into the middle of a slab, and a rewrite. The
 /// edge stops serving what the branch no longer reaches, stamps what follows exactly as the

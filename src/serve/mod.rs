@@ -349,6 +349,8 @@ pub fn run(o: Options) -> Result<()> {
         sealed: Vec::new(),
         l0: Vec::new(),
         last_head: Oid::ZERO,
+        retry: Retry::default(),
+        poll,
         generation: 0,
         supersets,
         blobs: None,
@@ -533,6 +535,7 @@ pub fn run(o: Options) -> Result<()> {
     loop {
         std::thread::sleep(poll);
         if let Err(e) = live.tick(&ctx, &warmer) {
+            ctx.metrics.live_failures.fetch_add(1, Ordering::Relaxed);
             crate::log!("serve: live sync failed: {e}");
         }
     }
@@ -1032,6 +1035,43 @@ fn keep_l0(end_ts: u64, max_ts: u64, newest: u64) -> bool {
     end_ts > max_ts || end_ts.saturating_add(L0_RETAIN) >= newest
 }
 
+/// The longest wait before a head whose ingest failed is tried again.
+const RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// When a head whose ingest failed is tried again. Each attempt fetches what the branch
+/// added once more, so a failure that repeats (a pack this edge cannot index, an object
+/// the upstream lacks) must not cost the upstream a fetch per poll: the wait starts at the
+/// poll interval and doubles with each failure, up to [`RETRY_MAX`]. Another head, or
+/// another manifest under it, is tried at once.
+#[derive(Default)]
+struct Retry {
+    head: Oid,
+    failures: u32,
+    wait: Duration,
+    at: Option<Instant>,
+}
+
+impl Retry {
+    fn due(&self, head: Oid, now: Instant) -> bool {
+        head != self.head || self.at.is_none_or(|at| now >= at)
+    }
+
+    /// Notes that ingesting `head` failed at `now`; returns the wait before its next
+    /// attempt.
+    fn failed(&mut self, head: Oid, poll: Duration, now: Instant) -> Duration {
+        if head == self.head && self.at.is_some() {
+            self.failures = self.failures.saturating_add(1);
+            self.wait = self.wait.saturating_mul(2).min(RETRY_MAX.max(poll));
+        } else {
+            self.head = head;
+            self.failures = 1;
+            self.wait = poll.max(Duration::from_millis(1));
+        }
+        self.at = now.checked_add(self.wait);
+        self.wait
+    }
+}
+
 /// The live thread's state.
 struct Live {
     store: Arc<Store>,
@@ -1047,6 +1087,9 @@ struct Live {
     l0: Vec<Arc<Slab>>,
     /// Upstream tip last ingested (or found to bring nothing).
     last_head: Oid,
+    /// When a head whose ingest failed is tried again, and the poll interval it starts from.
+    retry: Retry,
+    poll: Duration,
     generation: u64,
     supersets: Option<Tier>,
     /// The loaded `blobs.bin` (`--blobs separate` stores).
@@ -1262,6 +1305,7 @@ impl Live {
                 warmer.offer(next);
                 // The tip may now be behind the upstream: catch up below.
                 self.last_head = Oid::ZERO;
+                self.retry = Retry::default();
             }
         }
         if self.sync_upstream(ctx)? {
@@ -1277,9 +1321,30 @@ impl Live {
         };
         let head = up.head()?;
         let view = ctx.view();
-        if head == view.tip || head == self.last_head {
+        if head == view.tip || head == self.last_head || !self.retry.due(head, Instant::now()) {
             return Ok(false);
         }
+        match self.ingest(ctx, &view, head) {
+            Ok(published) => {
+                self.retry = Retry::default();
+                Ok(published)
+            }
+            Err(e) => {
+                let wait = self.retry.failed(head, self.poll, Instant::now());
+                Err(e).ctx(&format!(
+                    "ingesting {head} (attempt {}, the next in {wait:?})",
+                    self.retry.failures
+                ))
+            }
+        }
+    }
+
+    /// The L0 slabs follow the upstream branch to `head`. Returns whether a new snapshot
+    /// was published.
+    fn ingest(&mut self, ctx: &Ctx, view: &View, head: Oid) -> Result<bool> {
+        let Some(up) = self.upstream.as_mut() else {
+            return Ok(false);
+        };
         let Some(moved) = self.tip.advance(up, &view.manifest, &self.l0, head)? else {
             self.last_head = head;
             return Ok(false);
@@ -1401,6 +1466,7 @@ pub fn metrics_text(ctx: &Ctx) -> String {
          gvfs_objects_out_total {}\n\
          gvfs_l0_ingests_total {}\n\
          gvfs_manifest_loads_total {}\n\
+         gvfs_live_failures_total {}\n\
          gvfs_slabs {}\n\
          gvfs_l0_slabs {}\n\
          gvfs_manifest_generation {}\n\
@@ -1438,6 +1504,7 @@ pub fn metrics_text(ctx: &Ctx) -> String {
         get(&m.objects_out),
         get(&m.l0_ingests),
         get(&m.manifest_loads),
+        get(&m.live_failures),
         v.all.len(),
         v.l0_len,
         v.manifest.generation,
@@ -1468,6 +1535,30 @@ pub fn metrics_text(ctx: &Ctx) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A head whose ingest fails is tried again after one poll interval, then after twice
+    /// as long each time, up to a minute; another head is tried at once and starts over.
+    #[test]
+    #[allow(clippy::arithmetic_side_effects)]
+    fn a_failing_head_is_retried_less_and_less_often() {
+        let poll = Duration::from_secs(2);
+        let (a, b) = (Oid([1; 20]), Oid([2; 20]));
+        let mut now = Instant::now();
+        let mut retry = Retry::default();
+        assert!(retry.due(a, now));
+        let mut waits = Vec::new();
+        for _ in 0..8 {
+            let wait = retry.failed(a, poll, now);
+            assert!(!retry.due(a, now + wait - Duration::from_millis(1)));
+            assert!(retry.due(a, now + wait));
+            assert!(retry.due(b, now));
+            waits.push(wait.as_secs());
+            now += wait;
+        }
+        assert_eq!(waits, [2, 4, 8, 16, 32, 60, 60, 60]);
+        assert_eq!(retry.failed(b, poll, now), poll);
+        assert_eq!(retry.failed(a, poll, now), poll);
+    }
 
     /// Memory filesystems are told apart from the rest (`/dev/shm` is tmpfs on Linux).
     #[test]

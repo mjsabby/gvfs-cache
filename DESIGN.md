@@ -307,7 +307,11 @@ live loop runs every `--poll-ms`:
   repacked into one more L0 slab and stamped from its commits. This is the same code the
   pipeline runs, and the pipeline later stamps the same tip the same way. A forced push
   (the new head does not descend from the newest live L0 tip) drops the live L0 slabs the
-  head does not reach and fetches again from the newest boundary it does (above).
+  head does not reach and fetches again from the newest boundary it does (above). A head
+  whose ingest fails is tried again after one poll interval, then after twice as long
+  each time, up to a minute, since every attempt fetches the delta again; another head,
+  or a new manifest, is tried at once. `gvfs_live_failures_total` counts the polls that
+  failed.
 * A new manifest generation swaps in its slabs. L0 slabs it covers leave the live set
   (object lookups and cold plans) but stay in the timeline for 6 hours, so a client whose
   cursor is one of their boundaries is still answered exactly. If the manifest's tip falls
