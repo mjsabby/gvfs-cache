@@ -124,7 +124,10 @@ The indexer is a faster `git index-pack`:
   4 MiB) when the family is done. On SearchGold's baseline (9.25M objects, trees up to
   5.3 MB in chains 50 deep) the indexer holds 2.1 GiB of anonymous memory at 32 threads
   and 1.7 GiB at one, nearly all of it tables that grow with the object count; with a
-  buffer per depth, kept, it held 8.1 GiB at 32 threads.
+  buffer per depth, kept, it held 8.1 GiB at 32 threads. An id that a pack holds more
+  than once (git accepts that) has its REF deltas resolved once, by the first object
+  with that id to be resolved, so the walk ends even where a delta makes its own base's
+  id again.
 * The index build drops duplicate entries (the first copy wins) and builds the MPHF
   partitions in parallel.
 

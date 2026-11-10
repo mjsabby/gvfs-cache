@@ -261,6 +261,9 @@ pub struct Indexer {
     /// REF_DELTAs as (awaited base id, entry), sorted, with a 64K fanout on the id.
     waiters: Vec<(Oid, u32)>,
     fanout: Vec<u32>,
+    /// Pass 2: set at the first waiter of an id once an object with that id has taken
+    /// that id's waiters to resolve.
+    claimed: Vec<AtomicBool>,
     roots: Vec<u32>,
     facts: Vec<Facts>,
     scan: ScanScratch,
@@ -279,6 +282,7 @@ impl Indexer {
             fill: Vec::new(),
             waiters: Vec::new(),
             fanout: Vec::new(),
+            claimed: Vec::new(),
             roots: Vec::new(),
             facts: Vec::new(),
             scan: ScanScratch::new(),
@@ -557,11 +561,14 @@ impl Indexer {
             children,
             waiters,
             fanout,
+            claimed,
             roots,
             facts,
             resolve,
             ..
         } = self;
+        claimed.clear();
+        claimed.resize_with(waiters.len(), AtomicBool::default);
         let ctx = ResolveCtx {
             pack,
             end,
@@ -570,6 +577,7 @@ impl Indexer {
             children,
             waiters,
             fanout,
+            claimed,
         };
         facts.clear();
         facts.extend(scanned.iter().zip(base.iter()).map(|(sc, &b)| Facts {
@@ -685,7 +693,7 @@ impl Indexer {
     }
 }
 
-/// Read-only inputs shared by the resolver threads.
+/// Inputs shared by the resolver threads: read-only, but for the claims.
 struct ResolveCtx<'a> {
     pack: &'a [u8],
     end: usize,
@@ -694,6 +702,7 @@ struct ResolveCtx<'a> {
     children: &'a [u32],
     waiters: &'a [(Oid, u32)],
     fanout: &'a [u32],
+    claimed: &'a [AtomicBool],
 }
 
 impl ResolveCtx<'_> {
@@ -735,6 +744,22 @@ impl ResolveCtx<'_> {
             .partition_point(|(w, _)| w == oid);
         let start = lo.wrapping_add(u32_of(first));
         (start, start.wrapping_add(u32_of(len)))
+    }
+
+    /// [`Self::waiting_range`] for the object that will resolve those deltas: the first
+    /// with this id to ask gets them and any other gets none, so every REF delta is
+    /// resolved once. A pack that git accepts can hold an id more than once: a base
+    /// stored twice, or a delta that makes its base's id again (79 bytes are enough: a
+    /// blob, and a REF delta on it that copies it). Without the claim such deltas were
+    /// resolved once for every copy of their base: a chain stored twice 2^depth times,
+    /// and the delta that waits for its own result without end.
+    fn claim_waiters(&self, oid: &Oid) -> (u32, u32) {
+        let (lo, hi) = self.waiting_range(oid);
+        let taken = |first: &AtomicBool| first.swap(true, Ordering::Relaxed);
+        if lo < hi && self.claimed.get(lo as usize).is_none_or(taken) {
+            return (hi, hi);
+        }
+        (lo, hi)
     }
 
     /// Appends the roots among `part`, whose first entry is number `from`: the whole
@@ -827,7 +852,7 @@ fn resolve_family(ctx: &ResolveCtx<'_>, root: u32, s: &mut ResolveScratch) -> Re
     if let Some(l) = lens.first_mut() {
         *l = n;
     }
-    let (ref_lo, ref_hi) = ctx.waiting_range(&root_sc.oid);
+    let (ref_lo, ref_hi) = ctx.claim_waiters(&root_sc.oid);
     stack.clear();
     stack.push(Frame {
         entry: root,
@@ -891,7 +916,7 @@ fn resolve_family(ctx: &ResolveCtx<'_>, root: u32, s: &mut ResolveScratch) -> Re
             depth: u8::try_from(depth.saturating_add(1)).unwrap_or(u8::MAX),
             base: parent,
         });
-        let (ref_lo, ref_hi) = ctx.waiting_range(&oid);
+        let (ref_lo, ref_hi) = ctx.claim_waiters(&oid);
         if !ctx.ofs_kids(child).is_empty() || ref_lo < ref_hi {
             let frame = Frame {
                 entry: child,
@@ -1530,18 +1555,20 @@ pub(crate) mod tests {
     /// chain depth (0 for a whole object) and its base's id.
     type Entry = (u64, String, String, u32, String);
 
-    /// Every entry of `pack`, by offset, according to `git index-pack` and `verify-pack`.
-    fn git_entries(name: &str, pack: &[u8]) -> Vec<Entry> {
+    /// What `git <args>` prints about `pack` once `git index-pack` has indexed it, in a
+    /// directory of their own, as `x.pack` and `x.idx` (which is also the standard input).
+    fn git_about(name: &str, pack: &[u8], args: &[&str]) -> String {
         let dir = std::env::temp_dir().join(format!("gvfs-ingest-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("x.pack"), pack).unwrap();
-        let git = |args: &[&str]| {
+        let git = |args: &[&str], stdin: std::process::Stdio| {
             let out = Command::new("git")
                 .args(args)
                 .current_dir(&dir)
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .stdin(stdin)
                 .output()
                 .unwrap();
             assert!(
@@ -1551,8 +1578,19 @@ pub(crate) mod tests {
             );
             String::from_utf8(out.stdout).unwrap()
         };
-        git(&["index-pack", "-o", "x.idx", "x.pack"]);
-        let mut entries: Vec<Entry> = git(&["verify-pack", "-v", "x.idx"])
+        git(
+            &["index-pack", "-o", "x.idx", "x.pack"],
+            std::process::Stdio::null(),
+        );
+        let idx = std::fs::File::open(dir.join("x.idx")).unwrap();
+        let said = git(args, idx.into());
+        let _ = std::fs::remove_dir_all(&dir);
+        said
+    }
+
+    /// Every entry of `pack`, by offset, according to `git index-pack` and `verify-pack`.
+    fn git_entries(name: &str, pack: &[u8]) -> Vec<Entry> {
+        let mut entries: Vec<Entry> = git_about(name, pack, &["verify-pack", "-v", "x.idx"])
             .lines()
             .map(|l| l.split_whitespace().collect::<Vec<&str>>())
             .filter(|f| f.len() >= 5 && f[0].len() == 40)
@@ -1567,7 +1605,28 @@ pub(crate) mod tests {
             })
             .collect();
         entries.sort();
-        let _ = std::fs::remove_dir_all(&dir);
+        entries
+    }
+
+    /// (offset, id) of every entry of `pack`, by offset, in the index `git index-pack`
+    /// writes: all git says of a pack that holds an id twice (`verify-pack` refuses it).
+    fn git_index(name: &str, pack: &[u8]) -> Vec<(u64, String)> {
+        let mut entries: Vec<(u64, String)> = git_about(name, pack, &["show-index"])
+            .lines()
+            .map(|l| l.split_whitespace().collect::<Vec<&str>>())
+            .map(|f| (f[0].parse().unwrap(), f[1].to_string()))
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// The indexer's facts as [`git_index`] gives git's.
+    fn our_index(facts: &[Facts]) -> Vec<(u64, String)> {
+        let mut entries: Vec<(u64, String)> = facts
+            .iter()
+            .map(|f| (f.offset, f.oid.to_string()))
+            .collect();
+        entries.sort();
         entries
     }
 
@@ -1749,6 +1808,90 @@ pub(crate) mod tests {
             assert!(ix.roots.len() >= 64, "{} families", ix.roots.len());
             assert!(our_entries(&facts) == git, "on {threads} threads");
         }
+    }
+
+    /// The facts of `pack` and the number of deltas resolved for them, by an indexer on
+    /// a thread of its own: a walk that does not end fails the test, it does not hold it.
+    fn index_soon(pack: &[u8], threads: usize) -> (Vec<Facts>, usize) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pack = pack.to_vec();
+        std::thread::spawn(move || {
+            let mut ix = Indexer::new(threads);
+            let facts = ix.index(&pack).map(|f| f.to_vec());
+            let resolved: usize = ix.resolve.iter().map(|s| s.out.len()).sum();
+            let _ = tx.send((facts, resolved));
+        });
+        let (facts, resolved) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the indexer is still resolving after 5 s");
+        (facts.unwrap(), resolved)
+    }
+
+    /// A pack git accepts can hold a delta that makes its base's id again: here a blob
+    /// with a REF delta on it that copies it (79 bytes), and a blob with an edit and the
+    /// edit's undoing. Each delta is resolved once, to the id git gives it. The copy
+    /// used to wait for its own result without end, at 0.5 GB of memory a second.
+    #[test]
+    fn a_delta_that_makes_its_base_again_is_resolved_once() {
+        let (x, y) = (b"hello".to_vec(), b"hello!".to_vec());
+        let (xo, yo) = (hash_object(OBJ_BLOB, &x), hash_object(OBJ_BLOB, &y));
+        let mut copy = PackBuilder::new();
+        copy.whole(OBJ_BLOB, &x);
+        copy.ref_delta(&xo, &delta_of(&x, &x));
+        let mut undo = PackBuilder::new();
+        undo.whole(OBJ_BLOB, &x);
+        undo.ref_delta(&xo, &delta_of(&x, &y));
+        undo.ref_delta(&yo, &delta_of(&y, &x));
+        for (name, pack, ids) in [
+            ("copy", copy.finish(), vec![xo, xo]),
+            ("undo", undo.finish(), vec![xo, yo, xo]),
+        ] {
+            let (facts, resolved) = index_soon(&pack, 1);
+            assert_eq!(resolved, ids.len() - 1, "{name}");
+            for (i, (f, id)) in facts.iter().zip(&ids).enumerate() {
+                let base = if i == 0 { NO_BASE } else { i as u32 - 1 };
+                assert_eq!((f.oid, f.depth, f.base), (*id, i as u8, base), "{name}");
+            }
+            assert_eq!(our_index(&facts), git_index(name, &pack));
+        }
+    }
+
+    /// Deltas on a base the pack holds twice are resolved once, against one copy of it.
+    /// Resolved against every copy, the 80 deltas of a chain whose every version is
+    /// stored twice took 2^40 resolutions.
+    #[test]
+    fn deltas_on_a_base_stored_twice_are_resolved_once() {
+        let mut chain = PackBuilder::new();
+        let mut blob = b"a".to_vec();
+        for _ in 0..2 {
+            chain.whole(OBJ_BLOB, &blob);
+        }
+        for _ in 0..40 {
+            let next = [&blob[..], b"a"].concat();
+            for _ in 0..2 {
+                chain.ref_delta(&hash_object(OBJ_BLOB, &blob), &delta_of(&blob, &next));
+            }
+            blob = next;
+        }
+        let chain = chain.finish();
+        let (facts, resolved) = index_soon(&chain, 1);
+        assert_eq!(resolved, 80);
+        assert_eq!(our_index(&facts), git_index("chain-twice", &chain));
+
+        // Enough families for several workers: both copies of a base may ask at once.
+        let mut pairs = PackBuilder::new();
+        for i in 0..100 {
+            let blob = format!("blob {i}").into_bytes();
+            for _ in 0..2 {
+                pairs.whole(OBJ_BLOB, &blob);
+            }
+            let next = [&blob[..], b", edited"].concat();
+            pairs.ref_delta(&hash_object(OBJ_BLOB, &blob), &delta_of(&blob, &next));
+        }
+        let pairs = pairs.finish();
+        let (facts, resolved) = index_soon(&pairs, 4);
+        assert_eq!(resolved, 100);
+        assert_eq!(our_index(&facts), git_index("pairs", &pairs));
     }
 
     #[test]
