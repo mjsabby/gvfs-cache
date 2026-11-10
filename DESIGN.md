@@ -307,8 +307,8 @@ arenas, seal the allocator, and listen.
 
 **The live tip (L0).** The pipeline seals a slab every 15 minutes; L0 bridges the minutes
 since the last one, with one memory slab per move of the branch (its index on the heap,
-its pack in a memfd once it is 16 KiB, so that it too is sent with `sendfile(2)`). The
-live loop runs every `--poll-ms`:
+its pack in a memfd once it is 16 KiB, so that it too is sent with `sendfile(2)`). Two
+threads poll every `--poll-ms`, one the upstream and one the store:
 
 * A moved branch: `ingest_git_delta(newest boundary, HEAD)` fetches only the new commits,
   repacked into one more L0 slab and stamped from its commits. This is the same code the
@@ -321,15 +321,18 @@ live loop runs every `--poll-ms`:
   inside an L0 slab, what follows the tip is repacked out of it. Nothing is fetched again
   unless the branch was rewritten.
 
-Neither step needs the other to work: an edge that cannot read its store, or cannot apply
-a manifest, still follows the branch on the manifest it serves, and the reverse. A step
-that fails changes nothing: the slabs, the L0 slabs and what the tip knows of them (the
-stamps of their commits, the boundaries a forced push took away) are replaced together
-once everything that can fail has not, so a later view is never made of one manifest's
-bounds and another's slabs. What failed is tried again after one poll interval, then
-after twice as long each time, up to a minute, since an attempt fetches the delta or
-downloads the slabs again; another head, or another manifest, is tried at once.
-`gvfs_live_failures_total` counts the failures.
+The store's thread reads `blobs.bin` and the manifest, downloads and opens what they list,
+and hands it to the upstream's, which prunes its L0 slabs against the new slabs and makes
+the view. Neither waits for the other: while a weekly baseline downloads (gigabytes), or
+a store does not answer, or a manifest cannot be opened, the edge follows the branch on
+the manifest it serves; while a long fetch from the upstream runs, the next manifest is
+downloaded. A step that fails changes nothing: the slabs, the L0 slabs and what the tip
+knows of them (the stamps of their commits, the boundaries a forced push took away) are
+replaced together once everything that can fail has not, so a later view is never made
+of one manifest's bounds and another's slabs. What failed is tried again after one poll
+interval, then after twice as long each time, up to a minute, since an attempt fetches
+the delta or downloads the slabs again; another head, or another manifest, is tried at
+once. `gvfs_live_failures_total` counts the failures.
 
 Every change publishes a new immutable `View`; requests hold an `Arc` to the view they
 started with. Object lookups go through the live L0 slabs, the pyramid, the weekly deltas

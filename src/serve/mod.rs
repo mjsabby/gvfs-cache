@@ -10,7 +10,9 @@
 //! 4. allocate the connection buffers and request arenas, start the runtime, then seal the
 //!    allocator and serve.
 //!
-//! A live thread then polls the manifest and the upstream every `--poll-ms`. The L0 slabs
+//! Two threads then poll every `--poll-ms`: one the store (`blobs.bin` and the manifest,
+//! downloading and opening what they list), one the upstream, which also makes the views.
+//! Neither waits for the other. The L0 slabs
 //! bridge the minutes since the last sealed 15m slab, one per move of the branch, and every
 //! commit in them is fetched from the upstream once:
 //!
@@ -339,75 +341,87 @@ pub fn run(o: Options) -> Result<()> {
         supersets,
     } = o;
     let store = Arc::new(store);
-    let mut live = Live {
+    let mut sync = StoreSync {
         store,
         blob_cache: None,
-        upstream,
-        tip: LiveTip::default(),
         cache_dir,
         opened: HashMap::new(),
-        sealed: Vec::new(),
-        l0: Vec::new(),
-        last_head: Oid::ZERO,
-        retry: Retry::default(),
+        etag: String::new(),
+        generation: 0,
+        separate: false,
         manifest_retry: Retry::default(),
         blobs_retry: Retry::default(),
         poll,
-        generation: 0,
-        supersets,
         blobs: None,
         waiting_for: 0,
     };
+    let mut tip = LiveTip::default();
 
     // 1-3. Manifest, slabs, live tip.
-    let (manifest, etag) = live.wait_for_manifest()?;
+    let (manifest, etag) = sync.wait_for_manifest()?;
     let separate = manifest.separate_blobs();
-    let remote = live.store.local_path(MANIFEST_KEY).is_none();
+    let remote = sync.store.local_path(MANIFEST_KEY).is_none();
     if remote || (separate && upstream_spec.is_some()) {
-        std::fs::create_dir_all(&live.cache_dir)
-            .ctx(&format!("creating {}", live.cache_dir.display()))?;
-        if let Some(kind) = in_memory(&live.cache_dir) {
+        std::fs::create_dir_all(&sync.cache_dir)
+            .ctx(&format!("creating {}", sync.cache_dir.display()))?;
+        if let Some(kind) = in_memory(&sync.cache_dir) {
             crate::log!(
                 "serve: warning: --cache-dir {} is in memory ({kind}); it holds {}up to \
                  --blob-cache-mib and --proxy-cache-mib of blobs: give it a directory on disk",
-                live.cache_dir.display(),
+                sync.cache_dir.display(),
                 if remote { "the store's slabs and " } else { "" }
             );
         }
     }
     if separate {
         // Blob packs in object storage are read in blocks kept on local disk.
-        if live.store.local_path(crate::blobs::BLOBS_KEY).is_none() && blob_cache_bytes > 0 {
-            live.blob_cache = Some(Arc::new(blobcache::BlockCache::new(
-                Arc::clone(&live.store),
-                live.cache_dir.join("blob-blocks"),
+        if sync.store.local_path(crate::blobs::BLOBS_KEY).is_none() && blob_cache_bytes > 0 {
+            sync.blob_cache = Some(Arc::new(blobcache::BlockCache::new(
+                Arc::clone(&sync.store),
+                sync.cache_dir.join("blob-blocks"),
                 blob_cache_bytes,
             )?));
         }
-        live.tip.filter = Some("blob:none".to_string());
+        tip.filter = Some("blob:none".to_string());
         // The manifest's trees need the blobs.bin generation it names.
         loop {
-            live.load_blobs()?;
-            if live.blobs_generation() >= manifest.blobs_generation {
+            if let Some((bytes, etag)) = sync.changed_blobs()? {
+                sync.read_blobs(&bytes, etag)?;
+            }
+            if sync.blobs_generation() >= manifest.blobs_generation {
                 break;
             }
             crate::log!(
                 "serve: waiting for blobs.bin generation {} (have {})",
                 manifest.blobs_generation,
-                live.blobs_generation()
+                sync.blobs_generation()
             );
             std::thread::sleep(Duration::from_secs(1));
         }
     }
-    let (sealed, opened) = live.open_manifest(&manifest)?;
-    (live.sealed, live.opened) = (sealed, opened);
-    live.prune_slabs(&manifest);
+    let sealed = sync.adopt(&manifest, &etag)?;
+    let (changed, changes) = std::sync::mpsc::channel();
+    let mut live = Live {
+        upstream,
+        tip,
+        sealed,
+        l0: Vec::new(),
+        last_head: Oid::ZERO,
+        retry: Retry::default(),
+        apply_retry: Retry::default(),
+        poll,
+        generation: 0,
+        supersets,
+        blobs: sync.blobs.clone(),
+        changes,
+        pending: None,
+    };
     let first = live.snapshot(manifest, etag);
     let proxy = match (&upstream_spec, separate) {
         (Some((u, _, auth)), true) => Some(blobs::Proxy::new(
             u,
             auth,
-            &live.cache_dir.join("proxy"),
+            &sync.cache_dir.join("proxy"),
             proxy_cache_bytes,
         )?),
         _ => None,
@@ -475,7 +489,7 @@ pub fn run(o: Options) -> Result<()> {
         idx_wanted: AtomicBool::new(prefetch_idx == IdxPolicy::Always),
         sizes_wanted: AtomicBool::new(false),
         proxy,
-        blob_cache: live.blob_cache.clone(),
+        blob_cache: sync.blob_cache.clone(),
     });
     if let Err(e) = live.sync_upstream(&ctx) {
         crate::log!("serve: live tip not caught up at boot ({e}); serving sealed slabs");
@@ -531,10 +545,17 @@ pub fn run(o: Options) -> Result<()> {
         v.all.len(),
         v.l0_len,
         v.tip,
-        live.store.describe()
+        sync.store.describe()
     );
 
-    // The live loop runs on this thread for the life of the process.
+    // The store is followed on a thread of its own, the upstream branch on this one, for
+    // the life of the process.
+    {
+        let ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("gvfs-store".into())
+            .spawn(move || sync.run(&ctx, &changed))?;
+    }
     loop {
         std::thread::sleep(poll);
         live.tick(&ctx, &warmer);
@@ -1111,55 +1132,86 @@ impl<K: PartialEq> Retry<K> {
     }
 }
 
-/// The live thread's state.
-struct Live {
+/// What the store's thread follows: `blobs.bin` and the manifest. It downloads and opens
+/// what they list and hands it to the live thread ([`StoreChange`]), which makes the views.
+/// The two do not wait for each other: a store that is slow (a weekly baseline is
+/// gigabytes), unreachable or wrong does not keep the edge from following the branch, nor
+/// a long fetch from the upstream the store's next manifest from being downloaded.
+struct StoreSync {
     store: Arc<Store>,
     blob_cache: Option<Arc<blobcache::BlockCache>>,
-    upstream: Option<Upstream>,
-    tip: LiveTip,
     cache_dir: PathBuf,
     /// Sealed slabs already open, by id (reused across manifests).
     opened: HashMap<String, Arc<Slab>>,
-    /// The current manifest's slabs, in manifest order.
-    sealed: Vec<Arc<Slab>>,
-    /// The L0 slabs, oldest first.
-    l0: Vec<Arc<Slab>>,
-    /// Upstream tip last ingested (or found to bring nothing).
-    last_head: Oid,
-    /// When a head whose ingest failed is tried again, a manifest that could not be
-    /// applied, a `blobs.bin` that could not be loaded (the last two by etag); and the poll
-    /// interval the waits start from.
-    retry: Retry<Oid>,
+    /// The manifest last opened: its etag, its generation, whether its blobs are separate.
+    etag: String,
+    generation: u64,
+    separate: bool,
+    /// When a manifest that could not be opened and a `blobs.bin` that could not be loaded
+    /// are tried again (by etag), and the poll interval the waits start from.
     manifest_retry: Retry<String>,
     blobs_retry: Retry<String>,
     poll: Duration,
-    generation: u64,
-    supersets: Option<Tier>,
     /// The loaded `blobs.bin` (`--blobs separate` stores).
     blobs: Option<Arc<blobs::BlobSet>>,
     /// A manifest generation held back until its `blobs.bin` generation loads (logged once).
     waiting_for: u64,
 }
 
-impl Live {
+/// What the store's thread hands the live thread, in the order it happened.
+enum StoreChange {
+    Blobs(Arc<blobs::BlobSet>),
+    Manifest(Box<Opened>),
+}
+
+/// A newer manifest, with its etag and its slabs open in its order.
+struct Opened {
+    manifest: Manifest,
+    etag: String,
+    sealed: Vec<Arc<Slab>>,
+}
+
+/// The live thread's state.
+struct Live {
+    upstream: Option<Upstream>,
+    tip: LiveTip,
+    /// The current manifest's slabs, in manifest order.
+    sealed: Vec<Arc<Slab>>,
+    /// The L0 slabs, oldest first.
+    l0: Vec<Arc<Slab>>,
+    /// Upstream tip last ingested (or found to bring nothing).
+    last_head: Oid,
+    /// When a head whose ingest failed is tried again, and a manifest whose L0 slabs could
+    /// not be pruned against it; and the poll interval the waits start from.
+    retry: Retry<Oid>,
+    apply_retry: Retry<String>,
+    poll: Duration,
+    generation: u64,
+    supersets: Option<Tier>,
+    /// The loaded `blobs.bin` (`--blobs separate` stores).
+    blobs: Option<Arc<blobs::BlobSet>>,
+    /// What the store's thread has opened, and the manifest among it not applied yet.
+    changes: std::sync::mpsc::Receiver<StoreChange>,
+    pending: Option<Box<Opened>>,
+}
+
+impl StoreSync {
     fn blobs_generation(&self) -> u64 {
         self.blobs.as_ref().map_or(0, |b| b.generation)
     }
 
-    /// Loads `blobs.bin` if it changed. Returns whether it did.
-    fn load_blobs(&mut self) -> Result<bool> {
-        let Some((bytes, etag)) = self.store.get(crate::blobs::BLOBS_KEY)? else {
-            return Ok(false);
-        };
-        if self.blobs.as_ref().is_some_and(|b| b.etag == etag)
-            || !self.blobs_retry.due(&etag, Instant::now())
-        {
-            return Ok(false);
-        }
-        let loaded = self.read_blobs(&bytes, etag.clone());
-        self.blobs_retry
-            .note(etag, self.poll, "loading blobs.bin", loaded)?;
-        Ok(true)
+    /// The store's `blobs.bin` and its etag, if it is not the one loaded (and, after a
+    /// failure to load it, it is time to try again).
+    fn changed_blobs(&self) -> Result<Option<(Vec<u8>, String)>> {
+        let changed = self
+            .store
+            .get(crate::blobs::BLOBS_KEY)
+            .ctx("reading blobs.bin")?
+            .filter(|(_, etag)| {
+                !self.blobs.as_ref().is_some_and(|b| b.etag == *etag)
+                    && self.blobs_retry.due(etag, Instant::now())
+            });
+        Ok(changed)
     }
 
     /// The `blobs.bin` in `bytes` becomes the loaded one, or nothing changes.
@@ -1213,29 +1265,6 @@ impl Live {
         }
     }
 
-    /// The sizes the trees of a new L0 slab introduce (those `known` does not have), asked
-    /// of the upstream.
-    fn l0_sizes(&mut self, slab: &Arc<Slab>, known: &dyn Fn(&Oid) -> bool) -> Result<()> {
-        let Some(up) = self.upstream.as_mut() else {
-            return Ok(());
-        };
-        let unknown: Vec<Oid> = crate::blobcopy::referenced_blobs(slab, 1)?
-            .into_iter()
-            .filter(|b| !known(b))
-            .collect();
-        let sizes = up.object_sizes(&unknown)?;
-        let mut pairs = Vec::with_capacity(unknown.len());
-        for (oid, size) in unknown.iter().zip(sizes) {
-            let Some(size) = size else {
-                crate::bail!("the upstream has no blob {oid}, which a tree references");
-            };
-            pairs.push((*oid, size));
-        }
-        slab.set_sizes(Arc::new(crate::sizes::Sizes::from_heap(
-            crate::sizes::build(&mut pairs),
-        )?));
-        Ok(())
-    }
     fn wait_for_manifest(&mut self) -> Result<(Manifest, String)> {
         let mut logged = false;
         loop {
@@ -1254,8 +1283,7 @@ impl Live {
     }
 
     /// Opens (hydrating if needed) every slab of `m`: its slabs in manifest order, and by
-    /// id. They become the sealed slabs once the caller has done everything else that can
-    /// fail.
+    /// id.
     #[allow(clippy::type_complexity)]
     fn open_manifest(&self, m: &Manifest) -> Result<(Vec<Arc<Slab>>, HashMap<String, Arc<Slab>>)> {
         let mut sealed = Vec::with_capacity(m.slabs().count());
@@ -1297,21 +1325,6 @@ impl Live {
             sizes => sizes,
         }
         .ctx(&what)
-    }
-
-    /// A snapshot of the sealed slabs plus the L0 slabs.
-    fn snapshot(&mut self, m: Manifest, etag: String) -> View {
-        self.generation = self.generation.saturating_add(1);
-        View::new(
-            self.generation,
-            m,
-            etag,
-            self.sealed.clone(),
-            self.l0.clone(),
-            self.supersets,
-            self.blobs.clone(),
-            self.tip.retracted(),
-        )
     }
 
     fn open(&self, meta: &crate::slab::SlabMeta) -> Result<Arc<Slab>> {
@@ -1368,54 +1381,57 @@ impl Live {
         Ok(slab)
     }
 
-    /// One poll: the store, then the upstream branch. Neither needs the other to work: an
-    /// edge that cannot read its store, or cannot apply its manifest, still follows the
-    /// branch, and the reverse.
-    fn tick(&mut self, ctx: &Ctx, warmer: &Warmer) {
-        let failed = |e: crate::util::Error| {
-            ctx.metrics.live_failures.fetch_add(1, Ordering::Relaxed);
-            crate::log!("serve: live sync failed: {e}");
-        };
-        if let Err(e) = self.sync_store(ctx, warmer) {
-            failed(e);
-        }
-        match self.sync_upstream(ctx) {
-            Ok(true) => warmer.offer(ctx.view()),
-            Ok(false) => {}
-            Err(e) => failed(e),
+    /// Follows the store for the life of the process, a poll every `poll`.
+    fn run(mut self, ctx: &Ctx, changes: &std::sync::mpsc::Sender<StoreChange>) {
+        loop {
+            std::thread::sleep(self.poll);
+            if let Err(e) = self.step(changes) {
+                live_failed(ctx, &e);
+            }
         }
     }
 
-    /// Follows the store: a changed `blobs.bin`, then a newer manifest.
-    fn sync_store(&mut self, ctx: &Ctx, warmer: &Warmer) -> Result<()> {
-        let view = ctx.view();
-        if view.manifest.separate_blobs() && self.load_blobs()? {
-            let next = Arc::new(self.snapshot(view.manifest.clone(), view.etag.clone()));
-            ctx.publish(next);
+    /// One poll of the store: a changed `blobs.bin`, then a newer manifest.
+    fn step(&mut self, changes: &std::sync::mpsc::Sender<StoreChange>) -> Result<()> {
+        if self.separate
+            && let Some((bytes, etag)) = self.changed_blobs()?
+        {
+            let loaded = self.read_blobs(&bytes, etag.clone());
+            self.blobs_retry
+                .note(etag, self.poll, "loading blobs.bin", loaded)?;
+            if let Some(set) = &self.blobs {
+                let _ = changes.send(StoreChange::Blobs(Arc::clone(set)));
+            }
         }
-        let view = ctx.view();
         let Some((bytes, etag)) = self.store.get(MANIFEST_KEY).ctx("reading the manifest")? else {
             return Ok(());
         };
-        if etag == view.etag || !self.manifest_retry.due(&etag, Instant::now()) {
+        if etag == self.etag || !self.manifest_retry.due(&etag, Instant::now()) {
             return Ok(());
         }
-        let applied = self.apply_manifest(ctx, warmer, &view, &bytes, &etag);
-        self.manifest_retry
-            .note(etag, self.poll, "applying the store's manifest", applied)
+        let newer = self.open_newer(&bytes, &etag);
+        let what = "opening the store's manifest";
+        if let Some((manifest, sealed)) =
+            self.manifest_retry
+                .note(etag.clone(), self.poll, what, newer)?
+        {
+            let opened = Opened {
+                manifest,
+                etag,
+                sealed,
+            };
+            let _ = changes.send(StoreChange::Manifest(Box::new(opened)));
+        }
+        Ok(())
     }
 
-    /// Switches to the manifest in `bytes` if it is newer than `view`'s and its `blobs.bin`
-    /// is loaded. Whatever fails, this edge's slabs stay those of the view it serves: a
-    /// later view is made of them.
-    fn apply_manifest(
+    /// The manifest in `bytes` and its slabs, open, if it is newer than the last one opened
+    /// and its `blobs.bin` is loaded.
+    fn open_newer(
         &mut self,
-        ctx: &Ctx,
-        warmer: &Warmer,
-        view: &View,
         bytes: &[u8],
         etag: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<(Manifest, Vec<Arc<Slab>>)>> {
         let m = Manifest::decode(bytes)?;
         let blobs_behind = m.separate_blobs() && self.blobs_generation() < m.blobs_generation;
         if blobs_behind && self.waiting_for != m.generation {
@@ -1427,14 +1443,133 @@ impl Live {
             );
             self.waiting_for = m.generation;
         }
-        if m.generation <= view.manifest.generation || blobs_behind {
+        if m.generation <= self.generation || blobs_behind {
+            return Ok(None);
+        }
+        let sealed = self.adopt(&m, etag)?;
+        Ok(Some((m, sealed)))
+    }
+
+    /// Opens manifest `m`, which becomes the last one opened: its slabs, in its order. The
+    /// cached files of slabs it does not list go (views on older manifests keep what they
+    /// mapped).
+    fn adopt(&mut self, m: &Manifest, etag: &str) -> Result<Vec<Arc<Slab>>> {
+        let (sealed, opened) = self.open_manifest(m)?;
+        self.opened = opened;
+        self.prune_slabs(m);
+        self.etag = etag.to_string();
+        self.generation = m.generation;
+        self.separate = m.separate_blobs();
+        Ok(sealed)
+    }
+}
+
+/// A failure to follow the store or the upstream: logged and counted.
+fn live_failed(ctx: &Ctx, e: &crate::util::Error) {
+    ctx.metrics.live_failures.fetch_add(1, Ordering::Relaxed);
+    crate::log!("serve: live sync failed: {e}");
+}
+
+impl Live {
+    /// The sizes the trees of a new L0 slab introduce (those `known` does not have), asked
+    /// of the upstream.
+    fn l0_sizes(&mut self, slab: &Arc<Slab>, known: &dyn Fn(&Oid) -> bool) -> Result<()> {
+        let Some(up) = self.upstream.as_mut() else {
+            return Ok(());
+        };
+        let unknown: Vec<Oid> = crate::blobcopy::referenced_blobs(slab, 1)?
+            .into_iter()
+            .filter(|b| !known(b))
+            .collect();
+        let sizes = up.object_sizes(&unknown)?;
+        let mut pairs = Vec::with_capacity(unknown.len());
+        for (oid, size) in unknown.iter().zip(sizes) {
+            let Some(size) = size else {
+                crate::bail!("the upstream has no blob {oid}, which a tree references");
+            };
+            pairs.push((*oid, size));
+        }
+        slab.set_sizes(Arc::new(crate::sizes::Sizes::from_heap(
+            crate::sizes::build(&mut pairs),
+        )?));
+        Ok(())
+    }
+
+    /// A snapshot of the sealed slabs plus the L0 slabs.
+    fn snapshot(&mut self, m: Manifest, etag: String) -> View {
+        self.generation = self.generation.saturating_add(1);
+        View::new(
+            self.generation,
+            m,
+            etag,
+            self.sealed.clone(),
+            self.l0.clone(),
+            self.supersets,
+            self.blobs.clone(),
+            self.tip.retracted(),
+        )
+    }
+
+    /// One poll: what the store's thread has opened since the last, then the upstream
+    /// branch. Neither needs the other to work: an edge that cannot read its store, or
+    /// cannot apply its manifest, still follows the branch, and the reverse.
+    fn tick(&mut self, ctx: &Ctx, warmer: &Warmer) {
+        if let Err(e) = self.take_changes(ctx, warmer) {
+            live_failed(ctx, &e);
+        }
+        match self.sync_upstream(ctx) {
+            Ok(true) => warmer.offer(ctx.view()),
+            Ok(false) => {}
+            Err(e) => live_failed(ctx, &e),
+        }
+    }
+
+    /// Makes views of what the store's thread has opened: a `blobs.bin`, then the newest
+    /// manifest.
+    fn take_changes(&mut self, ctx: &Ctx, warmer: &Warmer) -> Result<()> {
+        while let Ok(change) = self.changes.try_recv() {
+            match change {
+                StoreChange::Blobs(set) => {
+                    self.blobs = Some(set);
+                    let view = ctx.view();
+                    let next = self.snapshot(view.manifest.clone(), view.etag.clone());
+                    ctx.publish(Arc::new(next));
+                }
+                StoreChange::Manifest(opened) => self.pending = Some(opened),
+            }
+        }
+        let Some(opened) = self.pending.take() else {
+            return Ok(());
+        };
+        if !self.apply_retry.due(&opened.etag, Instant::now()) {
+            self.pending = Some(opened);
             return Ok(());
         }
-        let (sealed, opened) = self.open_manifest(&m)?;
-        let l0 = self.tip.prune(&self.l0, &view.manifest, &m, &sealed)?;
-        (self.sealed, self.opened, self.l0) = (sealed, opened, l0);
-        self.prune_slabs(&m);
-        let next = self.snapshot(m, etag.to_string());
+        // The slabs, the L0 slabs pruned against them and the view change together, once
+        // the pruning (which may repack an L0 slab) has not failed: until then this edge's
+        // slabs are those of the view it serves, which a later view is made of.
+        let view = ctx.view();
+        let pruned = self
+            .tip
+            .prune(&self.l0, &view.manifest, &opened.manifest, &opened.sealed);
+        let what = "applying the store's manifest";
+        let l0 = match self
+            .apply_retry
+            .note(opened.etag.clone(), self.poll, what, pruned)
+        {
+            Ok(l0) => l0,
+            Err(e) => {
+                self.pending = Some(opened);
+                return Err(e);
+            }
+        };
+        let Opened {
+            manifest,
+            etag,
+            sealed,
+        } = *opened;
+        (self.sealed, self.l0) = (sealed, l0);
+        let next = self.snapshot(manifest, etag);
         crate::log!(
             "serve: manifest generation {} ({} slabs, {} L0)",
             next.manifest.generation,
