@@ -8,9 +8,9 @@
 //! * **Whole entries stream through** in fixed memory, whatever their size: inflated once
 //!   in 64 KiB pieces to verify the id (SHA-1 of `blob <size>\0` + content) and the size,
 //!   and written either as the upstream's zlib bytes untouched or, for a blob of at least
-//!   [`STORED_MIN`] whose first MiB compresses by less than 5%, as stored blocks (which
-//!   inflate at the speed of a copy). The sink deflates that first MiB itself to tell, so
-//!   the choice is the content's: a blob is encoded alike however it arrives.
+//!   [`STORED_MIN`] whose first 256 KiB compress by less than 5%, as stored blocks (which
+//!   inflate at the speed of a copy). The sink deflates those itself to tell, so the
+//!   choice is the content's: a blob is encoded alike however it arrives.
 //! * **Deltas** (OFS or REF) are inflated in memory and applied to their base, read back
 //!   from the output (the output must be a [`Spool`] that can do that, like a local file),
 //!   and the result is written whole. A REF base may arrive after its delta: the delta
@@ -38,8 +38,8 @@ use crate::zlib::{Deflater, Inflater, compress_bound};
 
 /// Inflate output piece.
 const CHUNK: usize = 64 << 10;
-/// The content that chooses a large blob's encoding: its first MiB.
-const SAMPLE: usize = 1 << 20;
+/// The content that chooses a large blob's encoding: its first 256 KiB.
+const SAMPLE: usize = 256 << 10;
 /// An entry's zlib stream may be as long as twice its content plus this. No encoder needs
 /// more: deflate's longest code is 15 bits, so a byte costs under two, a block's header is
 /// at most 286 bytes (the code lengths of a dynamic block), and a zlib stream's own
@@ -507,7 +507,7 @@ impl<S: Spool> BlobSink<S> {
                 Choice::Stored => self.out.content(content)?,
                 Choice::Undecided => {
                     // Less than SAMPLE + CHUNK of content is held, and so (the check
-                    // above) at most twice that plus PADDING_MAX of its stream: 2.1 MiB.
+                    // above) at most twice that plus PADDING_MAX of its stream: 641 KiB.
                     self.sample_z.extend_from_slice(input);
                     self.sample_c.extend_from_slice(content);
                     if self.sample_c.len() >= SAMPLE {
@@ -711,8 +711,10 @@ impl<S: Spool> BlobSink<S> {
 /// compressed it, whole or behind a delta, and however the wire cut it into pieces. (The
 /// measure used to be the upstream's bytes for as much content as the pieces had made when
 /// a MiB was in, or, behind a delta, the whole blob deflated: one blob could go either
-/// way.) The price is a deflate of 1 MiB per large blob, about 15 ms (2 ms if it is very
-/// repetitive), where inflating and hashing a MiB take 0.5 ms.
+/// way.) The price is a deflate of 256 KiB per large blob, about 4 ms, text or noise,
+/// where inflating and hashing a MiB take 0.5 ms: a mirror of 1.2 MiB blobs from a local
+/// upstream takes 1.5 to 1.7 times as long for it. (A sample of a whole MiB cost 16 ms,
+/// and that mirror 3.4 to 4.1 times as long.)
 fn incompressible(deflater: &mut Deflater, zbuf: &mut Vec<u8>, blob: &[u8]) -> Result<bool> {
     let sample = blob.get(..SAMPLE).unwrap_or(blob);
     zbuf.resize(compress_bound(sample.len()), 0);
@@ -1117,12 +1119,12 @@ mod tests {
         &pack[us(rec.offset)..us(rec.offset + rec.entry_len)]
     }
 
-    /// A blob on the 5% line whose content changes right after its first MiB: a MiB that
-    /// deflates to about 96%, then zeros. Its encoding is chosen from that first MiB alone,
-    /// so however the input is cut into writes, the output is one and the same pack. (The
-    /// choice used to be made from as much content as the writes had produced once a MiB
-    /// was out: a first write of 57,000 bytes moved that point tens of kilobytes into the
-    /// zeros, and the blob stored after one cut was kept deflated after another.)
+    /// A blob on the 5% line whose content changes right after its first 256 KiB: those
+    /// deflate to about 96%, then come zeros. Its encoding is chosen from them alone, so
+    /// however the input is cut into writes, the output is one and the same pack. (The
+    /// choice used to be made from as much content as the writes had produced once the
+    /// sample was in: a first write of 57,000 bytes moved that point tens of kilobytes into
+    /// the zeros, and the blob stored after one cut was kept deflated after another.)
     #[test]
     fn the_encoding_does_not_depend_on_how_the_input_is_cut() {
         let r = repo("cut");
@@ -1131,11 +1133,11 @@ mod tests {
             content.extend_from_slice(&noise(3900, 2 * content.len() as u64 + 1));
             content.extend_from_slice(&[0u8; 196]);
         }
-        content.extend_from_slice(&[0u8; 128 << 10]);
+        content.extend_from_slice(&vec![0u8; us(STORED_MIN)]);
         let first = deflate(&content[..SAMPLE]).len();
         assert!(
             first * 100 >= SAMPLE * 95,
-            "the first MiB deflates to {first}"
+            "the first 256 KiB deflate to {first}"
         );
         assert!(deflate(&content[..SAMPLE + 60_000]).len() * 100 < (SAMPLE + 60_000) * 95);
         let oid = blob_id(&content);
@@ -1163,13 +1165,13 @@ mod tests {
     }
 
     /// One blob, whole in one pack and a delta's result in another: one encoding, and the
-    /// same entry bytes. Its first MiB is incompressible and the rest zeros, so it is
-    /// stored. (A delta's result used to be judged by all of it: half its size deflated,
-    /// it was written deflated.)
+    /// same entry bytes. Its first 256 KiB are noise and the rest zeros, so it is stored.
+    /// (A delta's result used to be judged by all of it: a fifth of its size deflated, it
+    /// was written deflated.)
     #[test]
     fn a_blob_is_encoded_alike_whole_or_from_a_delta() {
         let r = repo("alike");
-        let base = [noise(SAMPLE, 11), vec![0u8; SAMPLE]].concat();
+        let base = [noise(SAMPLE, 11), vec![0u8; us(STORED_MIN)]].concat();
         let tail = b"and a last line\n";
         let top = [base.clone(), tail.to_vec()].concat();
         let (b, t) = (blob_id(&base), blob_id(&top));
@@ -1222,7 +1224,7 @@ mod tests {
         feed_in_pieces(&mut sink, &level0, &[4096]);
         check_output(&r, &sink.finish().unwrap(), &r.blobs);
 
-        let large = noise(SAMPLE + 5, 21);
+        let large = noise(us(STORED_MIN) + 5, 21);
         let small = b"a small blob\n".to_vec();
         let tail = b"and more\n";
         let top = [small.clone(), tail.to_vec()].concat();

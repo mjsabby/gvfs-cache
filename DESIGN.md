@@ -541,9 +541,9 @@ store/
 
 **Blob packs** (`src/blobs.rs`) hold whole entries only, so any entry is served by
 splicing its own bytes. An entry keeps the upstream's zlib stream untouched, unless the
-blob is at least 1 MiB and its first MiB compresses by less than 5%: then it is rewritten
+blob is at least 1 MiB and its first 256 KiB compress by less than 5%: then it is rewritten
 as deflate *stored* blocks (65,535 content bytes each, 5-byte headers, 0.008% overhead). The
-copier measures that itself: it deflates the first MiB at git's default level (about 15 ms
+copier measures that itself: it deflates those 256 KiB at git's default level (about 4 ms
 per blob of 1 MiB or more), so the choice depends on the blob's content alone, and a blob
 is encoded alike however the upstream compressed it, whole or as a delta, and in whatever
 pieces it arrived. A **segment** record is `id | pack u32 | offset (48 bits) | header
