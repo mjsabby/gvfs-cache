@@ -27,6 +27,9 @@ impl Request {
 pub enum Reply {
     /// A response: its status (with any more header lines) and its body.
     Whole(String, Vec<u8>),
+    /// A response that breaks off: the head promises the whole body, of which this many
+    /// bytes arrive before the connection closes.
+    Cut(String, Vec<u8>, usize),
     /// The connection closes without an answer.
     Close,
 }
@@ -93,14 +96,22 @@ fn connection(mut conn: std::net::TcpStream, answer: &dyn Fn(&Request) -> Reply)
         }
         request.body = buf[end..end + len].to_vec();
         buf.drain(..end + len);
-        let Reply::Whole(status, body) = answer(&request) else {
-            return;
+        let (status, body, sent) = match answer(&request) {
+            Reply::Whole(status, body) => {
+                let sent = body.len();
+                (status, body, sent)
+            }
+            Reply::Cut(status, body, sent) => (status, body, sent),
+            Reply::Close => return,
         };
         let head = format!(
             "HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n",
             body.len()
         );
-        if conn.write_all(head.as_bytes()).is_err() || conn.write_all(&body).is_err() {
+        if conn.write_all(head.as_bytes()).is_err() || conn.write_all(&body[..sent]).is_err() {
+            return;
+        }
+        if sent < body.len() {
             return;
         }
     }

@@ -15,6 +15,9 @@ pub enum ErrorKind {
     Conflict,
     /// The object does not exist.
     NotFound,
+    /// A response did not arrive whole (its connection failed or closed before the body's
+    /// end): the request can be made again.
+    Incomplete,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
