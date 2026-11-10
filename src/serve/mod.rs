@@ -545,8 +545,9 @@ fn raise_fd_limit() -> usize {
     usize::try_from(limit).unwrap_or(usize::MAX)
 }
 
-/// Descriptors kept for the edge's own use: open slabs, block cache and proxy files, the
-/// store's and the upstream's connections, pipes of local `git` processes.
+/// Descriptors kept for the edge's own use: open slabs, the memfds of L0 slabs and of
+/// the packs plans repack (one per boundary a warm client asks from), block cache and
+/// proxy files, the store's and the upstream's connections, pipes of local `git` processes.
 fn fd_reserve(fds: usize) -> usize {
     (fds / 16).max(4096)
 }

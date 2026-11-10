@@ -92,7 +92,7 @@ impl Shared {
                 bytes: crate::slab::Region::Heap(v),
             };
         }
-        match Shared::spill(&v) {
+        match crate::slab::memfd(c"gvfs-plan", &v) {
             Ok((file, map)) => Shared {
                 file: Some(file),
                 bytes: crate::slab::Region::Map(map),
@@ -102,20 +102,6 @@ impl Shared {
                 bytes: crate::slab::Region::Heap(v),
             },
         }
-    }
-
-    fn spill(v: &[u8]) -> std::io::Result<(std::fs::File, gvfs_mmap::Map)> {
-        use std::io::Write;
-        let fd =
-            nix::sys::memfd::memfd_create(c"gvfs-plan", nix::sys::memfd::MFdFlags::MFD_CLOEXEC)
-                .map_err(std::io::Error::from)?;
-        let mut file = std::fs::File::from(fd);
-        file.write_all(v)?;
-        let map = gvfs_mmap::Map::open(&file, false)?;
-        if map.bytes() != v {
-            return Err(std::io::ErrorKind::InvalidData.into());
-        }
-        Ok((file, map))
     }
 
     pub fn bytes(&self) -> &[u8] {

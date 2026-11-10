@@ -299,8 +299,9 @@ indexes when `blobs.bin` changes, and downloads that died with their process. Wi
 arenas, seal the allocator, and listen.
 
 **The live tip (L0).** The pipeline seals a slab every 15 minutes; L0 bridges the minutes
-since the last one, with one heap slab per move of the branch. The live loop runs every
-`--poll-ms`:
+since the last one, with one memory slab per move of the branch (its index on the heap,
+its pack in a memfd once it is 16 KiB, so that it too is sent with `sendfile(2)`). The
+live loop runs every `--poll-ms`:
 
 * A moved branch: `ingest_git_delta(newest boundary, HEAD)` fetches only the new commits,
   repacked into one more L0 slab and stamped from its commits. This is the same code the
@@ -357,7 +358,11 @@ per sealed day and week, that rollup whole):
   SearchGold): 1.11-1.53× the ideal instead of 1.00-1.02×. `168h` delivers weekly deltas
   only (1.04-1.31×, packs bounded by a week's worth); `never` keeps exact covers.
 * A cover of several slabs is repacked into one, so the response is about the size of one
-  upstream fetch of exactly that range.
+  upstream fetch of exactly that range. The repacked pack is kept in a memfd (when it is
+  16 KiB or more), so it leaves through `sendfile(2)` as a stored slab does. Written from
+  the heap it cost 2.6 times the CPU: 392 µs against 151 µs for a 739 KB pack (SearchGold,
+  a client one day behind), over half of it the kernel zeroing the socket pages the bytes
+  were then copied into.
 * Every response names the interval it covers (`X-GVFS-Pack-Start`/`X-GVFS-Pack-End`),
   so an interval hook (fable's `client-prefetch`) can unlink the local packs it subsumes.
 * An up-to-date client (cursor at or past the tip's stamp) gets an empty `GPRE` stream.
@@ -741,7 +746,7 @@ not the hot path's).
 | Edge range-reads slabs from S3/Blob (coalesced HTTP `Range`) | The edge hydrates slabs to local disk (`--cache-dir`) and maps them | Local reads cost microseconds: a deltified tree GET is 190 µs p50. The edge restarts from the store at any time. The cluster layout keeps range reads possible behind the same `Slab` type. |
 | Pack timestamps are creation times; warm clients get every slab newer than their cursor; rollups replace the slabs they fold | Timestamps are derived from commits; warm clients get the exact cover from their cursor (retained finer slabs, cascading rollups), repacked into one pack | An edge's L0 slab and the sealed slab that later ends at the same commit get the same stamp, so nothing is sent twice. Measured over 14 days of SearchGold, every client pattern gets within 2% of one upstream fetch of exactly what it lacks, against 2.2-2.5× before. |
 | Superset tombstoning: every rollup reaches clients whole, and a client hook unlinks the packs it subsumes | Only sealed days and weeks reach a client whole, once (`--superset-tier`); the response carries its interval for a hook, and stock `git multi-pack-index expire` does the unlinking | Stock clients (gvfs-helper, VFS for Git, Scalar) run no hook, but their maintenance expires packs that newer packs duplicate. Days and weeks suffice for daily maintenance; finer supersets would re-send each hour up to five times (fable: 1.9-5.3× the ideal). |
-| Tokio/Axum/Hyper, `DashMap` memtable for L0 | tokio with the in-house HTTP/1.1 and `sendfile` (no Axum or hyper); L0 = heap slabs (one per push) in the same format as sealed slabs | hyper cannot `sendfile`: a cold clone cost 20× the CPU per GB, plus 5-6 allocations per request (rule 3). tokio itself measured 24-38% less CPU per small request than thread-per-request, and slow clients hold no thread (REPORT.md §14). One code path serves every slab. |
+| Tokio/Axum/Hyper, `DashMap` memtable for L0 | tokio with the in-house HTTP/1.1 and `sendfile` (no Axum or hyper); L0 = memory slabs (one per push) in the same format as sealed slabs | hyper cannot `sendfile`: a cold clone cost 20× the CPU per GB, plus 5-6 allocations per request (rule 3). tokio itself measured 24-38% less CPU per small request than thread-per-request, and slow clients hold no thread (REPORT.md §14). One code path serves every slab. |
 | Parse every `Git-hfs 1.0` pointer during ingest; optional `.hfs` sidecar (content id + real size) | Ingest does not parse pointers. `inspect slab` uses the zero-allocation parser to report pointer coverage | No GVFS endpoint consumes real content sizes (`/gvfs/sizes` returns git object sizes), so the sidecar would be unused work on the critical path. |
 
 ## Protocol facts the implementation relies on
