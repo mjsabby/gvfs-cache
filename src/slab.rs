@@ -628,13 +628,19 @@ impl Slab {
     #[inline]
     pub fn preload(&self, oid: &Oid) {
         if let Some(slot) = self.mphf().slot(oid) {
-            let at = us(u64::from(slot))
-                .saturating_mul(REC_LEN)
-                .saturating_add(self.records_at);
-            let b = self.index.bytes();
-            crate::util::prefetch(b, at);
-            crate::util::prefetch(b, at.saturating_add(REC_LEN.saturating_sub(1)));
+            self.preload_rec(slot);
         }
+    }
+
+    /// Starts loading the record at `slot` (40 bytes: it may lie on two cache lines).
+    #[inline]
+    pub fn preload_rec(&self, slot: u32) {
+        let at = us(u64::from(slot))
+            .saturating_mul(REC_LEN)
+            .saturating_add(self.records_at);
+        let b = self.index.bytes();
+        crate::util::prefetch(b, at);
+        crate::util::prefetch(b, at.saturating_add(REC_LEN.saturating_sub(1)));
     }
 
     /// The slot holding `oid`, if this slab has it.

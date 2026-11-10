@@ -340,9 +340,18 @@ impl ObjectSplice {
         grow: bool,
         max: usize,
     ) -> Result<Option<u32>> {
+        /// How far ahead of the entry being laid out another's record and header are
+        /// asked for: each is a cache miss, and one entry at a time they wait in turn.
+        const AHEAD: usize = 16;
         let end = self.refs.len().min(self.next.saturating_add(max));
         let mut out = self.out;
         for i in self.next..end {
+            if let Some(&(k, offset, slot)) = self.refs.get(i.saturating_add(AHEAD))
+                && let Some(slab) = slabs.get(usize::from(k))
+            {
+                slab.preload_rec(slot);
+                crate::util::prefetch(slab.pack(), us(offset));
+            }
             let (k, offset, slot) = *self.refs.get(i).ctx("ref")?;
             let slab = slabs.get(usize::from(k)).ctx("slab out of range")?;
             let rec: Rec = slab.rec(slot).ctx("record")?;
@@ -355,14 +364,21 @@ impl ObjectSplice {
             if h.kind == OBJ_OFS_DELTA {
                 // The base precedes the delta in its slab, so it was emitted before it -
                 // unless the same object was already planned from another slab, in which
-                // case the delta names its base by id instead.
+                // case the delta names its base by id instead. A pack writes a base right
+                // before its delta more often than not, so the ref before this one is
+                // looked at first; the others are searched.
                 let base_offset = offset.saturating_sub(h.base_distance);
-                let emitted = self
-                    .refs
-                    .get(..i)
-                    .unwrap_or(&[])
-                    .binary_search_by(|r| (r.0, r.1).cmp(&(k, base_offset)))
-                    .ok();
+                let is_base = |r: &(u16, u64, u32)| (r.0, r.1) == (k, base_offset);
+                let before = i
+                    .checked_sub(1)
+                    .filter(|&j| self.refs.get(j).is_some_and(is_base));
+                let emitted = before.or_else(|| {
+                    self.refs
+                        .get(..i)
+                        .unwrap_or(&[])
+                        .binary_search_by(|r| (r.0, r.1).cmp(&(k, base_offset)))
+                        .ok()
+                });
                 let hdr = match emitted {
                     Some(j) => {
                         let dist = out.saturating_sub(*self.out_at.get(j).ctx("base offset")?);
