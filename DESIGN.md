@@ -118,8 +118,13 @@ The indexer is a faster `git index-pack`:
 * **Pass 2, resolve families.** Deltas are linked to their bases. OFS deltas link by
   offset. REF deltas link through a sorted `(base id, entry)` waiter table with a 64K
   fanout, because ADO sends *only* REF_DELTA entries, chained up to depth 50. Workers take
-  whole families from a shared counter and walk each depth first with one content buffer
-  per depth.
+  whole families from a shared counter and walk each depth first. A worker holds an
+  object's content only while the object has deltas left to resolve, so a chain of any
+  depth needs two buffers, and it frees what a family of large objects needed (beyond
+  4 MiB) when the family is done. On SearchGold's baseline (9.25M objects, trees up to
+  5.3 MB in chains 50 deep) the indexer holds 2.1 GiB of anonymous memory at 32 threads
+  and 1.7 GiB at one, nearly all of it tables that grow with the object count; with a
+  buffer per depth, kept, it held 8.1 GiB at 32 threads.
 * The index build drops duplicate entries (the first copy wins) and builds the MPHF
   partitions in parallel.
 
