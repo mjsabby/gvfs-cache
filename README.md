@@ -170,6 +170,9 @@ manifest lists stay for `--gc-grace-secs` (default 2 h) after a run first finds 
   deleted by the first run at least two hours later. An edge that has read a manifest
   has that long to fetch what it lists, and so has another run that started from it.
 * What a crashed run uploaded is noted by the next run, and deleted two hours after that.
+  So is what a run that was killed in the middle of an upload leaves in a directory
+  store: the part of the file it had written, under a temporary name
+  (`.<name>.tmp-<pid>-<n>`).
 * A file that is uploaded again meanwhile (another run making the same slab) has its two
   hours again, in which that run lists it; a file that is listed again is not deleted.
 

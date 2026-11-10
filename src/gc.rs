@@ -32,6 +32,16 @@
 //! an upload to a directory left a file of that name as it was: the manifest then listed
 //! a slab that was gone, both runs having exited 0.)
 //!
+//! A directory store has one more kind of file that nothing lists: what a writer that was
+//! killed leaves under the temporary name it wrote to ([`crate::fsutil::temp_path`]; for
+//! a run killed while it copied a baseline, what it had copied of it). A survey sees
+//! these too ([`Store::list_temps`]), beside the objects and in the store's own
+//! directory, where it looks at nothing else, and they go through the same notes. One
+//! that is being written has another version at each pass, by its length, and is never
+//! due; a dead one keeps its version and goes a grace period after the pass that first
+//! saw it. (No listing has a name that begins with a dot, so no pass saw them: they
+//! stayed for good.) An object store has none.
+//!
 //! `gc.bin` is replaced by compare-and-swap, once per pass that changed it. A pass that
 //! loses the swap, or cannot write, has deleted only what was due, and what it noted is
 //! noted by the next pass: later, never sooner. A pass that cannot read `gc.bin` ends
@@ -184,10 +194,11 @@ fn referenced(store: &Store, m: &Manifest) -> Result<HashSet<String>> {
 
 impl Pass {
     /// Reads `gc.bin` and lists the store, whose manifest is `m`, at `now` (Unix
-    /// seconds, the clock the notes are in). Of the objects that no listing references,
-    /// those noted at least `grace` seconds ago are due; the others are noted, or stay
-    /// so. A note from a clock ahead of this one counts from now. A `gc.bin` or a prefix
-    /// that cannot be read ends the pass.
+    /// seconds, the clock the notes are in): its objects, and the temp files of a
+    /// directory store's writers. Of those that no listing references, the ones noted
+    /// at least `grace` seconds ago are due; the others are noted, or stay so. A note
+    /// from a clock ahead of this one counts from now. A `gc.bin` or a prefix that
+    /// cannot be read ends the pass.
     pub fn survey(store: &Store, m: &Manifest, now: u64, grace: u64) -> Result<Pass> {
         let referenced = referenced(store, m)?;
         let (was, undecoded) = match store.get(GC_KEY)? {
@@ -210,13 +221,22 @@ impl Pass {
                 .flat_map(|(_, entries)| entries)
                 .map(|e| (e.key.as_str(), e))
                 .collect();
-            let prefixes: &[&str] = if m.separate_blobs() {
-                &["slabs/", "blobs/"]
+            // Where a pass looks, and whether at the objects there: of the store's own
+            // directory, which holds the listings, only at what their writers left.
+            let places: &[(&str, bool)] = if m.separate_blobs() {
+                &[("slabs/", true), ("blobs/", true), ("", false)]
             } else {
-                &["slabs/"]
+                &[("slabs/", true), ("", false)]
             };
-            for prefix in prefixes {
-                for obj in store.list(prefix).ctx(&format!("listing {prefix}"))? {
+            for &(prefix, objects) in places {
+                let what = format!("listing {}", if objects { prefix } else { "the store" });
+                let mut found = if objects {
+                    store.list(prefix).ctx(&what)?
+                } else {
+                    Vec::new()
+                };
+                found.extend(store.list_temps(prefix).ctx(&what)?);
+                for obj in found {
                     if referenced.contains(&obj.key) {
                         continue;
                     }
@@ -236,7 +256,7 @@ impl Pass {
                         }
                         // Seen unlisted for the first time, or another object than the
                         // one noted: written again since, by a run that may be about to
-                        // list it.
+                        // list it; or a temp file that is still being written.
                         _ => {
                             noted = noted.saturating_add(1);
                             kept.push(Unlisted {
@@ -324,7 +344,7 @@ impl Pass {
         if swept.replaced > 0 {
             crate::log!(
                 "gc: {} files that were due are not the ones listed any more (uploaded \
-                 again since): left",
+                 again since, or still being written): left",
                 swept.replaced
             );
         }
@@ -697,6 +717,301 @@ mod tests {
         assert_eq!((exist(&listed), exist(&dropped)), (3, 0));
         assert_eq!(noted(&store), []);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The files in the store's directory `sub` whose names begin with a dot, as keys.
+    fn dot_files(dir: &Path, sub: &str) -> Vec<String> {
+        let mut found: Vec<String> = std::fs::read_dir(dir.join(sub))
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.file_type().unwrap().is_file())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with('.'))
+            .map(|name| format!("{sub}{name}"))
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// The key of the file `path` in the store in `dir`.
+    fn key_of(dir: &Path, path: &Path) -> String {
+        let key = path.strip_prefix(dir).unwrap();
+        key.to_string_lossy().into_owned()
+    }
+
+    /// A streamed upload of `key` that has written `bytes`, left as a process that is
+    /// killed leaves it. Returns the key of its temp file.
+    fn killed_stream(store: &Store, dir: &Path, key: &str, bytes: &[u8]) -> String {
+        let sub = format!("{}/", key.rsplit_once('/').unwrap().0);
+        let before = dot_files(dir, &sub);
+        let mut w = store.writer(key).unwrap();
+        std::io::Write::write_all(&mut w, bytes).unwrap();
+        std::io::Write::flush(&mut w).unwrap();
+        std::mem::forget(w);
+        let mut new = dot_files(dir, &sub);
+        new.retain(|f| !before.contains(f));
+        assert_eq!(new.len(), 1);
+        new.remove(0)
+    }
+
+    /// What killed writers leave in a directory store goes as any file that nothing lists:
+    /// noted by the first pass that sees it, there a second short of the grace period,
+    /// deleted by the pass a grace period on. So in `slabs/`, in `blobs/` and in the
+    /// store's own directory, where a pass touches nothing else. (No listing has a name
+    /// that begins with a dot, so no pass saw them and they stayed for good: a baseline's
+    /// bytes for each run killed while it uploaded one.) Dot-files of other names are not
+    /// this program's and stay, and [`Store::list`] answers as it did.
+    #[test]
+    fn what_a_killed_writer_leaves_goes_as_any_file_that_nothing_lists() {
+        use crate::blobs::{BLOBS_KEY, BlobManifest, PackMeta, pack_key};
+        use crate::manifest::MANIFEST_KEY;
+        let (store, dir) = store("temps");
+        let base = meta(Tier::Base, 100);
+        let m = Manifest {
+            flags: crate::manifest::FLAG_SEPARATE_BLOBS,
+            ..manifest(&base, &[])
+        };
+        let bm = BlobManifest {
+            generation: 1,
+            packs: vec![PackMeta {
+                id: "p1".to_string(),
+                len: 4,
+                sha: [0; 20],
+                blobs: 1,
+            }],
+            ..BlobManifest::default()
+        };
+        let mut objects = vec![base.sizes_key(), pack_key("p1")];
+        objects.extend(files(&base));
+        for key in &objects {
+            upload(&store, &dir, key);
+        }
+        // The store's own objects, one of them none of this module's.
+        let own = [
+            (BLOBS_KEY, bm.encode()),
+            ("claims.bin", b"another's".to_vec()),
+            (MANIFEST_KEY, m.encode()),
+        ];
+        for (key, bytes) in &own {
+            store.put(key, bytes, Cond::None).unwrap();
+        }
+
+        // Killed: a blob pack and a sizes table as they streamed in, a slab's pack
+        // between its link and its rename, the manifest and `blobs.bin` as they were
+        // replaced.
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let pack = work.join("h1.pack");
+        std::fs::write(&pack, [9u8; 3000]).unwrap();
+        let slab = dir.join("slabs/h1-95-0123456789abcdef.pack");
+        let (manifest_bin, blobs_bin) = (dir.join(MANIFEST_KEY), dir.join(BLOBS_KEY));
+        let mut temps = vec![
+            killed_stream(&store, &dir, &pack_key("p2"), &[7u8; 5000]),
+            killed_stream(
+                &store,
+                &dir,
+                "slabs/h1-95-0123456789abcdef.sizes",
+                &[8u8; 40],
+            ),
+            key_of(&dir, &crate::fsutil::stage(&pack, &slab).unwrap()),
+            key_of(&dir, &crate::fsutil::temp_path(&manifest_bin)),
+            key_of(&dir, &crate::fsutil::temp_path(&blobs_bin)),
+        ];
+        for key in temps.iter().skip(3) {
+            std::fs::write(dir.join(key), b"half of it").unwrap();
+        }
+        temps.sort();
+        // Not this program's: other names that begin with a dot, a directory.
+        let others = [
+            ".manifest.bin.tmp-1",
+            ".stray",
+            "blobs/.nfs000000000001",
+            "slabs/..tmp-1-2",
+            "slabs/.hidden",
+            "slabs/.x.pack.tmp-1-2.bak",
+            "slabs/.x.pack.tmp-12",
+            "slabs/.x.pack.tmp-12-",
+            "slabs/.x.pack.tmp-a-1",
+            "slabs/.x.pack.tmp1-2",
+        ];
+        for other in others {
+            std::fs::write(dir.join(other), b"not ours").unwrap();
+        }
+        std::fs::create_dir(dir.join("slabs/.d.pack.tmp-1-2")).unwrap();
+
+        let there = |keys: &[String]| keys.iter().filter(|key| dir.join(key).exists()).count();
+        let listed = |prefix: &str| -> Vec<String> {
+            let listing = store.list(prefix).unwrap();
+            listing.into_iter().map(|o| o.key).collect()
+        };
+        let pass = |now: u64| collect(&store, &m, now, GRACE).unwrap();
+
+        assert_eq!(pass(T), swept(5, 0, 0));
+        let at = |since: u64| -> Vec<(String, u64)> {
+            temps.iter().map(|key| (key.clone(), since)).collect()
+        };
+        assert_eq!(noted(&store), at(T));
+        assert_eq!(pass(T + GRACE - 1), swept(0, 0, 0));
+        assert_eq!(there(&temps), 5);
+        // No listing has them: what an edge, the mirror and the cache pruning are told.
+        assert_eq!(listed("blobs/"), [pack_key("p1")]);
+        let mut slabs = files(&base).to_vec();
+        slabs.push(base.sizes_key());
+        slabs.sort();
+        assert_eq!(listed("slabs/"), slabs);
+        assert_eq!(listed(""), [BLOBS_KEY, "claims.bin", GC_KEY, MANIFEST_KEY]);
+        assert!(crate::separate::lost(&bm, &store.list("blobs/").unwrap()).is_empty());
+
+        assert_eq!(pass(T + GRACE), swept(0, 5, 0));
+        assert_eq!(there(&temps), 0);
+        assert_eq!(noted(&store), []);
+        // Everything else is as it was.
+        for (key, bytes) in &own {
+            assert!(std::fs::read(dir.join(key)).unwrap() == *bytes, "{key}");
+        }
+        assert_eq!(there(&objects), objects.len());
+        let mut left = dot_files(&dir, "");
+        left.extend(dot_files(&dir, "blobs/"));
+        left.extend(dot_files(&dir, "slabs/"));
+        let mut kept = vec![".lock".to_string()];
+        kept.extend(others.map(String::from));
+        assert_eq!(left, kept);
+        assert!(dir.join("slabs/.d.pack.tmp-1-2").is_dir());
+        assert_eq!(std::fs::read(&pack).unwrap(), [9u8; 3000]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An upload in flight is not a dead one. Its temp file is another at every pass, by
+    /// its length, so each pass notes it anew and none finds it due, however long the
+    /// upload takes. And a temp file that a pass does find due, its writer having
+    /// written nothing for a grace period, is deleted only as it was listed: one that
+    /// has grown since stays, and one that its writer has renamed into place since is
+    /// gone, which is no error.
+    #[test]
+    fn a_temp_file_that_is_being_written_is_not_deleted() {
+        use std::io::Write;
+        let (store, dir) = store("in-flight");
+        let base = meta(Tier::Base, 100);
+        for key in files(&base) {
+            upload(&store, &dir, &key);
+        }
+        let m = manifest(&base, &[]);
+        let pass = |now: u64| collect(&store, &m, now, GRACE).unwrap();
+        let key = "slabs/h1-95-0123456789abcdef.pack";
+        let mut stream = store.writer(key).unwrap();
+        for round in 0..6 {
+            stream.write_all(b"more of it").unwrap();
+            stream.flush().unwrap();
+            assert_eq!(pass(T + round * GRACE), swept(1, 0, 0));
+        }
+        let temp = dot_files(&dir, "slabs/").remove(0);
+        assert_eq!(noted(&store), [(temp.clone(), T + 5 * GRACE)]);
+
+        let listed = Pass::survey(&store, &m, T + 6 * GRACE, GRACE).unwrap();
+        assert_eq!(listed.due().collect::<Vec<_>>(), [temp.as_str()]);
+        stream.write_all(b", and more").unwrap();
+        stream.flush().unwrap();
+        assert_eq!(listed.sweep(&store).unwrap(), swept(0, 0, 1));
+        assert!(dir.join(&temp).exists());
+
+        assert_eq!(pass(T + 7 * GRACE), swept(1, 0, 0));
+        let listed = Pass::survey(&store, &m, T + 8 * GRACE, GRACE).unwrap();
+        assert_eq!(listed.due().collect::<Vec<_>>(), [temp.as_str()]);
+        stream.finish().unwrap();
+        assert_eq!(listed.sweep(&store).unwrap(), swept(0, 1, 0));
+        // The upload is whole, and from now on a file as any other that nothing lists.
+        assert_eq!(std::fs::read(dir.join(key)).unwrap().len(), 70);
+        assert!(dot_files(&dir, "slabs/").is_empty());
+        assert_eq!(pass(T + 9 * GRACE), swept(1, 0, 0));
+        assert_eq!(noted(&store), [(key.to_string(), T + 9 * GRACE)]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An upload that is a hard link has a temp name too, between the link and the
+    /// rename, and a process killed then leaves the file it was uploading a second name.
+    /// The name goes as any temp file. The file stays for whoever else has it: here the
+    /// store, under a key that the manifest lists, and the work directory it came from.
+    #[test]
+    fn a_staged_link_goes_and_the_file_it_links_stays() {
+        use std::os::unix::fs::MetadataExt;
+        let (store, dir) = store("staged");
+        let base = meta(Tier::Base, 100);
+        let m = manifest(&base, &[]);
+        let work = dir.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let src = work.join("base.pack");
+        std::fs::write(&src, b"the baseline's pack").unwrap();
+        store.upload_file(&base.pack_key(), &src).unwrap();
+        upload(&store, &dir, &base.index_key());
+        let pack = dir.join(base.pack_key());
+
+        let rollup = dir.join("slabs/h1-95-0123456789abcdef.pack");
+        let temp = crate::fsutil::stage(&src, &rollup).unwrap();
+        let inode = |path: &Path| std::fs::metadata(path).unwrap().ino();
+        assert!(inode(&temp) == inode(&pack) && inode(&temp) == inode(&src));
+        let listed = || -> Vec<(String, String)> {
+            let listing = store.list("slabs/").unwrap();
+            listing.into_iter().map(|o| (o.key, o.version)).collect()
+        };
+        let before = listed();
+        assert_eq!(before.len(), 2);
+
+        let pass = |now: u64| collect(&store, &m, now, GRACE).unwrap();
+        assert_eq!(pass(T), swept(1, 0, 0));
+        assert_eq!(noted(&store), [(key_of(&dir, &temp), T)]);
+        assert_eq!(pass(T + GRACE - 1), swept(0, 0, 0));
+        assert!(temp.exists());
+        assert_eq!(pass(T + GRACE), swept(0, 1, 0));
+        assert!(!temp.exists());
+        // The pack is the file it was: to the listing, to a pass, to its readers.
+        assert_eq!(listed(), before);
+        assert_eq!(pass(T + 2 * GRACE), swept(0, 0, 0));
+        assert_eq!(std::fs::read(&pack).unwrap(), b"the baseline's pack");
+        assert_eq!(std::fs::read(&src).unwrap(), b"the baseline's pack");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An object store has no temp files to list and is not asked for any: a pass asks
+    /// of it what it asked before. A blob with a temp file's name is there a blob as any
+    /// other.
+    #[test]
+    fn an_object_store_is_not_asked_for_temp_files() {
+        let (store, asked, _) = blob_service();
+        let base = meta(Tier::Base, 100);
+        let m = Manifest {
+            flags: crate::manifest::FLAG_SEPARATE_BLOBS,
+            ..manifest(&base, &[])
+        };
+        let put = |key: &str| drop(store.put(key, b"slab", Cond::None).unwrap());
+        files(&base).iter().for_each(|key| put(key));
+        put(&base.sizes_key());
+        asked.lock().unwrap().clear();
+        for dir in ["slabs/", "blobs/", ""] {
+            assert!(store.list_temps(dir).unwrap().is_empty());
+        }
+        assert!(asked.lock().unwrap().is_empty());
+        assert_eq!(collect(&store, &m, T, GRACE).unwrap(), swept(0, 0, 0));
+        let idle = ["GET blobs.bin", "GET gc.bin", "LIST slabs/", "LIST blobs/"];
+        assert_eq!(*asked.lock().unwrap(), idle);
+
+        let named = "slabs/.x.pack.tmp-1-2";
+        put(named);
+        assert_eq!(collect(&store, &m, T, GRACE).unwrap(), swept(1, 0, 0));
+        assert_eq!(noted(&store), [(named.to_string(), T)]);
+        asked.lock().unwrap().clear();
+        assert_eq!(
+            collect(&store, &m, T + GRACE, GRACE).unwrap(),
+            swept(0, 1, 0)
+        );
+        let deleting = [
+            "GET blobs.bin",
+            "GET gc.bin",
+            "LIST slabs/",
+            "LIST blobs/",
+            "DELETE slabs/.x.pack.tmp-1-2",
+            "PUT gc.bin",
+        ];
+        assert_eq!(*asked.lock().unwrap(), deleting);
     }
 
     /// A Blob service on this machine, as much of it as a pass uses: blobs with ETags,
