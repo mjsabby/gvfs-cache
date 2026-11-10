@@ -229,7 +229,7 @@ Two more tools work on slabs directly:
   (`gvfs_not_found_total`), 503s for want of an arena or growth budget (`gvfs_busy_total`),
   errors, and the bytes and objects sent;
 * **the store:** slabs, L0 slabs, L0 ingests, manifest loads and the manifest's generation,
-  and the polls of the store and the upstream that failed (`gvfs_live_failures_total`: an
+  and the failures to follow the store or the upstream (`gvfs_live_failures_total`: an
   edge whose count keeps rising is falling behind);
 * **allocations:** `gvfs_alloc_hot_path_total` (and its bytes), which must stay 0, and every
   allocation since startup, anywhere (`gvfs_alloc_post_seal_total`);

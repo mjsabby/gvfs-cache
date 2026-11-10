@@ -350,6 +350,8 @@ pub fn run(o: Options) -> Result<()> {
         l0: Vec::new(),
         last_head: Oid::ZERO,
         retry: Retry::default(),
+        manifest_retry: Retry::default(),
+        blobs_retry: Retry::default(),
         poll,
         generation: 0,
         supersets,
@@ -397,7 +399,8 @@ pub fn run(o: Options) -> Result<()> {
             std::thread::sleep(Duration::from_secs(1));
         }
     }
-    live.open_manifest(&manifest)?;
+    let (sealed, opened) = live.open_manifest(&manifest)?;
+    (live.sealed, live.opened) = (sealed, opened);
     live.prune_slabs(&manifest);
     let first = live.snapshot(manifest, etag);
     let proxy = match (&upstream_spec, separate) {
@@ -534,10 +537,7 @@ pub fn run(o: Options) -> Result<()> {
     // The live loop runs on this thread for the life of the process.
     loop {
         std::thread::sleep(poll);
-        if let Err(e) = live.tick(&ctx, &warmer) {
-            ctx.metrics.live_failures.fetch_add(1, Ordering::Relaxed);
-            crate::log!("serve: live sync failed: {e}");
-        }
+        live.tick(&ctx, &warmer);
     }
 }
 
@@ -898,6 +898,17 @@ impl LiveTip {
         &self.retracted
     }
 
+    /// What the tip knows of the L0 slabs, to put back with [`LiveTip::restore`] when a
+    /// move of theirs fails after [`LiveTip::advance`] has noted it.
+    fn state(&self) -> (HashMap<Oid, u64>, Vec<(u64, u64)>) {
+        (self.stamps.clone(), self.retracted.clone())
+    }
+
+    fn restore(&mut self, (stamps, retracted): (HashMap<Oid, u64>, Vec<(u64, u64)>)) {
+        self.stamps = stamps;
+        self.retracted = retracted;
+    }
+
     /// The L0 slab of `raw`, the commits `head` adds after boundary `from`: stamped from
     /// what the pipeline will know too, then repacked.
     fn slab(
@@ -1035,40 +1046,68 @@ fn keep_l0(end_ts: u64, max_ts: u64, newest: u64) -> bool {
     end_ts > max_ts || end_ts.saturating_add(L0_RETAIN) >= newest
 }
 
-/// The longest wait before a head whose ingest failed is tried again.
+/// The longest wait before something that failed is tried again.
 const RETRY_MAX: Duration = Duration::from_secs(60);
 
-/// When a head whose ingest failed is tried again. Each attempt fetches what the branch
-/// added once more, so a failure that repeats (a pack this edge cannot index, an object
-/// the upstream lacks) must not cost the upstream a fetch per poll: the wait starts at the
-/// poll interval and doubles with each failure, up to [`RETRY_MAX`]. Another head, or
-/// another manifest under it, is tried at once.
-#[derive(Default)]
-struct Retry {
-    head: Oid,
+/// When something that failed is tried again: an upstream head that could not be
+/// ingested, a manifest that could not be applied. An attempt costs a fetch of what the
+/// branch added, or a download of what the manifest lists, so a failure that repeats (a
+/// pack this edge cannot index, a slab the store lacks, a full disk) must not cost one per
+/// poll: the wait starts at the poll interval and doubles with each failure, up to
+/// [`RETRY_MAX`]. Something else (another head, another manifest) is tried at once.
+struct Retry<K> {
+    key: Option<K>,
     failures: u32,
     wait: Duration,
     at: Option<Instant>,
 }
 
-impl Retry {
-    fn due(&self, head: Oid, now: Instant) -> bool {
-        head != self.head || self.at.is_none_or(|at| now >= at)
+impl<K> Default for Retry<K> {
+    fn default() -> Self {
+        Retry {
+            key: None,
+            failures: 0,
+            wait: Duration::ZERO,
+            at: None,
+        }
+    }
+}
+
+impl<K: PartialEq> Retry<K> {
+    fn due(&self, key: &K, now: Instant) -> bool {
+        self.key.as_ref() != Some(key) || self.at.is_none_or(|at| now >= at)
     }
 
-    /// Notes that ingesting `head` failed at `now`; returns the wait before its next
-    /// attempt.
-    fn failed(&mut self, head: Oid, poll: Duration, now: Instant) -> Duration {
-        if head == self.head && self.at.is_some() {
+    /// Notes that the attempt for `key` failed at `now`; returns the wait before its next.
+    fn failed(&mut self, key: K, poll: Duration, now: Instant) -> Duration {
+        if self.key.as_ref() == Some(&key) {
             self.failures = self.failures.saturating_add(1);
             self.wait = self.wait.saturating_mul(2).min(RETRY_MAX.max(poll));
         } else {
-            self.head = head;
+            self.key = Some(key);
             self.failures = 1;
             self.wait = poll.max(Duration::from_millis(1));
         }
         self.at = now.checked_add(self.wait);
         self.wait
+    }
+
+    /// The outcome of the attempt for `key`: a success forgets the failures before it, a
+    /// failure is told which attempt it was and when the next is.
+    fn note<T>(&mut self, key: K, poll: Duration, what: &str, outcome: Result<T>) -> Result<T> {
+        match outcome {
+            Ok(v) => {
+                *self = Retry::default();
+                Ok(v)
+            }
+            Err(e) => {
+                let wait = self.failed(key, poll, Instant::now());
+                Err(e).ctx(&format!(
+                    "{what} (attempt {}, the next in {wait:?})",
+                    self.failures
+                ))
+            }
+        }
     }
 }
 
@@ -1087,8 +1126,12 @@ struct Live {
     l0: Vec<Arc<Slab>>,
     /// Upstream tip last ingested (or found to bring nothing).
     last_head: Oid,
-    /// When a head whose ingest failed is tried again, and the poll interval it starts from.
-    retry: Retry,
+    /// When a head whose ingest failed is tried again, a manifest that could not be
+    /// applied, a `blobs.bin` that could not be loaded (the last two by etag); and the poll
+    /// interval the waits start from.
+    retry: Retry<Oid>,
+    manifest_retry: Retry<String>,
+    blobs_retry: Retry<String>,
     poll: Duration,
     generation: u64,
     supersets: Option<Tier>,
@@ -1108,10 +1151,20 @@ impl Live {
         let Some((bytes, etag)) = self.store.get(crate::blobs::BLOBS_KEY)? else {
             return Ok(false);
         };
-        if self.blobs.as_ref().is_some_and(|b| b.etag == etag) {
+        if self.blobs.as_ref().is_some_and(|b| b.etag == etag)
+            || !self.blobs_retry.due(&etag, Instant::now())
+        {
             return Ok(false);
         }
-        let bm = crate::blobs::BlobManifest::decode(&bytes).ctx("reading blobs.bin")?;
+        let loaded = self.read_blobs(&bytes, etag.clone());
+        self.blobs_retry
+            .note(etag, self.poll, "loading blobs.bin", loaded)?;
+        Ok(true)
+    }
+
+    /// The `blobs.bin` in `bytes` becomes the loaded one, or nothing changes.
+    fn read_blobs(&mut self, bytes: &[u8], etag: String) -> Result<()> {
+        let bm = crate::blobs::BlobManifest::decode(bytes).ctx("reading blobs.bin")?;
         let set = blobs::BlobSet::load(
             &self.store,
             &self.cache_dir.join("blobs"),
@@ -1141,7 +1194,7 @@ impl Live {
         if removed > 0 {
             crate::log!("serve: pruned {removed} segment indexes blobs.bin no longer lists");
         }
-        Ok(true)
+        Ok(())
     }
 
     /// Removes the cached files of slabs `m` does not list (a request on an older view keeps
@@ -1200,8 +1253,11 @@ impl Live {
         }
     }
 
-    /// Opens (hydrating if needed) every slab of `m`; they become the sealed slabs.
-    fn open_manifest(&mut self, m: &Manifest) -> Result<()> {
+    /// Opens (hydrating if needed) every slab of `m`: its slabs in manifest order, and by
+    /// id. They become the sealed slabs once the caller has done everything else that can
+    /// fail.
+    #[allow(clippy::type_complexity)]
+    fn open_manifest(&self, m: &Manifest) -> Result<(Vec<Arc<Slab>>, HashMap<String, Arc<Slab>>)> {
         let mut sealed = Vec::with_capacity(m.slabs().count());
         let mut keep = HashMap::new();
         for meta in m.slabs() {
@@ -1229,9 +1285,7 @@ impl Live {
             keep.insert(meta.id.clone(), slab.clone());
             sealed.push(slab);
         }
-        self.opened = keep;
-        self.sealed = sealed;
-        Ok(())
+        Ok((sealed, keep))
     }
 
     /// A snapshot of the sealed slabs plus the L0 slabs.
@@ -1266,51 +1320,86 @@ impl Live {
         Slab::open(&pack, &index, meta.clone()).ctx(&format!("opening slab {}", meta.id))
     }
 
-    /// One poll: a new manifest, then a moved upstream branch.
-    fn tick(&mut self, ctx: &Ctx, warmer: &Warmer) -> Result<()> {
+    /// One poll: the store, then the upstream branch. Neither needs the other to work: an
+    /// edge that cannot read its store, or cannot apply its manifest, still follows the
+    /// branch, and the reverse.
+    fn tick(&mut self, ctx: &Ctx, warmer: &Warmer) {
+        let failed = |e: crate::util::Error| {
+            ctx.metrics.live_failures.fetch_add(1, Ordering::Relaxed);
+            crate::log!("serve: live sync failed: {e}");
+        };
+        if let Err(e) = self.sync_store(ctx, warmer) {
+            failed(e);
+        }
+        match self.sync_upstream(ctx) {
+            Ok(true) => warmer.offer(ctx.view()),
+            Ok(false) => {}
+            Err(e) => failed(e),
+        }
+    }
+
+    /// Follows the store: a changed `blobs.bin`, then a newer manifest.
+    fn sync_store(&mut self, ctx: &Ctx, warmer: &Warmer) -> Result<()> {
         let view = ctx.view();
         if view.manifest.separate_blobs() && self.load_blobs()? {
             let next = Arc::new(self.snapshot(view.manifest.clone(), view.etag.clone()));
             ctx.publish(next);
         }
         let view = ctx.view();
-        if let Some((bytes, etag)) = self.store.get(MANIFEST_KEY)?
-            && etag != view.etag
-        {
-            let m = Manifest::decode(&bytes)?;
-            let blobs_behind = m.separate_blobs() && self.blobs_generation() < m.blobs_generation;
-            if blobs_behind && self.waiting_for != m.generation {
-                crate::log!(
-                    "serve: manifest generation {} waits for blobs.bin generation {} (have {})",
-                    m.generation,
-                    m.blobs_generation,
-                    self.blobs_generation()
-                );
-                self.waiting_for = m.generation;
-            }
-            if m.generation > view.manifest.generation && !blobs_behind {
-                self.open_manifest(&m)?;
-                self.prune_slabs(&m);
-                self.l0 = self.tip.prune(&self.l0, &view.manifest, &m, &self.sealed)?;
-                let next = self.snapshot(m, etag);
-                crate::log!(
-                    "serve: manifest generation {} ({} slabs, {} L0)",
-                    next.manifest.generation,
-                    next.all.len(),
-                    next.l0_len
-                );
-                ctx.metrics.manifest_loads.fetch_add(1, Ordering::Relaxed);
-                let next = Arc::new(next);
-                ctx.publish(next.clone());
-                warmer.offer(next);
-                // The tip may now be behind the upstream: catch up below.
-                self.last_head = Oid::ZERO;
-                self.retry = Retry::default();
-            }
+        let Some((bytes, etag)) = self.store.get(MANIFEST_KEY).ctx("reading the manifest")? else {
+            return Ok(());
+        };
+        if etag == view.etag || !self.manifest_retry.due(&etag, Instant::now()) {
+            return Ok(());
         }
-        if self.sync_upstream(ctx)? {
-            warmer.offer(ctx.view());
+        let applied = self.apply_manifest(ctx, warmer, &view, &bytes, &etag);
+        self.manifest_retry
+            .note(etag, self.poll, "applying the store's manifest", applied)
+    }
+
+    /// Switches to the manifest in `bytes` if it is newer than `view`'s and its `blobs.bin`
+    /// is loaded. Whatever fails, this edge's slabs stay those of the view it serves: a
+    /// later view is made of them.
+    fn apply_manifest(
+        &mut self,
+        ctx: &Ctx,
+        warmer: &Warmer,
+        view: &View,
+        bytes: &[u8],
+        etag: &str,
+    ) -> Result<()> {
+        let m = Manifest::decode(bytes)?;
+        let blobs_behind = m.separate_blobs() && self.blobs_generation() < m.blobs_generation;
+        if blobs_behind && self.waiting_for != m.generation {
+            crate::log!(
+                "serve: manifest generation {} waits for blobs.bin generation {} (have {})",
+                m.generation,
+                m.blobs_generation,
+                self.blobs_generation()
+            );
+            self.waiting_for = m.generation;
         }
+        if m.generation <= view.manifest.generation || blobs_behind {
+            return Ok(());
+        }
+        let (sealed, opened) = self.open_manifest(&m)?;
+        let l0 = self.tip.prune(&self.l0, &view.manifest, &m, &sealed)?;
+        (self.sealed, self.opened, self.l0) = (sealed, opened, l0);
+        self.prune_slabs(&m);
+        let next = self.snapshot(m, etag.to_string());
+        crate::log!(
+            "serve: manifest generation {} ({} slabs, {} L0)",
+            next.manifest.generation,
+            next.all.len(),
+            next.l0_len
+        );
+        ctx.metrics.manifest_loads.fetch_add(1, Ordering::Relaxed);
+        let next = Arc::new(next);
+        ctx.publish(next.clone());
+        warmer.offer(next);
+        // The tip may now be behind the upstream: the upstream's turn catches up.
+        self.last_head = Oid::ZERO;
+        self.retry = Retry::default();
         Ok(())
     }
 
@@ -1319,52 +1408,39 @@ impl Live {
         let Some(up) = self.upstream.as_mut() else {
             return Ok(false);
         };
-        let head = up.head()?;
+        let head = up.head().ctx("reading the upstream's head")?;
         let view = ctx.view();
-        if head == view.tip || head == self.last_head || !self.retry.due(head, Instant::now()) {
+        if head == view.tip || head == self.last_head || !self.retry.due(&head, Instant::now()) {
             return Ok(false);
         }
-        match self.ingest(ctx, &view, head) {
-            Ok(published) => {
-                self.retry = Retry::default();
-                Ok(published)
-            }
-            Err(e) => {
-                let wait = self.retry.failed(head, self.poll, Instant::now());
-                Err(e).ctx(&format!(
-                    "ingesting {head} (attempt {}, the next in {wait:?})",
-                    self.retry.failures
-                ))
-            }
-        }
+        let ingested = self.ingest(ctx, &view, head);
+        self.retry
+            .note(head, self.poll, &format!("ingesting {head}"), ingested)
     }
 
     /// The L0 slabs follow the upstream branch to `head`. Returns whether a new snapshot
     /// was published.
     fn ingest(&mut self, ctx: &Ctx, view: &View, head: Oid) -> Result<bool> {
-        let Some(up) = self.upstream.as_mut() else {
-            return Ok(false);
+        // What the tip knows of the L0 slabs (their commits' stamps, the boundaries a forced
+        // push took away) changes with them or not at all: a move that fails halfway, its
+        // slabs dropped on paper but still served, is tried again from where it began.
+        let before = self.tip.state();
+        let (moved, dropped) = match self.advance(view, head) {
+            Ok(Some(moved)) => moved,
+            Ok(None) => {
+                self.last_head = head;
+                return Ok(false);
+            }
+            Err(e) => {
+                self.tip.restore(before);
+                return Err(e);
+            }
         };
-        let Some(moved) = self.tip.advance(up, &view.manifest, &self.l0, head)? else {
-            self.last_head = head;
-            return Ok(false);
-        };
-        let dropped: Vec<Arc<Slab>> = self.l0.get(moved.keep..).unwrap_or(&[]).to_vec();
-        if let (Some(slab), true) = (&moved.slab, view.manifest.separate_blobs()) {
-            // Sizes the dropped slabs' tables gave are not known once they go.
-            let known = |b: &Oid| {
-                view.all
-                    .iter()
-                    .filter(|s| !dropped.iter().any(|d| Arc::ptr_eq(d, s)))
-                    .any(|s| s.sizes().is_some_and(|t| t.get(b).is_some()))
-            };
-            self.l0_sizes(slab, &known)?;
-        }
         self.last_head = head;
-        if !dropped.is_empty() {
+        if dropped > 0 {
             crate::log!(
-                "serve: forced push to {head}: dropped {} L0 slabs the branch no longer reaches",
-                dropped.len()
+                "serve: forced push to {head}: dropped {dropped} L0 slabs the branch no longer \
+                 reaches"
             );
         }
         self.l0.truncate(moved.keep);
@@ -1383,6 +1459,29 @@ impl Live {
         ctx.metrics.l0_ingests.fetch_add(1, Ordering::Relaxed);
         ctx.publish(Arc::new(next));
         Ok(true)
+    }
+
+    /// How the L0 slabs follow the branch to `head`, the new slab with the sizes it
+    /// introduces, and how many slabs go. Everything about the move that can fail.
+    fn advance(&mut self, view: &View, head: Oid) -> Result<Option<(Moved, usize)>> {
+        let Some(up) = self.upstream.as_mut() else {
+            return Ok(None);
+        };
+        let Some(moved) = self.tip.advance(up, &view.manifest, &self.l0, head)? else {
+            return Ok(None);
+        };
+        let dropped: Vec<Arc<Slab>> = self.l0.get(moved.keep..).unwrap_or(&[]).to_vec();
+        if let (Some(slab), true) = (&moved.slab, view.manifest.separate_blobs()) {
+            // Sizes the dropped slabs' tables gave are not known once they go.
+            let known = |b: &Oid| {
+                view.all
+                    .iter()
+                    .filter(|s| !dropped.iter().any(|d| Arc::ptr_eq(d, s)))
+                    .any(|s| s.sizes().is_some_and(|t| t.get(b).is_some()))
+            };
+            self.l0_sizes(slab, &known)?;
+        }
+        Ok(Some((moved, dropped.len())))
     }
 }
 
@@ -1545,19 +1644,27 @@ mod tests {
         let (a, b) = (Oid([1; 20]), Oid([2; 20]));
         let mut now = Instant::now();
         let mut retry = Retry::default();
-        assert!(retry.due(a, now));
+        assert!(retry.due(&a, now));
         let mut waits = Vec::new();
         for _ in 0..8 {
             let wait = retry.failed(a, poll, now);
-            assert!(!retry.due(a, now + wait - Duration::from_millis(1)));
-            assert!(retry.due(a, now + wait));
-            assert!(retry.due(b, now));
+            assert!(!retry.due(&a, now + wait - Duration::from_millis(1)));
+            assert!(retry.due(&a, now + wait));
+            assert!(retry.due(&b, now));
             waits.push(wait.as_secs());
             now += wait;
         }
         assert_eq!(waits, [2, 4, 8, 16, 32, 60, 60, 60]);
         assert_eq!(retry.failed(b, poll, now), poll);
         assert_eq!(retry.failed(a, poll, now), poll);
+        // A success forgets them.
+        assert!(retry.note(a, poll, "trying", Ok(())).is_ok());
+        assert!(retry.due(&a, now));
+        let e = retry.note(a, poll, "trying", Err::<(), _>(crate::err!("no")));
+        assert_eq!(
+            e.unwrap_err().to_string(),
+            "trying (attempt 1, the next in 2s): no"
+        );
     }
 
     /// Memory filesystems are told apart from the rest (`/dev/shm` is tmpfs on Linux).
