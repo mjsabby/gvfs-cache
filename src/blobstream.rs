@@ -399,6 +399,17 @@ impl<S: Spool> BlobSink<S> {
         let used = self.take(buf, PACK_HEADER_LEN);
         if self.hdr.len() == PACK_HEADER_LEN {
             self.left = parse_pack_header(&self.hdr).ctx("not a pack")?;
+            // Every entry is a blob still asked for, once, so a pack that declares more
+            // entries than that is refused before any is read. (Its deltas would wait for
+            // bases that never come, bounded in bytes only: 2,000,000 empty ones, a 58 MB
+            // pack, took 494 MB.)
+            if us(u64::from(self.left)) > self.want.len() {
+                crate::bail!(
+                    "the upstream's pack has {} entries for the {} blobs asked for",
+                    self.left,
+                    self.want.len()
+                );
+            }
             let hdr = std::mem::take(&mut self.hdr);
             self.consumed(&hdr);
             self.hdr = hdr;
@@ -635,7 +646,10 @@ impl<S: Spool> BlobSink<S> {
     fn apply(&mut self, base: usize, delta: &[u8], at: u64) -> Result<(Oid, usize)> {
         let rec = *self.recs.get(base).ctx("delta base record")?;
         self.load(&rec)?;
-        let (_, size, _) = crate::delta::delta_sizes(delta).ctx("bad delta header")?;
+        // The size the delta's ops make, not the one its header declares, which costs
+        // nothing to state: a few bytes declaring a gigabyte had it allocated and zeroed.
+        let size = crate::delta::result_size(delta, us(rec.size))
+            .map_err(|e| crate::err!("the delta at offset {at}: {e:?}"))?;
         if size > RESOLVE_MAX {
             crate::bail!("a {size}-byte blob behind a delta is too large to resolve");
         }
@@ -1052,6 +1066,43 @@ mod tests {
         check_output(&r, &f, &[(b, base), (m, mid), (t, top)]);
     }
 
+    /// A pack that declares more entries than blobs were asked for is refused at its
+    /// header: nothing it holds is read. (Each entry was refused when it came; deltas
+    /// whose base never comes waited, and their number had no bound.) And a delta whose
+    /// header declares a result its ops do not make sizes no buffer by it.
+    #[test]
+    fn a_pack_cannot_ask_for_more_than_its_blobs_take() {
+        let base = b"a small base\n".to_vec();
+        let (b, absent) = (blob_id(&base), Oid([9; 20]));
+        let empty_deltas: Vec<(HeaderBytes, Vec<u8>)> = (0..3)
+            .map(|_| (HeaderBytes::ref_delta(0, &absent), Vec::new()))
+            .collect();
+        let pack = hand_pack(&empty_deltas);
+        let mut sink = BlobSink::new(Vec::new(), &[b, absent]).unwrap();
+        assert!(sink.write_all(&pack[..PACK_HEADER_LEN]).is_err());
+        let e = sink.failure().unwrap().to_string();
+        assert!(e.contains("3 entries for the 2 blobs asked for"), "{e}");
+
+        // `base ++ "x"`, as a delta whose header says the result is a gigabyte.
+        let mut lying = copy_insert_delta(base.len(), b"x");
+        let honest_len = lying.len();
+        lying.splice(1..2, [0x80, 0x80, 0x80, 0x80, 0x04]);
+        assert_eq!(lying.len(), honest_len + 4);
+        let pack = hand_pack(&[
+            (HeaderBytes::whole(OBJ_BLOB, u64_of(base.len())), base),
+            (HeaderBytes::ref_delta(u64_of(lying.len()), &b), lying),
+        ]);
+        let mut sink = BlobSink::new(Vec::new(), &[b, absent]).unwrap();
+        assert!(sink.write_all(&pack).is_err());
+        let e = sink.failure().unwrap().to_string();
+        assert!(e.contains("ResultSize"), "{e}");
+        assert!(
+            sink.target.capacity() < 1 << 20,
+            "a buffer of {}",
+            sink.target.capacity()
+        );
+    }
+
     #[test]
     fn rejects_what_was_not_asked_for() {
         let r = repo("err");
@@ -1064,7 +1115,11 @@ mod tests {
             sink.finish()
         };
         let err = |r: Result<Finished<Vec<u8>>>| r.err().unwrap().to_string();
-        assert!(err(feed(&all[1..], &pack)).contains("not asked for"));
+        let mut other = all[1..].to_vec();
+        other.push(Oid([8; 20]));
+        assert!(err(feed(&other, &pack)).contains("not asked for"));
+        let fewer = format!("{} entries for the {} blobs", all.len(), all.len() - 1);
+        assert!(err(feed(&all[1..], &pack)).contains(&fewer));
         let mut more = all.clone();
         more.push(Oid([7; 20]));
         assert!(err(feed(&more, &pack)).contains("did not arrive"));
