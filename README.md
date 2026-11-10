@@ -140,6 +140,8 @@ Run one job every 15 minutes with the highest tier that is due:
   already in the store.
 * Concurrent runs are safe: the manifest is published with compare-and-swap, and the loser
   starts over.
+* A run with nothing to do (no new commits, no rollup due) publishes nothing: the manifest
+  keeps its generation and edges keep their views.
 
 ```sh
 m=$(date -u +%M) h=$(date -u +%H) dow=$(date -u +%u)
