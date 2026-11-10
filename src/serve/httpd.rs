@@ -10,7 +10,6 @@
 
 use std::fs::File;
 use std::future::Future;
-use std::io::Write;
 use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -781,15 +780,37 @@ fn format_head_with(
         503 => "Service Unavailable",
         _ => "",
     };
-    let mut cur = std::io::Cursor::new(buf);
-    let _ = write!(
-        cur,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nConnection: {}\r\n",
-        if keep_alive { "keep-alive" } else { "close" }
-    );
-    let _ = cur.write_all(extra);
-    let _ = cur.write_all(b"\r\n");
-    usize::try_from(cur.position()).unwrap_or(0)
+    // The head's pieces, copied one after another: through `write!` (`core::fmt`) the same
+    // bytes were 1.2% of a small GET. A piece that does not fit ends the head there.
+    let mut digits = [0u8; 20];
+    let mut at = 0usize;
+    let mut full = false;
+    let mut put = |piece: &[u8]| {
+        let end = at.saturating_add(piece.len());
+        match buf.get_mut(at..end) {
+            Some(room) if !full => {
+                room.copy_from_slice(piece);
+                at = end;
+            }
+            _ => full = true,
+        }
+    };
+    put(b"HTTP/1.1 ");
+    put(crate::util::decimal(u64::from(status), &mut digits));
+    put(b" ");
+    put(reason.as_bytes());
+    put(b"\r\nContent-Type: ");
+    put(content_type.as_bytes());
+    put(b"\r\nContent-Length: ");
+    put(crate::util::decimal(len, &mut digits));
+    put(if keep_alive {
+        b"\r\nConnection: keep-alive\r\n"
+    } else {
+        b"\r\nConnection: close\r\n"
+    });
+    put(extra);
+    put(b"\r\n");
+    at
 }
 
 /// Only a response head, declaring a body of `len` bytes that does not follow (a HEAD
@@ -1078,6 +1099,15 @@ mod tests {
             &buf[..n],
             b"HTTP/1.1 413 Payload Too Large\r\nContent-Type: text/plain\r\nContent-Length: 18446744073709551615\r\nConnection: close\r\n\r\n"
         );
+        // With header lines of its own before the blank line; a buffer too short for a
+        // piece ends the head before it.
+        let n = format_head_with(&mut buf, 503, "text/plain", 5, false, b"Retry-After: 1\r\n");
+        assert_eq!(
+            &buf[..n],
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 5\r\nConnection: close\r\nRetry-After: 1\r\n\r\n"
+        );
+        let n = format_head(&mut buf[..20], 200, "application/json", 5, true);
+        assert_eq!(&buf[..n], b"HTTP/1.1 200 OK");
     }
 
     fn parse(h: &[u8]) -> std::io::Result<Request> {

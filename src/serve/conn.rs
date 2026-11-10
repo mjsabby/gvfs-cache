@@ -229,6 +229,9 @@ async fn connection(ctx: &Ctx, stream: &TcpStream) {
     // is still set), is no new response: checking again then closed idle connections
     // while others merely connected.
     let mut responded = false;
+    // One timer for the connection's life ([`idle_wait`]).
+    let timer = tokio::time::sleep(ctx.deadlines.idle);
+    tokio::pin!(timer);
     loop {
         if held.is_none() {
             if responded && ctx.idle.load(Ordering::Relaxed) >= ctx.max_idle {
@@ -237,12 +240,12 @@ async fn connection(ctx: &Ctx, stream: &TcpStream) {
             }
             responded = false;
             idle_add(ctx, 1);
-            let woke = tokio::time::timeout(ctx.deadlines.idle, stream.readable()).await;
+            let woke = idle_wait(stream, timer.as_mut(), ctx.deadlines.idle).await;
             idle_add(ctx, -1);
             match woke {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => return,
-                Err(_) => {
+                Some(Ok(())) => {}
+                Some(Err(_)) => return,
+                None => {
                     ctx.metrics.idle_closed.fetch_add(1, Ordering::Relaxed);
                     return;
                 }
@@ -270,6 +273,37 @@ async fn connection(ctx: &Ctx, stream: &TcpStream) {
             }
         }
     }
+}
+
+/// Waits for `stream` to have something to read, for at most `idle`: `None` once that
+/// has passed.
+///
+/// `timer` is the connection's own, set whenever it last was: when it fires before this
+/// wait is over it is set again, to this wait's end. A connection that is asked something
+/// more often than every `idle` so sets a timer once per `idle`, not once per request (a
+/// `timeout` around the wait put a timer in the runtime's wheel and took it out again
+/// for every request: 1.5% of a small GET).
+async fn idle_wait(
+    stream: &TcpStream,
+    mut timer: Pin<&mut tokio::time::Sleep>,
+    idle: std::time::Duration,
+) -> Option<std::io::Result<()>> {
+    let until = tokio::time::Instant::now().checked_add(idle);
+    let mut readable = std::pin::pin!(stream.readable());
+    std::future::poll_fn(|cx| {
+        if let Poll::Ready(ready) = readable.as_mut().poll(cx) {
+            return Poll::Ready(Some(ready));
+        }
+        // Set again, the timer is polled again: that is what has it wake this task.
+        while timer.as_mut().poll(cx).is_ready() {
+            match until {
+                Some(until) if tokio::time::Instant::now() < until => timer.as_mut().reset(until),
+                _ => return Poll::Ready(None),
+            }
+        }
+        Poll::Pending
+    })
+    .await
 }
 
 async fn request(ctx: &Ctx, stream: &TcpStream, b: &mut Bufs) -> Next {
