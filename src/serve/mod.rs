@@ -705,11 +705,12 @@ impl Warmer {
                 ctx.prefetch_idx != IdxPolicy::Never && ctx.idx_wanted.load(Ordering::Relaxed);
             if let Some(plan) = view.cold_plan() {
                 let t0 = std::time::Instant::now();
+                // With an index wanted, its tables are merged while the trailer is hashed.
+                let idx_len = idx.then(|| plan.idx().map_or(0, <[u8]>::len));
                 plan.trailer();
                 if ctx.sizes_wanted.load(Ordering::Relaxed) {
                     let _ = plan.sizes_section();
                 }
-                let idx_len = idx.then(|| plan.idx().map_or(0, <[u8]>::len));
                 if plan.len > (64 << 20) {
                     let idx_len = idx_len.map_or_else(String::new, |n| {
                         format!(
@@ -728,10 +729,10 @@ impl Warmer {
                 && prev_tip_ts < view.tip_ts
                 && let Prefetch::Pack(plan, _) = view.prefetch(prev_tip_ts)
             {
-                plan.trailer();
                 if idx {
                     let _ = plan.idx();
                 }
+                plan.trailer();
             }
             prev_tip_ts = view.tip_ts;
         }

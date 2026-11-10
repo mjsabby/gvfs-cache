@@ -83,6 +83,9 @@ pub struct Shared {
 
 /// Sections at least this large go to a memfd.
 const SPILL_MIN: usize = 1 << 20;
+/// A pack at least this long has its index merged beside the hashing of its trailer, on
+/// two threads (64 MiB: 30 ms of hashing).
+const IDX_BESIDE_TRAILER: u64 = 64 << 20;
 
 impl Shared {
     pub fn new(v: Vec<u8>) -> Shared {
@@ -184,9 +187,23 @@ impl PackPlan {
     fn idx_shared(&self) -> Option<&Shared> {
         self.idx
             .get_or_init(|| {
-                let sha = self.trailer();
                 let _cold = gvfs_alloc_guard::cold_section();
-                crate::idx::build(self, &sha).map(Shared::new)
+                // The index's tables need no trailer: for a pack whose trailer takes long
+                // and is not ready, they are merged while another thread hashes it
+                // (SearchGold's cold pack: 1.2 s for both, where one after the other took
+                // 1.7 s).
+                let merged = if self.trailer_ready() || self.len < IDX_BESIDE_TRAILER {
+                    crate::idx::merge(self)
+                } else {
+                    std::thread::scope(|s| {
+                        let hashing = s.spawn(|| self.trailer());
+                        let merged = crate::idx::merge(self);
+                        let _ = hashing.join();
+                        merged
+                    })
+                };
+                let sha = self.trailer();
+                merged.map(|tables| Shared::new(crate::idx::finish(tables, &sha)))
             })
             .as_ref()
     }

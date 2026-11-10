@@ -35,27 +35,72 @@ const MAX_OFFSET32: u64 = 0x7FFF_FFFF;
 pub struct SortedSlab {
     /// Slots, in id order.
     pub order: Vec<u32>,
-    /// CRC-32 of each slot's entry (header and zlib stream), by slot.
+    /// CRC-32 of each entry (header and zlib stream), in id order too: a merge reads both
+    /// arrays front to back.
     pub crc: Vec<u32>,
 }
+
+/// Entries one thread hashes when a slab's sorted run is built (about 30 ms of work).
+const SORT_CHUNK: usize = 1 << 18;
+/// Threads that share that work for a large slab.
+const SORT_THREADS: usize = 8;
+/// How far ahead of the entry being hashed, or merged, its successor's bytes are asked for.
+const AHEAD: usize = 16;
 
 impl SortedSlab {
     /// `None` when the pack holds entries its records do not describe (a second copy of
     /// an object), which an index would have to list as well.
+    ///
+    /// The CRC-32s are the work: every entry of the pack is read, in slot order, which is
+    /// no order of the pack's, so each is a cache miss or several. A large slab's are
+    /// hashed on [`SORT_THREADS`] threads, each asking for the entry [`AHEAD`] places on
+    /// while it hashes one: SearchGold's baseline (9.25M entries, 2.4 GiB) takes 0.5 s
+    /// where one thread without the hint took 3.1 s.
     pub fn build(slab: &Slab) -> Option<SortedSlab> {
+        SortedSlab::build_in(slab, SORT_CHUNK)
+    }
+
+    /// [`SortedSlab::build`], with a thread for every `chunk` entries (up to
+    /// [`SORT_THREADS`]).
+    fn build_in(slab: &Slab, chunk: usize) -> Option<SortedSlab> {
         if slab.entries() != slab.count() {
             return None;
         }
         let n = slab.count() as usize;
-        let mut keys: Vec<(u64, u32)> = Vec::with_capacity(n);
-        let mut crc: Vec<u32> = Vec::with_capacity(n);
-        for slot in 0..slab.count() {
-            let rec = slab.rec(slot)?;
-            let [a, b, c, d, e, f, g, h, ..] = rec.oid.0;
-            keys.push((u64::from_be_bytes([a, b, c, d, e, f, g, h]), slot));
-            crc.push(zlib_rs::crc32::crc32(0, slab.entry(&rec)?));
+        // (the id's first 8 bytes, slot, CRC-32), by slot.
+        let mut keys: Vec<(u64, u32, u32)> = vec![(0, 0, 0); n];
+        let threads = n.div_ceil(chunk.max(1)).clamp(1, SORT_THREADS);
+        let per = n.div_ceil(threads).max(1);
+        let hash = |first: usize, out: &mut [(u64, u32, u32)]| -> Option<()> {
+            for (i, key) in out.iter_mut().enumerate() {
+                let slot = u32::try_from(first.checked_add(i)?).ok()?;
+                if let Some(next) = slab.rec(slot.saturating_add(AHEAD as u32)) {
+                    crate::util::prefetch(slab.pack(), crate::util::us(next.offset));
+                }
+                let rec = slab.rec(slot)?;
+                let [a, b, c, d, e, f, g, h, ..] = rec.oid.0;
+                *key = (
+                    u64::from_be_bytes([a, b, c, d, e, f, g, h]),
+                    slot,
+                    zlib_rs::crc32::crc32(0, slab.entry(&rec)?),
+                );
+            }
+            Some(())
+        };
+        let hashed = std::thread::scope(|s| {
+            let workers: Vec<_> = keys
+                .chunks_mut(per)
+                .enumerate()
+                .map(|(i, out)| s.spawn(move || hash(i.saturating_mul(per), out)))
+                .collect();
+            workers
+                .into_iter()
+                .all(|w| w.join().ok().flatten().is_some())
+        });
+        if !hashed {
+            return None;
         }
-        keys.sort_unstable();
+        keys.sort_unstable_by_key(|k| (k.0, k.1));
         // Ids sharing their first 8 bytes (vanishingly rare): order by the whole id.
         for run in keys.chunk_by_mut(|a, b| a.0 == b.0) {
             if run.len() > 1 {
@@ -63,8 +108,8 @@ impl SortedSlab {
             }
         }
         Some(SortedSlab {
-            order: keys.into_iter().map(|k| k.1).collect(),
-            crc,
+            order: keys.iter().map(|k| k.1).collect(),
+            crc: keys.iter().map(|k| k.2).collect(),
         })
     }
 }
@@ -75,14 +120,55 @@ fn put(out: &mut [u8], at: usize, bytes: &[u8]) -> Option<()> {
     Some(())
 }
 
-/// The `.idx` of `plan`'s pack, whose trailer is `sha`. `None` if a slab cannot be indexed
-/// from its records.
-pub fn build(plan: &PackPlan, sha: &[u8; 20]) -> Option<Vec<u8>> {
-    // (slab, its sorted run, shift): an entry's pack offset is its slab offset + shift.
-    let mut runs: Vec<(&Slab, &SortedSlab, u64)> = Vec::with_capacity(plan.slabs.len());
+/// One slab's part in a merge: its sorted run, where it is in it, and the entry there.
+struct Run<'a> {
+    slab: &'a Slab,
+    sorted: &'a SortedSlab,
+    /// An entry's pack offset is its slab offset plus this.
+    shift: u64,
+    pos: usize,
+    rec: crate::slab::Rec,
+}
+
+impl Run<'_> {
+    /// Moves to the run's entry at `pos`, if it has one, asking for the record [`AHEAD`]
+    /// places on: records are read in id order, which is no order of theirs, so each is a
+    /// cache miss, and the ones asked for ahead overlap.
+    fn seek(&mut self, pos: usize) -> Option<()> {
+        if let Some(&ahead) = self.sorted.order.get(pos.saturating_add(AHEAD)) {
+            self.slab.preload_rec(ahead);
+        }
+        self.rec = self.slab.rec(*self.sorted.order.get(pos)?)?;
+        self.pos = pos;
+        Some(())
+    }
+}
+
+/// The `.idx` of `plan`'s pack up to its tables' end: everything but the pack's trailer
+/// and the index's own hash ([`finish`]), neither of which it needs, so that it can be
+/// made while the trailer is hashed. `None` if a slab cannot be indexed from its records.
+///
+/// A merge of the slabs' sorted runs. SearchGold's cold plan (9.26M entries, a 281 MB
+/// index) takes 0.5 s with its hash; it took 1.5 s reading each entry's record and CRC-32
+/// where they lay, two cache misses an entry, one after the other.
+pub fn merge(plan: &PackPlan) -> Option<Vec<u8>> {
+    let mut runs: Vec<Run> = Vec::with_capacity(plan.slabs.len());
+    // The runs that have an entry left, by that entry's id (then by slab).
+    let mut heap: BinaryHeap<Reverse<(Oid, usize)>> = BinaryHeap::with_capacity(plan.slabs.len());
     let mut shift = 0u64;
-    for (s, _, len) in plan.bodies() {
-        runs.push((s, s.sorted()?, shift));
+    for (slab, _, len) in plan.bodies() {
+        let mut run = Run {
+            slab,
+            sorted: slab.sorted()?,
+            shift,
+            pos: 0,
+            rec: crate::slab::Rec::default(),
+        };
+        if !run.sorted.order.is_empty() {
+            run.seek(0)?;
+            heap.push(Reverse((run.rec.oid, runs.len())));
+        }
+        runs.push(run);
         shift = shift.checked_add(len)?;
     }
     let n = plan.entries as usize;
@@ -92,23 +178,16 @@ pub fn build(plan: &PackPlan, sha: &[u8; 20]) -> Option<Vec<u8>> {
     put(&mut out, 0, &MAGIC)?;
     let mut fanout = [0u32; 256];
     let mut large: Vec<u8> = Vec::new();
-    // A k-way merge on (id, slab, position in the slab's run).
-    let mut heap: BinaryHeap<Reverse<(Oid, usize, usize)>> = BinaryHeap::with_capacity(runs.len());
-    for (k, (s, sorted, _)) in runs.iter().enumerate() {
-        if let Some(&slot) = sorted.order.first() {
-            heap.push(Reverse((s.rec(slot)?.oid, k, 0)));
-        }
-    }
     let mut i = 0usize;
-    while let Some(Reverse((oid, k, pos))) = heap.pop() {
-        let &(s, sorted, shift) = runs.get(k)?;
-        let slot = *sorted.order.get(pos)?;
-        let offset = s.rec(slot)?.offset.checked_add(shift)?;
+    while let Some(mut top) = heap.peek_mut() {
+        let Reverse((oid, k)) = *top;
+        let run = runs.get_mut(k)?;
+        let offset = run.rec.offset.checked_add(run.shift)?;
         put(&mut out, IDS_AT.checked_add(i.checked_mul(20)?)?, &oid.0)?;
         put(
             &mut out,
             crcs_at.checked_add(i.checked_mul(4)?)?,
-            &sorted.crc.get(slot as usize)?.to_be_bytes(),
+            &run.sorted.crc.get(run.pos)?.to_be_bytes(),
         )?;
         let off32 = if offset > MAX_OFFSET32 {
             let li = u32::try_from(large.len() / 8).ok()?;
@@ -125,9 +204,14 @@ pub fn build(plan: &PackPlan, sha: &[u8; 20]) -> Option<Vec<u8>> {
         let bucket = fanout.get_mut(usize::from(oid.0[0]))?;
         *bucket = bucket.checked_add(1)?;
         i = i.checked_add(1)?;
-        let next = pos.checked_add(1)?;
-        if let Some(&slot) = sorted.order.get(next) {
-            heap.push(Reverse((s.rec(slot)?.oid, k, next)));
+        // The run's next entry takes this one's place at the top and sinks from there:
+        // for the slab most entries come from, a comparison or two.
+        let next = run.pos.checked_add(1)?;
+        if next < run.sorted.order.len() {
+            run.seek(next)?;
+            *top = Reverse((run.rec.oid, k));
+        } else {
+            std::collections::binary_heap::PeekMut::pop(top);
         }
     }
     if i != n {
@@ -143,10 +227,21 @@ pub fn build(plan: &PackPlan, sha: &[u8; 20]) -> Option<Vec<u8>> {
         )?;
     }
     out.extend_from_slice(&large);
+    Some(out)
+}
+
+/// The `.idx` of `plan`'s pack, whose trailer is `sha`: [`merge`]'s part, then the two
+/// hashes an index ends with. `None` if a slab cannot be indexed from its records.
+pub fn build(plan: &PackPlan, sha: &[u8; 20]) -> Option<Vec<u8>> {
+    Some(finish(merge(plan)?, sha))
+}
+
+/// Ends the index [`merge`] made with the pack's trailer and the index's own SHA-1.
+pub fn finish(mut out: Vec<u8>, sha: &[u8; 20]) -> Vec<u8> {
     out.extend_from_slice(sha);
     let digest: [u8; 20] = Sha1::digest(&out).into();
     out.extend_from_slice(&digest);
-    Some(out)
+    out
 }
 
 #[cfg(test)]
@@ -267,6 +362,16 @@ mod tests {
                 assert_eq!(entries(got), entries(&want));
             } else {
                 assert_eq!(got, &want[..], "{} slabs", slabs.len());
+            }
+            // A slab's sorted run is the same on any number of threads (here one for every
+            // five entries, up to eight): a large slab's is made on several.
+            for s in &slabs {
+                let (one, many) = (
+                    SortedSlab::build_in(s, usize::MAX).unwrap(),
+                    SortedSlab::build_in(s, 5).unwrap(),
+                );
+                assert!(s.count() > 40, "{} entries", s.count());
+                assert!(one.order == many.order && one.crc == many.crc);
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
