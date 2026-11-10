@@ -1816,6 +1816,74 @@ fn force_main(up: &Upstream, oid: &str) {
     git(&up.bare, &["update-ref", "refs/heads/main", oid]);
 }
 
+/// A directory whose tree entry has a zero-padded mode (`040000`, which other tools have
+/// written and git reads as `40000`) is a directory: a commit's closure holds the trees
+/// under it. (Read as a file, it was left out with everything below.)
+#[test]
+fn a_zero_padded_directory_mode_is_a_directory() {
+    let root = tempdir("padded-mode");
+    let up = Upstream::new(&root);
+    let hex = |out: Vec<u8>| String::from_utf8(out).unwrap().trim().to_string();
+    let blob = hex(git_stdin(
+        &up.work,
+        &["hash-object", "-w", "--stdin"],
+        b"in a directory\n",
+    ));
+    let inner = hex(git_stdin(
+        &up.work,
+        &["mktree"],
+        format!("100644 blob {blob}\tf.txt\n").as_bytes(),
+    ));
+    let dir = hex(git_stdin(
+        &up.work,
+        &["mktree"],
+        format!("040000 tree {inner}\tinner\n").as_bytes(),
+    ));
+    let mut raw = b"040000 dir\0".to_vec();
+    raw.extend_from_slice(&gvfs_cache::util::Oid::from_hex(dir.as_bytes()).unwrap().0);
+    let top = hex(git_stdin(
+        &up.work,
+        &["hash-object", "-t", "tree", "-w", "--literally", "--stdin"],
+        &raw,
+    ));
+    let commit = hex(git_stdin(
+        &up.work,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit-tree",
+            &top,
+            "-m",
+            "padded",
+        ],
+        b"",
+    ));
+    git(
+        &up.work,
+        &["push", "-q", "origin", &format!("{commit}:refs/heads/main")],
+    );
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let cache = root.join("cache");
+    let server = Server::start(&["--store", &store, "--cache-dir", cache.to_str().unwrap()]);
+    let (status, _, pack) = server.post(
+        "/gvfs/objects",
+        json_ids(std::slice::from_ref(&commit), None).as_bytes(),
+        CT_PACK,
+    );
+    assert_eq!(status, 200);
+    let client = fresh_repo(&root, "client");
+    install_pack(&client, &pack);
+    let trees = [top, dir, inner];
+    assert_eq!(cat_batch(&client, &trees), cat_batch(&up.bare, &trees));
+    server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A push the edge cannot ingest (here the upstream itself lacks one of its trees) is not
 /// fetched again at every poll: the wait doubles from the poll interval. Once the upstream
 /// can serve it, the next attempt ingests it.
