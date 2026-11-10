@@ -32,7 +32,7 @@ use crate::manifest::Manifest;
 use crate::object::{TreeIter, commit_tree};
 use crate::pack::{OBJ_BLOB, OBJ_COMMIT, OBJ_TREE};
 use crate::sizes::Sizes;
-use crate::slab::{Slab, SlabMeta, Tier};
+use crate::slab::{Slab, SlabMeta};
 use crate::splice::Resolver;
 use crate::store::Store;
 use crate::upstream::Upstream;
@@ -241,20 +241,9 @@ fn is_download(name: &str) -> bool {
     let hex = |s: &str, n: usize| {
         s.len() == n && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
     };
-    let slab = |id: &str| {
-        let mut parts = id.splitn(3, '-');
-        let (Some(tier), Some(end_ts), Some(sha)) = (parts.next(), parts.next(), parts.next())
-        else {
-            return false;
-        };
-        Tier::ALL.iter().any(|t| t.name() == tier)
-            && !end_ts.is_empty()
-            && end_ts.bytes().all(|b| b.is_ascii_digit())
-            && hex(sha, 16)
-    };
     match name.rsplit_once('.') {
-        Some((id, "pack" | "mphf")) => slab(id),
-        Some((id, "sizes")) => id.strip_prefix("slabs_").is_some_and(slab),
+        Some((id, "pack" | "mphf")) => SlabMeta::is_id(id),
+        Some((id, "sizes")) => id.strip_prefix("slabs_").is_some_and(SlabMeta::is_id),
         Some((id, "bidx")) => hex(id, 40),
         _ => false,
     }
@@ -564,6 +553,7 @@ pub fn drop_lost(store: &Store, work: &Path, threads: usize, lost: &Lost) -> Res
 mod tests {
     use super::*;
     use crate::blobs::SegmentMeta;
+    use crate::slab::Tier;
 
     fn slab(tier: Tier, end: u64) -> SlabMeta {
         SlabMeta {
