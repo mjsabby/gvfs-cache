@@ -1816,6 +1816,78 @@ fn a_manifest_that_cannot_be_applied_leaves_the_edge_live() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The store and the upstream are followed apart: an edge whose store does not answer
+/// (here its manifest is a pipe nobody writes to, which a read waits on for ever) still
+/// ingests what is pushed, and follows the store again once it answers.
+#[test]
+fn a_store_that_hangs_does_not_stop_the_live_tip() {
+    use std::os::unix::fs::OpenOptionsExt;
+    let root = tempdir("hung-store");
+    let up = Upstream::new(&root);
+    let t0 = 1_700_000_000u64;
+    commit_dated(&up, &[("a.txt", "a\n")], t0);
+    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--upstream",
+        up.bare.to_str().unwrap(),
+        "--poll-ms",
+        "20",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ]);
+    let served = |s: &Server, oid: &str| s.get(&format!("/gvfs/objects/{oid}")).0 == 200;
+
+    // The manifest becomes a pipe. The edge is waiting on it once a writer can open it
+    // without waiting itself; the writer then writes nothing.
+    let path = store_dir.join(gvfs_cache::manifest::MANIFEST_KEY);
+    let real = root.join("manifest.real");
+    std::fs::rename(&path, &real).unwrap();
+    assert!(
+        std::process::Command::new("mkfifo")
+            .arg(&path)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let nonblocking = nix::fcntl::OFlag::O_NONBLOCK.bits();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let writer = loop {
+        let mut open = std::fs::OpenOptions::new();
+        match open.write(true).custom_flags(nonblocking).open(&path) {
+            Ok(file) => break file,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the edge never read its manifest"
+        );
+    };
+    let b = commit_dated(&up, &[("b.txt", "b\n")], t0 + 100);
+    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
+    server.wait_for("B in L0", |s| served(s, &b));
+
+    // The manifest is back before the pipe ends: the edge reads nothing from the pipe (a
+    // manifest it cannot decode), then follows the store again.
+    std::fs::rename(&real, &path).unwrap();
+    drop(writer);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let sealed = manifest(&store_dir).generation;
+    server.wait_for("the manifest", |s| {
+        s.metric("gvfs_manifest_generation") == sealed
+    });
+    assert!(served(&server, &b));
+    assert_eq!(server.metric("gvfs_live_failures_total"), 1);
+    server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Forced pushes under the edge's live L0 slabs, which only the edge saw (the pipeline did
 /// not run in between): a rewind, a rewind into the middle of a slab, and a rewrite. The
 /// edge stops serving what the branch no longer reaches, stamps what follows exactly as the
