@@ -11,7 +11,7 @@
 //! That is two small array reads and no binary search; the caller verifies the full id at
 //! `records[slot]` (keys outside the set land on an arbitrary slot).
 
-use crate::util::{Oid, Result, le_u16, le_u32, mul_hi};
+use crate::util::{Oid, Result, fmix64, le_u16, le_u32, mul_hi};
 
 /// Average keys per partition.
 pub const PART_KEYS: u64 = 2048;
@@ -20,15 +20,6 @@ pub const PART_KEYS: u64 = 2048;
 const BUCKET_KEYS: u64 = 4;
 const PHI: u64 = 0x9E37_79B9_7F4A_7C15;
 const DEFAULT_SEED: u64 = 0x6776_6673_2d6d_7068; // "gvfs-mph"
-
-#[inline(always)]
-fn fmix64(mut k: u64) -> u64 {
-    k ^= k.wrapping_shr(33);
-    k = k.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    k ^= k.wrapping_shr(33);
-    k = k.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    k ^ k.wrapping_shr(33)
-}
 
 /// The three independent hash words of a key.
 #[derive(Clone, Copy, Default)]

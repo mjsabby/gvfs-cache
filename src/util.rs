@@ -301,6 +301,29 @@ pub fn mul_hi(h: u64, n: u64) -> u64 {
     u64::try_from(wide.wrapping_shr(64)).unwrap_or(0)
 }
 
+/// MurmurHash3's 64-bit finalizer: every bit of `k` reaches every bit of the result.
+#[inline(always)]
+pub fn fmix64(mut k: u64) -> u64 {
+    k ^= k.wrapping_shr(33);
+    k = k.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    k ^= k.wrapping_shr(33);
+    k = k.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    k ^ k.wrapping_shr(33)
+}
+
+/// A key drawn once per process from the system's randomness (the standard library's
+/// hasher keys). Tables whose keys clients choose mix it in before placing a key, so that
+/// which keys land together cannot be chosen from outside.
+pub fn process_key() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    static KEY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *KEY.get_or_init(|| {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(std::process::id());
+        h.finish()
+    })
+}
+
 /// Appends `data` to `v` only if it fits in the existing capacity (never reallocates).
 #[inline]
 pub fn try_extend(v: &mut Vec<u8>, data: &[u8]) -> bool {
