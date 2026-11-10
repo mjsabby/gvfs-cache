@@ -95,6 +95,65 @@ fn retention(tier: Tier, keep_weeks: usize) -> u64 {
     }
 }
 
+/// The most slabs of a tier that stay listed as retained: four times what [`retention`]
+/// holds of them when one is made every period the tier is named for (384 15m slabs, 672
+/// of an hour).
+fn retained_max(tier: Tier, keep_weeks: usize) -> usize {
+    let period = match tier {
+        Tier::L0 | Tier::M15 => 900,
+        Tier::H1 => 3600,
+        Tier::H6 => 6 * 3600,
+        Tier::H12 => 12 * 3600,
+        Tier::H24 => DAY,
+        Tier::Week | Tier::Base => 7 * DAY,
+    };
+    let held = retention(tier, keep_weeks).checked_div(period).unwrap_or(0);
+    crate::util::us(held).max(4).saturating_mul(4)
+}
+
+/// Drops the retained slabs that have aged out; returns how many more went because their
+/// tier held too many.
+///
+/// A slab ages by stamps: it goes once the newest stamp, `max_ts`, is more than its
+/// tier's [`retention`] past its end. Stamps are commit times ([`crate::timeline`]), and
+/// a commit dated in the future puts every stamp after it ahead of the clock until the
+/// clock passes that date, each rising by one per commit meanwhile. With stamps alone,
+/// such a commit dropped every retained slab at once (two days ahead was enough: every
+/// warm client was then answered from an older boundary, with a rollup it mostly had),
+/// and from then on none: "a day" was 86,400 commits, so after a commit dated ten years
+/// ahead the manifest grew by 96 slabs a day, each one two more files every edge maps.
+/// So an age is taken against the run's clock, `now`, when the newest stamp is ahead of
+/// it, and no tier keeps more than [`retained_max`] slabs, those that end first going
+/// first.
+fn retain(retained: &mut Vec<SlabMeta>, max_ts: u64, now: u64, keep_weeks: usize) -> usize {
+    let at = max_ts.min(now);
+    retained.retain(|s| s.end_ts.saturating_add(retention(s.tier, keep_weeks)) >= at);
+    let mut dropped = 0usize;
+    for tier in Tier::ALL {
+        let mut ends: Vec<u64> = retained
+            .iter()
+            .filter(|s| s.tier == tier)
+            .map(|s| s.end_ts)
+            .collect();
+        let excess = ends.len().saturating_sub(retained_max(tier, keep_weeks));
+        if excess == 0 {
+            continue;
+        }
+        ends.sort_unstable();
+        let Some(&last) = ends.get(excess.saturating_sub(1)) else {
+            continue;
+        };
+        let mut left = excess;
+        retained.retain(|s| {
+            let goes = s.tier == tier && s.end_ts <= last && left > 0;
+            left = left.saturating_sub(usize::from(goes));
+            !goes
+        });
+        dropped = dropped.saturating_add(excess.saturating_sub(left));
+    }
+    dropped
+}
+
 /// `gvfs-cache pipeline ...`
 pub fn main(args: &[String]) -> Result<()> {
     let f = crate::cli::Flags::parse(
@@ -293,9 +352,18 @@ fn step(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<(Man
             );
         }
     }
-    let (max_ts, keep_weeks) = (m.max_ts, o.keep_weeks);
-    m.retained
-        .retain(|s| s.end_ts.saturating_add(retention(s.tier, keep_weeks)) >= max_ts);
+    if m.max_ts > o.now.saturating_add(DAY) {
+        crate::log!(
+            "warning: the branch's newest stamp is {} days ahead of the clock (a commit dated \
+             in the future): until the clock passes it, slabs kept for warm clients age by \
+             the clock and are bounded in number",
+            m.max_ts.saturating_sub(o.now) / DAY
+        );
+    }
+    let capped = retain(&mut m.retained, m.max_ts, o.now, o.keep_weeks);
+    if capped > 0 {
+        crate::log!("retention: {capped} more slabs dropped, their tiers holding too many");
+    }
 
     // A run that changed nothing publishes nothing: a new generation has every edge build a
     // view and hash its cold pack again (1.3 s on SearchGold, its `.idx` beside it),
@@ -844,5 +912,91 @@ fn gc(o: &Options, m: &Manifest) -> Result<()> {
         Some((n, first)) => Err(crate::err!(
             "{n} unreferenced files were not deleted, the first: {first}"
         )),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)]
+mod tests {
+    use super::*;
+
+    fn meta(tier: Tier, end_ts: u64) -> SlabMeta {
+        SlabMeta {
+            id: SlabMeta::make_id(tier, end_ts, &[0; 20]),
+            tier,
+            start_ts: end_ts.saturating_sub(1),
+            end_ts,
+            have: Oid::ZERO,
+            want: Oid::ZERO,
+            objects: 1,
+            pack_len: 32,
+            index_len: 32,
+            pack_sha: [0; 20],
+        }
+    }
+
+    fn ends(retained: &[SlabMeta], tier: Tier) -> Vec<u64> {
+        retained
+            .iter()
+            .filter(|s| s.tier == tier)
+            .map(|s| s.end_ts)
+            .collect()
+    }
+
+    /// Retained slabs age by stamps while the stamps are not ahead of the clock.
+    #[test]
+    fn retained_slabs_age_by_their_stamps() {
+        let now = 1_800_000_000;
+        let mut retained = vec![
+            meta(Tier::M15, now - DAY - 1),
+            meta(Tier::M15, now - DAY),
+            meta(Tier::H1, now - 7 * DAY - 1),
+            meta(Tier::H1, now - 2 * DAY),
+            meta(Tier::H24, now - 14 * DAY - 1),
+            meta(Tier::H24, now - 8 * DAY),
+        ];
+        assert_eq!(retain(&mut retained, now, now + 5, 2), 0);
+        assert_eq!(ends(&retained, Tier::M15), [now - DAY]);
+        assert_eq!(ends(&retained, Tier::H1), [now - 2 * DAY]);
+        assert_eq!(ends(&retained, Tier::H24), [now - 8 * DAY]);
+        // A branch that has not moved for a month: its stamps have not, so nothing ages.
+        assert_eq!(retain(&mut retained, now, now + 30 * DAY, 2), 0);
+        assert_eq!(retained.len(), 3);
+    }
+
+    /// A commit dated ten years ahead puts every later stamp ahead of the clock. The slabs
+    /// from before it then age by the clock (they all went at once), and the ones after
+    /// it, which the stamps would keep for ten years, are bounded in number (they were
+    /// not: 96 more a day).
+    #[test]
+    fn a_commit_dated_in_the_future_neither_empties_nor_floods_retention() {
+        let now = 1_800_000_000;
+        let ahead = now + 3650 * DAY;
+        let mut retained: Vec<SlabMeta> = (1..=95)
+            .map(|i| meta(Tier::M15, now - i * 900))
+            .chain((1..=20).map(|i| meta(Tier::H1, now - i * 3600)))
+            .collect();
+        // The run that seals the commit: nothing goes.
+        assert_eq!(retain(&mut retained, ahead, now, 2), 0);
+        assert_eq!(retained.len(), 115);
+        // Half a day later, half of the day's 15m slabs have aged out, by the clock.
+        assert_eq!(retain(&mut retained, ahead + 50, now + DAY / 2, 2), 0);
+        assert_eq!(ends(&retained, Tier::M15).len(), 48);
+        assert_eq!(ends(&retained, Tier::H1).len(), 20);
+        // Runs for a month: a 15m slab each, stamped a little after the date.
+        let cap = retained_max(Tier::M15, 2);
+        assert_eq!(cap, 384);
+        let mut capped = 0;
+        for run in 1..=2880u64 {
+            retained.push(meta(Tier::M15, ahead + 50 + run));
+            capped += retain(&mut retained, ahead + 50 + run, now + DAY + run * 900, 2);
+            assert!(ends(&retained, Tier::M15).len() <= cap);
+        }
+        assert_eq!(capped, 2880 - cap);
+        // What stays is the newest of them; the hour slabs from before went by the clock.
+        let kept = ends(&retained, Tier::M15);
+        assert_eq!(kept.len(), cap);
+        assert_eq!(kept.first().copied(), Some(ahead + 50 + 2880 - 383));
+        assert!(ends(&retained, Tier::H1).is_empty());
     }
 }

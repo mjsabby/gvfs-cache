@@ -1818,6 +1818,79 @@ fn force_main(up: &Upstream, oid: &str) {
     git(&up.bare, &["update-ref", "refs/heads/main", oid]);
 }
 
+/// A commit dated ten years ahead (a machine with a wrong clock) puts the newest stamp
+/// ten years past every slab kept for warm clients. They stay all the same: a client at
+/// one of their boundaries is still answered from exactly there. (The run that sealed the
+/// commit dropped them all, and such a client got the hour again.)
+#[test]
+fn a_commit_dated_in_the_future_leaves_warm_clients_their_slabs() {
+    let root = tempdir("future-date");
+    let mut up = Upstream::new(&root);
+    up.commit(2);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    let mut now = gvfs_cache::util::now_secs();
+    step(&root, &store, &up, &mut now, "15m", &[]);
+    let tip_a = up.commit(2);
+    step(&root, &store, &up, &mut now, "15m", &[]);
+    let ts_a = manifest(&store_dir).max_ts;
+    up.commit(2);
+    step(&root, &store, &up, &mut now, "1h", &[]);
+    let kept = |m: &gvfs_cache::manifest::Manifest| {
+        m.retained
+            .iter()
+            .map(|s| (s.tier, s.start_ts))
+            .collect::<Vec<_>>()
+    };
+    let before = manifest(&store_dir);
+    assert!(kept(&before).contains(&(Tier::M15, ts_a)), "{before:?}");
+
+    let ahead = now + 3650 * 86_400;
+    commit_dated(
+        &up,
+        &[("late.txt", "from a clock ten years ahead\n")],
+        ahead,
+    );
+    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
+    let log = step(&root, &store, &up, &mut now, "15m", &[]);
+    assert!(log.contains("days ahead of the clock"), "{log}");
+    let m = manifest(&store_dir);
+    assert_eq!(m.max_ts, ahead);
+    assert_eq!(kept(&m), kept(&before));
+    // The stamps after it rise by one per commit; the slabs still roll up.
+    let tip = up.commit(2);
+    step(&root, &store, &up, &mut now, "1h", &[]);
+    let m = manifest(&store_dir);
+    assert_eq!(m.max_ts, ahead + 1);
+    assert!(kept(&m).contains(&(Tier::M15, ts_a)), "{m:?}");
+
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--poll-ms",
+        "100",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ]);
+    let after_a = git(
+        &up.bare,
+        &["rev-list", "--objects", &tip, &format!("^{tip_a}")],
+    )
+    .lines()
+    .count();
+    let packs = server.prefetch(ts_a);
+    assert_eq!((packs.len(), packs[0].0), (1, m.max_ts));
+    assert_eq!(
+        install_pack(&fresh_repo(&root, "at-a"), &packs[0].1),
+        after_a
+    );
+    assert!(server.prefetch(m.max_ts).is_empty());
+    server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A directory whose tree entry has a zero-padded mode (`040000`, which other tools have
 /// written and git reads as `40000`) is a directory: a commit's closure holds the trees
 /// under it. (Read as a file, it was left out with everything below.)
