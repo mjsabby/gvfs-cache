@@ -344,10 +344,17 @@ threads poll every `--poll-ms`, one the upstream and one the store:
 
 The store's thread reads `blobs.bin` and the manifest, downloads and opens what they list,
 and hands it to the upstream's, which prunes its L0 slabs against the new slabs and makes
-the view. Neither waits for the other: while a weekly baseline downloads (gigabytes), or
-a store does not answer, or a manifest cannot be opened, the edge follows the branch on
-the manifest it serves; while a long fetch from the upstream runs, the next manifest is
-downloaded. A step that fails changes nothing: the slabs, the L0 slabs and what the tip
+the view. A poll that finds nothing new reads nothing: in object storage it is two
+requests with `If-None-Match` on a connection the thread keeps, each answered `304`
+without a body; in a directory, each file is opened and looked at (device, inode, length,
+times) and read only if it is not the file that was read, or was written in the last two
+seconds. (Each poll was two GETs of the whole objects, each on a new TLS connection:
+`blobs.bin` is about 120 bytes per blob pack, megabytes every `--poll-ms` for a store of
+large blobs.) Neither thread waits for the other: while a weekly baseline downloads
+(gigabytes), or a store does not answer, or a manifest cannot be opened, the edge
+follows the branch on the manifest it serves; while a long fetch from the upstream runs,
+the next manifest is downloaded.
+A step that fails changes nothing: the slabs, the L0 slabs and what the tip
 knows of them (the stamps of their commits, the boundaries a forced push took away) are
 replaced together once everything that can fail has not, so a later view is never made
 of one manifest's bounds and another's slabs. What failed is tried again after one poll

@@ -366,6 +366,9 @@ pub fn run(o: Options) -> Result<()> {
         blobs: None,
         waiting_for: 0,
         behind: None,
+        polls: crate::store::Poll::default(),
+        manifest: Followed::default(),
+        blobs_bin: Followed::default(),
     };
     let mut tip = LiveTip::default();
 
@@ -397,7 +400,7 @@ pub fn run(o: Options) -> Result<()> {
         tip.filter = Some("blob:none".to_string());
         // The manifest's trees need the blobs.bin generation it names.
         loop {
-            if let Some((bytes, etag)) = sync.changed_blobs()? {
+            if let Some((etag, bytes)) = sync.changed_blobs()? {
                 sync.read_blobs(&bytes, etag)?;
             }
             if sync.blobs_generation() >= manifest.blobs_generation {
@@ -1185,6 +1188,52 @@ struct StoreSync {
     /// A manifest not newer than the last one opened: its etag, and the polls it has been
     /// the store's ([`StoreSync::made_anew`]).
     behind: Option<(String, u32)>,
+    /// What the polls keep between them, and the manifest and the `blobs.bin` last read.
+    polls: crate::store::Poll,
+    manifest: Followed,
+    blobs_bin: Followed,
+}
+
+/// An object the store's thread follows, as it last read it. A poll asks the store for it
+/// only if it is no longer this one ([`Store::get_unless`]).
+#[derive(Default)]
+struct Followed {
+    etag: Option<String>,
+    /// Its bytes, until the edge has opened them: an object that could not be opened is
+    /// tried again from these, and a manifest that waits (for its `blobs.bin`, or to be
+    /// believed) is looked at again, without another read.
+    bytes: Arc<Vec<u8>>,
+}
+
+impl Followed {
+    /// The store's object `key`, its etag and its bytes: read if it is not the one read
+    /// last. `None` if the store has no such object.
+    fn poll(
+        &mut self,
+        store: &Store,
+        polls: &mut crate::store::Poll,
+        key: &str,
+    ) -> Result<Option<(String, Arc<Vec<u8>>)>> {
+        match store.get_unless(polls, key, self.etag.as_deref())? {
+            crate::store::Fresh::Gone => return Ok(None),
+            crate::store::Fresh::Same => {}
+            crate::store::Fresh::New(bytes, etag) => {
+                self.etag = Some(etag);
+                self.bytes = Arc::new(bytes);
+            }
+        }
+        Ok(self
+            .etag
+            .clone()
+            .map(|etag| (etag, Arc::clone(&self.bytes))))
+    }
+
+    /// The edge has opened the object: its bytes are not needed again.
+    fn opened(&mut self) {
+        if !self.bytes.is_empty() {
+            self.bytes = Arc::default();
+        }
+    }
 }
 
 /// Polls a manifest that is not newer than the one served stays the store's before the
@@ -1233,18 +1282,24 @@ impl StoreSync {
         self.blobs.as_ref().map_or(0, |b| b.generation)
     }
 
-    /// The store's `blobs.bin` and its etag, if it is not the one loaded (and, after a
-    /// failure to load it, it is time to try again).
-    fn changed_blobs(&self) -> Result<Option<(Vec<u8>, String)>> {
-        let changed = self
-            .store
-            .get(crate::blobs::BLOBS_KEY)
-            .ctx("reading blobs.bin")?
-            .filter(|(_, etag)| {
-                !self.blobs.as_ref().is_some_and(|b| b.etag == *etag)
-                    && self.blobs_retry.due(etag, Instant::now())
-            });
-        Ok(changed)
+    /// The store's `blobs.bin`, its etag and its bytes, if it is not the one loaded (and,
+    /// after a failure to load it, it is time to try again).
+    fn changed_blobs(&mut self) -> Result<Option<(String, Arc<Vec<u8>>)>> {
+        let found = self
+            .blobs_bin
+            .poll(&self.store, &mut self.polls, crate::blobs::BLOBS_KEY)
+            .ctx("reading blobs.bin")?;
+        let Some((etag, bytes)) = found else {
+            return Ok(None);
+        };
+        if self.blobs.as_ref().is_some_and(|b| b.etag == etag) {
+            self.blobs_bin.opened();
+            return Ok(None);
+        }
+        Ok(self
+            .blobs_retry
+            .due(&etag, Instant::now())
+            .then_some((etag, bytes)))
     }
 
     /// The `blobs.bin` in `bytes` becomes the loaded one, or nothing changes.
@@ -1299,7 +1354,10 @@ impl StoreSync {
     fn wait_for_manifest(&mut self) -> Result<(Manifest, String)> {
         let mut logged = false;
         loop {
-            if let Some((bytes, etag)) = self.store.get(MANIFEST_KEY)? {
+            let found = self
+                .manifest
+                .poll(&self.store, &mut self.polls, MANIFEST_KEY)?;
+            if let Some((etag, bytes)) = found {
                 return Ok((Manifest::decode(&bytes)?, etag));
             }
             if !logged {
@@ -1425,7 +1483,7 @@ impl StoreSync {
     /// One poll of the store: a changed `blobs.bin`, then a newer manifest.
     fn step(&mut self, changes: &std::sync::mpsc::Sender<StoreChange>) -> Result<()> {
         if self.separate
-            && let Some((bytes, etag)) = self.changed_blobs()?
+            && let Some((etag, bytes)) = self.changed_blobs()?
         {
             let loaded = self.read_blobs(&bytes, etag.clone());
             self.blobs_retry
@@ -1434,10 +1492,18 @@ impl StoreSync {
                 let _ = changes.send(StoreChange::Blobs(Arc::clone(set)));
             }
         }
-        let Some((bytes, etag)) = self.store.get(MANIFEST_KEY).ctx("reading the manifest")? else {
+        let found = self
+            .manifest
+            .poll(&self.store, &mut self.polls, MANIFEST_KEY)
+            .ctx("reading the manifest")?;
+        let Some((etag, bytes)) = found else {
             return Ok(());
         };
-        if etag == self.etag || !self.manifest_retry.due(&etag, Instant::now()) {
+        if etag == self.etag {
+            self.manifest.opened();
+            return Ok(());
+        }
+        if !self.manifest_retry.due(&etag, Instant::now()) {
             return Ok(());
         }
         let newer = self.open_newer(&bytes, &etag);
