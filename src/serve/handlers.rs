@@ -558,27 +558,76 @@ impl crate::store::Sink for ToClient<'_, '_, '_, '_> {
     }
 }
 
-/// A zlib stream's body on to `inner`, then its last four bytes (the Adler-32) kept.
-struct BodyThenTail<'a, S> {
-    inner: &'a mut S,
-    /// Body bytes, and bytes seen so far.
-    body: u64,
+/// The zlib stream of a blob entry in object storage going to a client as a loose
+/// object, as it arrives. Its first two bytes are its header: they say whether the
+/// stream can be spliced, and the response begins when they are here. What follows goes
+/// to the client, up to the last four bytes (the Adler-32), kept for the trailer.
+struct LooseStream<'o, 'w> {
+    out: &'o mut Out<'w>,
+    /// The blob's size, its stream's length, and whether the connection is kept.
+    size: u64,
+    zlen: u64,
+    keep: bool,
+    /// Bytes of the stream so far, its first two and its last four.
     seen: u64,
+    head: [u8; 2],
     tail: [u8; 4],
+    /// The response has begun: its head and the object's are in the output buffer.
+    begun: bool,
+    /// The client's socket error, if writing to it failed.
+    failed: Option<std::io::Error>,
 }
 
-impl<S: crate::store::Sink> crate::store::Sink for BodyThenTail<'_, S> {
-    async fn put(&mut self, piece: &[u8]) -> crate::util::Result<()> {
-        let to_body = us(self.body.saturating_sub(self.seen)).min(piece.len());
+impl LooseStream<'_, '_> {
+    /// The object's trailer, when the whole stream has passed.
+    fn trailer(&self) -> Option<[u8; 4]> {
+        if self.seen != self.zlen {
+            return None;
+        }
+        LooseSplice::plan_ends(OBJ_BLOB, self.size, us(self.zlen), self.head, self.tail)
+            .ok()
+            .map(|plan| plan.trailer)
+    }
+}
+
+impl crate::store::Sink for LooseStream<'_, '_> {
+    async fn put(&mut self, mut piece: &[u8]) -> crate::util::Result<()> {
+        while self.seen < 2 {
+            let Some((&byte, rest)) = piece.split_first() else {
+                return Ok(());
+            };
+            if let Some(place) = self.head.get_mut(us(self.seen)) {
+                *place = byte;
+            }
+            self.seen = self.seen.saturating_add(1);
+            piece = rest;
+        }
+        if !self.begun {
+            let plan =
+                LooseSplice::plan_ends(OBJ_BLOB, self.size, us(self.zlen), self.head, [0; 4])
+                    .map_err(|_| crate::err!("the blob's entry is no zlib stream"))?;
+            let len = u64_of(plan.total_len());
+            if self.out.head(200, CT_LOOSE, len, self.keep).is_err() || !self.out.put(plan.prefix())
+            {
+                crate::bail!("the response's head does not fit its buffer");
+            }
+            self.begun = true;
+        }
+        let body_end = self.zlen.saturating_sub(4);
+        let to_body = us(body_end.saturating_sub(self.seen)).min(piece.len());
         let (body, tail) = piece.split_at(to_body);
-        if !body.is_empty() {
-            self.inner.put(body).await?;
+        if !body.is_empty()
+            && let Err(e) = self.out.bytes(body).await
+        {
+            let err = crate::err!("sending to the client: {e}");
+            self.failed = Some(e);
+            return Err(err);
         }
         for (i, &byte) in tail.iter().enumerate() {
             let at = self
                 .seen
                 .saturating_add(u64_of(to_body.saturating_add(i)))
-                .saturating_sub(self.body);
+                .saturating_sub(body_end);
             *self
                 .tail
                 .get_mut(us(at))
@@ -589,35 +638,17 @@ impl<S: crate::store::Sink> crate::store::Sink for BodyThenTail<'_, S> {
     }
 }
 
-/// Exactly `buf.len()` bytes of a blob pack at `at` (cold path for remote packs).
-async fn read_pack(pack: &BlobPack, at: u64, buf: &mut [u8]) -> crate::util::Result<()> {
-    let mut n = 0usize;
-    pack.read(at, u64_of(buf.len()), &mut |chunk: &[u8]| {
-        let end = n.saturating_add(chunk.len());
-        buf.get_mut(n..end)
-            .ok_or_else(|| crate::err!("blob pack read overflow"))?
-            .copy_from_slice(chunk);
-        n = end;
-        Ok(())
-    })
-    .await?;
-    if n != buf.len() {
-        crate::bail!("short blob pack read");
-    }
-    Ok(())
-}
-
 /// The first two bytes of a zlib stream of `zlen` bytes at `zat` in a pack in object
 /// storage and its last four (its header and its Adler-32), if blocks the cache holds
-/// have them, unless the read of what follows the header is one the cache streams past.
-/// For the cache that is one read, as the header's was, and the body's is another.
+/// have them, unless the stream is one the cache streams past. For the cache that is
+/// one read, and the body's is another.
 fn stream_ends(
     pack: &BlobPack,
     zat: u64,
     zlen: u64,
     reader: &mut Reader<'_>,
 ) -> Option<([u8; 2], [u8; 4])> {
-    if pack.streams_past(zlen.saturating_sub(2)) {
+    if pack.streams_past(zlen) {
         return None;
     }
     let head = pack.peek(zat, 2, reader)?.try_into().ok()?;
@@ -630,9 +661,8 @@ fn stream_ends(
 /// A blob as a loose object: its entry's deflate blocks spliced between a stored block
 /// and the combined Adler-32, never inflated. An entry of a pack in object storage that
 /// is in blocks the cache holds is planned from its ends and sent from those blocks, as
-/// a local pack's is from its mapping. Of another remote entry the zlib header is read
-/// first; its Adler-32 (the stream's last four bytes) comes with the body, in the same
-/// read, and the trailer is made from it then.
+/// a local pack's is from its mapping; another is read and sent as it arrives
+/// ([`loose_remote`]).
 async fn loose_blob(
     ctx: &Ctx,
     b: &mut Bufs,
@@ -643,22 +673,14 @@ async fn loose_blob(
 ) -> std::io::Result<bool> {
     let (zat, zlen) = rec.zlib();
     let mut reader = Reader::new(ctx.blob_cache.as_deref());
-    let mut head = [0u8; 2];
-    let mut cached = false;
     let plan = match pack.bytes() {
         Some(b) => crate::util::sub(b, us(zat), us(zlen))
             .and_then(|z| LooseSplice::plan(OBJ_BLOB, rec.size, z).ok()),
         None => match stream_ends(pack, zat, zlen, &mut reader) {
             Some((head, tail)) => {
-                cached = true;
                 LooseSplice::plan_ends(OBJ_BLOB, rec.size, us(zlen), head, tail).ok()
             }
-            None => cold(read_pack(pack, zat, &mut head))
-                .await
-                .ok()
-                .and_then(|()| {
-                    LooseSplice::plan_ends(OBJ_BLOB, rec.size, us(zlen), head, [0; 4]).ok()
-                }),
+            None => return loose_remote(ctx, b, stream, pack, rec, keep).await,
         },
     };
     let Some(plan) = plan else {
@@ -676,32 +698,54 @@ async fn loose_blob(
         zat.saturating_add(u64_of(plan.body_start)),
         u64_of(plan.body_end.saturating_sub(plan.body_start)),
     );
-    let mut trailer = plan.trailer;
-    if pack.bytes().is_none() && !cached {
-        let mut to = ToClient {
-            out: &mut out,
-            hash: None,
-            budget: &mut budget,
-            failed: None,
-        };
-        let mut body = BodyThenTail {
-            inner: &mut to,
-            body: n,
-            seen: 0,
-            tail: [0; 4],
-        };
-        let read = cold(pack.read(at, n.saturating_add(4), &mut body)).await;
-        let (tail, whole) = (body.tail, body.seen == n.saturating_add(4));
-        client_or_store(read, to.failed)?;
-        if !whole {
-            return Err(super::httpd::other("blob entry read short"));
-        }
-        trailer = LooseSplice::plan_ends(OBJ_BLOB, rec.size, us(zlen), head, tail)
-            .map_err(|_| super::httpd::other("blob entry trailer"))?
-            .trailer;
-    } else if !put_mapped(&mut out, pack, at, n, &mut reader) {
+    if !put_mapped(&mut out, pack, at, n, &mut reader) {
         send_pack_range(&mut out, pack, at, n, None, &mut budget, &mut reader).await?;
     }
+    if !out.put(&plan.trailer) {
+        out.bytes(&plan.trailer).await?;
+    }
+    out.flush().await?;
+    ctx.metrics.bytes_out.fetch_add(out.sent, Ordering::Relaxed);
+    inc(&ctx.metrics.objects_out);
+    Ok(keep)
+}
+
+/// A blob of a pack in object storage that the cache does not hold, as a loose object:
+/// one read of its zlib stream, sent as it arrives ([`LooseStream`]). (Its header was
+/// read first, in a read of its own before the body's: without a cache a ranged GET of
+/// two bytes, with one a block fetched and kept for them, also of a blob too long to
+/// keep.)
+async fn loose_remote(
+    ctx: &Ctx,
+    b: &mut Bufs,
+    stream: &TcpStream,
+    pack: &BlobPack,
+    rec: &BlobRec,
+    keep: bool,
+) -> std::io::Result<bool> {
+    let (zat, zlen) = rec.zlib();
+    let mut out = Out::new(stream, &mut b.out, ctx.deadlines.write);
+    let mut to = LooseStream {
+        out: &mut out,
+        size: rec.size,
+        zlen,
+        keep,
+        seen: 0,
+        head: [0; 2],
+        tail: [0; 4],
+        begun: false,
+        failed: None,
+    };
+    let read = cold(pack.read(zat, zlen, &mut to)).await;
+    let (begun, trailer, failed) = (to.begun, to.trailer(), to.failed.take());
+    if !begun {
+        // Nothing has left: the entry could not be read, or is no zlib stream.
+        inc(&ctx.metrics.errors);
+        respond(ctx, stream, 500, "blob unreadable\n", false).await?;
+        return Ok(false);
+    }
+    client_or_store(read, failed)?;
+    let trailer = trailer.ok_or_else(|| super::httpd::other("blob entry read short"))?;
     if !out.put(&trailer) {
         out.bytes(&trailer).await?;
     }
@@ -2059,5 +2103,104 @@ mod tests {
         );
         let mut tight = Vec::with_capacity(10);
         assert!(!size_item(&mut tight, true, &Oid([0xab; 20]), 7));
+    }
+
+    /// `z` through a [`LooseStream`] of a blob of `size` bytes whose zlib stream its
+    /// record says is `zlen` long, in pieces of `step` bytes, then the trailer: whether
+    /// the response began, whether the stream was whole, and what a client got.
+    fn loose_stream(z: &[u8], zlen: usize, size: u64, step: usize) -> (bool, bool, Vec<u8>) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use crate::store::Sink;
+            use tokio::io::AsyncReadExt;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let got = tokio::spawn(async move {
+                let mut got = Vec::new();
+                client.read_to_end(&mut got).await.unwrap();
+                got
+            });
+            let mut buf = Vec::with_capacity(1 << 10);
+            let mut out = Out::new(&server, &mut buf, std::time::Duration::from_secs(10));
+            let mut to = LooseStream {
+                out: &mut out,
+                size,
+                zlen: u64_of(zlen),
+                keep: true,
+                seen: 0,
+                head: [0; 2],
+                tail: [0; 4],
+                begun: false,
+                failed: None,
+            };
+            let mut read = Ok(());
+            for piece in z.chunks(step) {
+                read = to.put(piece).await;
+                if read.is_err() {
+                    break;
+                }
+            }
+            let (begun, trailer) = (to.begun, to.trailer());
+            if let (Ok(()), Some(trailer)) = (read, trailer) {
+                out.bytes(&trailer).await.unwrap();
+                out.flush().await.unwrap();
+            }
+            drop(server);
+            (begun, trailer.is_some(), got.await.unwrap())
+        })
+    }
+
+    /// The loose object made of a zlib stream as it arrives is the one made of the whole
+    /// stream, however its pieces fall: its header in two, its Adler-32 in four, as a
+    /// block's end or a piece from the store may divide them.
+    #[test]
+    #[allow(clippy::arithmetic_side_effects)]
+    fn a_loose_stream_is_spliced_however_its_pieces_fall() {
+        let mut x = 1u32;
+        let data: Vec<u8> = (0..20_000)
+            .map(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x >> 24) as u8
+            })
+            .collect();
+        let mut z = vec![0u8; crate::zlib::compress_bound(data.len())];
+        let n = crate::zlib::Deflater::new(1)
+            .deflate_parts(&[&data], &mut z)
+            .unwrap();
+        z.truncate(n);
+        let size = u64_of(data.len());
+        let plan = LooseSplice::plan(OBJ_BLOB, size, &z).unwrap();
+        let mut want = plan.prefix().to_vec();
+        want.extend_from_slice(&z[plan.body_start..plan.body_end]);
+        want.extend_from_slice(&plan.trailer);
+        for step in [1, 2, 3, 7, n - 5, n - 3, n - 1, n] {
+            let (begun, whole, got) = loose_stream(&z, n, size, step);
+            assert!(begun && whole, "pieces of {step}");
+            let body = got.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let head = std::str::from_utf8(&got[..body]).unwrap();
+            assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+            assert!(
+                head.contains(&format!("Content-Length: {}\r\n", want.len())),
+                "{head}"
+            );
+            assert!(got[body..] == want[..], "pieces of {step}");
+        }
+        // No zlib header: no response begins, so the request can be answered with an error.
+        let mut bad = z.clone();
+        bad[0] ^= 1;
+        for step in [1, n] {
+            let (begun, whole, got) = loose_stream(&bad, n, size, step);
+            assert!(!begun && !whole && got.is_empty(), "pieces of {step}");
+        }
+        // A stream shorter or longer than its record says has no trailer.
+        let (begun, whole, _) = loose_stream(&z[..n - 1], n, size, 64);
+        assert!(begun && !whole);
+        let (begun, whole, _) = loose_stream(&z, n - 1, size, 64);
+        assert!(begun && !whole);
     }
 }
