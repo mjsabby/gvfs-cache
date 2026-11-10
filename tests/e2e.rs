@@ -1888,6 +1888,54 @@ fn a_store_that_hangs_does_not_stop_the_live_tip() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A store made anew under a running edge (its generations start over, behind the one
+/// the edge serves) is followed once its manifest has stayed, as a restarted edge would
+/// follow it; the edge does not go on serving the store that is gone.
+#[test]
+fn a_store_made_anew_is_followed() {
+    let root = tempdir("anew");
+    let mut up = Upstream::new(&root);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    for _ in 0..3 {
+        up.commit(3);
+        pipeline(&root, &store, &up, "15m", &[]);
+    }
+    let old = manifest(&store_dir);
+    assert_eq!(old.generation, 3);
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--poll-ms",
+        "20",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ]);
+    assert_eq!(server.metric("gvfs_manifest_generation"), 3);
+
+    let tip = up.commit(3);
+    std::fs::remove_dir_all(&store_dir).unwrap();
+    std::fs::remove_dir_all(root.join("pipeline-work")).unwrap();
+    pipeline(&root, &store, &up, "15m", &[]);
+    let new = manifest(&store_dir);
+    assert_eq!(new.generation, 1);
+    assert_ne!(new.baseline.id, old.baseline.id);
+    server.wait_for("the new store's manifest", |s| {
+        s.metric("gvfs_manifest_generation") == 1
+    });
+    assert_eq!(server.metric("gvfs_slabs"), 1);
+    let client = fresh_repo(&root, "client");
+    for (_, pack) in server.prefetch(0) {
+        install_pack(&client, &pack);
+    }
+    assert_complete(&client, &tip);
+    assert_eq!(server.metric("gvfs_live_failures_total"), 0);
+    server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Forced pushes under the edge's live L0 slabs, which only the edge saw (the pipeline did
 /// not run in between): a rewind, a rewind into the middle of a slab, and a rewrite. The
 /// edge stops serving what the branch no longer reaches, stamps what follows exactly as the

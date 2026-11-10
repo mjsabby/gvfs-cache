@@ -332,7 +332,12 @@ replaced together once everything that can fail has not, so a later view is neve
 of one manifest's bounds and another's slabs. What failed is tried again after one poll
 interval, then after twice as long each time, up to a minute, since an attempt fetches
 the delta or downloads the slabs again; another head, or another manifest, is tried at
-once. `gvfs_live_failures_total` counts the failures.
+once. `gvfs_live_failures_total` counts the failures. A manifest whose generation is not
+above the one served is not an older state of the store, whose generations only grow,
+but a store made anew (or put back from a copy): the edge follows it, as a restarted edge
+would, once it has stayed the store's manifest for 30 polls, which a read that returned
+an older manifest for a moment does not. Ignored, it left the edge serving the store
+that was gone, its L0 slabs growing.
 
 Every change publishes a new immutable `View`; requests hold an `Arc` to the view they
 started with. Object lookups go through the live L0 slabs, the pyramid, the weekly deltas
