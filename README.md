@@ -161,10 +161,19 @@ gvfs-cache pipeline --store "$STORE" --upstream "$ADO_URL" --auth-command ~/get_
     --tier $tier
 ```
 
-A crashed or skipped run only makes the next 15m slab wider. Slab files that no manifest
-references are deleted after `--gc-grace-secs` (default 2 h). A run that fails to delete
-some says so in its log and still exits 0: its manifest is published by then, and a later
-run deletes them.
+A crashed or skipped run only makes the next 15m slab wider. Files in the store that no
+manifest lists stay for `--gc-grace-secs` (default 2 h) after a run first finds them so:
+
+* What a run drops (a retained slab that has aged out, the baseline a weekly run
+  replaces) is noted by that run in `gc.bin`, a small object beside the manifest, and
+  deleted by the first run at least two hours later. An edge that has read a manifest
+  has that long to fetch what it lists, and so has another run that started from it.
+* What a crashed run uploaded is noted by the next run, and deleted two hours after that.
+* A file that is uploaded again meanwhile (another run making the same slab) has its two
+  hours again, in which that run lists it; a file that is listed again is not deleted.
+
+A run that fails to delete some says so in its log and still exits 0: its manifest is
+published by then, and a later run deletes them.
 
 ### Real blobs in their own packs (`--blobs separate`)
 
@@ -352,7 +361,7 @@ src/slab.rs, mphf.rs       slab index format and the partitioned PTHash MPHF
 src/idfilter.rs            blocked Bloom filters that rule slabs out of a lookup
 src/timeline.rs            commit-derived timestamps; which slabs answer a client's cursor
 src/pipeline.rs            the scheduled job: genesis, 15m, rollups, weekly
-src/gc.rs                  garbage collection of the store, at the end of each pipeline run
+src/gc.rs                  garbage collection of the store, at the end of each pipeline run; gc.bin
 src/mirror.rs              --blobs separate: the resumable seed (and on-demand repair) of the blob packs
 src/separate.rs            --blobs separate: what pipeline, mirror and edge share (sizes, blob index,
                            the history's blobs, lost-object checks)

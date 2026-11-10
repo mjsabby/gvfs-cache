@@ -367,6 +367,7 @@ fn main() {
         tier: Tier::M15,
         work_dir: work.join("pipeline"),
         now: t0,
+        now_fixed: true,
         keep_weeks: 8,
         weekly_always: false,
         gc_grace: 7200,

@@ -25,6 +25,16 @@ pub fn main(args: &[String]) -> Result<()> {
                 .ctx("no manifest.bin in the store")?;
             let m = Manifest::decode(&bytes)?;
             print!("{} etag {etag}\n{}", store.describe(), m.describe());
+            // What garbage collection is keeping for now, if `gc.bin` can be read.
+            if let Ok(noted) = crate::gc::load(&store)
+                && let Some(first) = noted.iter().map(|e| e.since).min()
+            {
+                println!(
+                    "  unlisted {} files noted in gc.bin, the first at {first}: each is deleted \
+                     --gc-grace-secs after its note",
+                    noted.len()
+                );
+            }
             Ok(())
         }
         "slab" => {

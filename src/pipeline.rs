@@ -25,12 +25,15 @@
 //!    for byte plus the delta's objects, with each directory's newest version stored as a
 //!    delta against the old baseline's version. It waits for its week ([`weekly_wait`]),
 //!    and publishes the new baseline's tail on the old one beside it ([`crate::tail`]).
-//! 5. Publish with `If-Match` (lost race: start over), then delete unreferenced slab files
-//!    older than the grace period (a crashed run's uploads; slabs no longer listed). A run
-//!    that changed nothing (no new commits, no rollup due) publishes nothing: the manifest
-//!    keeps its generation, and every edge its view. It still collects garbage. A failure
-//!    of that collection is logged, not returned: the run has published by then, and a
-//!    scheduler that runs a failed run again would repeat it.
+//! 5. Publish with `If-Match` (lost race: start over), then collect garbage
+//!    ([`crate::gc`]): the files in the store that no manifest lists (a crashed run's
+//!    uploads; slabs this run or an earlier one dropped) are noted in `gc.bin`, and
+//!    deleted by a run a grace period later, so that the readers of the manifest that
+//!    listed them have that long. A run that changed nothing (no new commits, no rollup
+//!    due) publishes nothing: the manifest keeps its generation, and every edge its view.
+//!    It still collects garbage. A failure of that collection is logged, not returned:
+//!    the run has published by then, and a scheduler that runs a failed run again would
+//!    repeat it.
 //!
 //! Timestamps are derived from commits ([`crate::timeline`]): a 15m slab ends at the
 //! stamp of the tip it was fetched up to, which is exactly the stamp an edge gave the same
@@ -71,9 +74,13 @@ pub struct Options {
     pub upstream: Upstream,
     pub tier: Tier,
     pub work_dir: PathBuf,
-    /// The clock (seconds): for garbage collection, for retention when stamps are ahead of
-    /// it, and for whether a weekly rebuild is due.
+    /// The clock (seconds) when the run started: what retention ages by when stamps are
+    /// ahead of it, and what says whether a weekly rebuild is due.
     pub now: u64,
+    /// `now` was given (`--now`, a simulated clock) and stands still for the run. Else
+    /// garbage collection, at the end of a run that may take hours, reads the system's
+    /// clock again: its grace period counts from when it looks at the store.
+    pub now_fixed: bool,
     pub keep_weeks: usize,
     /// `--weekly always`: a `--tier 168h` run rebuilds the baseline whenever it is asked
     /// to, not only when one is due ([`weekly_due`]).
@@ -229,6 +236,7 @@ pub fn main(args: &[String]) -> Result<()> {
         tier,
         work_dir: work_dir.clone(),
         now: f.num("now", crate::util::now_secs())?,
+        now_fixed: f.get("now").is_some(),
         keep_weeks: f.num("keep-weeks", 8usize)?,
         weekly_always: match f.get("weekly").unwrap_or("due") {
             "due" => false,
@@ -421,7 +429,12 @@ fn step(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<(Man
     // The manifest is the store's now, so the run has succeeded, and nothing after this
     // fails it: an error exit has a scheduler run it again, and a weekly run again is a
     // second weekly. What garbage collection did not get to waits for a later run.
-    if let Err(e) = crate::gc::collect(&o.store, &m, o.now, o.gc_grace) {
+    let now = if o.now_fixed {
+        o.now
+    } else {
+        crate::util::now_secs()
+    };
+    if let Err(e) = crate::gc::collect(&o.store, &m, now, o.gc_grace) {
         crate::log!("gc: incomplete ({e}); what it did not delete stays until a later run");
     }
     if m.separate_blobs() {

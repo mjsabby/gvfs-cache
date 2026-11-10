@@ -75,7 +75,10 @@ PIPELINE OPTIONS:
                                end is six days old (due, the default: a run asked for
                                again sooner does the lower tiers and waits), or whenever
                                it is asked to (always)
-    --gc-grace-secs <N>        orphaned slab files older than this are deleted (default: 7200)
+    --gc-grace-secs <N>        a file in the store that no manifest lists is deleted by the
+                               first run at least this long after the run that first
+                               found it so and noted it in gc.bin (default: 7200); the
+                               readers of a manifest have that long for what it lists
     --threads <N>              indexing threads (default: all cores)
     --blobs <inline|separate>  at genesis: keep blobs in the slabs (inline, the default)
                                or every blob, real content, in blob packs with sizes

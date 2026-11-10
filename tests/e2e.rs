@@ -549,19 +549,13 @@ fn pyramid_rollups_and_weekly_rebuilds() {
     );
     assert_complete(&old, &up.tip());
 
-    // The second week, keeping one week, collecting garbage immediately.
+    // The second week, keeping one week.
     up.commit(4);
     step(&root, &store, &up, &mut now, "15m", &[]);
+    let before = manifest(&store_dir);
     up.commit(4);
     now += 7 * 86_400;
-    step(
-        &root,
-        &store,
-        &up,
-        &mut now,
-        "168h",
-        &["--keep-weeks", "1", "--gc-grace-secs", "0"],
-    );
+    step(&root, &store, &up, &mut now, "168h", &["--keep-weeks", "1"]);
     let m = manifest(&store_dir);
     assert_eq!(m.weekly.len(), 1);
     assert_eq!(m.weekly[0].start_ts, ts_week1);
@@ -575,18 +569,41 @@ fn pyramid_rollups_and_weekly_rebuilds() {
         m.baseline.objects as usize
     );
 
-    // GC left exactly the referenced slab files (the baseline's tail on the one before it
-    // among them: the first week's tail went with its baseline).
+    // What the weekly run dropped (the baseline it replaced, the first week's delta) is
+    // in the store still, for the readers of the manifest before it: every file that
+    // one lists is. (They went with the run that dropped them.)
+    let slab_files = |m: &gvfs_cache::manifest::Manifest| {
+        let mut files: Vec<String> = m
+            .slabs()
+            .flat_map(|s| [s.pack_key(), s.index_key()])
+            .collect();
+        files.sort();
+        files
+    };
+    let dropped: Vec<String> = slab_files(&before)
+        .into_iter()
+        .filter(|f| !slab_files(&m).contains(f))
+        .collect();
+    assert!(dropped.contains(&before.baseline.pack_key()) && dropped.len() >= 4);
+    for file in &dropped {
+        assert!(
+            store_dir.join(file).exists(),
+            "{file} went with its manifest"
+        );
+    }
+    // A grace period later, a run leaves exactly the referenced slab files: the slabs',
+    // and the baseline's tail on the one before it (the first week's tail has gone with
+    // its baseline).
+    now += 7200 - 900;
+    let log = step(&root, &store, &up, &mut now, "15m", &["--keep-weeks", "1"]);
+    assert!(log.contains("no new commits"), "{log}");
     let mut files: Vec<String> = std::fs::read_dir(store_dir.join("slabs"))
         .unwrap()
         .map(|e| format!("slabs/{}", e.unwrap().file_name().to_string_lossy()))
         .collect();
     files.sort();
-    let mut referenced: Vec<String> = m
-        .slabs()
-        .flat_map(|s| [s.pack_key(), s.index_key()])
-        .chain([m.baseline.tail_key()])
-        .collect();
+    let mut referenced = slab_files(&m);
+    referenced.push(m.baseline.tail_key());
     referenced.sort();
     assert_eq!(files, referenced);
 
@@ -724,19 +741,23 @@ fn idle_runs_publish_nothing() {
     assert!(log.contains("weekly: nothing new"), "{log}");
     assert_eq!(published(&store), weekly);
 
-    // An idle run still deletes what no manifest references.
+    // An idle run still collects garbage: one notes what no manifest references, and one
+    // a grace period later deletes it.
     let orphan = store_dir.join("slabs/orphan.pack");
     std::fs::write(&orphan, b"x").unwrap();
-    let far = (now + 86_400 * 30).to_string();
-    pipeline(
-        &root,
-        &store,
-        &up,
-        "15m",
-        &["--now", &far, "--gc-grace-secs", "60"],
-    );
-    assert!(!orphan.exists());
-    assert_eq!(published(&store), weekly);
+    let far = now + 86_400 * 30;
+    for (at, there) in [(far, true), (far + 59, true), (far + 60, false)] {
+        let at = at.to_string();
+        pipeline(
+            &root,
+            &store,
+            &up,
+            "15m",
+            &["--now", &at, "--gc-grace-secs", "60"],
+        );
+        assert_eq!(orphan.exists(), there, "at {at}, noted at {far}");
+        assert_eq!(published(&store), weekly);
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -761,9 +782,22 @@ fn a_gc_failure_does_not_fail_the_run() {
     for f in [&orphan, &stray, &later] {
         std::fs::write(f, b"x").unwrap();
     }
+    // A run notes the three files, which no manifest lists: nothing to delete yet.
+    let far = gvfs_cache::util::now_secs() + 86_400 * 30;
+    let noting = far.to_string();
+    let log = pipeline(
+        &root,
+        &store,
+        &up,
+        "15m",
+        &["--now", &noting, "--gc-grace-secs", "60"],
+    );
+    assert!(!log.contains("gc: incomplete"), "{log}");
+    assert!(orphan.exists() && later.exists() && stray.exists());
+    // A grace period later, the run that publishes the next commit is to delete them.
     let tip = up.commit(4);
-    let far = (gvfs_cache::util::now_secs() + 86_400 * 30).to_string();
-    let gc_now = ["--now", far.as_str(), "--gc-grace-secs", "60"];
+    let due = (far + 60).to_string();
+    let gc_now = ["--now", due.as_str(), "--gc-grace-secs", "60"];
     let log = pipeline(&root, &store, &up, "15m", &gc_now);
     let m = manifest(&store_dir);
     assert_eq!((m.generation, m.tip.to_string()), (2, tip));
@@ -775,6 +809,12 @@ fn a_gc_failure_does_not_fail_the_run() {
     let log = pipeline(&root, &store, &up, "15m", &gc_now);
     assert!(log.contains(said), "{log}");
     assert_eq!(manifest(&store_dir).generation, 2);
+    // Nor does a `gc.bin` that cannot be read fail a run: that run deletes nothing.
+    std::fs::remove_file(store_dir.join("gc.bin")).unwrap();
+    std::fs::create_dir(store_dir.join("gc.bin")).unwrap();
+    let log = pipeline(&root, &store, &up, "15m", &gc_now);
+    assert!(log.contains("gc: incomplete (reading gc.bin: "), "{log}");
+    assert!(stray.exists());
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -831,15 +871,16 @@ fn assert_store_serves(root: &std::path::Path, store: &str, tip: &str) {
     server.assert_clean();
 }
 
-/// Two runs and one slab id. An earlier run died after uploading a rollup. Run A's
-/// garbage collection lists the store and finds the rollup's files due. Run B then makes
-/// the same rollup (ids are content-addressed), uploads it and publishes a manifest that
-/// lists it. Run A deletes what it listed: not the rollup, whose files are B's now, not
-/// the ones A listed. (B's upload left the files that were there, and A deleted them by
-/// name: both runs exited 0, the manifest listed a slab that was gone, and no edge could
-/// start.)
+/// Two runs and one slab id. An earlier run died after uploading a rollup, and a pass has
+/// noted its files, which no manifest lists. A grace period later, run A's garbage
+/// collection lists the store and finds them due. Run B then makes the same rollup (ids
+/// are content-addressed), uploads it and publishes a manifest that lists it. Run A
+/// deletes what it listed: not the rollup, whose files are B's now, not the ones A
+/// listed. (B's upload left the files that were there, and A deleted them by name: both
+/// runs exited 0, the manifest listed a slab that was gone, and no edge could start.)
 #[test]
 fn a_slab_uploaded_again_outlives_the_collection_that_listed_it() {
+    use gvfs_cache::gc::{Pass, Swept};
     let root = tempdir("gc-race");
     let mut up = Upstream::new(&root);
     let (store_dir, rollup) = store_with_an_orphan_rollup(&root, &mut up);
@@ -848,20 +889,17 @@ fn a_slab_uploaded_again_outlives_the_collection_that_listed_it() {
     files.sort();
 
     let s = gvfs_cache::store::Store::open(&store, "").unwrap();
-    let far = gvfs_cache::util::now_secs() + 86_400 * 30;
-    let pass = gvfs_cache::gc::Pass::survey(&s, &manifest(&store_dir), far, 60).unwrap();
+    let t = gvfs_cache::util::now_secs();
+    let noted = gvfs_cache::gc::collect(&s, &manifest(&store_dir), t, 3600).unwrap();
+    assert_eq!((noted.noted, noted.deleted), (2, 0));
+    let pass = Pass::survey(&s, &manifest(&store_dir), t + 3600, 3600).unwrap();
     let mut due: Vec<&str> = pass.due().collect();
     due.sort_unstable();
     assert_eq!(due, files);
 
-    let far = far.to_string();
-    pipeline(
-        &root,
-        &store,
-        &up,
-        "1h",
-        &["--now", &far, "--gc-grace-secs", "60"],
-    );
+    let later = (t + 3600).to_string();
+    let gc_now = ["--now", later.as_str(), "--gc-grace-secs", "3600"];
+    pipeline(&root, &store, &up, "1h", &gc_now);
     let m = manifest(&store_dir);
     assert_eq!(m.pyramid, [rollup]);
 
@@ -869,9 +907,182 @@ fn a_slab_uploaded_again_outlives_the_collection_that_listed_it() {
     for key in &files {
         assert!(store_dir.join(key).exists(), "{key} is listed, and gone");
     }
-    assert_eq!((swept.deleted, swept.replaced), (0, 2));
+    let replaced = Swept {
+        replaced: 2,
+        ..Swept::default()
+    };
+    assert_eq!(swept, replaced);
+    assert_store_serves(&root, &store, &up.tip());
+    // Listed, the files have no note any more, and later runs leave them.
+    assert_eq!(gvfs_cache::gc::load(&s).unwrap(), []);
+    let much_later = (t + 30 * 3600).to_string();
+    let gc_now = ["--now", much_later.as_str(), "--gc-grace-secs", "3600"];
+    pipeline(&root, &store, &up, "15m", &gc_now);
+    assert!(files.iter().all(|key| store_dir.join(key).exists()));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The same two runs in the other order: run B has uploaded the rollup again and has not
+/// published yet when run A's collection comes by, whole, with the note of the old files
+/// due. What is there is not what was noted but B's upload, which is noted anew: it has a
+/// grace period, in which B publishes. (Were a note the key's, whatever file has it, the
+/// files would go, and B publish a manifest that lists them.)
+#[test]
+fn a_slab_uploaded_again_has_a_grace_period_to_be_listed() {
+    use gvfs_cache::gc::{Swept, collect};
+    use gvfs_cache::store::{Cond, Store};
+    let root = tempdir("gc-race-unpublished");
+    let mut up = Upstream::new(&root);
+    let (store_dir, rollup) = store_with_an_orphan_rollup(&root, &mut up);
+    let store = store_spec(&store_dir);
+    let files = [rollup.pack_key(), rollup.index_key()];
+    let noted = Swept {
+        noted: 2,
+        ..Swept::default()
+    };
+
+    let s = Store::open(&store, "").unwrap();
+    let t = gvfs_cache::util::now_secs();
+    let m = manifest(&store_dir);
+    assert_eq!(collect(&s, &m, t, 3600).unwrap(), noted);
+    // Run B's uploads, as the run on the copy of the store made the files.
+    let copy = root.join("copy");
+    for key in &files {
+        s.upload_file(key, &copy.join(key)).unwrap();
+    }
+    // Run A's collection.
+    assert_eq!(collect(&s, &m, t + 3600, 3600).unwrap(), noted);
+    for key in &files {
+        assert!(
+            store_dir.join(key).exists(),
+            "{key} is to be listed, and gone"
+        );
+    }
+    // Run B publishes: the manifest of the run on the copy, which follows this store's.
+    let (_, etag) = s.get("manifest.bin").unwrap().unwrap();
+    let published = std::fs::read(copy.join("manifest.bin")).unwrap();
+    s.put("manifest.bin", &published, Cond::IfMatch(etag))
+        .unwrap();
+    assert_eq!(manifest(&store_dir).pyramid, [rollup]);
+    assert_store_serves(&root, &store, &up.tip());
+    let later = (t + 3 * 3600).to_string();
+    let gc_now = ["--now", later.as_str(), "--gc-grace-secs", "3600"];
+    pipeline(&root, &store, &up, "15m", &gc_now);
+    assert!(files.iter().all(|key| store_dir.join(key).exists()));
+    assert_eq!(gvfs_cache::gc::load(&s).unwrap(), []);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// What a run drops stays in the store for the grace period, for the readers of the
+/// manifest before: an edge that takes that manifest still starts. Here retained slabs
+/// that age out, then the baseline a weekly run replaces, all written long before by the
+/// runs' clock. A run a second short of the grace period leaves them, the next deletes
+/// them. (They went with the run that dropped them, being older than the grace period.)
+#[test]
+fn what_a_run_drops_stays_for_the_grace_period() {
+    let root = tempdir("gc-dropped");
+    let mut up = Upstream::new(&root);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    let t = gvfs_cache::util::now_secs();
+    let run = |up: &Upstream, tier: &str, now: u64| {
+        let now = now.to_string();
+        pipeline(&root, &store, up, tier, &["--now", &now]);
+        manifest(&store_dir)
+    };
+    let slab_files = |m: &gvfs_cache::manifest::Manifest| {
+        let files = m.slabs().flat_map(|s| [s.pack_key(), s.index_key()]);
+        files.collect::<Vec<String>>()
+    };
+    let in_store = |files: &[String]| files.iter().filter(|f| store_dir.join(f).exists()).count();
+    // An edge that reads `m`, the manifest before the store's, from the store's files.
+    let view = root.join("the-manifest-before");
+    std::fs::create_dir_all(&view).unwrap();
+    std::os::unix::fs::symlink(store_dir.join("slabs"), view.join("slabs")).unwrap();
+    let assert_readable = |m: &gvfs_cache::manifest::Manifest| {
+        std::fs::write(view.join("manifest.bin"), m.encode()).unwrap();
+        let server = Server::start(&["--store", view.to_str().unwrap()]);
+        assert_eq!(server.metric("gvfs_manifest_generation"), m.generation);
+        assert_eq!(server.prefetch(0).len(), 1);
+    };
+    let noted = || {
+        let s = gvfs_cache::store::Store::open(&store, "").unwrap();
+        let mut keys: Vec<String> = gvfs_cache::gc::load(&s)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        keys.sort();
+        keys
+    };
+    let sorted = |mut files: Vec<String>| {
+        files.sort();
+        files
+    };
+
+    // Two 15m slabs and the hour's rollup, which retains them for a day.
+    up.commit(4);
+    run(&up, "15m", t);
+    up.commit(4);
+    run(&up, "15m", t + 900);
+    up.commit(4);
+    let hour = run(&up, "1h", t + 1800);
+    assert_eq!(hour.retained.len(), 2);
+    // Two days later the retained slabs have aged out: the run drops them.
+    let day2 = t + 2 * 86_400;
+    commit_dated(&up, &[("later.txt", "two days later\n")], day2);
+    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
+    let after = run(&up, "15m", day2);
+    assert!(after.retained.is_empty());
+    let dropped: Vec<String> = hour.retained.iter().flat_map(slab_files_of).collect();
+    assert_eq!(
+        in_store(&dropped),
+        4,
+        "the retained slabs went with their manifest"
+    );
+    assert_readable(&hour);
+    assert_eq!(noted(), sorted(dropped.clone()));
+    let inspected = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-cache"))
+        .args(["inspect", "manifest", "--store", &store])
+        .output()
+        .unwrap();
+    let inspected = String::from_utf8_lossy(&inspected.stdout);
+    let said = format!("unlisted 4 files noted in gc.bin, the first at {day2}:");
+    assert!(inspected.contains(&said), "{inspected}");
+    run(&up, "15m", day2 + 7199);
+    assert_eq!(in_store(&dropped), 4);
+    run(&up, "15m", day2 + 7200);
+    assert_eq!(in_store(&dropped), 0);
+    assert!(noted().is_empty());
+    assert_eq!(in_store(&slab_files(&after)), slab_files(&after).len());
+
+    // The weekly run replaces the baseline, which every reader of the manifest before
+    // starts from.
+    up.commit(4);
+    let before = run(&up, "15m", day2 + 8100);
+    let week = run(&up, "168h", day2 + 9000);
+    assert_ne!(week.baseline.id, before.baseline.id);
+    let old_baseline = slab_files_of(&before.baseline).to_vec();
+    assert_eq!(
+        in_store(&old_baseline),
+        2,
+        "the baseline went with its manifest"
+    );
+    assert_readable(&before);
+    assert_eq!(noted(), sorted(old_baseline.clone()));
+    run(&up, "15m", day2 + 9000 + 7199);
+    assert_eq!(in_store(&old_baseline), 2);
+    run(&up, "15m", day2 + 9000 + 7200);
+    assert_eq!(in_store(&old_baseline), 0);
+    assert!(noted().is_empty());
+    assert_eq!(in_store(&slab_files(&week)), slab_files(&week).len());
     assert_store_serves(&root, &store, &up.tip());
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The store keys of a slab's files.
+fn slab_files_of(slab: &gvfs_cache::slab::SlabMeta) -> [String; 2] {
+    [slab.pack_key(), slab.index_key()]
 }
 
 /// Superset deliveries (`--superset-tier`, default 24h). Once the tip moves past a sealed
