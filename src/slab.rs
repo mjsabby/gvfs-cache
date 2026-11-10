@@ -344,31 +344,28 @@ pub fn dedupe_facts(facts: &[Facts]) -> Vec<Facts> {
     out
 }
 
-fn encode_index(
-    facts: &[Facts],
-    built: &crate::mphf::Built,
-    entries: u32,
-    pack_len: u64,
-    pack_sha: &[u8; 20],
-) -> Result<Vec<u8>> {
-    let n = facts.len();
-    for f in facts {
-        if f.offset > MAX_OFFSET || f.size > (1u64 << 40).saturating_sub(1) {
-            crate::bail!(
-                "object {} too large for the slab index (offset {}, size {})",
-                f.oid,
-                f.offset,
-                f.size
-            );
-        }
-    }
-
+/// Where the sections of an index of `n` objects begin whose table is `built`: its
+/// pilots, its records, and its end.
+fn layout(built: &crate::mphf::Built, n: usize) -> (usize, usize, usize) {
     let offsets_at = INDEX_HEADER_LEN;
     let pilots_at = align8(offsets_at.saturating_add(built.offsets.len().saturating_mul(4)));
     let records_at = align8(pilots_at.saturating_add(built.pilots.len().saturating_mul(2)));
     let total = records_at.saturating_add(n.saturating_mul(REC_LEN));
-    let mut out = vec![0u8; total];
+    (pilots_at, records_at, total)
+}
 
+/// Writes what an index holds before its records, at the start of `out`: the header and
+/// the table's offsets and pilots.
+fn encode_tables(
+    out: &mut [u8],
+    built: &crate::mphf::Built,
+    n: usize,
+    entries: u32,
+    pack_len: u64,
+    pack_sha: &[u8; 20],
+) {
+    let offsets_at = INDEX_HEADER_LEN;
+    let (pilots_at, records_at, total) = layout(built, n);
     let mut header = [0u8; INDEX_HEADER_LEN];
     let fields: [(usize, &[u8]); 13] = [
         (0, INDEX_MAGIC),
@@ -413,6 +410,30 @@ fn encode_index(
     {
         chunk.copy_from_slice(&v.to_le_bytes());
     }
+}
+
+fn encode_index(
+    facts: &[Facts],
+    built: &crate::mphf::Built,
+    entries: u32,
+    pack_len: u64,
+    pack_sha: &[u8; 20],
+) -> Result<Vec<u8>> {
+    let n = facts.len();
+    for f in facts {
+        if f.offset > MAX_OFFSET || f.size > (1u64 << 40).saturating_sub(1) {
+            crate::bail!(
+                "object {} too large for the slab index (offset {}, size {})",
+                f.oid,
+                f.offset,
+                f.size
+            );
+        }
+    }
+
+    let (_, records_at, total) = layout(built, n);
+    let mut out = vec![0u8; total];
+    encode_tables(&mut out, built, n, entries, pack_len, pack_sha);
     let records = out.get_mut(records_at..).unwrap_or(&mut []);
     for (f, &slot) in facts.iter().zip(&built.slots) {
         let base = if f.base == NO_BASE {
@@ -439,6 +460,183 @@ fn encode_index(
         encode_rec(&rec, dst);
     }
     Ok(out)
+}
+
+/// What an index says of itself in its header, checked against its length.
+pub struct IndexHeader {
+    pub count: u32,
+    /// The entries of its pack (`count` of them distinct objects).
+    pub entries: u32,
+    pub pack_len: u64,
+    pub pack_sha: [u8; 20],
+    seed: u64,
+    parts: u32,
+    buckets: u32,
+    offsets_at: usize,
+    pilots_at: usize,
+    records_at: usize,
+}
+
+impl IndexHeader {
+    /// The header of the index `ix` (`what` says whose it is, in an error).
+    pub fn parse(ix: &[u8], what: &str) -> Result<IndexHeader> {
+        if ix.get(..8) != Some(&INDEX_MAGIC[..]) || le_u32(ix, 8) != Some(INDEX_VERSION) {
+            crate::bail!("{what}: not a slab index");
+        }
+        let count = le_u32(ix, 12).ctx("index header")?;
+        let parts = le_u32(ix, 16).ctx("index header")?;
+        let buckets = le_u32(ix, 20).ctx("index header")?;
+        let seed = le_u64(ix, 24).ctx("index header")?;
+        let pack_len = le_u64(ix, 32).ctx("index header")?;
+        let pack_sha: [u8; 20] = sub(ix, 40, 20)
+            .and_then(|s| s.try_into().ok())
+            .ctx("index header")?;
+        let entries = le_u32(ix, 60).ctx("index header")?;
+        let offsets_at = us(le_u64(ix, 64).ctx("index header")?);
+        let pilots_at = us(le_u64(ix, 72).ctx("index header")?);
+        let records_at = us(le_u64(ix, 80).ctx("index header")?);
+        let total = us(le_u64(ix, 88).ctx("index header")?);
+        let offsets_len = us(u64::from(parts)).saturating_add(1).saturating_mul(4);
+        let pilots_len = us(u64::from(parts))
+            .saturating_mul(us(u64::from(buckets)))
+            .saturating_mul(2);
+        let records_len = us(u64::from(count)).saturating_mul(REC_LEN);
+        let consistent = total == ix.len()
+            && offsets_at.saturating_add(offsets_len) <= pilots_at
+            && pilots_at.saturating_add(pilots_len) <= records_at
+            && records_at.saturating_add(records_len) == total
+            && parts > 0
+            && count <= entries;
+        if !consistent {
+            crate::bail!("{what}: index sections are inconsistent");
+        }
+        Ok(IndexHeader {
+            count,
+            entries,
+            pack_len,
+            pack_sha,
+            seed,
+            parts,
+            buckets,
+            offsets_at,
+            pilots_at,
+            records_at,
+        })
+    }
+
+    /// The records of the index `ix`, whose header this is: 40 bytes an object, in slot
+    /// order.
+    pub fn records<'a>(&self, ix: &'a [u8]) -> &'a [u8] {
+        ix.get(self.records_at..).unwrap_or(&[])
+    }
+}
+
+/// The offset of the entry a record is of.
+pub fn record_offset(rec: &[u8]) -> Option<u64> {
+    Some(le_u64(rec, 20)? & MAX_OFFSET)
+}
+
+/// Writes at `out` the index of a pack that is the pack of the index `old` and `more`
+/// objects after it: the index [`build_index`] makes of that pack, without the pack.
+/// `more` holds the new objects' records as that index has them (40 bytes each; a
+/// delta's base is a slot of it). `old`'s records go to the slots that a table of all
+/// the ids gives them, their bases with them.
+///
+/// Under a fixed seed the table is a function of the ids ([`crate::mphf::build_from`]),
+/// so the two indexes are one, byte for byte. Under a seed derived from the ids' order
+/// they are not, nor where the pack holds an id twice (an error here). Whoever calls
+/// compares the SHA-256 returned, and the length, with those the index is known by.
+///
+/// Memory: 12 bytes an object while the table is built, 8 while the file is written (the
+/// ids are hashed where they are in `old`, and its records read as they are placed and
+/// written in slot order): 109 MB at most for 9.25M objects.
+pub fn grow_index(
+    old: &[u8],
+    more: &[u8],
+    entries: u32,
+    pack_len: u64,
+    pack_sha: &[u8; 20],
+    threads: usize,
+    out: &Path,
+) -> Result<([u8; 32], u64)> {
+    use std::io::Write;
+    let head = IndexHeader::parse(old, "the index to grow")?;
+    let old_recs = head.records(old);
+    let n_old = us(u64::from(head.count));
+    if !more.len().is_multiple_of(REC_LEN) {
+        crate::bail!("{} bytes of records", more.len());
+    }
+    let n = n_old.saturating_add(more.len().checked_div(REC_LEN).unwrap_or(0));
+    // The ids where they are: `old`'s records in slot order, then `more`'s.
+    let key = |i: usize| {
+        let id = match i.checked_sub(n_old) {
+            None => sub(old_recs, i.saturating_mul(REC_LEN), 20),
+            Some(new) => sub(more, new.saturating_mul(REC_LEN), 20),
+        };
+        id.and_then(Oid::from_slice).unwrap_or(Oid::ZERO)
+    };
+    let built = crate::mphf::build_from(n, key, threads)?;
+    let (_, records_at, total) = layout(&built, n);
+    let mut tables = vec![0u8; records_at];
+    encode_tables(&mut tables, &built, n, entries, pack_len, pack_sha);
+    // The key each slot is for.
+    let mut key_of = vec![u32::MAX; n];
+    for (key, &slot) in built.slots.iter().enumerate() {
+        if let Some(k) = key_of.get_mut(us(u64::from(slot))) {
+            *k = crate::util::u32_of(key);
+        }
+    }
+    let tmp = crate::fsutil::temp_path(out);
+    let written = (|| -> Result<[u8; 32]> {
+        /// Records are hashed and written this many bytes at a time.
+        const PIECE: usize = 1 << 20;
+        let mut file = File::create(&tmp)?;
+        let mut sha = ring::digest::Context::new(&ring::digest::SHA256);
+        sha.update(&tables);
+        file.write_all(&tables)?;
+        let mut piece: Vec<u8> = Vec::with_capacity(PIECE);
+        for &key in &key_of {
+            let key = us(u64::from(key));
+            let at = piece.len();
+            let base_at = at.saturating_add(36);
+            match key.checked_sub(n_old) {
+                None => {
+                    let rec = sub(old_recs, key.saturating_mul(REC_LEN), REC_LEN);
+                    piece.extend_from_slice(rec.ctx("a record of the index to grow")?);
+                    let base = le_u32(&piece, base_at).unwrap_or(NO_BASE);
+                    if base != NO_BASE {
+                        let slot = built
+                            .slots
+                            .get(us(u64::from(base)))
+                            .filter(|_| base < head.count)
+                            .ctx("a record's base")?;
+                        if let Some(dst) = piece.get_mut(base_at..base_at.saturating_add(4)) {
+                            dst.copy_from_slice(&slot.to_le_bytes());
+                        }
+                    }
+                }
+                Some(new) => {
+                    let rec = sub(more, new.saturating_mul(REC_LEN), REC_LEN);
+                    piece.extend_from_slice(rec.ctx("a slot without a record")?);
+                }
+            }
+            if piece.len().saturating_add(REC_LEN) > PIECE {
+                sha.update(&piece);
+                file.write_all(&piece)?;
+                piece.clear();
+            }
+        }
+        sha.update(&piece);
+        file.write_all(&piece)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, out)?;
+        sha.finish().as_ref().try_into().ok().ctx("a SHA-256")
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    let sha = written.ctx(&format!("writing {}", out.display()))?;
+    Ok((sha, u64_of(total)))
 }
 
 /// Bytes backing a slab file: a read-only map, or a heap buffer (the L0 slab).
@@ -628,35 +826,8 @@ impl Slab {
     }
 
     fn new(meta: SlabMeta, pack: Region, pack_file: Option<File>, index: Region) -> Result<Slab> {
-        let ix = index.bytes();
-        if ix.get(..8) != Some(&INDEX_MAGIC[..]) || le_u32(ix, 8) != Some(INDEX_VERSION) {
-            crate::bail!("slab {}: not a slab index", meta.id);
-        }
-        let count = le_u32(ix, 12).ctx("index header")?;
-        let parts = le_u32(ix, 16).ctx("index header")?;
-        let buckets = le_u32(ix, 20).ctx("index header")?;
-        let seed = le_u64(ix, 24).ctx("index header")?;
-        let pack_len = le_u64(ix, 32).ctx("index header")?;
-        let pack_sha = sub(ix, 40, 20).ctx("index header")?;
-        let entries = le_u32(ix, 60).ctx("index header")?;
-        let offsets_at = us(le_u64(ix, 64).ctx("index header")?);
-        let pilots_at = us(le_u64(ix, 72).ctx("index header")?);
-        let records_at = us(le_u64(ix, 80).ctx("index header")?);
-        let total = us(le_u64(ix, 88).ctx("index header")?);
-        let offsets_len = us(u64::from(parts)).saturating_add(1).saturating_mul(4);
-        let pilots_len = us(u64::from(parts))
-            .saturating_mul(us(u64::from(buckets)))
-            .saturating_mul(2);
-        let records_len = us(u64::from(count)).saturating_mul(REC_LEN);
-        let consistent = total == ix.len()
-            && offsets_at.saturating_add(offsets_len) <= pilots_at
-            && pilots_at.saturating_add(pilots_len) <= records_at
-            && records_at.saturating_add(records_len) == total
-            && parts > 0
-            && count <= entries;
-        if !consistent {
-            crate::bail!("slab {}: index sections are inconsistent", meta.id);
-        }
+        let h = IndexHeader::parse(index.bytes(), &format!("slab {}", meta.id))?;
+        let (count, entries, pack_len) = (h.count, h.entries, h.pack_len);
         let p = pack.bytes();
         if u64_of(p.len()) != pack_len || p.len() < crate::pack::PACK_MIN_LEN {
             crate::bail!(
@@ -665,7 +836,7 @@ impl Slab {
                 p.len()
             );
         }
-        if p.get(p.len().saturating_sub(20)..) != Some(pack_sha) {
+        if p.get(p.len().saturating_sub(20)..) != Some(&h.pack_sha[..]) {
             crate::bail!("slab {}: pack trailer does not match its index", meta.id);
         }
         if crate::pack::parse_pack_header(p) != Some(entries) {
@@ -681,12 +852,12 @@ impl Slab {
             index,
             count,
             entries,
-            seed,
-            parts,
-            buckets,
-            offsets_at,
-            pilots_at,
-            records_at,
+            seed: h.seed,
+            parts: h.parts,
+            buckets: h.buckets,
+            offsets_at: h.offsets_at,
+            pilots_at: h.pilots_at,
+            records_at: h.records_at,
             sorted: std::sync::OnceLock::new(),
             sizes: std::sync::OnceLock::new(),
             filter: std::sync::OnceLock::new(),

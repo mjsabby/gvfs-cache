@@ -55,7 +55,8 @@ store/
   manifest.bin                  the one object readers follow (compare-and-swap)
   slabs/<tier>-<end_ts>-<sha16>.pack     a pack written by repack (src/repack.rs)
   slabs/<tier>-<end_ts>-<sha16>.mphf     its index
-  slabs/base-<end_ts>-<sha16>.tail       a weekly baseline's bytes after the one before it
+  slabs/base-<end_ts>-<sha16>.tail       a weekly baseline's bytes after the one before it,
+                                         and its index's records of them
   gc.bin                        the pipeline's own: files no manifest lists, and since when
 ```
 
@@ -283,8 +284,25 @@ Each run is at most one compare-and-swap of `manifest.bin`:
    it lacks the old pack, or the store has no tail, it downloads the pack. On a 512 MiB
    baseline in Azurite, a week of 2 MiB cost an edge 516 MiB before and 4.0 MiB after
    (the tail, the week's delta slab and the indexes); SearchGold's baseline is 2.6 GB a
-   week, for every edge and every agent VM's proxy. The index is still downloaded
-   (375 MB there). `gvfs_baselines_grown_total` counts the baselines an edge made so.
+   week, for every edge and every agent VM's proxy.
+   The index is made the same way. It is 40 bytes an object, in the slots a table of all
+   the ids gives them (375 MB for SearchGold's 9.25M objects), and holds nothing an edge
+   lacks but the week's objects. The tail carries the new index's records of those
+   (3,720 of them, 149 KB, for a week of SearchGold), with the index's length and
+   SHA-256, and the edge makes the index of them and the old one: the table again over
+   all the ids (`mphf::build_from`), the old records moved to their new slots, their
+   bases with them (`slab::grow_index`). The table is a function of the ids unless its
+   seed had to be derived from their order, so what comes out is the index the run
+   uploaded. The run does not reason about that: it makes the index so itself, and
+   publishes the records only if it comes out as the file, to the byte; the edge checks
+   its own by the SHA-256, and downloads the index where that fails. For SearchGold's
+   two baselines here the tail is 634 KB in all, and the edge makes the index in 2.4 s
+   of one thread with 12 bytes of memory an object meanwhile (109 MB), in place of
+   375 MB to download; a baseline of a million small files in Azurite cost an edge
+   42.6 MiB a week before (38.6 of them the index) and 4.0 MiB after (the tail and the
+   week's own slab, 2 MiB each). `gvfs_baselines_grown_total` counts the baselines an
+   edge made so, and `gvfs_baseline_indexes_grown_total` those whose index it made
+   too.
 5. Publish with `If-Match` (a lost race starts over, up to 3 times), then collect
    garbage (below). A run that changed nothing (no new commits, no rollup due) publishes
    nothing: the manifest keeps its generation, so no edge builds a new view and hashes
