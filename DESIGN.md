@@ -265,7 +265,13 @@ Each run is at most one compare-and-swap of `manifest.bin`:
    clients; the pyramid's slabs are retained). The new baseline is the old one, byte for
    byte, plus the delta's objects, with each directory's newest version stored as a delta
    against the old baseline's (`frozen`). Old index records keep their offsets, and one
-   MPHF is built over all ids.
+   MPHF is built over all ids. A rebuild waits for its week: asked for before the last
+   week's end is six days old by the run's clock (a job retried, a trigger that fired
+   twice), the run does the lower tiers only. Each rebuild made a week of whatever the
+   pyramid held, rewrote the baseline and dropped the oldest week beyond `--keep-weeks`:
+   two such runs with `--keep-weeks 2` left two weeks of three objects each, and every
+   client older than that was sent the cold pack. `--weekly always` rebuilds whenever
+   asked.
 5. Publish with `If-Match` (a lost race starts over, up to 3 times), then delete slab
    files no manifest references once they are older than `--gc-grace-secs`. A run that
    changed nothing (no new commits, no rollup due) publishes nothing: the manifest keeps

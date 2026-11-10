@@ -137,6 +137,10 @@ Run one job every 15 minutes with the highest tier that is due:
 * Runners need no state: everything comes from the store.
 * A tier's rollup folds everything below it: `--tier 6h` also covers the 1h rollup, and
   `168h` folds the whole pyramid into the week's delta and appends it to the baseline.
+* A weekly rebuild waits for its week: `--tier 168h` asked for again before the last
+  week's end is six days old (a job retried, a trigger that fired twice) does the lower
+  tiers and leaves the baseline and the weeks as they are. `--weekly always` rebuilds
+  whenever asked.
 * Only the new commits are fetched from the upstream; every rollup is repacked from slabs
   already in the store.
 * Concurrent runs are safe: the manifest is published with compare-and-swap, and the loser
@@ -145,13 +149,14 @@ Run one job every 15 minutes with the highest tier that is due:
   keeps its generation and edges keep their views.
 
 ```sh
-m=$(date -u +%M) h=$(date -u +%H) dow=$(date -u +%u)
+# The tier of the quarter hour the job belongs to, whenever in it the job starts.
+m=$((10#$(date -u +%M) / 15 * 15)) h=$(date -u +%H) dow=$(date -u +%u)
 tier=15m
-[ "$m" = 00 ] && tier=1h
-[ "$m" = 00 ] && [ $((10#$h % 6)) = 0 ] && tier=6h
-[ "$m" = 00 ] && [ $((10#$h % 12)) = 0 ] && tier=12h
-[ "$m" = 00 ] && [ "$h" = 00 ] && tier=24h
-[ "$m" = 00 ] && [ "$h" = 00 ] && [ "$dow" = 7 ] && tier=168h
+[ "$m" = 0 ] && tier=1h
+[ "$m" = 0 ] && [ $((10#$h % 6)) = 0 ] && tier=6h
+[ "$m" = 0 ] && [ $((10#$h % 12)) = 0 ] && tier=12h
+[ "$m" = 0 ] && [ "$h" = 00 ] && tier=24h
+[ "$m" = 0 ] && [ "$h" = 00 ] && [ "$dow" = 7 ] && tier=168h
 gvfs-cache pipeline --store "$STORE" --upstream "$ADO_URL" --auth-command ~/get_token \
     --tier $tier
 ```

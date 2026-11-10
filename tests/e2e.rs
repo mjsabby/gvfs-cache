@@ -553,6 +553,7 @@ fn pyramid_rollups_and_weekly_rebuilds() {
     up.commit(4);
     step(&root, &store, &up, &mut now, "15m", &[]);
     up.commit(4);
+    now += 7 * 86_400;
     step(
         &root,
         &store,
@@ -615,6 +616,63 @@ fn published(store: &str) -> (u64, String) {
         .next()
         .unwrap();
     (generation.parse().unwrap(), etag.to_string())
+}
+
+/// A weekly rebuild asked for again before a week has passed (a run retried, a trigger
+/// that fired twice) waits: the week kept for warm clients stays, and the baseline is not
+/// rewritten. (Each such run made a "week" of the minutes since the last: with
+/// `--keep-weeks 2`, two of them and the real week was gone.) What it brings is rolled up
+/// as far as a day. `--weekly always` rebuilds whenever asked; six days later one is due.
+#[test]
+fn a_weekly_rebuild_asked_for_again_waits_for_the_week() {
+    let root = tempdir("weekly-due");
+    let mut up = Upstream::new(&root);
+    up.commit(4);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    let mut now = gvfs_cache::util::now_secs();
+    let keep = ["--keep-weeks", "2"];
+    step(&root, &store, &up, &mut now, "15m", &[]);
+    up.commit(4);
+    step(&root, &store, &up, &mut now, "15m", &[]);
+    up.commit(4);
+    step(&root, &store, &up, &mut now, "168h", &keep);
+    let week = manifest(&store_dir);
+    assert_eq!((week.weekly.len(), week.pyramid.len()), (1, 0));
+
+    for _ in 0..2 {
+        up.commit(4);
+        let log = step(&root, &store, &up, &mut now, "168h", &keep);
+        assert!(log.contains("weekly: the last week ended"), "{log}");
+    }
+    let m = manifest(&store_dir);
+    assert_eq!(m.weekly, week.weekly);
+    assert_eq!(m.baseline, week.baseline);
+    assert_eq!(m.tip.to_string(), up.tip());
+    assert_eq!(
+        m.pyramid.iter().map(|s| s.tier).collect::<Vec<_>>(),
+        vec![Tier::H24; 2]
+    );
+
+    // Whenever asked.
+    up.commit(4);
+    let always = ["--keep-weeks", "2", "--weekly", "always"];
+    step(&root, &store, &up, &mut now, "168h", &always);
+    let forced = manifest(&store_dir);
+    assert_eq!((forced.weekly.len(), forced.pyramid.len()), (2, 0));
+    assert_ne!(forced.baseline.id, week.baseline.id);
+    // Not five days later; six days later, yes.
+    up.commit(4);
+    now += 5 * 86_400;
+    step(&root, &store, &up, &mut now, "168h", &keep);
+    assert_eq!(manifest(&store_dir).weekly, forced.weekly);
+    now += 86_400;
+    step(&root, &store, &up, &mut now, "168h", &keep);
+    let m = manifest(&store_dir);
+    assert_eq!(m.weekly.len(), 2);
+    assert_eq!(m.weekly[0], forced.weekly[1]);
+    assert_eq!(m.baseline.objects as usize, up.objects(&up.tip()).len());
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A run that changes nothing publishes nothing: with no new commits and no rollup due the

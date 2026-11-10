@@ -71,6 +71,10 @@ PIPELINE OPTIONS:
     --work-dir <DIR>           scratch space for slab files (default: system temp)
     --now <UNIX-SECONDS>       override the clock (tests)
     --keep-weeks <N>           weekly deltas kept for warm clients (default: 8)
+    --weekly <due|always>      --tier 168h rebuilds the baseline only once the last week's
+                               end is six days old (due, the default: a run asked for
+                               again sooner does the lower tiers and waits), or whenever
+                               it is asked to (always)
     --gc-grace-secs <N>        orphaned slab files older than this are deleted (default: 7200)
     --threads <N>              indexing threads (default: all cores)
     --blobs <inline|separate>  at genesis: keep blobs in the slabs (inline, the default)
