@@ -354,6 +354,7 @@ pub fn run(o: Options) -> Result<()> {
         poll,
         blobs: None,
         waiting_for: 0,
+        behind: None,
     };
     let mut tip = LiveTip::default();
 
@@ -1156,7 +1157,14 @@ struct StoreSync {
     blobs: Option<Arc<blobs::BlobSet>>,
     /// A manifest generation held back until its `blobs.bin` generation loads (logged once).
     waiting_for: u64,
+    /// A manifest not newer than the last one opened: its etag, and the polls it has been
+    /// the store's ([`StoreSync::made_anew`]).
+    behind: Option<(String, u32)>,
 }
+
+/// Polls a manifest that is not newer than the one served stays the store's before the
+/// edge follows it: a minute at the default `--poll-ms`.
+const BEHIND_POLLS: u32 = 30;
 
 /// What the store's thread hands the live thread, in the order it happened.
 enum StoreChange {
@@ -1426,13 +1434,16 @@ impl StoreSync {
     }
 
     /// The manifest in `bytes` and its slabs, open, if it is newer than the last one opened
-    /// and its `blobs.bin` is loaded.
+    /// (or the store was made anew) and its `blobs.bin` is loaded.
     fn open_newer(
         &mut self,
         bytes: &[u8],
         etag: &str,
     ) -> Result<Option<(Manifest, Vec<Arc<Slab>>)>> {
         let m = Manifest::decode(bytes)?;
+        if m.generation <= self.generation && !self.made_anew(&m, etag) {
+            return Ok(None);
+        }
         let blobs_behind = m.separate_blobs() && self.blobs_generation() < m.blobs_generation;
         if blobs_behind && self.waiting_for != m.generation {
             crate::log!(
@@ -1443,11 +1454,43 @@ impl StoreSync {
             );
             self.waiting_for = m.generation;
         }
-        if m.generation <= self.generation || blobs_behind {
+        if blobs_behind {
             return Ok(None);
         }
         let sealed = self.adopt(&m, etag)?;
+        self.behind = None;
         Ok(Some((m, sealed)))
+    }
+
+    /// Whether manifest `m`, which is not newer than the last one opened, is the store's
+    /// all the same. A store's generations only grow, so a manifest behind the one served
+    /// is a store made anew (or put back from a copy), not an older state of the same one,
+    /// and an edge that ignored it would serve the old store for good, its L0 slabs
+    /// growing. It is followed, as a restarted edge would follow it, once it has stayed
+    /// the store's for [`BEHIND_POLLS`] polls: a read that returned an older manifest for
+    /// a moment (a store that is not consistent) does not last that long.
+    fn made_anew(&mut self, m: &Manifest, etag: &str) -> bool {
+        let polls = match &self.behind {
+            Some((seen, polls)) if seen == etag => polls.saturating_add(1),
+            _ => 1,
+        };
+        self.behind = Some((etag.to_string(), polls));
+        if polls == 1 {
+            crate::log!(
+                "serve: the store's manifest is generation {}, not after generation {} which \
+                 this edge serves: followed if it is still the store's in {BEHIND_POLLS} polls",
+                m.generation,
+                self.generation
+            );
+        }
+        if polls < BEHIND_POLLS {
+            return false;
+        }
+        crate::log!(
+            "serve: the store was made anew: following its manifest, generation {}",
+            m.generation
+        );
+        true
     }
 
     /// Opens manifest `m`, which becomes the last one opened: its slabs, in its order. The
