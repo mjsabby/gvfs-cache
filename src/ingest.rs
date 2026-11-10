@@ -1952,6 +1952,37 @@ pub(crate) mod tests {
         refused(&base, &d, "too large");
     }
 
+    /// A pack git accepts in which an object is first a delta and then whole, the base of
+    /// its own delta base: a REF delta that makes X from Y, then X, then Y as a delta of
+    /// that X. The slab indexes X whole and both objects resolve. (With the first copy of
+    /// X in the index, X was a delta of Y and Y a delta of X.)
+    #[test]
+    fn an_object_stored_as_a_delta_and_whole_is_indexed_whole() {
+        let x: Vec<u8> = (0..200)
+            .flat_map(|i| format!("line {i}\n").into_bytes())
+            .collect();
+        let y = [&x[..], b"one more line\n"].concat();
+        let (xo, yo) = (hash_object(OBJ_BLOB, &x), hash_object(OBJ_BLOB, &y));
+        let mut b = PackBuilder::new();
+        b.ref_delta(&yo, &delta_of(&y, &x));
+        let whole = b.whole(OBJ_BLOB, &x);
+        b.ofs_delta(whole, &delta_of(&x, &y));
+        let pack = b.finish();
+        assert_eq!(git_index("delta-and-whole", &pack).len(), 3);
+        let tier = crate::slab::Tier::M15;
+        let mut ix = Indexer::new(1);
+        let slab = memory_slab(&mut ix, pack, tier, (0, 1), (Oid::ZERO, Oid::ZERO))
+            .unwrap()
+            .slab;
+        assert_eq!((slab.count(), slab.entries()), (2, 3));
+        let (xs, ys) = (slab.find(&xo).unwrap(), slab.find(&yo).unwrap());
+        let (xr, yr) = (slab.rec(xs).unwrap(), slab.rec(ys).unwrap());
+        assert_eq!((xr.offset, xr.base, yr.base), (whole, NO_BASE, xs));
+        let mut r = crate::splice::Resolver::default();
+        assert!(r.resolve(&slab, xs).unwrap().1 == x);
+        assert!(r.resolve(&slab, ys).unwrap().1 == y);
+    }
+
     #[test]
     fn index_matches_git_with_ref_deltas() {
         let dir = std::env::temp_dir().join(format!("gvd-ingest-ref-{}", std::process::id()));

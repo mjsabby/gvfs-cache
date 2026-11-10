@@ -230,7 +230,7 @@ pub fn build_index(
 
 /// Like [`build_index`] for a pack holding `entries` entries of which `facts` are the
 /// distinct objects (a concatenated rollup may carry a re-introduced object twice; only
-/// its first copy is indexed, and git accepts the duplicate).
+/// one copy of it is indexed, and git accepts the duplicate).
 pub fn build_index_with_entries(
     facts: &[Facts],
     entries: u32,
@@ -242,7 +242,7 @@ pub fn build_index_with_entries(
     match crate::mphf::build(&oids, threads) {
         Ok(built) => encode_index(facts, &built, entries, pack_len, pack_sha),
         Err(e) if e.is_conflict() => {
-            // The pack carries some object twice: index its first copy only.
+            // The pack carries some object twice: index one copy of it.
             let unique = dedupe_facts(facts);
             let oids: Vec<Oid> = unique.iter().map(|f| f.oid).collect();
             let built = crate::mphf::build(&oids, threads)?;
@@ -252,24 +252,72 @@ pub fn build_index_with_entries(
     }
 }
 
-/// Keeps the first entry of every object id; delta bases are remapped onto kept entries.
+/// The delta chain length of every entry: the base links from it to a whole object.
+/// (`Facts::depth` is the same number up to 255, where it stops.)
+fn chain_lengths(facts: &[Facts]) -> Vec<u32> {
+    const UNKNOWN: u32 = u32::MAX;
+    let mut chain = vec![UNKNOWN; facts.len()];
+    let mut path: Vec<usize> = Vec::new();
+    for start in 0..facts.len() {
+        // Up the base links to an entry whose chain is known, or to a whole object; then
+        // back down, one link longer at every entry passed.
+        let mut cur = start;
+        let mut length = loop {
+            match chain.get(cur) {
+                Some(&UNKNOWN) => path.push(cur),
+                Some(&known) => break known.saturating_add(1),
+                None => break 0,
+            }
+            match facts.get(cur) {
+                Some(f) if f.base != NO_BASE && path.len() <= facts.len() => cur = f.base as usize,
+                _ => break 0,
+            }
+        };
+        while let Some(entry) = path.pop() {
+            if let Some(c) = chain.get_mut(entry) {
+                *c = length;
+            }
+            length = length.saturating_add(1);
+        }
+    }
+    chain
+}
+
+/// Keeps one entry of every object id, the one with the shortest delta chain (the first
+/// such entry in the pack), and remaps delta bases onto kept entries. A base's kept copy
+/// has a chain no longer than the copy its delta was resolved against, so the kept
+/// entries' chains end. Keeping the first copy did not see to that: of a REF delta that
+/// makes X from Y, X whole, and Y as a delta of that X (a pack git accepts), it kept the
+/// first X, a delta of Y, and Y, a delta of X.
 pub fn dedupe_facts(facts: &[Facts]) -> Vec<Facts> {
-    let mut first: std::collections::HashMap<Oid, u32> =
+    let chain = chain_lengths(facts);
+    let mut kept: std::collections::HashMap<Oid, u32> =
         std::collections::HashMap::with_capacity(facts.len());
-    let mut new_index = vec![NO_BASE; facts.len()];
-    let mut out: Vec<Facts> = Vec::with_capacity(facts.len());
     for (i, f) in facts.iter().enumerate() {
-        let idx = *first.entry(f.oid).or_insert_with(|| {
+        let i = crate::util::u32_of(i);
+        let k = kept.entry(f.oid).or_insert(i);
+        if chain.get(i as usize) < chain.get(*k as usize) {
+            *k = i;
+        }
+    }
+    let mut new_index = vec![NO_BASE; facts.len()];
+    let mut out: Vec<Facts> = Vec::with_capacity(kept.len());
+    for (i, f) in facts.iter().enumerate() {
+        if kept.get(&f.oid) == Some(&crate::util::u32_of(i)) {
+            if let Some(slot) = new_index.get_mut(i) {
+                *slot = crate::util::u32_of(out.len());
+            }
             out.push(*f);
-            crate::util::u32_of(out.len().saturating_sub(1))
-        });
-        if let Some(slot) = new_index.get_mut(i) {
-            *slot = idx;
         }
     }
     for f in &mut out {
         if f.base != NO_BASE {
-            f.base = new_index.get(f.base as usize).copied().unwrap_or(NO_BASE);
+            f.base = facts
+                .get(f.base as usize)
+                .and_then(|base| kept.get(&base.oid))
+                .and_then(|&k| new_index.get(k as usize))
+                .copied()
+                .unwrap_or(NO_BASE);
         }
     }
     out
@@ -845,5 +893,48 @@ mod tests {
         }
         assert_eq!(Slab::open_file(&index_path).unwrap().records().count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Of an id the pack holds twice, the entry with the shortest delta chain is kept, and
+    /// the chains of the kept entries end.
+    #[test]
+    fn dedupe_keeps_the_shortest_chain() {
+        let id = |n: u16| Oid(n.to_le_bytes().repeat(10).try_into().unwrap());
+        let fact = |oid: Oid, depth: usize, base: u32| Facts {
+            oid,
+            depth: depth.min(255) as u8,
+            base,
+            ..Facts::default()
+        };
+        let chains_end = |kept: &[Facts]| {
+            kept.iter().all(|f| {
+                let mut base = f.base;
+                (0..kept.len()).any(|_| {
+                    let whole = base == NO_BASE;
+                    base = kept.get(base as usize).map_or(NO_BASE, |b| b.base);
+                    whole
+                })
+            })
+        };
+        // A REF delta that makes X from Y; X whole; Y as a delta of that X. Keeping the
+        // first X kept a delta of Y, and Y, a delta of X.
+        let (x, y) = (id(1), id(2));
+        let kept = dedupe_facts(&[fact(x, 2, 2), fact(x, 0, NO_BASE), fact(y, 1, 1)]);
+        let links: Vec<(Oid, u32)> = kept.iter().map(|f| (f.oid, f.base)).collect();
+        assert_eq!(links, [(x, NO_BASE), (y, 0)]);
+
+        // A chain of 300, past the 255 a depth can say: X is its 260th object, and is
+        // also the first entry of the pack, as a delta of the chain's last object.
+        let x = id(260);
+        let mut facts = vec![fact(x, 300, 300)];
+        for k in 0..300 {
+            let base = if k == 0 { NO_BASE } else { k as u32 };
+            facts.push(fact(id(k as u16), k, base));
+        }
+        let kept = dedupe_facts(&facts);
+        assert_eq!(kept.len(), 300);
+        assert!(chains_end(&kept));
+        let kept_x = kept.iter().position(|f| f.oid == x).unwrap();
+        assert_eq!(kept[kept_x].base, kept_x as u32 - 1);
     }
 }

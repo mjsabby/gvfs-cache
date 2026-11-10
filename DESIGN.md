@@ -130,8 +130,9 @@ The indexer is a faster `git index-pack`:
   id again. A buffer is sized for a delta's result by what the delta's ops write, never
   by the size its header declares, and a delta, its base or its result of more than
   1 GiB fails the pack, as it does in a blob pack.
-* The index build drops duplicate entries (the first copy wins) and builds the MPHF
-  partitions in parallel.
+* The index build drops duplicate entries (of an id's copies, the one with the shortest
+  delta chain is kept, the first of them in the pack) and builds the MPHF partitions in
+  parallel.
 
 On SearchGold's 12.08M-object ADO pack this takes 7.0 s, against 107 s for
 `git index-pack --threads=32`. Every id and offset was verified against git's `.idx`
