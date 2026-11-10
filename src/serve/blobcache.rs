@@ -110,7 +110,8 @@ impl Drop for Block {
     }
 }
 
-/// What the cache keeps of one pack: where it is, and a slot per block.
+/// What the cache keeps of one pack: where it is, and, once a block of it has been
+/// cached, a slot per block.
 pub struct Pack {
     /// Among this cache's packs: with a block's number, the block's key.
     serial: u64,
@@ -120,9 +121,45 @@ pub struct Pack {
     len: u64,
     /// The cached block, where there is one. A hit reads its block's slot under that
     /// slot's lock, which the readers of other blocks do not touch; a slot is written
-    /// under the cache's lock too.
-    slots: Box<[RwLock<Option<Arc<Block>>>]>,
+    /// under the cache's lock too. Made when the pack's first block is cached, and kept
+    /// as long as the pack is listed: a pack that is listed and never read has none.
+    /// (Every pack had its slots from when it was listed, 24 bytes a block: 6 MB for
+    /// each TiB of packs in the store, 403 MB for 64 TiB, before a byte was read.)
+    slots: OnceLock<Box<[Slot]>>,
 }
+
+type Slot = RwLock<Option<Arc<Block>>>;
+
+impl Pack {
+    /// Block `b`'s slot, if the pack has its slots.
+    #[inline]
+    fn slot(&self, b: u64) -> Option<&Slot> {
+        self.slots.get()?.get(us(b))
+    }
+
+    /// Block `b`'s slot, made with the pack's others if there are none yet: called under
+    /// the cache's lock, when a block is cached. `None` for a pack of more blocks than
+    /// [`PACK_BLOCKS_MAX`], or than memory has room to list.
+    fn slot_or_make(&self, b: u64) -> Option<&Slot> {
+        if self.slots.get().is_none() {
+            let blocks = self.len.div_ceil(BLOCK);
+            if blocks > PACK_BLOCKS_MAX {
+                return None;
+            }
+            let blocks = usize::try_from(blocks).ok()?;
+            let mut slots = Vec::new();
+            slots.try_reserve_exact(blocks).ok()?;
+            slots.resize_with(blocks, || RwLock::new(None));
+            let _ = self.slots.set(slots.into_boxed_slice());
+        }
+        self.slot(b)
+    }
+}
+
+/// Most blocks of a pack that the cache keeps any of: 256 TiB, more than the largest
+/// object a store holds (a block blob ends at 190.7 TiB). A pack listed as longer is a
+/// listing gone wrong: it is read all the same, and nothing of it is kept.
+const PACK_BLOCKS_MAX: u64 = 1 << 26;
 
 /// A pack's serial and a block's number in it.
 type Key = (u64, u64);
@@ -464,21 +501,16 @@ impl BlockCache {
         })
     }
 
-    /// What the cache keeps of the pack `id` of `len` bytes: nothing yet. `None` for a
-    /// length that has more blocks than memory has room to list (no pack's: such a one
-    /// is read without the cache).
-    pub fn pack(&self, id: &str, len: u64) -> Option<Arc<Pack>> {
-        let blocks = usize::try_from(len.div_ceil(BLOCK)).ok()?;
-        let mut slots = Vec::new();
-        slots.try_reserve_exact(blocks).ok()?;
-        slots.resize_with(blocks, || RwLock::new(None));
-        Some(Arc::new(Pack {
+    /// What the cache keeps of the pack `id` of `len` bytes: nothing yet, and nothing
+    /// that grows with `len` until a block of it is cached.
+    pub fn pack(&self, id: &str, len: u64) -> Arc<Pack> {
+        Arc::new(Pack {
             serial: self.packs.fetch_add(1, Ordering::Relaxed),
             id: id.to_string(),
             object: crate::blobs::pack_key(id),
             len,
-            slots: slots.into_boxed_slice(),
-        }))
+            slots: OnceLock::new(),
+        })
     }
 
     /// The file of generation `file` of block `b` of `pack`: a block fetched again after
@@ -497,7 +529,7 @@ impl BlockCache {
     /// the only lock is the block's slot's.
     #[inline]
     pub fn cached(&self, pack: &Pack, b: u64) -> Option<Arc<Block>> {
-        let block = read(pack.slots.get(us(b))?).clone()?;
+        let block = read(pack.slot(b)?).clone()?;
         // Written once per tick of the clock: most hits leave the block's memory as it is.
         let now = self.clock.load(Ordering::Relaxed);
         if block.used.load(Ordering::Relaxed) != now {
@@ -728,7 +760,9 @@ impl BlockCache {
         (got, Ok(()))
     }
 
-    /// Caches `block` as block `b` of `pack`; what it replaces goes to `gone`.
+    /// Caches `block` as block `b` of `pack`; what it replaces goes to `gone`. The pack
+    /// gets its slots here if this is its first block. A pack that can have none keeps
+    /// no block: the read that fetched this one has it, and the next fetches again.
     fn keep(
         &self,
         st: &mut State,
@@ -737,6 +771,9 @@ impl BlockCache {
         block: &Arc<Block>,
         gone: &mut Vec<Arc<Block>>,
     ) {
+        let Some(slot) = pack.slot_or_make(b) else {
+            return;
+        };
         let cached = Cached {
             pack: Arc::clone(pack),
             block: Arc::clone(block),
@@ -746,9 +783,7 @@ impl BlockCache {
             gone.push(old.block);
         }
         st.bytes = st.bytes.saturating_add(block.len());
-        if let Some(slot) = pack.slots.get(us(b)) {
-            gone.extend(write(slot).replace(Arc::clone(block)));
-        }
+        gone.extend(write(slot).replace(Arc::clone(block)));
     }
 
     /// Least recently used blocks leave the cache until it is within its bounds. They go
@@ -782,7 +817,7 @@ impl BlockCache {
             }
             if let Some(c) = st.cached.remove(&key) {
                 st.bytes = st.bytes.saturating_sub(c.block.len());
-                if let Some(slot) = c.pack.slots.get(us(key.1)) {
+                if let Some(slot) = c.pack.slot(key.1) {
                     let mut slot = write(slot);
                     if slot.as_ref().is_some_and(|b| Arc::ptr_eq(b, &c.block)) {
                         gone.extend(slot.take());
@@ -919,11 +954,14 @@ mod tests {
         assert!(st.bytes <= cache.budget && st.cached.len() <= cache.max_blocks);
         for ((serial, b), c) in &st.cached {
             assert_eq!(*serial, c.pack.serial);
-            let slot = read(&c.pack.slots[*b as usize]);
+            let slot = read(c.pack.slot(*b).unwrap());
             assert!(slot.as_ref().is_some_and(|s| Arc::ptr_eq(s, &c.block)));
             assert_eq!(Arc::strong_count(&c.block), 2, "block {b}");
         }
-        let slots = pack.slots.iter().filter(|s| read(s).is_some()).count();
+        let slots = pack
+            .slots
+            .get()
+            .map_or(0, |s| s.iter().filter(|s| read(s).is_some()).count());
         let of_pack = st.cached.keys().filter(|k| k.0 == pack.serial).count();
         assert_eq!(slots, of_pack);
         let mut want: Vec<PathBuf> = st.cached.values().map(|c| c.block.path.clone()).collect();
@@ -978,7 +1016,7 @@ mod tests {
         std::io::Write::write_all(&mut w, &data).unwrap();
         w.finish().unwrap();
         let cache = BlockCache::new(store, dir.join("cache"), budget, max_blocks).unwrap();
-        let pack = cache.pack("p", data.len() as u64).unwrap();
+        let pack = cache.pack("p", data.len() as u64);
         (dir, cache, pack, data)
     }
 
@@ -1058,7 +1096,7 @@ mod tests {
             format!("BlobEndpoint=http://127.0.0.1:{port}/acct;AccountName=acct;AccountKey=a2V5");
         let store = Store::Azure(crate::azure::AzureStore::new(&account, "packs").unwrap());
         let cache = BlockCache::new(Arc::new(store), dir.clone(), BLOCK * 64, usize::MAX).unwrap();
-        let pack = cache.pack("p", BLOCK * 8).unwrap();
+        let pack = cache.pack("p", BLOCK * 8);
         let cache = Arc::new(cache);
         let read = |cache: Arc<BlockCache>, pack: Arc<Pack>| async move {
             let sink = &mut |_: &[u8]| Ok(());
@@ -1160,7 +1198,7 @@ mod tests {
             format!("BlobEndpoint=http://127.0.0.1:{port}/acct;AccountName=acct;AccountKey=a2V5");
         let store = Store::Azure(crate::azure::AzureStore::new(&account, "packs").unwrap());
         let cache = BlockCache::new(Arc::new(store), dir.clone(), BLOCK * 64, usize::MAX).unwrap();
-        let pack = cache.pack("p", BLOCK * 3).unwrap();
+        let pack = cache.pack("p", BLOCK * 3);
         let cache = Arc::new(cache);
         // The bytes of blocks `from..=to`, or the error of reading them.
         let read = |cache: Arc<BlockCache>, pack: Arc<Pack>, from: u64, to: u64| async move {
@@ -1294,7 +1332,7 @@ mod tests {
             // One block is held, the one read last; the others are the cache's alone. A
             // look ahead at another leaves it so.
             assert!(reader.range(&pack, 0, 1).is_some());
-            let refs = |b: usize| Arc::strong_count(read(&pack.slots[b]).as_ref().unwrap());
+            let refs = |b: u64| Arc::strong_count(read(pack.slot(b).unwrap()).as_ref().unwrap());
             let mut looked = 0;
             for at in [7, BLOCK + 7, 4 * BLOCK + 7] {
                 reader.ahead(&pack, at, |bytes, from| {
@@ -1339,12 +1377,12 @@ mod tests {
         read_all(&cache, &pack, &data, BLOCK, 10);
         let mut reader = Reader::new(Some(&cache));
         let bytes = reader.range(&pack, 100, 1 << 20).unwrap();
-        let file = read(&pack.slots[0]).as_ref().unwrap().path.clone();
+        let file = read(pack.slot(0).unwrap()).as_ref().unwrap().path.clone();
         // Two more blocks: the cache has room for two.
         read_all(&cache, &pack, &data, 2 * BLOCK, 10);
         read_all(&cache, &pack, &data, 3 * BLOCK, 10);
         assert_eq!(cache.kept(), (2, 2 * BLOCK));
-        assert!(read(&pack.slots[0]).is_none() && read(&pack.slots[1]).is_none());
+        assert!(read(pack.slot(0).unwrap()).is_none() && read(pack.slot(1).unwrap()).is_none());
         assert!(bytes == &data[100..100 + (1 << 20)], "the bytes stay");
         assert!(file.exists());
         assert_eq!(open_and_mapped(&cache), (3, 3));
@@ -1354,6 +1392,49 @@ mod tests {
         assert!(!file.exists());
         assert_eq!(open_and_mapped(&cache), (2, 2));
         drop(reader);
+        consistent(&cache, &pack);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An edge lists every pack of its store and reads few of them: a pack has no slots
+    /// until a block of it is cached. Looking one up makes none; the pack's first cached
+    /// block makes them all, hits read them from then on, and they stay when its blocks
+    /// are evicted. (Each pack had a slot per block from when it was listed.) A pack
+    /// listed as longer than any object is read all the same: its blocks are fetched for
+    /// each read, and none is kept.
+    #[test]
+    fn a_pack_has_its_slots_from_its_first_cached_block() {
+        let (dir, cache, pack, data) = cache_over("slots", BLOCK);
+        let unread = cache.pack("q", 1 << 40);
+        assert!(pack.slots.get().is_none() && unread.slots.get().is_none());
+        assert!(cache.cached(&pack, 3).is_none());
+        let mut reader = Reader::new(Some(&cache));
+        assert!(reader.range(&pack, 100, 50).is_none());
+        assert!(reader.block(&pack, 100).is_none());
+        drop(reader);
+        assert!(pack.slots.get().is_none(), "a look made the slots");
+
+        read_all(&cache, &pack, &data, BLOCK + 5, 100);
+        assert_eq!(pack.slots.get().map(|s| s.len()), Some(6));
+        assert!(unread.slots.get().is_none());
+        let mut reader = Reader::new(Some(&cache));
+        assert!(hit(&mut reader, &pack, BLOCK + 5, 100).is_some());
+        drop(reader);
+        // Another block: the cache has room for one, and the first one's slot is empty.
+        read_all(&cache, &pack, &data, 5, 100);
+        assert_eq!(pack.slots.get().map(|s| s.len()), Some(6));
+        assert!(read(pack.slot(1).unwrap()).is_none() && read(pack.slot(0).unwrap()).is_some());
+        consistent(&cache, &pack);
+
+        // The same object, listed as 2^62 bytes long.
+        let wrong = cache.pack("p", 1 << 62);
+        let fetches = cache.fetches.load(Ordering::Relaxed);
+        for _ in 0..3 {
+            read_all(&cache, &wrong, &data, 2 * BLOCK + 9, 1000);
+        }
+        assert_eq!(cache.fetches.load(Ordering::Relaxed), fetches + 3);
+        assert!(wrong.slots.get().is_none());
+        assert_eq!(cache.kept(), (1, BLOCK));
         consistent(&cache, &pack);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1372,7 +1453,7 @@ mod tests {
                     let mut w = cache.store.writer(&format!("blobs/q{i}.pack")).unwrap();
                     std::io::Write::write_all(&mut w, &bytes).unwrap();
                     w.finish().unwrap();
-                    (cache.pack(&format!("q{i}"), 1000).unwrap(), bytes)
+                    (cache.pack(&format!("q{i}"), 1000), bytes)
                 })
                 .collect()
         };
@@ -1426,7 +1507,7 @@ mod tests {
         for b in 0..4 {
             read_all(&cache, &pack, &data, b * BLOCK, 10);
         }
-        let cached = |b: usize| read(&pack.slots[b]).is_some();
+        let cached = |b: u64| read(pack.slot(b).unwrap()).is_some();
         let touch = |b: u64| {
             let mut reader = Reader::new(Some(&cache));
             assert!(reader.range(&pack, b * BLOCK + 3, 300).is_some());
@@ -1485,7 +1566,7 @@ mod tests {
             format!("BlobEndpoint=http://127.0.0.1:{port}/acct;AccountName=acct;AccountKey=a2V5");
         let store = Store::Azure(crate::azure::AzureStore::new(&account, "packs").unwrap());
         let cache = BlockCache::new(Arc::new(store), dir.clone(), BLOCK * 64, usize::MAX).unwrap();
-        let pack = cache.pack("p", BLOCK * 3).unwrap();
+        let pack = cache.pack("p", BLOCK * 3);
         let cache = Arc::new(cache);
         rt().block_on(async {
             let (reading, wanted) = (Arc::clone(&cache), Arc::clone(&pack));

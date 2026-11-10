@@ -90,7 +90,7 @@ impl BlobPack {
         id: &str,
         len: u64,
     ) -> BlobPack {
-        let cached = cache.and_then(|c| Some(Remote::Cached(Arc::clone(c), c.pack(id, len)?)));
+        let cached = cache.map(|c| Remote::Cached(Arc::clone(c), c.pack(id, len)));
         BlobPack {
             id: id.to_string(),
             len,

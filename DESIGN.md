@@ -939,9 +939,13 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   that send. Such a read does not take the cache's lock: a pack has a slot per block,
   read under a lock of its own, and a read leaves a stamp of the cache's clock in the
   block (the clock moves when blocks are fetched or evicted, so most reads write
-  nothing). A request keeps the block it read last, so blobs that are neighbours in a
-  pack cost one lookup between them, and adds its hits to the cache's count when it
-  ends. (A read of a cached block took the cache's lock twice and moved the block in
+  nothing). The slots are made when a pack's first block is cached: an edge lists every
+  pack of its store and reads few, and the packs it has not read cost it their names
+  (24 bytes a block from when a pack was listed came to 6 MB for each TiB of packs:
+  403 MB and 221 ms to list 64 TiB, now 9 MB and 15 ms). A request keeps the block it
+  read last, so blobs that are neighbours in a pack cost one lookup between them, and
+  adds its hits to the cache's count when it ends. (A read of a cached block took the
+  cache's lock twice and moved the block in
   an ordered map; it opened, read and closed the block's file, and passed the bytes on
   through a buffer allocated for it: seven allocations and three system calls a blob.
   Through the cache, every block cached: 3.8 µs for 300 bytes and 64 µs for 1 MiB,
