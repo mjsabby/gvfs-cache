@@ -458,6 +458,9 @@ pub fn run(o: Options) -> Result<()> {
     let (manifest, etag) = sync.wait_for_manifest()?;
     let separate = manifest.separate_blobs();
     let remote = sync.store.local_path(MANIFEST_KEY).is_none();
+    // Connections, the proxy's files and the block cache's may not take the descriptors
+    // the edge needs for its other files and sockets.
+    let fds = raise_fd_limit();
     if remote || (separate && upstream_spec.is_some()) {
         std::fs::create_dir_all(&sync.cache_dir)
             .ctx(&format!("creating {}", sync.cache_dir.display()))?;
@@ -471,12 +474,28 @@ pub fn run(o: Options) -> Result<()> {
         }
     }
     if separate {
-        // Blob packs in object storage are read in blocks kept on local disk.
+        // Blob packs in object storage are read in blocks kept on local disk, each open
+        // and mapped: as many as the byte budget holds, within what the limits leave.
         if sync.store.local_path(crate::blobs::BLOBS_KEY).is_none() && blob_cache_bytes > 0 {
+            let maps = max_map_count();
+            let blocks = cache_blocks(fds, maps);
+            let wanted = blob_cache_bytes.div_ceil(blobcache::BLOCK);
+            if wanted > crate::util::u64_of(blocks) {
+                crate::log!(
+                    "serve: --blob-cache-mib {} is {wanted} blocks, each a file with a \
+                     descriptor and a mapping of its own; within the limits here ({fds} \
+                     descriptors, {maps} mappings) the cache keeps {blocks} ({})",
+                    blob_cache_bytes.wrapping_shr(20),
+                    crate::util::human_bytes(
+                        crate::util::u64_of(blocks).saturating_mul(blobcache::BLOCK)
+                    )
+                );
+            }
             sync.blob_cache = Some(Arc::new(blobcache::BlockCache::new(
                 Arc::clone(&sync.store),
                 sync.cache_dir.join("blob-blocks"),
                 blob_cache_bytes,
+                blocks,
             )?));
         }
         tip.filter = Some("blob:none".to_string());
@@ -514,9 +533,6 @@ pub fn run(o: Options) -> Result<()> {
         pending: None,
     };
     let first = live.snapshot(manifest, etag);
-    // Connections, and the proxy's files, may not take the descriptors the edge needs for
-    // its other files and sockets.
-    let fds = raise_fd_limit();
     let proxy = match (&upstream_spec, separate) {
         (Some((u, _, auth)), true) => Some(blobs::Proxy::new(
             u,
@@ -709,6 +725,26 @@ const OUT_BYTES: usize = 256 << 10;
 /// 8,192 under 524,288.
 pub fn default_proxy_packs(fds: usize) -> usize {
     (fd_reserve(fds).min(fds) / 4).clamp(256, 16384)
+}
+
+/// The blocks the block cache keeps at most, whatever `--blob-cache-mib` would hold: a
+/// cached block is a file with a descriptor and a mapping of its own. A quarter of the
+/// descriptors the edge keeps for its own use ([`fd_reserve`]), as the proxy's packs
+/// take ([`default_proxy_packs`]), and a quarter of the mappings a process may have
+/// (`maps`, `vm.max_map_count`: 65,530 by default, of which the proxy's packs take
+/// 16,384 at most). 8,192 blocks under a limit of 524,288 descriptors, which is the
+/// default budget of 32 GiB; 1,024 (4 GiB) under 65,536; 256 (1 GiB) under 1,024.
+pub fn cache_blocks(fds: usize, maps: usize) -> usize {
+    (fd_reserve(fds).min(fds) / 4).min(maps / 4)
+}
+
+/// The mappings a process may have (`vm.max_map_count`); the kernel's default where it
+/// cannot be read.
+fn max_map_count() -> usize {
+    std::fs::read_to_string("/proc/sys/vm/max_map_count")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(65_530)
 }
 
 /// Accepts connections for the life of the process: one task each, at most `--max-conns`
@@ -2119,6 +2155,7 @@ pub fn metrics_text(ctx: &Ctx) -> String {
     let v = ctx.view();
     let get = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
     let proxied = ctx.proxy.as_ref().map_or((0, 0, 0), blobs::Proxy::kept);
+    let blocks = ctx.blob_cache.as_ref().map_or((0, 0), |c| c.kept());
     format!(
         "gvfs_requests_total{{endpoint=\"prefetch\"}} {}\n\
          gvfs_requests_total{{endpoint=\"objects_get\"}} {}\n\
@@ -2152,6 +2189,7 @@ pub fn metrics_text(ctx: &Ctx) -> String {
          gvfs_blob_cache_fetches_total {}\n\
          gvfs_blob_cache_bypass_total {}\n\
          gvfs_blob_cache_bytes {}\n\
+         gvfs_blob_cache_blocks {}\n\
          gvfs_proxy_cache_packs {}\n\
          gvfs_proxy_cache_files {}\n\
          gvfs_proxy_cache_bytes {}\n\
@@ -2197,7 +2235,8 @@ pub fn metrics_text(ctx: &Ctx) -> String {
         ctx.blob_cache.as_ref().map_or(0, |c| get(&c.misses)),
         ctx.blob_cache.as_ref().map_or(0, |c| get(&c.fetches)),
         ctx.blob_cache.as_ref().map_or(0, |c| get(&c.bypassed)),
-        ctx.blob_cache.as_ref().map_or(0, |c| c.bytes()),
+        blocks.1,
+        blocks.0,
         proxied.0,
         proxied.1,
         proxied.2,

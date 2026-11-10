@@ -32,6 +32,7 @@ use sha1::{Digest, Sha1};
 use tokio::net::TcpStream;
 
 use super::Ctx;
+use super::blobcache::Reader;
 use super::blobs::BlobPack;
 use super::budget::{Budget, blocking, cold};
 use super::conn::Bufs;
@@ -439,27 +440,40 @@ async fn hash_into(h: &mut Sha1, bytes: &[u8], budget: &mut Budget) {
 /// File ranges at least this long leave with `sendfile(2)` ([`Out::mapped`]).
 const SENDFILE_MIN: u64 = 16 << 10;
 
-/// A small range of a mapped blob pack, copied into the response buffer without an
-/// `.await` (see `Out::put`); false if it is large, remote, or does not fit.
+/// A small range of a blob pack that is in memory (a local pack's mapping; a block the
+/// cache holds of a pack in object storage), copied into the response buffer without an
+/// `.await` (see `Out::put`); false if it is large, not in memory, or does not fit.
 #[inline]
-fn put_mapped(out: &mut Out<'_>, pack: &BlobPack, at: u64, len: u64) -> bool {
-    len < SENDFILE_MIN
-        && pack
-            .bytes()
-            .and_then(|b| crate::util::sub(b, us(at), us(len)))
-            .is_some_and(|r| out.put(r))
+fn put_mapped(
+    out: &mut Out<'_>,
+    pack: &BlobPack,
+    at: u64,
+    len: u64,
+    reader: &mut Reader<'_>,
+) -> bool {
+    if len >= SENDFILE_MIN {
+        return false;
+    }
+    let range = match pack.bytes() {
+        Some(b) => crate::util::sub(b, us(at), us(len)),
+        None => pack.range(at, len, reader),
+    };
+    range.is_some_and(|r| out.put(r))
 }
 
-/// Sends `len` bytes of a blob pack at `at`, hashing them into `hash` when given (mapped:
-/// `sendfile(2)` when large; remote: the whole range in one read, each piece sent as it
-/// arrives).
+/// Sends `len` bytes of a blob pack at `at`, hashing them into `hash` when given: from
+/// the pack's mapping, with `sendfile(2)` when large. A pack in object storage leaves the
+/// same way, block by block, as far as the cache holds its blocks; from the first it
+/// lacks (or all of it, if it is read past the cache) the rest is read in one read (a
+/// cold path), each piece sent as it arrives.
 async fn send_pack_range(
     out: &mut Out<'_>,
     pack: &BlobPack,
     at: u64,
     len: u64,
-    hash: Option<&mut Sha1>,
+    mut hash: Option<&mut Sha1>,
     budget: &mut Budget,
+    reader: &mut Reader<'_>,
 ) -> std::io::Result<()> {
     if let Some(bytes) = pack.bytes() {
         if let Some(h) = hash {
@@ -469,13 +483,39 @@ async fn send_pack_range(
         }
         return out.mapped(pack.file(), bytes, at, len).await;
     }
+    let end = at.saturating_add(len);
+    let (mut pos, mut blocks) = (at, 0u64);
+    if !pack.streams_past(len) {
+        while pos < end
+            && let Some((block, from)) = pack.block(pos, reader)
+        {
+            let bytes = block.bytes();
+            let n = end
+                .saturating_sub(pos)
+                .min(u64_of(bytes.len()).saturating_sub(from));
+            let Some(range) = crate::util::sub(bytes, us(from), us(n)).filter(|r| !r.is_empty())
+            else {
+                break;
+            };
+            if let Some(h) = hash.as_deref_mut() {
+                hash_into(h, range, budget).await;
+            }
+            out.mapped(Some(block.file()), bytes, from, n).await?;
+            pos = pos.saturating_add(n);
+            blocks = blocks.saturating_add(1);
+        }
+        reader.count(blocks, pos >= end);
+    }
+    if pos >= end {
+        return Ok(());
+    }
     let mut to = ToClient {
         out,
         hash,
         budget,
         failed: None,
     };
-    let read = cold(pack.read(at, len, &mut to)).await;
+    let read = cold(pack.read(pos, end.saturating_sub(pos), &mut to)).await;
     client_or_store(read, to.failed)
 }
 
@@ -567,10 +607,32 @@ async fn read_pack(pack: &BlobPack, at: u64, buf: &mut [u8]) -> crate::util::Res
     Ok(())
 }
 
+/// The first two bytes of a zlib stream of `zlen` bytes at `zat` in a pack in object
+/// storage and its last four (its header and its Adler-32), if blocks the cache holds
+/// have them, unless the read of what follows the header is one the cache streams past.
+/// For the cache that is one read, as the header's was, and the body's is another.
+fn stream_ends(
+    pack: &BlobPack,
+    zat: u64,
+    zlen: u64,
+    reader: &mut Reader<'_>,
+) -> Option<([u8; 2], [u8; 4])> {
+    if pack.streams_past(zlen.saturating_sub(2)) {
+        return None;
+    }
+    let head = pack.peek(zat, 2, reader)?.try_into().ok()?;
+    let tail = zat.checked_add(zlen)?.checked_sub(4)?;
+    let tail = pack.peek(tail, 4, reader)?.try_into().ok()?;
+    reader.count(1, true);
+    Some((head, tail))
+}
+
 /// A blob as a loose object: its entry's deflate blocks spliced between a stored block
-/// and the combined Adler-32, never inflated. A remote entry's zlib header is read first;
-/// its Adler-32 (the stream's last four bytes) comes with the body, in the same read, and
-/// the trailer is made from it then.
+/// and the combined Adler-32, never inflated. An entry of a pack in object storage that
+/// is in blocks the cache holds is planned from its ends and sent from those blocks, as
+/// a local pack's is from its mapping. Of another remote entry the zlib header is read
+/// first; its Adler-32 (the stream's last four bytes) comes with the body, in the same
+/// read, and the trailer is made from it then.
 async fn loose_blob(
     ctx: &Ctx,
     b: &mut Bufs,
@@ -580,14 +642,24 @@ async fn loose_blob(
     keep: bool,
 ) -> std::io::Result<bool> {
     let (zat, zlen) = rec.zlib();
+    let mut reader = Reader::new(ctx.blob_cache.as_deref());
     let mut head = [0u8; 2];
+    let mut cached = false;
     let plan = match pack.bytes() {
         Some(b) => crate::util::sub(b, us(zat), us(zlen))
             .and_then(|z| LooseSplice::plan(OBJ_BLOB, rec.size, z).ok()),
-        None => cold(read_pack(pack, zat, &mut head))
-            .await
-            .ok()
-            .and_then(|()| LooseSplice::plan_ends(OBJ_BLOB, rec.size, us(zlen), head, [0; 4]).ok()),
+        None => match stream_ends(pack, zat, zlen, &mut reader) {
+            Some((head, tail)) => {
+                cached = true;
+                LooseSplice::plan_ends(OBJ_BLOB, rec.size, us(zlen), head, tail).ok()
+            }
+            None => cold(read_pack(pack, zat, &mut head))
+                .await
+                .ok()
+                .and_then(|()| {
+                    LooseSplice::plan_ends(OBJ_BLOB, rec.size, us(zlen), head, [0; 4]).ok()
+                }),
+        },
     };
     let Some(plan) = plan else {
         inc(&ctx.metrics.errors);
@@ -605,7 +677,7 @@ async fn loose_blob(
         u64_of(plan.body_end.saturating_sub(plan.body_start)),
     );
     let mut trailer = plan.trailer;
-    if pack.bytes().is_none() {
+    if pack.bytes().is_none() && !cached {
         let mut to = ToClient {
             out: &mut out,
             hash: None,
@@ -627,8 +699,8 @@ async fn loose_blob(
         trailer = LooseSplice::plan_ends(OBJ_BLOB, rec.size, us(zlen), head, tail)
             .map_err(|_| super::httpd::other("blob entry trailer"))?
             .trailer;
-    } else if !put_mapped(&mut out, pack, at, n) {
-        send_pack_range(&mut out, pack, at, n, None, &mut budget).await?;
+    } else if !put_mapped(&mut out, pack, at, n, &mut reader) {
+        send_pack_range(&mut out, pack, at, n, None, &mut budget, &mut reader).await?;
     }
     if !out.put(&trailer) {
         out.bytes(&trailer).await?;
@@ -657,9 +729,10 @@ async fn whole_pack(
     keep: bool,
 ) -> std::io::Result<bool> {
     let mut budget = Budget::new();
+    let mut reader = Reader::new(ctx.blob_cache.as_deref());
     let mut out = Out::new(stream, &mut b.out, ctx.deadlines.write);
     out.head(200, CT_PACK, pack.len, keep)?;
-    send_pack_range(&mut out, pack, 0, pack.len, None, &mut budget).await?;
+    send_pack_range(&mut out, pack, 0, pack.len, None, &mut budget, &mut reader).await?;
     out.flush().await?;
     ctx.metrics.bytes_out.fetch_add(out.sent, Ordering::Relaxed);
     inc(&ctx.metrics.objects_out);
@@ -1243,18 +1316,30 @@ async fn objects_post(
         BlobSrc::Store(seg) => view.blobs.as_ref().and_then(|s| s.pack(seg, rec)),
         BlobSrc::Proxied(k) => arena.proxied.get(us(u64::from(k))),
     };
+    // A pack in object storage is read from the blocks the edge's cache holds of it, as
+    // a local one from its mapping: the request keeps the block it read last.
+    let mut reader = Reader::new(ctx.blob_cache.as_deref());
     for (i, (_, src, rec)) in arena.blobs.iter().enumerate() {
         if let Some((_, s, r)) = arena.blobs.get(i.saturating_add(AHEAD))
-            && let Some(b) = pack_of(*s, r).and_then(|p| p.bytes())
+            && let Some(p) = pack_of(*s, r)
         {
-            preload_entry(b, us(r.offset), us(r.entry_len));
+            match p.bytes() {
+                Some(b) => preload_entry(b, us(r.offset), us(r.entry_len)),
+                None => p.ahead(r.offset, r.entry_len, &reader, |bytes, at| {
+                    preload_entry(bytes, at, us(r.entry_len));
+                }),
+            }
         }
         let pack = pack_of(*src, rec)
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
-        let small = pack
-            .bytes()
-            .filter(|_| rec.entry_len < SENDFILE_MIN)
-            .and_then(|b| crate::util::sub(b, us(rec.offset), us(rec.entry_len)));
+        let small = if rec.entry_len >= SENDFILE_MIN {
+            None
+        } else {
+            match pack.bytes() {
+                Some(b) => crate::util::sub(b, us(rec.offset), us(rec.entry_len)),
+                None => pack.range(rec.offset, rec.entry_len, &mut reader),
+            }
+        };
         if let Some(entry) = small {
             h.update(entry);
             if !out.put(entry) {
@@ -1272,9 +1357,11 @@ async fn objects_post(
             rec.entry_len,
             Some(&mut h),
             &mut budget,
+            &mut reader,
         )
         .await?;
     }
+    drop(reader);
     let trailer: [u8; 20] = h.finalize().into();
     if !out.put(&trailer) {
         out.bytes(&trailer).await?;
