@@ -542,9 +542,13 @@ store/
 **Blob packs** (`src/blobs.rs`) hold whole entries only, so any entry is served by
 splicing its own bytes. An entry keeps the upstream's zlib stream untouched, unless the
 blob is at least 1 MiB and its first MiB compresses by less than 5%: then it is rewritten
-as deflate *stored* blocks (65,535 content bytes each, 5-byte headers, 0.008% overhead). A
-**segment** record is `id | pack u32 | offset (48 bits) | header length (8) | stored (1) |
-entry length u64 | size u64`: 64-bit lengths, so entries beyond 4 GiB are ordinary.
+as deflate *stored* blocks (65,535 content bytes each, 5-byte headers, 0.008% overhead). The
+copier measures that itself: it deflates the first MiB at git's default level (about 15 ms
+per blob of 1 MiB or more), so the choice depends on the blob's content alone, and a blob
+is encoded alike however the upstream compressed it, whole or as a delta, and in whatever
+pieces it arrived. A **segment** record is `id | pack u32 | offset (48 bits) | header
+length (8) | stored (1) | entry length u64 | size u64`: 64-bit lengths, so entries beyond
+4 GiB are ordinary.
 
 The stored encoding is **optional**: an optimization for clients, not part of the format.
 Readers take either encoding, the edge serves both alike (it inflates neither), and a store
@@ -625,7 +629,12 @@ whole-blob pack:
 * a delta is inflated in memory and applied to its base, read back from the output (a REF
   base may come later: the delta waits);
 * the output declares as many entries as blobs were asked for; any other object, a blob
-  twice, a blob missing, or a bad input trailer fails the pack.
+  twice, a blob missing, or a bad input trailer fails the pack;
+* so does an entry whose zlib stream is longer than twice its content plus 1 KiB. No
+  encoder writes one (deflate's longest code is 15 bits): it is padded with empty blocks,
+  which a hostile or broken upstream can send without end, and which the copy would hold
+  in memory (while a large blob's encoding is undecided, and when a delta's base is read
+  back) and write to the store.
 
 Work is cut into items in the order given. A blob of 16 MiB or more is an item of its
 own: one request whose single whole entry streams straight into the store (`fs`: a temp

@@ -9,14 +9,17 @@
 //!   in 64 KiB pieces to verify the id (SHA-1 of `blob <size>\0` + content) and the size,
 //!   and written either as the upstream's zlib bytes untouched or, for a blob of at least
 //!   [`STORED_MIN`] whose first MiB compresses by less than 5%, as stored blocks (which
-//!   inflate at the speed of a copy).
+//!   inflate at the speed of a copy). The sink deflates that first MiB itself to tell, so
+//!   the choice is the content's: a blob is encoded alike however it arrives.
 //! * **Deltas** (OFS or REF) are inflated in memory and applied to their base, read back
 //!   from the output (the output must be a [`Spool`] that can do that, like a local file),
 //!   and the result is written whole. A REF base may arrive after its delta: the delta
 //!   waits for it. Requests for large blobs are made one blob each, so their packs hold
 //!   one whole entry and need no read-back.
 //! * The output declares as many entries as blobs were asked for; any other object, a
-//!   blob twice, a blob missing, a size or trailer mismatch fails the pack.
+//!   blob twice, a blob missing, a size or trailer mismatch fails the pack. So does a zlib
+//!   stream longer than twice its content plus 1 KiB: one padded with empty blocks, which
+//!   no encoder writes, and which the sink would hold in memory or write out as it came.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -35,13 +38,22 @@ use crate::zlib::{Deflater, Inflater, compress_bound};
 
 /// Inflate output piece.
 const CHUNK: usize = 64 << 10;
-/// Content of a large blob inflated before its encoding is chosen.
+/// The content that chooses a large blob's encoding: its first MiB.
 const SAMPLE: usize = 1 << 20;
+/// An entry's zlib stream may be as long as twice its content plus this. No encoder needs
+/// more: deflate's longest code is 15 bits, so a byte costs under two, a block's header is
+/// at most 286 bytes (the code lengths of a dynamic block), and a zlib stream's own
+/// framing is 6. A longer stream is padded with empty blocks, which are valid and can go
+/// on without end, as a hostile or broken upstream may send them: every byte of them was
+/// held while a large blob's encoding was undecided, held again when a delta's base was
+/// read back, and written to the store.
+const PADDING_MAX: u64 = 1 << 10;
 /// Largest delta, base or delta result held in memory.
 pub const RESOLVE_MAX: u64 = 1 << 30;
 /// Most delta bytes waiting for a base that has not arrived.
 const WAITING_MAX: u64 = 1 << 30;
-/// zlib level of blobs rebuilt from deltas (git's default).
+/// zlib level of blobs rebuilt from deltas, and of the sample that chooses a large blob's
+/// encoding (git's default).
 const LEVEL: i32 = 6;
 /// Longest entry header: a 10-byte size varint and a 20-byte base id.
 const HEADER_MAX: usize = 32;
@@ -478,6 +490,15 @@ impl<S: Spool> BlobSink<S> {
                 self.size
             );
         }
+        let taken = self.z.total_in();
+        if taken > self.produced.saturating_mul(2).saturating_add(PADDING_MAX) {
+            crate::bail!(
+                "entry at offset {}: {taken} bytes of zlib stream for {} bytes of content, \
+                 more than any encoder needs",
+                self.entry_at,
+                self.produced
+            );
+        }
         let content = self.chunk.get(..made).ctx("inflate output")?;
         if self.stage == Stage::Whole {
             self.obj_sha.update(content);
@@ -485,6 +506,8 @@ impl<S: Spool> BlobSink<S> {
                 Choice::Raw => self.out.raw(input)?,
                 Choice::Stored => self.out.content(content)?,
                 Choice::Undecided => {
+                    // Less than SAMPLE + CHUNK of content is held, and so (the check
+                    // above) at most twice that plus PADDING_MAX of its stream: 2.1 MiB.
                     self.sample_z.extend_from_slice(input);
                     self.sample_c.extend_from_slice(content);
                     if self.sample_c.len() >= SAMPLE {
@@ -525,11 +548,10 @@ impl<S: Spool> BlobSink<S> {
         Ok(used)
     }
 
-    /// Chooses a large blob's encoding from the sample and writes the sample out.
+    /// Chooses a large blob's encoding from its first [`SAMPLE`] bytes and writes out
+    /// what was held meanwhile.
     fn decide(&mut self) -> Result<()> {
-        let z = u64_of(self.sample_z.len());
-        let c = u64_of(self.sample_c.len());
-        if z.saturating_mul(100) >= c.saturating_mul(95) {
+        if incompressible(&mut self.deflater, &mut self.zbuf, &self.sample_c)? {
             self.out.begin(self.size, Encoding::Stored)?;
             self.out.content(&self.sample_c)?;
             self.choice = Choice::Stored;
@@ -625,15 +647,15 @@ impl<S: Spool> BlobSink<S> {
         if !self.want.remove(&oid) {
             crate::bail!("the upstream sent blob {oid}, which was not asked for (or twice)");
         }
-        let n = compress_bound(self.target.len());
-        self.zbuf.resize(n, 0);
-        let zlen = self
-            .deflater
-            .deflate_parts(&[&self.target], &mut self.zbuf)?;
-        if size >= STORED_MIN && u64_of(zlen).saturating_mul(100) >= size.saturating_mul(95) {
+        if size >= STORED_MIN && incompressible(&mut self.deflater, &mut self.zbuf, &self.target)? {
             self.out.begin(size, Encoding::Stored)?;
             self.out.content(&self.target)?;
         } else {
+            let n = compress_bound(self.target.len());
+            self.zbuf.resize(n, 0);
+            let zlen = self
+                .deflater
+                .deflate_parts(&[&self.target], &mut self.zbuf)?;
             self.out.begin(size, Encoding::Raw)?;
             self.out.raw(self.zbuf.get(..zlen).ctx("deflate output")?)?;
         }
@@ -653,6 +675,8 @@ impl<S: Spool> BlobSink<S> {
             crate::bail!("a {}-byte delta base is too large to resolve", rec.size);
         }
         self.base_oid = None;
+        // The entry is at most twice the base plus PADDING_MAX (and its header): `body` lets
+        // no upstream stream be longer, and what is written here otherwise is shorter.
         self.entry_buf.resize(us(rec.entry_len), 0);
         self.out
             .spool()
@@ -679,6 +703,21 @@ impl<S: Spool> BlobSink<S> {
         }
         Ok(used)
     }
+}
+
+/// Whether a blob of at least [`STORED_MIN`] is written as stored blocks: when its first
+/// [`SAMPLE`] bytes deflate by less than 5% (at [`LEVEL`], into `zbuf`). That depends on
+/// the blob's bytes alone, so every copy of a blob chooses alike: however the upstream
+/// compressed it, whole or behind a delta, and however the wire cut it into pieces. (The
+/// measure used to be the upstream's bytes for as much content as the pieces had made when
+/// a MiB was in, or, behind a delta, the whole blob deflated: one blob could go either
+/// way.) The price is a deflate of 1 MiB per large blob, about 15 ms (2 ms if it is very
+/// repetitive), where inflating and hashing a MiB take 0.5 ms.
+fn incompressible(deflater: &mut Deflater, zbuf: &mut Vec<u8>, blob: &[u8]) -> Result<bool> {
+    let sample = blob.get(..SAMPLE).unwrap_or(blob);
+    zbuf.resize(compress_bound(sample.len()), 0);
+    let zlen = deflater.deflate_parts(&[sample], zbuf)?;
+    Ok(u64_of(zlen).saturating_mul(100) >= u64_of(sample.len()).saturating_mul(95))
 }
 
 impl<S: Spool> Write for BlobSink<S> {
@@ -967,10 +1006,17 @@ mod tests {
     }
 
     fn hand_pack(entries: &[(HeaderBytes, Vec<u8>)]) -> Vec<u8> {
+        let deflated: Vec<(HeaderBytes, Vec<u8>)> =
+            entries.iter().map(|(h, b)| (*h, deflate(b))).collect();
+        raw_pack(&deflated)
+    }
+
+    /// A pack of entries given with their zlib streams.
+    fn raw_pack(entries: &[(HeaderBytes, Vec<u8>)]) -> Vec<u8> {
         let mut p = crate::pack::pack_header(u32::try_from(entries.len()).unwrap()).to_vec();
-        for (h, body) in entries {
+        for (h, zlib) in entries {
             p.extend_from_slice(h.as_slice());
-            p.extend_from_slice(&deflate(body));
+            p.extend_from_slice(zlib);
         }
         let sha: [u8; 20] = Sha1::digest(&p).into();
         p.extend_from_slice(&sha);
@@ -1058,6 +1104,165 @@ mod tests {
         let f = sink.finish().unwrap();
         assert_eq!(f.recs.len(), 1);
         assert!(f.recs[0].stored);
+    }
+
+    fn whole_entry(content: &[u8]) -> (HeaderBytes, Vec<u8>) {
+        (
+            HeaderBytes::whole(OBJ_BLOB, u64_of(content.len())),
+            content.to_vec(),
+        )
+    }
+
+    fn entry_bytes<'a>(pack: &'a [u8], rec: &BlobRec) -> &'a [u8] {
+        &pack[us(rec.offset)..us(rec.offset + rec.entry_len)]
+    }
+
+    /// A blob on the 5% line whose content changes right after its first MiB: a MiB that
+    /// deflates to about 96%, then zeros. Its encoding is chosen from that first MiB alone,
+    /// so however the input is cut into writes, the output is one and the same pack. (The
+    /// choice used to be made from as much content as the writes had produced once a MiB
+    /// was out: a first write of 57,000 bytes moved that point tens of kilobytes into the
+    /// zeros, and the blob stored after one cut was kept deflated after another.)
+    #[test]
+    fn the_encoding_does_not_depend_on_how_the_input_is_cut() {
+        let r = repo("cut");
+        let mut content = Vec::new();
+        while content.len() < SAMPLE {
+            content.extend_from_slice(&noise(3900, 2 * content.len() as u64 + 1));
+            content.extend_from_slice(&[0u8; 196]);
+        }
+        content.extend_from_slice(&[0u8; 128 << 10]);
+        let first = deflate(&content[..SAMPLE]).len();
+        assert!(
+            first * 100 >= SAMPLE * 95,
+            "the first MiB deflates to {first}"
+        );
+        assert!(deflate(&content[..SAMPLE + 60_000]).len() * 100 < (SAMPLE + 60_000) * 95);
+        let oid = blob_id(&content);
+        let pack = hand_pack(&[whole_entry(&content)]);
+        let cuts: [&[usize]; 5] = [
+            &[usize::MAX],
+            &[57_000, usize::MAX],
+            &[CHUNK],
+            &[1, 2, 3, 5, 7, 11],
+            &[100_000, 4096],
+        ];
+        let outs: Vec<Finished<Vec<u8>>> = cuts
+            .iter()
+            .map(|cut| {
+                let mut sink = BlobSink::new(Vec::new(), &[oid]).unwrap();
+                feed_in_pieces(&mut sink, &pack, cut);
+                sink.finish().unwrap()
+            })
+            .collect();
+        check_output(&r, &outs[0], &[(oid, content)]);
+        for (f, cut) in outs.iter().zip(cuts) {
+            assert!(f.recs[0].stored, "cut {cut:?}");
+            assert!(f.out == outs[0].out, "cut {cut:?}: another pack");
+        }
+    }
+
+    /// One blob, whole in one pack and a delta's result in another: one encoding, and the
+    /// same entry bytes. Its first MiB is incompressible and the rest zeros, so it is
+    /// stored. (A delta's result used to be judged by all of it: half its size deflated,
+    /// it was written deflated.)
+    #[test]
+    fn a_blob_is_encoded_alike_whole_or_from_a_delta() {
+        let r = repo("alike");
+        let base = [noise(SAMPLE, 11), vec![0u8; SAMPLE]].concat();
+        let tail = b"and a last line\n";
+        let top = [base.clone(), tail.to_vec()].concat();
+        let (b, t) = (blob_id(&base), blob_id(&top));
+        let d = copy_insert_delta(base.len(), tail);
+        let with_delta = hand_pack(&[
+            whole_entry(&base),
+            (HeaderBytes::ref_delta(u64_of(d.len()), &b), d),
+        ]);
+        let mut sink = BlobSink::new(Vec::new(), &[b, t]).unwrap();
+        feed_in_pieces(&mut sink, &with_delta, &[CHUNK]);
+        let f = sink.finish().unwrap();
+        check_output(&r, &f, &[(b, base), (t, top.clone())]);
+        let from_delta = f.recs.iter().find(|x| x.oid == t).unwrap();
+
+        let mut sink = BlobSink::new(Vec::new(), &[t]).unwrap();
+        feed_in_pieces(&mut sink, &hand_pack(&[whole_entry(&top)]), &[CHUNK]);
+        let g = sink.finish().unwrap();
+        assert!(from_delta.stored && g.recs[0].stored);
+        assert!(entry_bytes(&f.out, from_delta) == entry_bytes(&g.out, &g.recs[0]));
+    }
+
+    /// `zlib` with `blocks` empty stored blocks (5 bytes each, no content) after its
+    /// header: still a valid stream of the same content.
+    fn padded(zlib: &[u8], blocks: usize) -> Vec<u8> {
+        let mut out = zlib[..2].to_vec();
+        for _ in 0..blocks {
+            out.extend_from_slice(&[0, 0, 0, 0xff, 0xff]);
+        }
+        out.extend_from_slice(&zlib[2..]);
+        out
+    }
+
+    /// A zlib stream padded with empty blocks is valid, and nothing an encoder writes. The
+    /// sink held a large blob's padding while the blob's encoding was undecided, and read a
+    /// delta base's back whole: memory without a bound. A stream longer than twice its
+    /// content plus 1 KiB now fails the pack in the write that passes the bound; under it,
+    /// padding is accepted as before, and so are the longest streams git writes, at level
+    /// 0 (11 bytes for an empty blob).
+    #[test]
+    fn padded_streams_fail_the_pack() {
+        let r = repo("pad");
+        let all: Vec<Oid> = r.blobs.iter().map(|b| b.0).collect();
+        let list: String = all.iter().map(|o| format!("{o}\n")).collect();
+        let level0 = git(
+            &r.dir.join("r.git"),
+            &["-c", "pack.compression=0", "pack-objects", "--stdout", "-q"],
+            list.as_bytes(),
+        );
+        let mut sink = BlobSink::new(Vec::new(), &all).unwrap();
+        feed_in_pieces(&mut sink, &level0, &[4096]);
+        check_output(&r, &sink.finish().unwrap(), &r.blobs);
+
+        let large = noise(SAMPLE + 5, 21);
+        let small = b"a small blob\n".to_vec();
+        let tail = b"and more\n";
+        let top = [small.clone(), tail.to_vec()].concat();
+        let (l, s, t) = (blob_id(&large), blob_id(&small), blob_id(&top));
+        let d = copy_insert_delta(small.len(), tail);
+        let pack = |blocks: usize, large_first: bool| {
+            let small_entry = (
+                HeaderBytes::whole(OBJ_BLOB, u64_of(small.len())),
+                padded(&deflate(&small), if large_first { 0 } else { blocks }),
+            );
+            let large_entry = (
+                HeaderBytes::whole(OBJ_BLOB, u64_of(large.len())),
+                padded(&deflate(&large), if large_first { blocks } else { 0 }),
+            );
+            let delta = (HeaderBytes::ref_delta(u64_of(d.len()), &s), deflate(&d));
+            if large_first {
+                raw_pack(&[large_entry, small_entry, delta])
+            } else {
+                raw_pack(&[small_entry, delta, large_entry])
+            }
+        };
+        // 1,000 bytes of padding are within the bound, before a large blob or a delta's base.
+        for large_first in [true, false] {
+            let mut sink = BlobSink::new(Vec::new(), &[l, s, t]).unwrap();
+            feed_in_pieces(&mut sink, &pack(200, large_first), &[4096]);
+            let want = [(l, large.clone()), (s, small.clone()), (t, top.clone())];
+            check_output(&r, &sink.finish().unwrap(), &want);
+        }
+        // 1.5 MB of it are not: the first write of 4 KiB fails the pack.
+        for large_first in [true, false] {
+            let pack = pack(300_000, large_first);
+            let mut sink = BlobSink::new(Vec::new(), &[l, s, t]).unwrap();
+            let taken = pack
+                .chunks(4096)
+                .take_while(|piece| sink.write_all(piece).is_ok())
+                .count();
+            assert_eq!(taken, 0, "writes of 4 KiB accepted");
+            let e = sink.end_input().unwrap_err().to_string();
+            assert!(e.contains("more than any encoder needs"), "{e}");
+        }
     }
 
     /// On a clock that only the throttle's own waits advance, at `--rate-mbps 4000`: the
