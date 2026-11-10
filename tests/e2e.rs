@@ -1301,6 +1301,8 @@ fn busy_connections_beyond_the_workers_take_turns() {
         "answers per client: {answered:?}"
     );
     server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// Malformed requests get a 400 and change nothing: the server keeps serving, and their
