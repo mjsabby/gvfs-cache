@@ -609,7 +609,9 @@ the mirror.
   that dies in between leaves blobs no tree references yet, never a tree without its
   blobs. Pipeline runners keep the store objects a run reads (sizes tables, segment
   indexes, and the slabs the tip's tree is walked through) in `--cache-dir` across runs,
-  pruned to what the store lists.
+  pruned to what the store lists. Only those downloads are pruned, known by their names
+  (`<slab id>.pack`, `.mphf`, `slabs_<slab id>.sizes`, `<segment id>.bidx`): any other
+  file in the directory is left alone.
 * **The manifest names the `blobs.bin` generation** the run computed its copies against,
   or the one it published if newer, even when it copied nothing: a run that died after
   publishing `blobs.bin` left the blobs the next run's trees rely on.

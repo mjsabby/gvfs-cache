@@ -1797,6 +1797,47 @@ fn a_manifest_names_the_blobs_generation_its_trees_need() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// `--cache-dir` may be a directory that holds other files: a run prunes there the
+/// downloads the store no longer lists, which it knows by their names, and leaves the rest.
+/// (It removed every file the store did not list. A directory store downloads nothing, so
+/// that was every file.)
+#[test]
+fn a_run_leaves_other_files_in_its_cache_dir() {
+    let root = tempdir("sep-cache-dir");
+    let up = Upstream::new(&root);
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    commit_files(&up, "c1", &[("a.txt", Some(b"one\n".to_vec()))]);
+    let shared = root.join("shared");
+    std::fs::create_dir_all(&shared).unwrap();
+    let others = [
+        shared.join("notes.txt"),
+        shared.join(format!("pack-{}.pack", "c".repeat(40))),
+    ];
+    for f in &others {
+        std::fs::write(f, b"not the pipeline's\n").unwrap();
+    }
+    let cache = ["--cache-dir", shared.to_str().unwrap()];
+    pipeline(
+        &root,
+        &store,
+        &up,
+        "15m",
+        &["--blobs", "separate", cache[0], cache[1]],
+    );
+    commit_files(&up, "c2", &[("b.txt", Some(b"two\n".to_vec()))]);
+    // A download of an earlier run that the store has dropped since.
+    let stale = shared.join("slabs_m15-1-0123456789abcdef.sizes");
+    std::fs::write(&stale, b"stale").unwrap();
+    let log = pipeline(&root, &store, &up, "15m", &cache);
+    assert!(log.contains("cache: removed 1 files"), "{log}");
+    assert!(!stale.exists());
+    for f in &others {
+        assert!(f.exists(), "{} is gone\n{log}", f.display());
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The upstream client over each transport it meets: a local repository; smart HTTP with
 /// protocol v2 (blobs by id, `object-info`, as Azure DevOps allows them); and a GVFS upstream
 /// (another edge: `POST /gvfs/objects` and `POST /gvfs/sizes`). Through `AsyncUpstream` (the
