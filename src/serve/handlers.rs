@@ -39,7 +39,7 @@ use super::httpd::{
     Body, Grow, Method, Out, Request, format_head, read_body, respond_text, write_all, write_head,
     write_response,
 };
-use super::view::{Prefetch, View};
+use super::view::{Ahead, Prefetch, View};
 use crate::arena::{Arena, BlobSrc, Lease};
 use crate::blobs::BlobRec;
 use crate::pack::{OBJ_BLOB, OBJ_COMMIT, OBJ_TREE, ObjectHeader, pack_header, parse_entry_header};
@@ -1318,14 +1318,15 @@ async fn find_ids(view: &View, arena: &mut Arena, budget: &mut Budget) -> bool {
     let Arena { oids, found, .. } = arena;
     found.clear();
     let mut commit = false;
+    let mut ring = Ring::new();
     for (i, o) in oids.iter().enumerate() {
         if commit && i >= found.capacity() {
             break;
         }
-        if let Some(next) = oids.get(i.saturating_add(AHEAD)) {
-            view.preload(next);
-        }
-        let hit = view.find(o);
+        let next = oids
+            .get(i.saturating_add(AHEAD))
+            .map_or(Ahead::Unknown, |next| view.preload(next));
+        let hit = view.find_ahead(o, ring.turn(i, next));
         commit |= hit
             .and_then(|(k, s)| view.all.get(usize::from(k)).and_then(|sl| sl.rec(s)))
             .is_some_and(|r| r.kind == OBJ_COMMIT);
@@ -1528,17 +1529,18 @@ async fn take_stored_blobs(
     } = arena;
     oid_at.clear();
     let mut rest = 0usize;
+    let mut ring = Ring::new();
     for i in 0..oids.len() {
         if budget.due() {
             budget.pause().await;
         }
         let Some(&oid) = oids.get(i) else { break };
         // Ahead of `i`: not yet moved by the compaction (it writes at `rest <= i`).
-        if let Some(next) = oids.get(i.saturating_add(AHEAD)) {
-            set.preload(next);
-        }
+        let next = oids
+            .get(i.saturating_add(AHEAD))
+            .map_or(Ahead::Unknown, |next| set.preload(next));
         let at = crate::util::u32_of(i);
-        match set.locate(&oid) {
+        match set.locate_ahead(&oid, ring.turn(i, next)) {
             Some((seg, rec)) => {
                 if !crate::arena::push(blobs, (at, BlobSrc::Store(seg), rec), true) {
                     return Err(Miss::Capacity);
@@ -1698,6 +1700,26 @@ async fn fetch_unresolved(
 /// How far ahead of the id it is on a batched lookup starts loading another's record.
 const AHEAD: usize = 16;
 
+/// What the lookups a loop started [`AHEAD`] ids ahead learned ([`Ahead`]), each kept
+/// until its id's turn.
+struct Ring([Ahead; AHEAD]);
+
+impl Ring {
+    fn new() -> Ring {
+        Ring([Ahead::Unknown; AHEAD])
+    }
+
+    /// What was learned of id `i` (nothing, of the first [`AHEAD`]); `next`, what was
+    /// just learned of id `i + AHEAD`, takes its place.
+    #[inline]
+    fn turn(&mut self, i: usize, next: Ahead) -> Ahead {
+        match self.0.get_mut(i % AHEAD) {
+            Some(place) => std::mem::replace(place, next),
+            None => Ahead::Unknown,
+        }
+    }
+}
+
 /// How far ahead of the piece it is sending a batch starts loading another's bytes (a
 /// piece is one entry, or a run of entries that are neighbours in their slab).
 const PIECES_AHEAD: usize = 8;
@@ -1754,19 +1776,27 @@ async fn sizes(
     out.buf.clear();
     let mut ok = out.buf.capacity() > 2;
     out.buf.push(b'[');
+    let set = view.blobs.as_deref();
+    let mut ring = Ring::new();
     for (i, oid) in oids.iter().enumerate() {
         if budget.due() {
             budget.pause().await;
         }
-        if let Some(next) = oids.get(i.saturating_add(AHEAD)) {
-            match view.blobs.as_ref() {
-                Some(set) => set.preload(next),
-                None => view.preload(next),
-            }
-        }
-        let size = match stored_blob(&view, oid) {
+        // The lookup of the id `AHEAD` places on starts where this id's will: in the blob
+        // packs of a separate-blob store (sizes are asked of blobs), else in the slabs.
+        let next = match (oids.get(i.saturating_add(AHEAD)), set) {
+            (Some(next), Some(set)) => set.preload(next),
+            (Some(next), None) => view.preload(next),
+            (None, _) => Ahead::Unknown,
+        };
+        let known = ring.turn(i, next);
+        let (blob, in_slabs) = match set {
+            Some(set) => (set.locate_ahead(oid, known), Ahead::Unknown),
+            None => (None, known),
+        };
+        let size = match blob {
             Some((_, r)) => r.size,
-            None => match view.find(oid) {
+            None => match view.find_ahead(oid, in_slabs) {
                 Some((k, slot)) => view
                     .all
                     .get(usize::from(k))

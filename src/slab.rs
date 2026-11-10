@@ -714,12 +714,18 @@ impl Slab {
         sub(self.index.bytes(), at, REC_LEN)
     }
 
-    /// Starts loading the record [`Slab::find`] would read for `oid`.
+    /// The only slot `oid` can occupy, if the index has one for it.
     #[inline]
-    pub fn preload(&self, oid: &Oid) {
-        if let Some(slot) = self.mphf().slot(oid) {
-            self.preload_rec(slot);
-        }
+    pub fn slot(&self, oid: &Oid) -> Option<u32> {
+        self.mphf().slot(oid)
+    }
+
+    /// Whether the record at `slot` ([`Slab::slot`]) is `oid`'s: whether the slab has it.
+    #[inline]
+    pub fn holds(&self, oid: &Oid, slot: u32) -> bool {
+        self.rec_bytes(slot)
+            .and_then(|rec| rec.get(..20))
+            .is_some_and(|id| id == oid.0)
     }
 
     /// Starts loading the record at `slot` (40 bytes: it may lie on two cache lines).
@@ -739,13 +745,8 @@ impl Slab {
         if self.filter.get().is_some_and(|f| !f.may_contain(oid)) {
             return None;
         }
-        let slot = self.mphf().slot(oid)?;
-        let rec = self.rec_bytes(slot)?;
-        if rec.get(..20)? == oid.0 {
-            Some(slot)
-        } else {
-            None
-        }
+        let slot = self.slot(oid)?;
+        self.holds(oid, slot).then_some(slot)
     }
 
     /// Builds the id filter [`Slab::find`] checks before the index (once; an edge does it
