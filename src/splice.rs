@@ -560,7 +560,7 @@ impl Resolver {
 }
 
 /// Most bytes deflate makes of one compressed byte (a 258-byte match in about two bits).
-const INFLATE_RATIO_MAX: u64 = 1032;
+pub(crate) const INFLATE_RATIO_MAX: u64 = 1032;
 
 /// Inflates a record's entry data (an object if `whole`, else a delta) into `buf`; returns
 /// its length. The length its header declares is checked before a buffer is sized for it:

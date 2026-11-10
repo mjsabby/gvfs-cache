@@ -127,7 +127,9 @@ The indexer is a faster `git index-pack`:
   buffer per depth, kept, it held 8.1 GiB at 32 threads. An id that a pack holds more
   than once (git accepts that) has its REF deltas resolved once, by the first object
   with that id to be resolved, so the walk ends even where a delta makes its own base's
-  id again.
+  id again. A buffer is sized for a delta's result by what the delta's ops write, never
+  by the size its header declares, and a delta, its base or its result of more than
+  1 GiB fails the pack, as it does in a blob pack.
 * The index build drops duplicate entries (the first copy wins) and builds the MPHF
   partitions in parallel.
 

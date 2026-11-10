@@ -23,7 +23,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use sha1::{Digest, Sha1};
 
-use crate::delta::{apply_delta, delta_sizes};
+use crate::blobstream::RESOLVE_MAX;
+use crate::delta::{apply_delta, result_size};
 use crate::pack::{
     OBJ_OFS_DELTA, OBJ_REF_DELTA, ObjectHeader, PACK_HEADER_LEN, PACK_TRAILER_LEN, is_delta,
     parse_entry_header,
@@ -793,7 +794,9 @@ fn room(buf: &mut Vec<u8>, n: usize) -> &mut [u8] {
     buf.get_mut(..n).unwrap_or(&mut [])
 }
 
-/// Inflates entry `e`'s data into `buf[..size]`; returns that size.
+/// Inflates entry `e`'s data into `buf[..size]`; returns that size. The entry is a delta or
+/// a delta's base, of the size pass 1 inflated it to: one of more than `RESOLVE_MAX`
+/// bytes is refused, as in a blob pack.
 fn inflate_entry(
     ctx: &ResolveCtx<'_>,
     e: u32,
@@ -801,6 +804,18 @@ fn inflate_entry(
     buf: &mut Vec<u8>,
 ) -> Result<usize> {
     let sc = ctx.scanned.get(e as usize).ctx("entry out of range")?;
+    if sc.size > RESOLVE_MAX {
+        crate::bail!(
+            "entry at offset {}: a {}-byte {} is too large to resolve",
+            sc.offset,
+            sc.size,
+            if is_delta(sc.kind) {
+                "delta"
+            } else {
+                "delta base"
+            }
+        );
+    }
     let n = us(sc.size);
     let zlib = ctx.zlib(e).ctx("entry out of range")?;
     inflater
@@ -889,7 +904,6 @@ fn resolve_family(ctx: &ResolveCtx<'_>, root: u32, s: &mut ResolveScratch) -> Re
         }
         let dlen = inflate_entry(ctx, child, inflater, delta)?;
         let delta_bytes = delta.get(..dlen).ctx("delta buffer")?;
-        let (_, rsz, _) = delta_sizes(delta_bytes).ctx("bad delta header")?;
         let next_level = at.saturating_add(1);
         while levels.len() <= next_level {
             levels.push(Vec::new());
@@ -901,6 +915,17 @@ fn resolve_family(ctx: &ResolveCtx<'_>, root: u32, s: &mut ResolveScratch) -> Re
             .get(at)
             .and_then(|l| l.get(..parent_len))
             .ctx("missing level")?;
+        // The size a delta declares for its result sizes no buffer before its ops are
+        // seen to write that much: 81 bytes of pack can declare 1 TiB (an allocation that
+        // aborts the process) or 2^64 - 1 (one that panics).
+        let rsz = result_size(delta_bytes, parent_len)
+            .with_ctx(|| format!("delta at offset {}", child_sc.offset))?;
+        if rsz > RESOLVE_MAX {
+            crate::bail!(
+                "delta at offset {}: a {rsz}-byte result is too large to resolve",
+                child_sc.offset
+            );
+        }
         let target = room(upper.first_mut().ctx("missing level")?, us(rsz));
         apply_delta(parent_bytes, delta_bytes, target)
             .with_ctx(|| format!("applying delta at offset {}", child_sc.offset))?;
@@ -1892,6 +1917,39 @@ pub(crate) mod tests {
         let (facts, resolved) = index_soon(&pairs, 4);
         assert_eq!(resolved, 100);
         assert_eq!(our_index(&facts), git_index("pairs", &pairs));
+    }
+
+    /// The size a delta declares for its result sizes no buffer before the delta's ops
+    /// are seen to write that much, and no more than `RESOLVE_MAX` then: the pack is
+    /// refused. An 81-byte pack that declared 1 TiB used to abort the process, and one
+    /// that declared 2^64 - 1 to panic.
+    #[test]
+    fn a_delta_sizes_no_buffer_by_what_it_declares() {
+        let refused = |base: &[u8], delta: &[u8], why: &str| {
+            let mut b = PackBuilder::new();
+            b.whole(OBJ_BLOB, base);
+            b.ref_delta(&hash_object(OBJ_BLOB, base), delta);
+            let mut ix = Indexer::new(1);
+            let e = ix.index(&b.finish()).map(|f| f.len()).expect_err(why);
+            assert!(e.to_string().contains(why), "{e}");
+        };
+        // Five bytes copied, and a header that declares more.
+        for declared in [6, 1 << 40, u64::MAX] {
+            let mut d = Vec::new();
+            put_varint(&mut d, 5);
+            put_varint(&mut d, declared);
+            put_copy(&mut d, 0, 5);
+            refused(b"hello", &d, "result size");
+        }
+        // 64 KiB copied 16,385 times over: a delta of 16 KiB that does make 1 GiB + 64 KiB.
+        let base = vec![7u8; 64 << 10];
+        let mut d = Vec::new();
+        put_varint(&mut d, base.len() as u64);
+        put_varint(&mut d, 16_385 * base.len() as u64);
+        for _ in 0..16_385 {
+            put_copy(&mut d, 0, base.len());
+        }
+        refused(&base, &d, "too large");
     }
 
     #[test]

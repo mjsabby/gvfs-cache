@@ -67,6 +67,71 @@ pub fn delta_sizes(delta: &[u8]) -> Option<(u64, u64, usize)> {
     Some((base, result, pos))
 }
 
+/// The range `(offset, size)` of the base that the copy op `op` copies: its argument
+/// bytes follow it at `delta[*pos..]`.
+#[inline(always)]
+fn copy_range(op: u8, delta: &[u8], pos: &mut usize) -> Result<(usize, usize), DeltaError> {
+    let mut off = 0u32;
+    let mut size = 0u32;
+    for i in 0..4u32 {
+        if op & 1u8.wrapping_shl(i) != 0 {
+            let b = *delta.get(*pos).ok_or(DeltaError::Truncated)?;
+            *pos = pos.wrapping_add(1);
+            off |= u32::from(b).wrapping_shl(i.wrapping_mul(8));
+        }
+    }
+    for i in 0..3u32 {
+        if op & 0x10u8.wrapping_shl(i) != 0 {
+            let b = *delta.get(*pos).ok_or(DeltaError::Truncated)?;
+            *pos = pos.wrapping_add(1);
+            size |= u32::from(b).wrapping_shl(i.wrapping_mul(8));
+        }
+    }
+    if size == 0 {
+        size = 0x10000;
+    }
+    Ok((off as usize, size as usize))
+}
+
+/// The size of the object `delta` makes of a base of `base_len` bytes, once the delta is
+/// known to make it: its header names that base size, and its ops stay inside the base
+/// and write exactly the result size the header declares. Only the delta is read. A
+/// header can declare any size (ten bytes of it say 2^64 - 1), so this is the check to
+/// make before a buffer is sized for a delta's result.
+pub fn result_size(delta: &[u8], base_len: usize) -> Result<u64, DeltaError> {
+    let (base_size, result_size, mut pos) = delta_sizes(delta).ok_or(DeltaError::Header)?;
+    if base_size != crate::util::u64_of(base_len) {
+        return Err(DeltaError::BaseSize);
+    }
+    let mut made = 0u64;
+    while let Some(&op) = delta.get(pos) {
+        pos = pos.wrapping_add(1);
+        let n = if op & 0x80 != 0 {
+            let (off, size) = copy_range(op, delta, &mut pos)?;
+            if off.checked_add(size).is_none_or(|end| end > base_len) {
+                return Err(DeltaError::CopyOutOfRange);
+            }
+            size
+        } else if op != 0 {
+            let n = usize::from(op);
+            pos = pos
+                .checked_add(n)
+                .filter(|&end| end <= delta.len())
+                .ok_or(DeltaError::Truncated)?;
+            n
+        } else {
+            return Err(DeltaError::BadOp);
+        };
+        made = made
+            .checked_add(crate::util::u64_of(n))
+            .ok_or(DeltaError::ResultSize)?;
+    }
+    if made != result_size {
+        return Err(DeltaError::ResultSize);
+    }
+    Ok(result_size)
+}
+
 /// Applies `delta` to `base`, writing exactly `out.len()` (== the delta's result size) bytes.
 pub fn apply_delta(base: &[u8], delta: &[u8], out: &mut [u8]) -> Result<(), DeltaError> {
     let (base_size, result_size, mut pos) = delta_sizes(delta).ok_or(DeltaError::Header)?;
@@ -80,27 +145,7 @@ pub fn apply_delta(base: &[u8], delta: &[u8], out: &mut [u8]) -> Result<(), Delt
     while let Some(&op) = delta.get(pos) {
         pos = pos.wrapping_add(1);
         if op & 0x80 != 0 {
-            let mut off = 0u32;
-            let mut size = 0u32;
-            for i in 0..4u32 {
-                if op & 1u8.wrapping_shl(i) != 0 {
-                    let b = *delta.get(pos).ok_or(DeltaError::Truncated)?;
-                    pos = pos.wrapping_add(1);
-                    off |= u32::from(b).wrapping_shl(i.wrapping_mul(8));
-                }
-            }
-            for i in 0..3u32 {
-                if op & 0x10u8.wrapping_shl(i) != 0 {
-                    let b = *delta.get(pos).ok_or(DeltaError::Truncated)?;
-                    pos = pos.wrapping_add(1);
-                    size |= u32::from(b).wrapping_shl(i.wrapping_mul(8));
-                }
-            }
-            if size == 0 {
-                size = 0x10000;
-            }
-            let off = off as usize;
-            let size = size as usize;
+            let (off, size) = copy_range(op, delta, &mut pos)?;
             let src = base
                 .get(off..off.checked_add(size).ok_or(DeltaError::CopyOutOfRange)?)
                 .ok_or(DeltaError::CopyOutOfRange)?;
@@ -343,6 +388,50 @@ mod tests {
             apply_delta(base, &oob, &mut out[..4]),
             Err(DeltaError::CopyOutOfRange)
         );
+    }
+
+    /// `result_size` judges a delta as `apply_delta` does, with no buffer for the result:
+    /// what the header declares must be what the ops write.
+    #[test]
+    fn result_size_is_what_the_ops_write() {
+        let base = b"hello world, hello delta";
+        let delta = |declared: u64, ops: &[u8]| {
+            let mut d = Vec::new();
+            enc(base.len() as u64, &mut d);
+            enc(declared, &mut d);
+            d.extend_from_slice(ops);
+            d
+        };
+        // 0x91 copies (one offset byte, one size byte), 0x90 copies from offset 0: here
+        // base[13..18], then " to" inserted, then base[0..8]. 16 bytes.
+        let ops = [0x91, 13, 5, 3, b' ', b't', b'o', 0x90, 8];
+        let judged = |d: &[u8], declared: u64| {
+            let applied = usize::try_from(declared)
+                .ok()
+                .filter(|&n| n < 1 << 20)
+                .map(|n| apply_delta(base, d, &mut vec![0u8; n]).map(|()| declared));
+            let sized = result_size(d, base.len());
+            assert!(applied.is_none_or(|a| a == sized), "{applied:?} {sized:?}");
+            sized
+        };
+        assert_eq!(judged(&delta(16, &ops), 16), Ok(16));
+        for declared in [0, 15, 17, 1 << 40, u64::MAX] {
+            let sized = judged(&delta(declared, &ops), declared);
+            assert_eq!(sized, Err(DeltaError::ResultSize));
+        }
+        assert_eq!(
+            result_size(&delta(16, &ops), base.len() - 1),
+            Err(DeltaError::BaseSize)
+        );
+        for (declared, ops, error) in [
+            (4, &[0x91, 30, 4][..], DeltaError::CopyOutOfRange),
+            (1, &[0][..], DeltaError::BadOp),
+            (3, &[3, b'a'][..], DeltaError::Truncated),
+            (5, &[0x91, 13][..], DeltaError::Truncated),
+        ] {
+            assert_eq!(judged(&delta(declared, ops), declared), Err(error));
+        }
+        assert_eq!(result_size(&[0x80], 0), Err(DeltaError::Header));
     }
 
     /// A tree from `(name, is_dir, id byte)` entries, sorted in git order.
