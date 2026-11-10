@@ -35,6 +35,8 @@ const PARALLEL_MIN_BYTES: usize = 8 << 20;
 /// Smallest speculative chunk.
 const MIN_CHUNK: usize = 2 << 20;
 const STREAM_CHUNK: usize = 64 << 10;
+/// Fewest entries given to one thread when pass 2 lists its roots (about 7 ms of lookups).
+const ROOTS_MIN_CHUNK: usize = 1 << 14;
 
 /// Pass-1 facts about one entry, in pack order.
 #[derive(Clone, Copy, Default)]
@@ -549,21 +551,34 @@ impl Indexer {
             depth: 0,
             base: b,
         }));
+        // The roots, in pack order whatever the thread count: every thread lists those of
+        // one run of entries. On one thread the 6.98M lookups of SearchGold's pack took
+        // 3.1 s of the indexer's 8.5 s; on 32 they take 0.3 s.
         roots.clear();
-        for (i, sc) in scanned.iter().enumerate() {
-            // The cheap tests first: a delta is no root, and OFS children are two adjacent
-            // reads. Finding an id's waiters is two binary searches in a table far larger
-            // than the cache, 0.3 to 0.4 µs. Made for every entry they took 4.7 s of the
-            // indexer's 10.1 s on SearchGold's 12.13M-entry pack; its 5.15M deltas no
-            // longer make them.
-            if is_delta(sc.kind) {
-                continue;
-            }
-            if !ctx.ofs_kids(u32_of(i)).is_empty() || {
-                let (wlo, whi) = ctx.waiting_range(&sc.oid);
-                wlo < whi
-            } {
-                roots.push(u32_of(i));
+        let per = scanned
+            .len()
+            .div_ceil((*threads).max(1))
+            .max(ROOTS_MIN_CHUNK);
+        if scanned.len() <= per {
+            ctx.roots_of(0, scanned, roots);
+        } else {
+            let found: Vec<Option<Vec<u32>>> = std::thread::scope(|s| {
+                let ctx = &ctx;
+                let handles: Vec<_> = scanned
+                    .chunks(per)
+                    .enumerate()
+                    .map(|(c, part)| {
+                        s.spawn(move || {
+                            let mut mine = Vec::new();
+                            ctx.roots_of(c.saturating_mul(per), part, &mut mine);
+                            mine
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().ok()).collect()
+            });
+            for part in found {
+                roots.extend(part.ctx("root finder thread failed")?);
             }
         }
 
@@ -688,6 +703,28 @@ impl ResolveCtx<'_> {
             .partition_point(|(w, _)| w == oid);
         let start = lo.wrapping_add(u32_of(first));
         (start, start.wrapping_add(u32_of(len)))
+    }
+
+    /// Appends the roots among `part`, whose first entry is number `from`: the whole
+    /// entries that some delta is based on.
+    fn roots_of(&self, from: usize, part: &[Scanned], roots: &mut Vec<u32>) {
+        for (i, sc) in part.iter().enumerate() {
+            // The cheap tests first: a delta is no root, and OFS children are two adjacent
+            // reads. Finding an id's waiters is two binary searches in a table far larger
+            // than the cache, 0.3 to 0.4 µs. Made for every entry they took 4.7 s of the
+            // indexer's 10.1 s on SearchGold's 12.13M-entry pack; its 5.15M deltas no
+            // longer make them.
+            if is_delta(sc.kind) {
+                continue;
+            }
+            let e = u32_of(from.saturating_add(i));
+            if !self.ofs_kids(e).is_empty() || {
+                let (wlo, whi) = self.waiting_range(&sc.oid);
+                wlo < whi
+            } {
+                roots.push(e);
+            }
+        }
     }
 }
 
@@ -1243,9 +1280,78 @@ impl<T> LazyContext<T> for Option<T> {
 }
 
 #[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)]
 pub(crate) mod tests {
     use super::*;
+    use crate::delta::{put_copy, put_insert, put_varint};
+    use crate::pack::{HeaderBytes, OBJ_BLOB, pack_header};
     use std::process::Command;
+
+    /// A pack written entry by entry, for the shapes git's `pack-objects` does not make.
+    struct PackBuilder {
+        deflater: crate::zlib::Deflater,
+        zbuf: Vec<u8>,
+        pack: Vec<u8>,
+        entries: u32,
+    }
+
+    impl PackBuilder {
+        fn new() -> PackBuilder {
+            PackBuilder {
+                deflater: crate::zlib::Deflater::new(6),
+                zbuf: Vec::new(),
+                pack: pack_header(0).to_vec(),
+                entries: 0,
+            }
+        }
+
+        /// Appends an entry: `header`, then `data` deflated. Returns its offset.
+        fn entry(&mut self, header: HeaderBytes, data: &[u8]) -> u64 {
+            let at = self.pack.len() as u64;
+            self.zbuf.resize(crate::zlib::compress_bound(data.len()), 0);
+            let n = self
+                .deflater
+                .deflate_parts(&[data], &mut self.zbuf)
+                .unwrap();
+            self.pack.extend_from_slice(header.as_slice());
+            self.pack.extend_from_slice(&self.zbuf[..n]);
+            self.entries += 1;
+            at
+        }
+
+        fn whole(&mut self, kind: u8, content: &[u8]) -> u64 {
+            self.entry(HeaderBytes::whole(kind, content.len() as u64), content)
+        }
+
+        fn ref_delta(&mut self, base: &Oid, delta: &[u8]) -> u64 {
+            self.entry(HeaderBytes::ref_delta(delta.len() as u64, base), delta)
+        }
+
+        /// An OFS delta against the entry at offset `base`.
+        fn ofs_delta(&mut self, base: u64, delta: &[u8]) -> u64 {
+            let dist = self.pack.len() as u64 - base;
+            self.entry(HeaderBytes::ofs_delta(delta.len() as u64, dist), delta)
+        }
+
+        /// The pack: its header's count set, its trailer appended.
+        fn finish(mut self) -> Vec<u8> {
+            self.pack[..PACK_HEADER_LEN].copy_from_slice(&pack_header(self.entries));
+            let trailer: [u8; 20] = Sha1::digest(&self.pack).into();
+            self.pack.extend_from_slice(&trailer);
+            self.pack
+        }
+    }
+
+    /// A delta that makes `result` of `base`: their common prefix copied, the rest inserted.
+    fn delta_of(base: &[u8], result: &[u8]) -> Vec<u8> {
+        let same = base.iter().zip(result).take_while(|(a, b)| a == b).count();
+        let mut d = Vec::new();
+        put_varint(&mut d, base.len() as u64);
+        put_varint(&mut d, result.len() as u64);
+        put_copy(&mut d, 0, same);
+        put_insert(&mut d, &result[same..]);
+        d
+    }
 
     /// Builds a small repository with deltas and returns its pack (OFS_DELTA entries).
     pub(crate) fn sample_pack(dir: &std::path::Path) -> Vec<u8> {
@@ -1442,6 +1548,52 @@ pub(crate) mod tests {
         bad[mid] ^= 0x55;
         assert!(Indexer::new(1).index(&bad).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pass 2 lists its roots on every thread, each thread those of one run of entries.
+    /// The list is the one a single thread makes: the whole entries with a delta on them,
+    /// in pack order. Here every seventh blob is followed by an OFS delta on it, and every
+    /// fifth has a REF delta on it three blobs earlier.
+    #[test]
+    fn roots_are_listed_in_pack_order_on_any_number_of_threads() {
+        let content = |i: usize| format!("blob {i}").into_bytes();
+        let edited = |base: &[u8], how: &str| delta_of(base, &[base, how.as_bytes()].concat());
+        let blobs = 40_000;
+        let mut b = PackBuilder::new();
+        let mut entries = 0u32;
+        let mut want = Vec::new();
+        for i in 0..blobs {
+            let blob = content(i);
+            let at = b.whole(OBJ_BLOB, &blob);
+            if i % 7 == 3 || i % 5 == 4 {
+                want.push(entries);
+            }
+            entries += 1;
+            if i % 7 == 3 {
+                b.ofs_delta(at, &edited(&blob, ", edited"));
+                entries += 1;
+            }
+            if i % 5 == 1 && i + 3 < blobs {
+                let base = content(i + 3);
+                b.ref_delta(&hash_object(OBJ_BLOB, &base), &edited(&base, ", renamed"));
+                entries += 1;
+            }
+        }
+        let pack = b.finish();
+        assert!(
+            entries as usize > 3 * ROOTS_MIN_CHUNK,
+            "{entries} entries are no four threads' worth"
+        );
+        let facts = |ix: &mut Indexer| -> Vec<(Oid, u32, u8)> {
+            let facts = ix.index(&pack).unwrap();
+            facts.iter().map(|f| (f.oid, f.base, f.depth)).collect()
+        };
+        let (mut one, mut four) = (Indexer::new(1), Indexer::new(4));
+        let (by_one, by_four) = (facts(&mut one), facts(&mut four));
+        assert_eq!(by_one.len(), entries as usize);
+        assert_eq!(one.roots, want);
+        assert_eq!(four.roots, want);
+        assert!(by_one == by_four);
     }
 
     /// The pipeline indexes two packs with one indexer: the upstream's, then its repack's.
