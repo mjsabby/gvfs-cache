@@ -307,16 +307,22 @@ live loop runs every `--poll-ms`:
   repacked into one more L0 slab and stamped from its commits. This is the same code the
   pipeline runs, and the pipeline later stamps the same tip the same way. A forced push
   (the new head does not descend from the newest live L0 tip) drops the live L0 slabs the
-  head does not reach and fetches again from the newest boundary it does (above). A head
-  whose ingest fails is tried again after one poll interval, then after twice as long
-  each time, up to a minute, since every attempt fetches the delta again; another head,
-  or a new manifest, is tried at once. `gvfs_live_failures_total` counts the polls that
-  failed.
+  head does not reach and fetches again from the newest boundary it does (above).
 * A new manifest generation swaps in its slabs. L0 slabs it covers leave the live set
   (object lookups and cold plans) but stay in the timeline for 6 hours, so a client whose
   cursor is one of their boundaries is still answered exactly. If the manifest's tip falls
   inside an L0 slab, what follows the tip is repacked out of it. Nothing is fetched again
   unless the branch was rewritten.
+
+Neither step needs the other to work: an edge that cannot read its store, or cannot apply
+a manifest, still follows the branch on the manifest it serves, and the reverse. A step
+that fails changes nothing: the slabs, the L0 slabs and what the tip knows of them (the
+stamps of their commits, the boundaries a forced push took away) are replaced together
+once everything that can fail has not, so a later view is never made of one manifest's
+bounds and another's slabs. What failed is tried again after one poll interval, then
+after twice as long each time, up to a minute, since an attempt fetches the delta or
+downloads the slabs again; another head, or another manifest, is tried at once.
+`gvfs_live_failures_total` counts the failures.
 
 Every change publishes a new immutable `View`; requests hold an `Arc` to the view they
 started with. Object lookups go through the live L0 slabs, the pyramid, the weekly deltas

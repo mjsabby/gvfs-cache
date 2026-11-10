@@ -1744,6 +1744,78 @@ fn a_failing_ingest_is_retried_less_and_less_often() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A manifest the edge cannot apply (here the store lacks the pack of its new slab) does
+/// not stop the live tip: the edge keeps the manifest it serves and follows the branch on
+/// it, tries the new one again less and less often, and takes it once it can.
+#[test]
+fn a_manifest_that_cannot_be_applied_leaves_the_edge_live() {
+    let root = tempdir("stuck-manifest");
+    let up = Upstream::new(&root);
+    let t0 = 1_700_000_000u64;
+    commit_dated(&up, &[("a.txt", "a\n")], t0);
+    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let first = manifest(&store_dir);
+    let cache = root.join("cache");
+    let server = Server::start(&[
+        "--store",
+        &store,
+        "--upstream",
+        up.bare.to_str().unwrap(),
+        "--poll-ms",
+        "20",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ]);
+    let served = |s: &Server, oid: &str| s.get(&format!("/gvfs/objects/{oid}")).0 == 200;
+    let b = commit_dated(&up, &[("b.txt", "b\n")], t0 + 100);
+    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
+    server.wait_for("B in L0", |s| served(s, &b));
+
+    // The pipeline seals B while the edge cannot see the store, which comes back without
+    // the new slab's pack.
+    let away = root.join("store.away");
+    std::fs::rename(&store_dir, &away).unwrap();
+    pipeline(&root, &store_spec(&away), &up, "15m", &[]);
+    let second = manifest(&away);
+    assert!(second.generation > first.generation);
+    let new = second
+        .slabs()
+        .find(|s| first.slabs().all(|f| f.id != s.id))
+        .expect("a slab for B");
+    let pack = store_dir.join(new.pack_key());
+    let hidden = root.join("hidden.pack");
+    std::fs::rename(away.join(new.pack_key()), &hidden).unwrap();
+    std::fs::rename(&away, &store_dir).unwrap();
+    server.wait_for("a manifest that cannot be applied", |s| {
+        s.metric("gvfs_live_failures_total") > 0
+    });
+
+    // The branch is still followed, on the manifest the edge serves.
+    let c = commit_dated(&up, &[("c.txt", "c\n")], t0 + 200);
+    git(&up.work, &["push", "-q", "origin", "HEAD:main"]);
+    server.wait_for("C in L0", |s| served(s, &c));
+    assert_eq!(server.metric("gvfs_manifest_generation"), first.generation);
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+    let failures = server.metric("gvfs_live_failures_total");
+    assert!((2..=9).contains(&failures), "{failures} attempts");
+
+    std::fs::rename(&hidden, &pack).unwrap();
+    server.wait_for("the manifest", |s| {
+        s.metric("gvfs_manifest_generation") == second.generation
+    });
+    let client = fresh_repo(&root, "client");
+    for (_, pack) in server.prefetch(0) {
+        install_pack(&client, &pack);
+    }
+    assert_complete(&client, &c);
+    server.assert_clean();
+    drop(server);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Forced pushes under the edge's live L0 slabs, which only the edge saw (the pipeline did
 /// not run in between): a rewind, a rewind into the middle of a slab, and a rewrite. The
 /// edge stops serving what the branch no longer reaches, stamps what follows exactly as the

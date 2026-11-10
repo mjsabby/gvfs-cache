@@ -68,8 +68,8 @@ pub struct Metrics {
     pub objects_out: AtomicU64,
     pub l0_ingests: AtomicU64,
     pub manifest_loads: AtomicU64,
-    /// Polls of the live loop that failed: the store or the upstream could not be read, or
-    /// what the branch added could not be ingested.
+    /// Failures of the live loop: the store or the upstream could not be read, a manifest
+    /// could not be applied, or what the branch added could not be ingested.
     pub live_failures: AtomicU64,
     /// Blobs served from the store's blob packs, and through the proxy.
     pub blobs_store: AtomicU64,
