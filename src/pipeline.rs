@@ -6,7 +6,7 @@
 //! is published comes out of [`crate::repack`], and every rollup is built from slabs
 //! already in the store.
 //!
-//! One run is one compare-and-swap of `manifest.bin`:
+//! One run is at most one compare-and-swap of `manifest.bin`:
 //!
 //! 1. **Genesis** (no manifest): `ingest_git_delta(none, HEAD)`, repacked with its deltas
 //!    re-pointed as OFS, becomes the first baseline, published with `If-None-Match: *`
@@ -25,7 +25,9 @@
 //!    for byte plus the delta's objects, with each directory's newest version stored as a
 //!    delta against the old baseline's version.
 //! 5. Publish with `If-Match` (lost race: start over), then delete unreferenced slab files
-//!    older than the grace period (a crashed run's uploads; slabs no longer listed).
+//!    older than the grace period (a crashed run's uploads; slabs no longer listed). A run
+//!    that changed nothing (no new commits, no rollup due) publishes nothing: the manifest
+//!    keeps its generation, and every edge its view. It still collects garbage.
 //!
 //! Timestamps are derived from commits ([`crate::timeline`]): a 15m slab ends at the
 //! stamp of the tip it was fetched up to, which is exactly the stamp an edge gave the same
@@ -154,8 +156,15 @@ pub fn main(args: &[String]) -> Result<()> {
             .map(PathBuf::from)
             .unwrap_or_else(|| work_dir.join("gvfs-cache-store-cache")),
     };
-    let m = run(&mut opts)?;
-    crate::log!("published manifest:\n{}", m.describe());
+    let (m, published) = run(&mut opts)?;
+    if published {
+        crate::log!("published manifest:\n{}", m.describe());
+    } else {
+        crate::log!(
+            "nothing to publish: the manifest stays at generation {}",
+            m.generation
+        );
+    }
     crate::log!(
         "peak RSS {}",
         crate::util::human_bytes(crate::util::peak_rss())
@@ -170,8 +179,10 @@ struct Engines {
     resolver: Resolver,
 }
 
-/// Runs one pipeline step, retrying from scratch when another writer wins the CAS.
-pub fn run(o: &mut Options) -> Result<Manifest> {
+/// Runs one pipeline step, retrying from scratch when another writer wins the CAS. Returns
+/// the store's manifest and whether this run published it: a run that changed nothing
+/// leaves the one it read.
+pub fn run(o: &mut Options) -> Result<(Manifest, bool)> {
     let mut e = Engines {
         indexer: Indexer::new(o.threads),
         repacker: Repacker::new(),
@@ -191,11 +202,12 @@ pub fn run(o: &mut Options) -> Result<Manifest> {
     }
 }
 
-fn step(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<Manifest> {
+fn step(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<(Manifest, bool)> {
     let Some((bytes, etag)) = o.store.get(MANIFEST_KEY)? else {
-        return genesis(o, e, work, head);
+        return Ok((genesis(o, e, work, head)?, true));
     };
     let mut m = Manifest::decode(&bytes).ctx("reading manifest.bin")?;
+    let read = m.clone();
     if let Some(want) = o.blobs
         && want != m.separate_blobs()
     {
@@ -283,9 +295,16 @@ fn step(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<Mani
     m.retained
         .retain(|s| s.end_ts.saturating_add(retention(s.tier, keep_weeks)) >= max_ts);
 
-    m.generation = m.generation.saturating_add(1);
-    o.store
-        .put(MANIFEST_KEY, &m.encode(), Cond::IfMatch(etag))?;
+    // A run that changed nothing publishes nothing: a new generation has every edge build a
+    // view and hash its cold pack again (1.3 s on SearchGold, and 4.6 s for its `.idx`),
+    // up to 96 times a day while the branch is quiet. Everything but the generation counts
+    // as a change, the `blobs.bin` generation the trees need included.
+    let published = m != read;
+    if published {
+        m.generation = m.generation.saturating_add(1);
+        o.store
+            .put(MANIFEST_KEY, &m.encode(), Cond::IfMatch(etag))?;
+    }
     gc(o, &m)?;
     if m.separate_blobs() {
         // The manifest is published: a failure here only costs downloads next run.
@@ -297,7 +316,7 @@ fn step(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<Mani
             Err(e) => crate::log!("cache: pruning {} failed: {e}", o.cache_dir.display()),
         }
     }
-    Ok(m)
+    Ok((m, published))
 }
 
 /// The one-time seed: the upstream's full pack, deltas re-pointed as OFS.

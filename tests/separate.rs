@@ -226,8 +226,15 @@ fn separate_store_pipeline_copies_blobs_before_trees() {
     }
     assert!(lone && stored_noise);
 
-    // Nothing new: no copy, no new slab.
+    // Nothing new: no copy, no new slab, and nothing published. `blobs.bin` has moved on
+    // with the mirror, but these trees need no more of it than their manifest names.
+    assert!(bm.generation > m2.blobs_generation);
+    let before = std::fs::read(store_dir.join("manifest.bin")).unwrap();
     pipeline(&root, &store, &up, "15m", &[]);
+    assert!(
+        std::fs::read(store_dir.join("manifest.bin")).unwrap() == before,
+        "an idle run published a manifest"
+    );
     assert_eq!(manifest(&store_dir).pyramid.len(), 1);
 
     // Another window, then rollups: their tables are unions.

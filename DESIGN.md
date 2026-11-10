@@ -223,7 +223,7 @@ ADO pack by 90.7 MB (2.8%) in 9.9 s.
 
 The pipeline runs as a scheduled ADO pipeline or GitHub Action. Runners are stateless:
 each run reads the manifest, downloads the slabs it needs from the store, and publishes.
-Each run is one compare-and-swap of `manifest.bin`:
+Each run is at most one compare-and-swap of `manifest.bin`:
 
 1. **Genesis** (no manifest; the one-time seed): `ingest_git_delta(none, HEAD)`,
    repacked in copy mode (deltas re-pointed as OFS), becomes the baseline, published with
@@ -243,7 +243,12 @@ Each run is one compare-and-swap of `manifest.bin`:
    against the old baseline's (`frozen`). Old index records keep their offsets, and one
    MPHF is built over all ids.
 5. Publish with `If-Match` (a lost race starts over, up to 3 times), then delete slab
-   files no manifest references once they are older than `--gc-grace-secs`.
+   files no manifest references once they are older than `--gc-grace-secs`. A run that
+   changed nothing (no new commits, no rollup due) publishes nothing: the manifest keeps
+   its generation, so no edge builds a new view and hashes its cold pack again (1.3 s on
+   SearchGold, and 4.6 s for its `.idx`: the runs of a quiet branch would cost that 96
+   times a day). What counts as a change is everything but the generation, the `blobs.bin`
+   generation the manifest names included. Such a run still collects garbage.
 
 Crash recovery needs nothing: unpublished uploads are garbage, and the next run's range
 starts at the manifest tip. The fs store implements CAS with `flock`; Azure uses ETags.

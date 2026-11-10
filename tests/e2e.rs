@@ -592,6 +592,94 @@ fn pyramid_rollups_and_weekly_rebuilds() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The generation and the etag `gvfs-cache inspect manifest` prints of a store.
+fn published(store: &str) -> (u64, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-cache"))
+        .args(["inspect", "manifest", "--store", store])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "inspect manifest: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    let mut lines = text.lines();
+    let etag = lines.next().unwrap().rsplit_once(" etag ").unwrap().1;
+    let generation = lines
+        .next()
+        .unwrap()
+        .strip_prefix("generation ")
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    (generation.parse().unwrap(), etag.to_string())
+}
+
+/// A run that changes nothing publishes nothing: with no new commits and no rollup due the
+/// manifest keeps its generation and its etag, so no edge builds a new view (each idle run
+/// used to publish one more generation). A new commit, or a rollup that is due without
+/// one, still publishes, and an idle run still collects garbage.
+#[test]
+fn idle_runs_publish_nothing() {
+    let root = tempdir("idle");
+    let mut up = Upstream::new(&root);
+    up.commit(4);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    let mut now = gvfs_cache::util::now_secs();
+    step(&root, &store, &up, &mut now, "15m", &[]);
+    up.commit(4);
+    step(&root, &store, &up, &mut now, "15m", &[]);
+    let sealed = published(&store);
+    assert_eq!(sealed.0, 2);
+    for _ in 0..2 {
+        let log = step(&root, &store, &up, &mut now, "15m", &[]);
+        assert!(
+            log.contains("no new commits") && !log.contains("published manifest"),
+            "{log}"
+        );
+        assert_eq!(published(&store), sealed);
+    }
+
+    // A rollup that is due publishes without a new commit; asked for again, it is not due.
+    step(&root, &store, &up, &mut now, "1h", &[]);
+    let rolled = published(&store);
+    assert_eq!(rolled.0, 3);
+    assert_ne!(rolled.1, sealed.1);
+    assert_eq!(manifest(&store_dir).pyramid[0].tier, Tier::H1);
+    step(&root, &store, &up, &mut now, "1h", &[]);
+    assert_eq!(published(&store), rolled);
+
+    // So does a new commit, and the weekly rebuild of what the pyramid holds.
+    let tip = up.commit(4);
+    step(&root, &store, &up, &mut now, "15m", &[]);
+    assert_eq!(published(&store).0, 4);
+    assert_eq!(manifest(&store_dir).tip.to_string(), tip);
+    step(&root, &store, &up, &mut now, "168h", &[]);
+    let weekly = published(&store);
+    assert_eq!(weekly.0, 5);
+    let log = step(&root, &store, &up, &mut now, "168h", &[]);
+    assert!(log.contains("weekly: nothing new"), "{log}");
+    assert_eq!(published(&store), weekly);
+
+    // An idle run still deletes what no manifest references.
+    let orphan = store_dir.join("slabs/orphan.pack");
+    std::fs::write(&orphan, b"x").unwrap();
+    let far = (now + 86_400 * 30).to_string();
+    pipeline(
+        &root,
+        &store,
+        &up,
+        "15m",
+        &["--now", &far, "--gc-grace-secs", "60"],
+    );
+    assert!(!orphan.exists());
+    assert_eq!(published(&store), weekly);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Superset deliveries (`--superset-tier`, default 24h). Once the tip moves past a sealed
 /// day, a client inside it, or current at its end, receives the day whole with what
 /// follows: once, labelled with its interval. Stock client maintenance
