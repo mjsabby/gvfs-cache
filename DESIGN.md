@@ -248,7 +248,10 @@ Each run is at most one compare-and-swap of `manifest.bin`:
    its generation, so no edge builds a new view and hashes its cold pack again (1.3 s on
    SearchGold, and 4.6 s for its `.idx`: the runs of a quiet branch would cost that 96
    times a day). What counts as a change is everything but the generation, the `blobs.bin`
-   generation the manifest names included. Such a run still collects garbage.
+   generation the manifest names included. Such a run still collects garbage. Once its
+   manifest is the store's, a run has succeeded: garbage collection that fails is logged,
+   with the file or listing it stopped at, and the run exits 0 (after an error exit a
+   scheduler runs it again, a weekly a second time); a later run collects what it left.
 
 Crash recovery needs nothing: unpublished uploads are garbage, and the next run's range
 starts at the manifest tip. The fs store implements CAS with `flock`; Azure uses ETags.
