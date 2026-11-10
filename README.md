@@ -351,7 +351,8 @@ src/idx.rs                 the git .idx of a prefetch pack (merged per-slab sort
 src/slab.rs, mphf.rs       slab index format and the partitioned PTHash MPHF
 src/idfilter.rs            blocked Bloom filters that rule slabs out of a lookup
 src/timeline.rs            commit-derived timestamps; which slabs answer a client's cursor
-src/pipeline.rs            the scheduled job: genesis, 15m, rollups, weekly, GC
+src/pipeline.rs            the scheduled job: genesis, 15m, rollups, weekly
+src/gc.rs                  garbage collection of the store, at the end of each pipeline run
 src/mirror.rs              --blobs separate: the resumable seed (and on-demand repair) of the blob packs
 src/separate.rs            --blobs separate: what pipeline, mirror and edge share (sizes, blob index,
                            the history's blobs, lost-object checks)

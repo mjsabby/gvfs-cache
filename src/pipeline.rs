@@ -421,7 +421,7 @@ fn step(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<(Man
     // The manifest is the store's now, so the run has succeeded, and nothing after this
     // fails it: an error exit has a scheduler run it again, and a weekly run again is a
     // second weekly. What garbage collection did not get to waits for a later run.
-    if let Err(e) = gc(o, &m) {
+    if let Err(e) = crate::gc::collect(&o.store, &m, o.now, o.gc_grace) {
         crate::log!("gc: incomplete ({e}); what it did not delete stays until a later run");
     }
     if m.separate_blobs() {
@@ -937,62 +937,6 @@ pub fn open_slabs(store: &Store, work: &Path, metas: &[SlabMeta]) -> Result<Vec<
         out.push(Slab::open(&pack, &index, meta.clone())?);
     }
     Ok(out)
-}
-
-/// Deletes slab files no manifest references any more, once older than the grace period.
-/// A file that cannot be deleted is passed over and the rest collected; the error then
-/// says how many there were and names the first. A prefix that cannot be listed ends it.
-fn gc(o: &Options, m: &Manifest) -> Result<()> {
-    let separate = m.separate_blobs();
-    let mut referenced: std::collections::HashSet<String> = m
-        .slabs()
-        .flat_map(|s| [s.pack_key(), s.index_key()])
-        .collect();
-    // The baseline's tail on the one before it, for the edges that still have that one.
-    referenced.insert(m.baseline.tail_key());
-    if separate {
-        referenced.extend(m.slabs().map(SlabMeta::sizes_key));
-        // Blob packs and segments: only what `blobs.bin` lists now is kept; a copy that has
-        // not published yet is younger than the grace period.
-        let (bm, _) = crate::blobcopy::load(&o.store)?;
-        referenced.extend(bm.packs.iter().map(|p| crate::blobs::pack_key(&p.id)));
-        referenced.extend(bm.segments.iter().map(|s| crate::blobs::segment_key(&s.id)));
-    }
-    let cutoff = o.now.saturating_sub(o.gc_grace);
-    let mut deleted = 0usize;
-    // The files that could not be deleted: how many, and the first one's error.
-    let mut kept: Option<(usize, crate::util::Error)> = None;
-    let prefixes: &[&str] = if separate {
-        &["slabs/", "blobs/"]
-    } else {
-        &["slabs/"]
-    };
-    for prefix in prefixes {
-        for obj in o.store.list(prefix).ctx(&format!("listing {prefix}"))? {
-            if !referenced.contains(&obj.key) && obj.modified < cutoff {
-                // A file that cannot be deleted does not keep the ones listed after it:
-                // it did, at every run.
-                match o.store.delete(&obj.key) {
-                    Ok(()) => deleted = deleted.saturating_add(1),
-                    Err(e) => {
-                        kept = Some(match kept {
-                            Some((n, first)) => (n.saturating_add(1), first),
-                            None => (1, e),
-                        });
-                    }
-                }
-            }
-        }
-    }
-    if deleted > 0 {
-        crate::log!("gc: deleted {deleted} unreferenced slab files");
-    }
-    match kept {
-        None => Ok(()),
-        Some((n, first)) => Err(crate::err!(
-            "{n} unreferenced files were not deleted, the first: {first}"
-        )),
-    }
 }
 
 #[cfg(test)]
