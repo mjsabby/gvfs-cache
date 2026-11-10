@@ -1214,29 +1214,35 @@ impl AsyncUpstream {
         )
     }
 
-    /// Whether this is an HTTP upstream answering the GVFS protocol (detected once).
-    async fn is_gvfs(&mut self) -> bool {
+    /// Whether this is an HTTP upstream answering the GVFS protocol: `GET /gvfs/config`,
+    /// asked until it gets a definite answer, which is kept. 200: it is. Any other status
+    /// an upstream gives a path it does not serve (404, usually): it is not. No answer, a
+    /// 5xx, a 408, a 429 and rejected credentials (401) say nothing about the endpoint:
+    /// the call fails with that error and the next one asks again. (Kept as "not GVFS", one
+    /// 503 to an edge's first probe sent every later request for sizes and blobs down the
+    /// git path, which Azure DevOps, speaking protocol v0, does not offer: its live tip
+    /// stopped until a restart.)
+    async fn is_gvfs(&mut self) -> Result<bool> {
         if let Some(g) = self.gvfs {
-            return g;
+            return Ok(g);
         }
         let g = match &self.transport {
             AsyncTransport::Http(http) => {
-                match http
+                let r = http
                     .request("GET", "/gvfs/config", &[], bytes::Bytes::new())
-                    .await
-                {
-                    Ok(mut r) => {
-                        let ok = r.status == 200;
-                        let _ = r.body_vec(1 << 20).await;
-                        ok
-                    }
-                    Err(_) => false,
-                }
+                    .await?;
+                let mut r = match r.status {
+                    401 | 408 | 429 | 500..=599 => r.ensure_ok("GET /gvfs/config").await?,
+                    _ => r,
+                };
+                let ok = r.status == 200;
+                let _ = r.body_vec(1 << 20).await;
+                ok
             }
             AsyncTransport::Local { .. } => false,
         };
         self.gvfs = Some(g);
-        g
+        Ok(g)
     }
 
     /// The current tip of branch `branch_ref` (`refs/heads/<branch>`).
@@ -1304,7 +1310,7 @@ impl AsyncUpstream {
     /// `POST /gvfs/objects` from a GVFS upstream (one object it sends loose is re-encoded as
     /// a pack), else as protocol v2 `want`s. Returns the pack length.
     pub async fn fetch_objects<P: PackPieces>(&mut self, oids: &[Oid], out: &mut P) -> Result<u64> {
-        if self.is_gvfs().await {
+        if self.is_gvfs().await? {
             let body = gvfs_objects_body(oids);
             let AsyncTransport::Http(http) = &self.transport else {
                 crate::bail!("GVFS upstreams are HTTP");
@@ -1386,7 +1392,7 @@ impl AsyncUpstream {
     pub async fn object_sizes(&mut self, oids: &[Oid]) -> Result<Vec<Option<u64>>> {
         let mut out = Vec::with_capacity(oids.len());
         for batch in oids.chunks(BATCH) {
-            if self.is_gvfs().await {
+            if self.is_gvfs().await? {
                 let AsyncTransport::Http(http) = &self.transport else {
                     crate::bail!("GVFS upstreams are HTTP");
                 };
@@ -1526,6 +1532,73 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         out.stdout
+    }
+
+    /// The `/gvfs/config` probe keeps only a definite answer. Probes that get no answer,
+    /// then a 503, fail their calls with that error, and the next call asks again: the 200
+    /// that follows is kept, and sizes come from `/gvfs/sizes` from then on. (Kept as "not
+    /// GVFS", the first failure sent every later call down the git path, for good.) A 404
+    /// is an answer: that upstream is asked once, and the git path is taken.
+    #[test]
+    fn a_failed_gvfs_probe_is_asked_again() {
+        use crate::testhttp::{Reply, serve};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let oid = Oid([0x42; 20]);
+
+        let probes = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&probes);
+        let port = serve(move |r| {
+            if r.line.contains("/gvfs/config") {
+                match seen.fetch_add(1, Ordering::SeqCst) {
+                    0 => Reply::Close,
+                    1 => Reply::Whole("503 Service Unavailable".to_string(), b"busy".to_vec()),
+                    _ => Reply::ok(b"{}"),
+                }
+            } else if r.line.contains("/gvfs/sizes") {
+                Reply::ok(br#"[{"Id":"4242424242424242424242424242424242424242","Size":7}]"#)
+            } else {
+                Reply::status("404 Not Found")
+            }
+        });
+        let spec = format!("http://127.0.0.1:{port}/r");
+        let mut up = Upstream::open(&spec, "main", &Auth::default()).unwrap();
+        let e = up.object_sizes(&[oid]).unwrap_err().to_string();
+        assert!(e.contains("/r/gvfs/config"), "{e}");
+        let e = up.fetch_objects(&[oid], &mut Vec::new()).unwrap_err();
+        let e = e.to_string();
+        assert!(e.contains("GET /gvfs/config: HTTP 503: busy"), "{e}");
+        assert_eq!(up.object_sizes(&[oid]).unwrap(), vec![Some(7)]);
+        assert_eq!(up.object_sizes(&[oid]).unwrap(), vec![Some(7)]);
+        assert_eq!(probes.load(Ordering::SeqCst), 3, "the 200 is kept");
+
+        let probes = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&probes);
+        let port = serve(move |r| {
+            if r.line.contains("/gvfs/config") {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Reply::status("404 Not Found")
+            } else if r.line.contains("/info/refs") {
+                // Protocol v0, without `object-info`: as far as the git path gets.
+                let mut b = Vec::new();
+                pktline::put_str(&mut b, "# service=git-upload-pack\n");
+                pktline::flush(&mut b);
+                pktline::put(
+                    &mut b,
+                    b"1111111111111111111111111111111111111111 refs/heads/main\0side-band-64k\n",
+                );
+                pktline::flush(&mut b);
+                Reply::ok(&b)
+            } else {
+                Reply::status("404 Not Found")
+            }
+        });
+        let spec = format!("http://127.0.0.1:{port}/r");
+        let mut up = Upstream::open(&spec, "main", &Auth::default()).unwrap();
+        for _ in 0..2 {
+            let e = up.object_sizes(&[oid]).unwrap_err().to_string();
+            assert!(e.contains("neither /gvfs/sizes nor object-info"), "{e}");
+        }
+        assert_eq!(probes.load(Ordering::SeqCst), 1, "the 404 is kept");
     }
 
     fn pack_objects(dir: &std::path::Path, pack: &[u8], strict: bool) -> Vec<(String, String)> {

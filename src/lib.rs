@@ -25,6 +25,14 @@
 
 pub mod util;
 
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+mod testhttp;
+
 pub mod aclient;
 pub mod b64;
 pub mod http;
