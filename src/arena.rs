@@ -16,12 +16,17 @@ use tokio::sync::{Semaphore, SemaphorePermit};
 use crate::splice::{ObjectSplice, Resolver};
 use crate::util::{Oid, Result};
 
-/// Open-addressed set of object ids with fixed capacity. Ids are uniformly random, so a
-/// slot is simply some bytes of the id (no hashing); the all-zero id marks a free slot.
+/// Open-addressed set of object ids with fixed capacity; the all-zero id marks a free
+/// slot. An id's home slot is some of its bytes mixed with a key drawn once per process.
+/// Ids are uniformly random, but a client chooses which ones it sends: with the bytes
+/// taken as they are it could send ids whose homes fall in a narrow window, and each
+/// insert then walks the run the others left (48,000 such ids of a real store took 0.65 s
+/// to plan, against 0.03 s for 48,000 others).
 pub struct OidSet {
     slots: Vec<Oid>,
     used: Vec<u32>,
     mask: usize,
+    key: u64,
 }
 
 impl OidSet {
@@ -32,13 +37,15 @@ impl OidSet {
             slots: vec![Oid::ZERO; cap],
             used: Vec::with_capacity(n),
             mask: cap.saturating_sub(1),
+            key: crate::util::process_key(),
         }
     }
 
     #[inline]
     fn home(&self, oid: &Oid) -> usize {
         let [a, b, c, d, e, f, g, h, ..] = oid.0;
-        (u64::from_le_bytes([a, b, c, d, e, f, g, h]) as usize) & self.mask
+        let word = u64::from_le_bytes([a, b, c, d, e, f, g, h]);
+        (crate::util::fmix64(word ^ self.key) as usize) & self.mask
     }
 
     /// Inserts `oid`; `Ok(false)` if it was already present, `Err` when full (unless
@@ -96,6 +103,7 @@ impl OidSet {
             slots: vec![Oid::ZERO; cap],
             used: Vec::with_capacity(cap / 2),
             mask: cap.saturating_sub(1),
+            key: self.key,
         };
         for id in &ids {
             let _ = self.insert(id);
@@ -462,6 +470,33 @@ mod tests {
         assert!(s.insert(&Oid([6; 20])).is_err(), "capacity is enforced");
         s.clear();
         assert!(!s.contains(&a) && s.is_empty());
+    }
+
+    /// Ids picked so that their first bytes, taken as they are, fall in one window of the
+    /// table (a client can pick such ids among a store's): they spread like any others.
+    #[test]
+    #[allow(clippy::arithmetic_side_effects)]
+    fn chosen_ids_do_not_share_a_window() {
+        const N: u64 = 48_000;
+        const WINDOW: u64 = 16_574;
+        let mut s = OidSet::with_capacity(N as usize);
+        let slots = s.slots.len() as u64;
+        for j in 0..N {
+            // The low bits inside the window, the rest distinct.
+            let word = j % WINDOW + (j / WINDOW + 1) * slots;
+            let mut id = [0u8; 20];
+            id[..8].copy_from_slice(&word.to_le_bytes());
+            assert!(s.insert(&Oid(id)).unwrap());
+        }
+        let furthest = s
+            .used
+            .iter()
+            .map(|&i| (i as usize).wrapping_sub(s.home(&s.slots[i as usize])) & s.mask)
+            .max()
+            .unwrap();
+        // A uniform set at this load (37%) has its furthest id a few dozen slots from home.
+        // Placed by their own bytes, these fill one run of 48,000 slots: up to 33,000.
+        assert!(furthest < 512, "an id is {furthest} slots from its home");
     }
 
     #[test]
