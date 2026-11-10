@@ -27,7 +27,9 @@
 //! 5. Publish with `If-Match` (lost race: start over), then delete unreferenced slab files
 //!    older than the grace period (a crashed run's uploads; slabs no longer listed). A run
 //!    that changed nothing (no new commits, no rollup due) publishes nothing: the manifest
-//!    keeps its generation, and every edge its view. It still collects garbage.
+//!    keeps its generation, and every edge its view. It still collects garbage. A failure
+//!    of that collection is logged, not returned: the run has published by then, and a
+//!    scheduler that runs a failed run again would repeat it.
 //!
 //! Timestamps are derived from commits ([`crate::timeline`]): a 15m slab ends at the
 //! stamp of the tip it was fetched up to, which is exactly the stamp an edge gave the same
@@ -305,9 +307,16 @@ fn step(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<(Man
         o.store
             .put(MANIFEST_KEY, &m.encode(), Cond::IfMatch(etag))?;
     }
-    gc(o, &m)?;
+    // The manifest is the store's now, so the run has succeeded, and nothing after this
+    // fails it: an error exit has a scheduler run it again, and a weekly run again is a
+    // second weekly. What garbage collection did not get to waits for a later run.
+    if let Err(e) = gc(o, &m) {
+        crate::log!(
+            "gc: stopped ({e}); the unreferenced files it had not deleted stay until a later run"
+        );
+    }
     if m.separate_blobs() {
-        // The manifest is published: a failure here only costs downloads next run.
+        // A failure here only costs downloads next run.
         match crate::blobcopy::load(&o.store)
             .and_then(|(bm, _)| crate::separate::prune_cache(&o.cache_dir, &m, &bm))
         {
@@ -787,6 +796,8 @@ pub fn open_slabs(store: &Store, work: &Path, metas: &[SlabMeta]) -> Result<Vec<
 }
 
 /// Deletes slab files no manifest references any more, once older than the grace period.
+/// It stops at the first prefix it cannot list or file it cannot delete, which the error
+/// names.
 fn gc(o: &Options, m: &Manifest) -> Result<()> {
     let separate = m.separate_blobs();
     let mut referenced: std::collections::HashSet<String> = m
@@ -809,9 +820,11 @@ fn gc(o: &Options, m: &Manifest) -> Result<()> {
         &["slabs/"]
     };
     for prefix in prefixes {
-        for obj in o.store.list(prefix)? {
+        for obj in o.store.list(prefix).ctx(&format!("listing {prefix}"))? {
             if !referenced.contains(&obj.key) && obj.modified < cutoff {
-                o.store.delete(&obj.key)?;
+                o.store
+                    .delete(&obj.key)
+                    .ctx(&format!("{} was not deleted", obj.key))?;
                 deleted = deleted.saturating_add(1);
             }
         }

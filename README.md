@@ -156,7 +156,9 @@ gvfs-cache pipeline --store "$STORE" --upstream "$ADO_URL" --auth-command ~/get_
 ```
 
 A crashed or skipped run only makes the next 15m slab wider. Slab files that no manifest
-references are deleted after `--gc-grace-secs` (default 2 h).
+references are deleted after `--gc-grace-secs` (default 2 h). A run that fails to delete
+some says so in its log and still exits 0: its manifest is published by then, and a later
+run deletes them.
 
 ### Real blobs in their own packs (`--blobs separate`)
 
