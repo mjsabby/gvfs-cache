@@ -124,6 +124,21 @@ impl SlabMeta {
         )
     }
 
+    /// Whether `id` has the form of a slab's ([`SlabMeta::make_id`]): what a cache's
+    /// pruning goes by, so that it removes slabs' files and nothing else kept beside them.
+    pub fn is_id(id: &str) -> bool {
+        let mut parts = id.splitn(3, '-');
+        let (Some(tier), Some(end_ts), Some(sha)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        Tier::ALL.iter().any(|t| t.name() == tier)
+            && !end_ts.is_empty()
+            && end_ts.bytes().all(|b| b.is_ascii_digit())
+            && sha.len() == 16
+            && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    }
+
     pub fn pack_key(&self) -> String {
         format!("slabs/{}.pack", self.id)
     }

@@ -1273,7 +1273,7 @@ impl StoreSync {
         let keep: std::collections::HashSet<&str> =
             bm.segments.iter().map(|s| s.id.as_str()).collect();
         let removed = prune_dir(&self.cache_dir.join("blobs"), |id, ext| {
-            ext == "bidx" && !keep.contains(id)
+            stale_segment_index(id, ext, &keep)
         });
         if removed > 0 {
             crate::log!("serve: pruned {removed} segment indexes blobs.bin no longer lists");
@@ -1286,9 +1286,7 @@ impl StoreSync {
     /// downloaded: each 15m slab, each rollup, a new baseline every week.
     fn prune_slabs(&self, m: &Manifest) {
         let keep: std::collections::HashSet<&str> = m.slabs().map(|s| s.id.as_str()).collect();
-        let removed = prune_dir(&self.cache_dir, |id, ext| {
-            matches!(ext, "pack" | "mphf" | "sizes") && !keep.contains(id)
-        });
+        let removed = prune_dir(&self.cache_dir, |id, ext| stale_slab_file(id, ext, &keep));
         if removed > 0 {
             crate::log!(
                 "serve: pruned {removed} files of slabs manifest generation {} does not list",
@@ -1744,6 +1742,25 @@ impl Live {
     }
 }
 
+/// Whether `<id>.<ext>` in the edge's cache is a slab's file that the manifest, whose slab
+/// ids are `keep`, no longer lists. Only names the edge gives its downloads count
+/// (`<slab id>.pack`, `.mphf`, `.sizes`): `--cache-dir` is the operator's choice, and what
+/// else it holds is not the edge's to delete. (Any `*.pack` there went.)
+fn stale_slab_file(id: &str, ext: &str, keep: &std::collections::HashSet<&str>) -> bool {
+    matches!(ext, "pack" | "mphf" | "sizes")
+        && crate::slab::SlabMeta::is_id(id)
+        && !keep.contains(id)
+}
+
+/// The same for a segment index (`<40 hex digits>.bidx`) that `blobs.bin`, whose segment
+/// ids are `keep`, no longer lists.
+fn stale_segment_index(id: &str, ext: &str, keep: &std::collections::HashSet<&str>) -> bool {
+    ext == "bidx"
+        && id.len() == 40
+        && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        && !keep.contains(id)
+}
+
 /// Removes the files of `dir` (not its directories) named `<id>.<ext>` that `doomed` picks,
 /// and downloads in progress (`.<name>.tmp-<pid>-<n>`) of processes no longer running.
 /// Returns how many went.
@@ -1978,6 +1995,35 @@ mod tests {
         want.sort();
         assert_eq!(left, want);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What an edge prunes from its cache are its own downloads no longer listed, known by
+    /// their names; a file that only shares an extension with them is another program's.
+    #[test]
+    fn pruning_goes_by_the_names_of_the_edges_downloads() {
+        let listed = "base-10-0123456789abcdef";
+        let keep: std::collections::HashSet<&str> = [listed].into();
+        let git_pack = format!("pack-{}", "c".repeat(40));
+        for (id, ext, stale) in [
+            ("m15-12-0123456789abcdef", "pack", true),
+            ("m15-12-0123456789abcdef", "mphf", true),
+            ("week-7-fedcba9876543210", "sizes", true),
+            (listed, "pack", false),
+            (git_pack.as_str(), "pack", false),
+            ("data", "pack", false),
+            ("m15-12", "mphf", false),
+            ("m15-12-0123456789ABCDEF", "pack", false),
+            ("report", "sizes", false),
+            ("m15-12-0123456789abcdef", "txt", false),
+        ] {
+            assert_eq!(stale_slab_file(id, ext, &keep), stale, "{id}.{ext}");
+        }
+        let (kept, gone) = ("a".repeat(40), "b".repeat(40));
+        let keep: std::collections::HashSet<&str> = [kept.as_str()].into();
+        assert!(stale_segment_index(&gone, "bidx", &keep));
+        assert!(!stale_segment_index(&kept, "bidx", &keep));
+        assert!(!stale_segment_index("index", "bidx", &keep));
+        assert!(!stale_segment_index(&gone, "pack", &keep));
     }
 
     #[test]

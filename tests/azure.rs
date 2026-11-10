@@ -359,12 +359,18 @@ fn azure_pipeline_and_serve() {
     assert!(log.contains("repack: 2 slabs"), "{log}");
 
     // What an earlier run left: a slab the store has since dropped, and a download that
-    // died with its process (no process has that id).
+    // died with its process (no process has that id). And a file that is not the edge's.
     let cache = root.join("cache");
     std::fs::create_dir_all(&cache).unwrap();
-    for stale in ["gone.pack", "gone.mphf", ".old.pack.tmp-999999999-0"] {
+    for stale in [
+        "m15-1-0123456789abcdef.pack",
+        "m15-1-0123456789abcdef.mphf",
+        ".old.pack.tmp-999999999-0",
+    ] {
         std::fs::write(cache.join(stale), b"stale").unwrap();
     }
+    let other = cache.join("another-program.pack");
+    std::fs::write(&other, b"not the edge's").unwrap();
     let server = Server::start_with_env(
         &[
             "--store",
@@ -378,17 +384,20 @@ fn azure_pipeline_and_serve() {
         ],
         &env,
     );
-    // The edge's cache holds the files of the slabs its manifest lists, and nothing else.
+    // The edge's cache holds the files of the slabs its manifest lists and none of an
+    // earlier run's; what was not the edge's is still there.
     let cached = || {
         let mut v: Vec<String> = std::fs::read_dir(&cache)
             .unwrap()
             .map(|e| e.unwrap())
             .filter(|e| e.file_type().unwrap().is_file())
             .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "another-program.pack")
             .collect();
         v.sort();
         v
     };
+    assert!(other.exists());
     let listed = || {
         let (bytes, _) = backend.store("").get("manifest.bin").unwrap().unwrap();
         let m = gvfs_cache::manifest::Manifest::decode(&bytes).unwrap();
@@ -425,8 +434,10 @@ fn azure_pipeline_and_serve() {
         !cache.join("blob-blocks").exists(),
         "an inline store's edge keeps no blob blocks"
     );
-    // The weekly run replaced every slab: the old ones' files went with them.
+    // The weekly run replaced every slab: the old ones' files went with them, and only
+    // they.
     assert_eq!(cached(), listed());
+    assert!(other.exists());
 
     // GC removed the slabs the rollups and the weekly rebuild replaced.
     let s = backend.store("");
@@ -549,7 +560,8 @@ fn azure_separate_store() {
     // A segment index blobs.bin no longer lists, and a dead download of one.
     let cache = root.join("cache");
     std::fs::create_dir_all(cache.join("blobs")).unwrap();
-    for stale in ["gone.bidx", ".x.bidx.tmp-999999999-0"] {
+    let gone = format!("{}.bidx", "e".repeat(40));
+    for stale in [gone.as_str(), ".x.bidx.tmp-999999999-0"] {
         std::fs::write(cache.join("blobs").join(stale), b"stale").unwrap();
     }
     let server = Server::start_with_env(

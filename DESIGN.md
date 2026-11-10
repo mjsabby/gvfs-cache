@@ -321,7 +321,8 @@ it holds the slabs (gigabytes) and the caches of blob packs, and the system's te
 directory, otherwise the default, is memory on many hosts (a memory filesystem is warned
 about at startup). Whenever a manifest is applied, at boot too, the files of slabs it does
 not list are deleted (a request on an older view keeps what it mapped), as are segment
-indexes when `blobs.bin` changes, and downloads that died with their process. With `--upstream`, rebuild the live tip as an L0 slab. Then allocate all buffers and
+indexes when `blobs.bin` changes, and downloads that died with their process: files named
+as the edge names its downloads, and no others the directory may hold. With `--upstream`, rebuild the live tip as an L0 slab. Then allocate all buffers and
 arenas, seal the allocator, and listen.
 
 **The live tip (L0).** The pipeline seals a slab every 15 minutes; L0 bridges the minutes
