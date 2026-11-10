@@ -499,26 +499,7 @@ pub fn fold(
     Ok(Some(out))
 }
 
-/// The type of object a tree entry's mode names: a directory is a tree, a gitlink a
-/// commit (of another repository), anything else a blob, whatever the zero padding (as
-/// git reads modes). `None` if the mode is not octal.
-pub fn mode_kind(mode: &[u8]) -> Option<u8> {
-    if mode.is_empty() || mode.len() > 7 {
-        return None;
-    }
-    let mut v = 0u32;
-    for &c in mode {
-        if !(b'0'..=b'7').contains(&c) {
-            return None;
-        }
-        v = v.wrapping_shl(3) | u32::from(c.wrapping_sub(b'0'));
-    }
-    Some(match v & 0o170_000 {
-        0o040_000 => OBJ_TREE,
-        0o160_000 => crate::pack::OBJ_COMMIT,
-        _ => crate::pack::OBJ_BLOB,
-    })
-}
+pub use crate::object::mode_kind;
 
 /// Every blob id the trees of `slab` reference: sorted, distinct.
 pub fn referenced_blobs(slab: &Slab, threads: usize) -> Result<Vec<Oid>> {
