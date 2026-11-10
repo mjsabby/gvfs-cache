@@ -653,6 +653,10 @@ whole-blob pack:
   base may come later: the delta waits);
 * the output declares as many entries as blobs were asked for; any other object, a blob
   twice, a blob missing, or a bad input trailer fails the pack;
+* so does a pack that declares more entries than blobs are still asked for, at its header
+  (the deltas of one would wait for bases that never come, however many there are), and
+  a delta whose ops do not make the result its header declares, before a buffer is sized
+  for it;
 * so does an entry whose zlib stream is longer than twice its content plus 1 KiB. No
   encoder writes one (deflate's longest code is 15 bits): it is padded with empty blocks,
   which a hostile or broken upstream can send without end, and which the copy would hold
