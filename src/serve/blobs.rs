@@ -3,8 +3,10 @@
 //! * [`BlobSet`]: the blob packs `blobs.bin` lists, as of one generation. Every segment
 //!   index is local (mapped in place in a directory store, else downloaded once: 48 bytes
 //!   per blob). Packs of a directory store are mapped in place and leave through
-//!   `sendfile(2)`; packs in object storage stay there and are read by range when a
-//!   request needs them (cold path), never downloaded whole.
+//!   `sendfile(2)`; packs in object storage stay there, never downloaded whole: they are
+//!   read by range, in blocks that the edge's cache keeps mapped
+//!   ([`super::blobcache`]) and that leave as a local pack's bytes do. Only a block not
+//!   cached is a cold path.
 //! * [`Proxy`]: blobs the store does not have come from the upstream: the L0 overlay's
 //!   (the pipeline copies them when it seals their trees), and, as a fault the edge counts,
 //!   any a sealed tree names that a complete store lacks. Once per blob per edge (requests
@@ -24,7 +26,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::Notify;
 
-use super::blobcache::Attempt;
+use super::blobcache::{Attempt, Block, BlockCache, Pack, Reader};
 use super::view::Ahead;
 use crate::blobs::{BlobManifest, BlobRec, Segment, pack_key};
 use crate::blobstream::{BlobSink, FileSpool};
@@ -53,8 +55,8 @@ enum Local {
 enum Remote {
     /// Ranged reads straight from the store.
     Direct(Arc<Store>, String),
-    /// Through the edge's block cache ([`super::blobcache`]).
-    Cached(Arc<super::blobcache::BlockCache>, Arc<str>, String),
+    /// Through the edge's block cache ([`super::blobcache`]), which keeps this of it.
+    Cached(Arc<BlockCache>, Arc<Pack>),
 }
 
 impl BlobPack {
@@ -84,19 +86,16 @@ impl BlobPack {
     /// A pack in object storage, read through `cache` when there is one.
     pub fn remote(
         store: Arc<Store>,
-        cache: Option<&Arc<super::blobcache::BlockCache>>,
+        cache: Option<&Arc<BlockCache>>,
         id: &str,
         len: u64,
     ) -> BlobPack {
-        let key = pack_key(id);
+        let cached = cache.and_then(|c| Some(Remote::Cached(Arc::clone(c), c.pack(id, len)?)));
         BlobPack {
             id: id.to_string(),
             len,
             local: None,
-            remote: Some(match cache {
-                Some(c) => Remote::Cached(Arc::clone(c), Arc::from(id), key),
-                None => Remote::Direct(store, key),
-            }),
+            remote: Some(cached.unwrap_or_else(|| Remote::Direct(store, pack_key(id)))),
             unlink: None,
         }
     }
@@ -119,10 +118,62 @@ impl BlobPack {
         }
     }
 
+    /// `len` bytes at `at` of a pack in object storage, if one block the cache holds has
+    /// them all (`reader` is the request's, and counts a hit).
+    #[inline]
+    pub fn range<'a>(&'a self, at: u64, len: u64, reader: &'a mut Reader<'_>) -> Option<&'a [u8]> {
+        match &self.remote {
+            Some(Remote::Cached(_, pack)) => reader.range(pack, at, len),
+            _ => None,
+        }
+    }
+
+    /// [`BlobPack::range`], not counted as a hit: a few bytes of a read that is counted
+    /// as a whole.
+    #[inline]
+    pub fn peek<'a>(&'a self, at: u64, len: u64, reader: &'a mut Reader<'_>) -> Option<&'a [u8]> {
+        match &self.remote {
+            Some(Remote::Cached(_, pack)) => reader.peek(pack, at, len),
+            _ => None,
+        }
+    }
+
+    /// The block the cache holds of a pack in object storage with byte `at` in it, and
+    /// where in it.
+    #[inline]
+    pub fn block<'a>(&'a self, at: u64, reader: &'a mut Reader<'_>) -> Option<(&'a Block, u64)> {
+        match &self.remote {
+            Some(Remote::Cached(_, pack)) => reader.block(pack, at),
+            _ => None,
+        }
+    }
+
+    /// Runs `f` on the bytes of the block that the cache holds of a pack in object
+    /// storage with byte `at` in it, and on where in them: a look ahead at an entry of
+    /// `len` bytes that `reader`'s request reads soon, to start loading it.
+    #[inline]
+    pub fn ahead(&self, at: u64, len: u64, reader: &Reader<'_>, f: impl FnOnce(&[u8], usize)) {
+        if let Some(Remote::Cached(cache, pack)) = &self.remote
+            && !cache.bypasses(len)
+        {
+            reader.ahead(pack, at, f);
+        }
+    }
+
+    /// Whether a read of `len` bytes of a pack in object storage comes straight from the
+    /// store: there is no cache, or the read is too long for it.
+    pub fn streams_past(&self, len: u64) -> bool {
+        match &self.remote {
+            Some(Remote::Cached(cache, _)) => cache.bypasses(len),
+            Some(Remote::Direct(..)) => true,
+            None => false,
+        }
+    }
+
     /// `len` bytes at `at`, handed to `sink` in pieces as they arrive (a remote pack:
     /// through the block cache when there is one, else a ranged GET per
-    /// [`super::blobcache::WINDOW`] blocks). Pass whole ranges: the cache decides by a read's
-    /// length, and fetches a window at a time.
+    /// [`super::blobcache::WINDOW`] blocks). Pass whole ranges, or all that is left of
+    /// one: the cache decides by a read's length, and fetches a window at a time.
     pub async fn read<S: crate::store::Sink>(&self, at: u64, len: u64, sink: &mut S) -> Result<()> {
         if let Some(b) = self.bytes() {
             return sink
@@ -141,9 +192,7 @@ impl BlobPack {
                 }
                 Ok(())
             }
-            Some(Remote::Cached(cache, id, key)) => {
-                cache.read(id, key, self.len, at, len, sink).await
-            }
+            Some(Remote::Cached(cache, pack)) => cache.read(pack, at, len, sink).await,
             None => crate::bail!("blob pack {} has no bytes", self.id),
         }
     }

@@ -931,18 +931,45 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   mapped and leave through `sendfile(2)`. Packs in Azure stay there. The edge holds
   their segment indexes and reads the packs in 4 MiB blocks into a local cache
   (`src/serve/blobcache.rs`), at most 8 blocks per read at a time: a read fetches the
-  blocks it lacks, each run of consecutive ones with a single ranged GET, and pins them
-  while it streams them. Unpinned blocks are evicted least recently used beyond
-  `--blob-cache-mib` (default 32 GiB), so every read finishes, whatever the budget; they are
-  kept in order of last use (an eviction is O(log n)), and evicted files are unlinked after
-  the cache's lock is let go (each file's name carries a generation, so the unlink never
-  removes a block fetched again meanwhile). A read
+  blocks it lacks, each run of consecutive ones with a single ranged GET. A cached
+  block is a file that stays open and mapped, and what the cache holds is read as a
+  local pack is: an entry under 16 KiB is copied from the mapping into the response, a
+  longer one leaves through `sendfile(2)` from the block's file (block by block, where
+  it lies across several), with no wait, no allocation and no system call but those
+  that send. Such a read does not take the cache's lock: a pack has a slot per block,
+  read under a lock of its own, and a read leaves a stamp of the cache's clock in the
+  block (the clock moves when blocks are fetched or evicted, so most reads write
+  nothing). A request keeps the block it read last, so blobs that are neighbours in a
+  pack cost one lookup between them, and adds its hits to the cache's count when it
+  ends. (A read of a cached block took the cache's lock twice and moved the block in
+  an ordered map; it opened, read and closed the block's file, and passed the bytes on
+  through a buffer allocated for it: seven allocations and three system calls a blob.
+  Through the cache, every block cached: 3.8 µs for 300 bytes and 64 µs for 1 MiB,
+  now 0.03 µs and 18 µs, 0.01 µs more than a copy from a mapping of the pack. An edge
+  of a store in Azurite, its cache warm: a POST of 4,000 small blobs took 33.5 ms of
+  CPU and 13,000 system calls, and takes 8.0 ms and 53, as from a directory store's
+  mapped pack (7.7 ms, and as many calls); a GET of one blob took 30.0 µs, and takes
+  14.3, as mapped.)
+  Blocks are evicted least recently used beyond `--blob-cache-mib` (default 32 GiB),
+  and beyond a number of blocks, since each holds a descriptor and a mapping: a
+  quarter of the descriptors the edge keeps for itself, as the proxy's packs below,
+  and a quarter of `vm.max_map_count`. That is 8,192 blocks under a limit of 524,288
+  descriptors, which is what the default budget holds, and 1,024 (4 GiB) under 65,536:
+  the edge says at start when its limits leave the cache fewer blocks than its budget
+  holds. Eviction sorts the blocks by stamp when it needs room and takes them in that
+  order until it is used up (O(log n) a block); a block read since has another stamp
+  and is passed over. A read holds the block it is sending: one evicted meanwhile
+  stays readable, and its file is removed, unmapped and closed with its last reader,
+  so every read finishes whatever the bounds; a block that does not become whole (its
+  fetch failed, or the request that fetched it went away) leaves no file.
+  `gvfs_blob_cache_blocks` and `gvfs_blob_cache_bytes` report what is kept. A read
   of more than a quarter of the budget (one huge blob) streams straight from the store,
   32 MiB at a time, instead of evicting everything else (`--blob-cache-mib 0`: every read
-  does). Each read is of a whole range, its pieces handed to an async sink as they
-  arrive (a client's socket, the pack's hash, an inflater): no buffer between the store and
-  the client, and the cache sees a read's length. A loose blob reads its zlib header, then
-  its body and Adler-32 in one read. The mirror writes the tip's blobs first, in path order, so a
+  does). A read that fetches is of a whole range, or of all that is left of one, its
+  pieces handed to an async sink as they arrive (a client's socket, the pack's hash, an
+  inflater): no buffer between the store and the client, and the cache sees a read's
+  length. A loose blob that is not cached reads its zlib header, then its body and
+  Adler-32 in one read. The mirror writes the tip's blobs first, in path order, so a
   checkout's blobs share blocks; a block being fetched is fetched once (other readers'
   tasks wait for it, and fail with it if that fetch fails). The ranged GETs go through the
   async client, its connections pooled per account.

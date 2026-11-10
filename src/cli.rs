@@ -147,7 +147,12 @@ SERVE OPTIONS:
                                keeps for itself, 256 to 16384); the oldest go first,
                                and a fetch goes once the store has its blobs
     --blob-cache-mib <N>       --blobs separate: 4 MiB blocks of blob packs in object
-                               storage kept on local disk (default: 32768)
+                               storage kept on local disk (default: 32768), each a file
+                               that stays open and mapped: at most a quarter of the
+                               descriptors the edge keeps for itself, and of the
+                               mappings it may have (8192 blocks under a limit of 524288
+                               descriptors; the edge says at start if that is fewer
+                               than N holds); 0: every read goes to the store
     --superset-tier <24h|168h|never>     send each sealed day and week (24h, default) or
                                week (168h) to a warm client whole, once, so that client
                                maintenance can expire its smaller packs; never: exact covers

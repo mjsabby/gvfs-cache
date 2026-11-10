@@ -707,10 +707,13 @@ fn azure_separate_store() {
     // Read again: from the edge's block cache, without asking Azure.
     let fetches = server.metric("gvfs_blob_cache_fetches_total");
     assert!(fetches > 0);
+    let hits = server.metric("gvfs_blob_cache_hits_total");
     for id in &ids {
         assert_eq!(server.get(&format!("/gvfs/objects/{id}")).0, 200);
     }
     assert_eq!(server.metric("gvfs_blob_cache_fetches_total"), fetches);
+    let again = server.metric("gvfs_blob_cache_hits_total");
+    assert!(again >= hits + ids.len() as u64, "{hits} then {again}");
     // One pack of every blob.
     let (status, _, pack) = server.post("/gvfs/objects", json_ids(&ids, None).as_bytes(), CT_PACK);
     assert_eq!(status, 200);
@@ -722,6 +725,8 @@ fn azure_separate_store() {
     );
     assert_eq!(cat_batch(&posted, &ids), cat_batch(&up.bare, &ids));
     assert_eq!(server.metric("gvfs_blob_cache_fetches_total"), fetches);
+    let hits = server.metric("gvfs_blob_cache_hits_total");
+    assert!(hits >= again + ids.len() as u64, "{again} then {hits}");
     // Blob packs stay in the store: the edge holds their indexes only, those blobs.bin
     // lists.
     let mut local: Vec<String> = std::fs::read_dir(cache.join("blobs"))
@@ -793,6 +798,187 @@ fn azure_separate_store() {
     );
     edge.assert_clean();
     drop(edge);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Runs `gvfs-cache mirror` to its end: every blob of the upstream's history in one pack.
+fn mirror(root: &std::path::Path, store: &str, upstream: &str, env: &[(&str, &str)]) {
+    let work = root.join("mirror-work");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_gvfs-cache"));
+    cmd.args(["mirror", "--store", store, "--store-auth-env", "GVD_AZ_CS"])
+        .args(["--upstream", upstream, "--work-dir", work.to_str().unwrap()])
+        .args(["--publish-secs", "0", "--jobs", "1"])
+        .envs(env.iter().copied());
+    gvfs_cache::upstream::hermetic_git_env(&mut cmd);
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The files of the edge's block cache that process `pid` holds open, and those it has
+/// mapped.
+fn open_and_mapped_blocks(pid: u32) -> (usize, usize) {
+    let descriptors = std::fs::read_dir(format!("/proc/{pid}/fd"))
+        .unwrap()
+        .filter_map(|e| std::fs::read_link(e.ok()?.path()).ok())
+        .filter(|target| target.to_string_lossy().contains("/blob-blocks/"))
+        .count();
+    let mappings = std::fs::read_to_string(format!("/proc/{pid}/maps"))
+        .unwrap()
+        .lines()
+        .filter(|l| l.contains("/blob-blocks/"))
+        .count();
+    (descriptors, mappings)
+}
+
+/// Blobs of a pack in object storage that the edge has read before come from the blocks
+/// its cache keeps open and mapped, as a local pack's do: the store is not asked, and
+/// nothing is allocated. (A read of cached blocks was a cold section of its own, for
+/// every blob: a boxed future, a zeroed buffer, and the block's file opened by a name
+/// formatted for it, read and closed. Four POSTs of these 623 blobs made 17,481
+/// allocations, seven a blob; they make 21, for their connections.) A cached block is a
+/// file, a descriptor and a mapping, and the cache keeps as many as it has room for.
+#[test]
+fn cached_blocks_are_read_as_a_local_pack_is() {
+    let Some(backend) = Backend::new("hits") else {
+        return;
+    };
+    let root = tempdir("azure-hits");
+    let env = [("GVD_AZ_CS", backend.cs.as_str())];
+    let store = format!("azure:{}", backend.spec);
+    let up = Upstream::new(&root);
+    let upstream = up.bare.to_str().unwrap().to_string();
+    // Blobs that are copied into a response (600 of some hundred bytes, half of them
+    // before the others in path order, which is the pack's, and half after) and blobs
+    // that leave with sendfile (20 of 40 KiB, 3 of 1.5 MiB): one pack of 6 MiB, two
+    // blocks of the edge's cache, with small blobs in both and a large one across them.
+    let mut files: Vec<(String, Vec<u8>)> = (0..600usize)
+        .map(|i| {
+            let text = format!("small blob {i}\n").repeat(1 + i % 40);
+            let dir = if i % 2 == 0 { "a" } else { "s" };
+            (format!("{dir}/{}/f{i}.txt", i % 16), text.into_bytes())
+        })
+        .collect();
+    files.extend((0..20).map(|i| (format!("m/n{i}.bin"), noise(40 << 10, 101 + 2 * i))));
+    files.extend((0..3).map(|i| (format!("l/n{i}.bin"), noise(3 << 19, 201 + 2 * i))));
+    let listed: Vec<(&str, Option<Vec<u8>>)> = files
+        .iter()
+        .map(|(path, content)| (path.as_str(), Some(content.clone())))
+        .collect();
+    commit_files(&up, "c1", &listed);
+    let auth = ["--store-auth-env", "GVD_AZ_CS", "--blobs", "separate"];
+    pipeline_at(&root, &store, &upstream, "15m", &auth, &env)
+        .unwrap_or_else(|log| panic!("pipeline: {log}"));
+    mirror(&root, &store, &upstream, &env);
+    let packs: Vec<u64> = backend
+        .store("")
+        .list("blobs/")
+        .unwrap()
+        .iter()
+        .filter(|o| o.key.ends_with(".pack"))
+        .map(|o| o.size)
+        .collect();
+    assert!(
+        packs.len() == 1 && packs[0] > 4 << 20 && packs[0] < 8 << 20,
+        "{packs:?}"
+    );
+    let ids: Vec<String> = git_blobs(&up.bare, &["--all"]).keys().cloned().collect();
+    assert_eq!(ids.len(), 623);
+    let blobs = ids.len() as u64;
+    // Nothing follows the store or an upstream meanwhile: what is allocated is the
+    // requests'.
+    let edge = |tag: &str, extra: &[&str]| -> Server {
+        let dir = root.join(format!("cache-{tag}"));
+        let mut args = vec!["--store", &store, "--store-auth-env", "GVD_AZ_CS"];
+        args.extend(["--poll-ms", "600000", "--cache-dir", dir.to_str().unwrap()]);
+        args.extend(extra);
+        Server::start_with_env(&args, &env)
+    };
+    let post = |server: &Server, ids: &[String]| {
+        let body = json_ids(ids, None);
+        let (status, _, pack) = server.post("/gvfs/objects", body.as_bytes(), CT_PACK);
+        assert_eq!(status, 200);
+        pack
+    };
+    let server = edge("a", &[]);
+    // The first read fetches the pack's two blocks.
+    let pack = post(&server, &ids);
+    let posted = fresh_repo(&root, "post");
+    git_stdin(
+        &posted,
+        &["index-pack", "--stdin", "--strict", "--keep=t"],
+        &pack,
+    );
+    assert_eq!(cat_batch(&posted, &ids), cat_batch(&up.bare, &ids));
+    let fetches = server.metric("gvfs_blob_cache_fetches_total");
+    assert!((1..=2).contains(&fetches), "{fetches} fetches");
+    // Read again, four times: the same bytes, from the blocks.
+    let hits = server.metric("gvfs_blob_cache_hits_total");
+    let allocated = server.metric("gvfs_alloc_post_seal_total");
+    for _ in 0..4 {
+        assert!(post(&server, &ids) == pack);
+    }
+    let allocated = server.metric("gvfs_alloc_post_seal_total") - allocated;
+    assert!(
+        allocated < blobs / 2,
+        "{allocated} allocations for four POSTs of {blobs} cached blobs"
+    );
+    let again = server.metric("gvfs_blob_cache_hits_total");
+    assert!(again >= hits + 4 * blobs, "{hits} then {again}");
+    // Each as a loose object.
+    let loose = fresh_repo(&root, "loose");
+    for id in &ids {
+        let (status, ct, body) = server.get(&format!("/gvfs/objects/{id}"));
+        assert_eq!((status, ct.as_str()), (200, CT_LOOSE), "{id}");
+        let dir = loose.join("objects").join(&id[..2]);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&id[2..]), body).unwrap();
+    }
+    git(&loose, &["fsck", "--strict", "--no-dangling"]);
+    assert_eq!(cat_batch(&loose, &ids), cat_batch(&up.bare, &ids));
+    let hits = server.metric("gvfs_blob_cache_hits_total");
+    assert!(hits >= again + blobs, "{again} then {hits}");
+    // The blobs in path order, as a checkout asks for them: the pack's order.
+    let by_path: Vec<String> = git(&up.bare, &["ls-tree", "-r", "main"])
+        .lines()
+        .map(|l| l.split_whitespace().nth(2).unwrap().to_string())
+        .collect();
+    assert_eq!(by_path.len(), ids.len());
+    let in_order = post(&server, &by_path);
+    assert_eq!(server.metric("gvfs_blob_cache_fetches_total"), fetches);
+    assert_eq!(server.metric("gvfs_blob_cache_bypass_total"), 0);
+    // Both blocks are kept: a file, a descriptor and a mapping each.
+    assert_eq!(server.metric("gvfs_blob_cache_blocks"), 2);
+    assert_eq!(server.metric("gvfs_blob_cache_bytes"), packs[0]);
+    assert_eq!(open_and_mapped_blocks(server.pid()), (2, 2));
+    let files = std::fs::read_dir(root.join("cache-a/blob-blocks")).unwrap();
+    assert_eq!(files.count(), 2);
+    server.assert_clean();
+    drop(server);
+
+    // With room for one block the edge keeps one: a batch in path order reads the small
+    // blobs of the first block, then those of the second, which takes the first one's
+    // place while the request still holds it. Reads of more than a quarter of a block
+    // (the three largest blobs) come straight from the store.
+    let server = edge("b", &["--blob-cache-mib", "4"]);
+    for _ in 0..2 {
+        assert!(post(&server, &by_path) == in_order);
+        assert_eq!(server.metric("gvfs_blob_cache_blocks"), 1);
+        assert_eq!(open_and_mapped_blocks(server.pid()), (1, 1));
+    }
+    assert_eq!(server.metric("gvfs_blob_cache_bypass_total"), 6);
+    assert_eq!(
+        server.metric("gvfs_blob_cache_fetches_total"),
+        10,
+        "the large blobs, and each block once a request"
+    );
+    assert!(server.metric("gvfs_blob_cache_bytes") <= 4 << 20);
+    server.assert_clean();
+    drop(server);
+    drop(backend);
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -299,6 +299,11 @@ impl Server {
         format!("http://127.0.0.1:{}", self.port)
     }
 
+    /// The server's process id (its `/proc` entry says what it holds open and mapped).
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn client(&self) -> Client {
         Client::new(Url::parse(&self.url()).unwrap(), Duration::from_secs(600))
     }
