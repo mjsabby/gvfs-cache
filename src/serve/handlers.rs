@@ -326,6 +326,15 @@ enum Blob {
     Failed,
 }
 
+/// What is known of a blob without asking the upstream.
+enum Known {
+    Found(Arc<BlobPack>, BlobRec),
+    /// Not a blob the store's trees name (or not a separate-blob store).
+    Unknown,
+    /// Named by a tree, and only the upstream has it.
+    Upstream,
+}
+
 /// A single blob at least this large is answered with a pack, not a loose object, when the
 /// client accepts both (the store's large-blob threshold).
 const LOOSE_BLOB_MAX: u64 = crate::blobcopy::LARGE_MIN;
@@ -352,39 +361,55 @@ fn missing(ctx: &Ctx, generation: u64, count: usize, first: &Oid) {
 
 /// A blob from the store's packs, else (if the store's trees name it) through the proxy.
 async fn find_blob(ctx: &Ctx, view: &View, oid: &Oid) -> Blob {
+    match known_blob(ctx, view, oid) {
+        Known::Found(pack, rec) => Blob::Found(pack, rec),
+        Known::Unknown => Blob::Unknown,
+        Known::Upstream => match fetch_blob(ctx, oid).await {
+            Some((pack, rec)) => Blob::Found(pack, rec),
+            None => Blob::Failed,
+        },
+    }
+}
+
+/// A blob in the store's packs or the proxy's cache, or where else it is: no wait, so a
+/// request can decide with its arena in hand whether it still needs it.
+fn known_blob(ctx: &Ctx, view: &View, oid: &Oid) -> Known {
     let Some(set) = view.blobs.as_ref() else {
-        return Blob::Unknown;
+        return Known::Unknown;
     };
     if let Some((pack, rec)) = set.find(oid) {
         inc(&ctx.metrics.blobs_store);
-        return Blob::Found(Arc::clone(pack), rec);
+        return Known::Found(Arc::clone(pack), rec);
     }
     if let Some((pack, rec)) = ctx.proxy.as_ref().and_then(|p| p.cached(oid)) {
         inc(&ctx.metrics.blobs_proxied);
-        return Blob::Found(pack, rec);
+        return Known::Found(pack, rec);
     }
     if view.blob_size(oid).is_none() {
-        return Blob::Unknown;
+        return Known::Unknown;
     }
     if set.complete && view.blob_sealed(oid) {
         missing(ctx, set.generation, 1, oid);
     }
-    // Named by a tree but not in the store: only the upstream has it.
-    let Some(proxy) = ctx.proxy.as_ref() else {
-        return Blob::Failed;
-    };
+    Known::Upstream
+}
+
+/// A blob only the upstream has ([`Known::Upstream`]), through the proxy: `None` if the
+/// upstream could not supply it.
+async fn fetch_blob(ctx: &Ctx, oid: &Oid) -> Option<(Arc<BlobPack>, BlobRec)> {
+    let proxy = ctx.proxy.as_ref()?;
     match cold(proxy.fetch(std::slice::from_ref(oid))).await {
-        Ok(mut v) => match v.pop() {
-            Some((pack, rec)) => {
+        Ok(mut v) => {
+            let hit = v.pop();
+            if hit.is_some() {
                 inc(&ctx.metrics.blobs_proxied);
-                Blob::Found(pack, rec)
             }
-            None => Blob::Unknown,
-        },
+            hit
+        }
         Err(e) => {
             let _cold = gvfs_alloc_guard::cold_section();
             crate::log!("serve: proxying blob {oid} failed: {e}");
-            Blob::Failed
+            None
         }
     }
 }
@@ -1023,23 +1048,37 @@ async fn objects_post(
                     .or_else(|| view.blob_size(&oid))
                     .unwrap_or(0);
                 let large = size >= LOOSE_BLOB_MAX;
+                // A blob answered from a blob pack, the proxy or the upstream uses nothing
+                // of the arena: it goes back first, so that neither a client reading
+                // slowly nor the upstream's answer keeps other requests waiting for it.
                 if !accepts_loose || (accepts_pack && large) {
                     if let Some((pack, rec)) = stored
                         && own_pack(pack, &rec)
                     {
                         inc(&ctx.metrics.blobs_store);
+                        drop(lease);
                         return whole_pack(ctx, b, stream, pack, keep).await;
                     }
                 } else if let Some((pack, rec)) = stored {
                     inc(&ctx.metrics.blobs_store);
+                    drop(lease);
                     return loose_blob(ctx, b, stream, pack, &rec, keep).await;
                 } else {
-                    match find_blob(ctx, &view, &oid).await {
-                        Blob::Found(pack, rec) => {
+                    match known_blob(ctx, &view, &oid) {
+                        Known::Found(pack, rec) => {
+                            drop(lease);
                             return loose_blob(ctx, b, stream, &pack, &rec, keep).await;
                         }
-                        Blob::Failed => return unavailable(ctx, stream, keep).await,
-                        Blob::Unknown => {}
+                        Known::Upstream => {
+                            drop(lease);
+                            return match fetch_blob(ctx, &oid).await {
+                                Some((pack, rec)) => {
+                                    loose_blob(ctx, b, stream, &pack, &rec, keep).await
+                                }
+                                None => unavailable(ctx, stream, keep).await,
+                            };
+                        }
+                        Known::Unknown => {}
                     }
                 }
             }
