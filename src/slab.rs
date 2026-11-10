@@ -388,6 +388,26 @@ impl Region {
     }
 }
 
+/// `bytes` in an anonymous file (a memfd named `name`), mapped: what `sendfile(2)` can
+/// send as it sends a slab's file. The file has no other holder and is never written
+/// again, which is what a [`gvfs_mmap::Map`] asks of the file under it.
+pub fn memfd(name: &std::ffi::CStr, bytes: &[u8]) -> std::io::Result<(File, gvfs_mmap::Map)> {
+    use std::io::Write;
+    let fd = nix::sys::memfd::memfd_create(name, nix::sys::memfd::MFdFlags::MFD_CLOEXEC)
+        .map_err(std::io::Error::from)?;
+    let mut file = File::from(fd);
+    file.write_all(bytes)?;
+    let map = gvfs_mmap::Map::open(&file, false)?;
+    if map.bytes() != bytes {
+        return Err(std::io::ErrorKind::InvalidData.into());
+    }
+    Ok((file, map))
+}
+
+/// A memory slab's pack at least this large is kept in a memfd: the length from which the
+/// edge sends a file's range with `sendfile(2)` instead of copying it.
+const MEMFD_MIN: usize = 16 << 10;
+
 /// An open slab.
 pub struct Slab {
     pub meta: SlabMeta,
@@ -451,12 +471,25 @@ impl Slab {
         Slab::open(&index.with_extension("pack"), index, meta)
     }
 
-    /// A slab held in memory (the L0 slab, tests).
+    /// A slab held in memory: an L0 slab, the pack a plan repacks for warm clients, tests.
+    ///
+    /// Its pack goes to a memfd when it is large enough, so that the edge sends it with
+    /// `sendfile(2)` as it sends a stored slab's. Written to the socket from the heap,
+    /// every byte is copied into a socket page the kernel has just zeroed: that was 56% of
+    /// the CPU of a warm prefetch of 739 KB (SearchGold, a client one day behind), 392 µs
+    /// where the same bytes from a memfd take 151 µs.
     pub fn from_heap(meta: SlabMeta, pack: Vec<u8>, index: Vec<u8>) -> Result<Arc<Slab>> {
+        let in_file = (pack.len() >= MEMFD_MIN)
+            .then(|| memfd(c"gvfs-slab", &pack).ok())
+            .flatten();
+        let (pack, pack_file) = match in_file {
+            Some((file, map)) => (Region::Map(map), Some(file)),
+            None => (Region::Heap(pack), None),
+        };
         Ok(Arc::new(Slab::new(
             meta,
-            Region::Heap(pack),
-            None,
+            pack,
+            pack_file,
             Region::Heap(index),
         )?))
     }
@@ -684,5 +717,54 @@ mod tests {
         assert_eq!(Tier::parse("15m"), Some(Tier::M15));
         assert_eq!(Tier::parse("base"), Some(Tier::Base));
         assert_eq!(Tier::from_u8(6), Some(Tier::Week));
+    }
+
+    /// A memory slab whose pack the edge would `sendfile(2)` has a file to send it from,
+    /// holding the pack's bytes; a small one, which the edge copies, stays on the heap.
+    #[test]
+    #[allow(clippy::arithmetic_side_effects)]
+    fn a_memory_slab_of_some_size_has_a_file() {
+        use std::os::unix::fs::FileExt;
+        let slab_of = |size: u32| {
+            // One whole blob of noise, which does not compress.
+            let mut x = 0x9E37_79B9_7F4A_7C15u64;
+            let content: Vec<u8> = (0..size)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect();
+            let mut z = vec![0u8; crate::zlib::compress_bound(content.len())];
+            let n = crate::zlib::Deflater::new(1)
+                .deflate_parts(&[&content], &mut z)
+                .unwrap();
+            let mut pack = crate::pack::pack_header(1).to_vec();
+            let header = crate::pack::HeaderBytes::whole(crate::pack::OBJ_BLOB, u64::from(size));
+            pack.extend_from_slice(header.as_slice());
+            pack.extend_from_slice(&z[..n]);
+            let trailer = <sha1::Sha1 as sha1::Digest>::digest(&pack);
+            pack.extend_from_slice(&trailer);
+            let range = (0, 1);
+            let commits = (Oid::ZERO, Oid::ZERO);
+            let mut indexer = crate::ingest::Indexer::new(1);
+            let slab =
+                crate::ingest::memory_slab(&mut indexer, pack.clone(), Tier::M15, range, commits)
+                    .unwrap()
+                    .slab;
+            assert!(slab.pack() == pack);
+            (slab, pack)
+        };
+        let (large, pack) = slab_of(40_000);
+        let mut from_file = vec![0u8; pack.len()];
+        large
+            .pack_file()
+            .expect("a pack of 40 KB is kept in a file")
+            .read_exact_at(&mut from_file, 0)
+            .unwrap();
+        assert!(from_file == pack);
+        let (small, _) = slab_of(100);
+        assert!(small.pack_file().is_none());
     }
 }
