@@ -2093,10 +2093,25 @@ fn objects_rebuilt_from_deltas_are_sent_stored_when_asked() {
         git(repo, &["fsck", "--strict", "--no-dangling"]);
         assert_eq!(cat_batch(repo, &all), cat_batch(&up.bare, &all));
     }
-    for server in &servers {
+    // `--profile proxy` sends them stored, unless the flag says otherwise.
+    let profile = |name: &str, more: &[&str]| {
+        let cache = root.join(format!("cache-{name}"));
+        let mut args = vec!["--store", store.as_str(), "--profile", "proxy"];
+        args.extend_from_slice(&["--cache-dir", cache.to_str().unwrap()]);
+        args.extend_from_slice(more);
+        Server::start(&args)
+    };
+    let proxy = profile("proxy", &[]);
+    let told = profile("proxy-deflate", &["--loose-deltas", "deflate"]);
+    for oid in &all {
+        let get = |server: &Server| server.get(&format!("/gvfs/objects/{oid}")).2;
+        assert!(get(&proxy) == get(&servers[2]), "{oid}");
+        assert!(get(&told) == get(&servers[0]), "{oid}");
+    }
+    for server in servers.iter().chain([&proxy, &told]) {
         server.assert_clean();
     }
-    drop(servers);
+    drop((servers, proxy, told));
     let _ = std::fs::remove_dir_all(&root);
 }
 

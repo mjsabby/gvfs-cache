@@ -589,7 +589,8 @@ park. Fetches
 from object storage or the upstream are awaited: a request waiting on them parks its task.
 
 A POST's working set (its ids, dedupe sets, the splice plan) lives in a leased arena
-(default: 2 × cores arenas of 8 MiB and 2^18 ids), awaited without holding a thread; if all
+(default: 2 × cores arenas of 8 MiB of buffers and room for 2^18 ids: about 31 MB each,
+resident from the start, 2 GB on 32 cores), awaited without holding a thread; if all
 arenas are busy for 10 s, the request gets a 503. Arenas are few, so a slow client must not
 hold one: the body is read first, into the connection's own output buffer (bodies of up to
 256 KiB fit it; a larger one, up to a quarter of `--arena-mib`, grows it as its bytes arrive,
@@ -608,6 +609,13 @@ before it is refused is the walk so far, which `--max-commit-depth` keeps near o
 (0.9 s of CPU for RepoB's 838k objects). The lease's end shrinks
 what grew, then returns its charge. The server speaks plain HTTP/1.1: put TLS and HTTP/2 on
 the load balancer in front of an edge. The localhost proxy needs neither.
+
+The same binary on `127.0.0.1` is the localhost proxy of an agent VM, and three of an
+edge's defaults do not fit it: `--profile proxy` sets them otherwise (a flag given still
+wins). Two arenas, since one client needs two: 73 MB of memory at the start where the
+edge's two per core were 2 GB on 32 cores. A poll every 15 s, not every 2: a thousand
+proxies each poll the upstream and the store. And `--loose-deltas stored`: its clients
+inflate at once what it would deflate for them.
 
 ## Stores with real blobs (`--blobs separate`)
 

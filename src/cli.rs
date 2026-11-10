@@ -113,8 +113,9 @@ SERVE OPTIONS:
                                (head and body) to arrive whole (default: 30)
     --quantum-us <N>           work a long request does between yields to others
                                (default: 100)
-    --arenas <N>               request scratch arenas (default: 2 x cores)
-    --arena-mib <N>            size of each arena (default: 8)
+    --arenas <N>               request scratch arenas (default: 2 x cores); with the
+                               defaults below each is about 31 MB, resident from the start
+    --arena-mib <N>            buffers of each arena (default: 8)
     --arena-objects <N>        ids each arena plans without growing (default: 262144)
     --max-request-objects <N>  objects one commit expansion may plan (default: 4194304);
                                beyond: 413
@@ -154,6 +155,11 @@ SERVE OPTIONS:
                                that memory is the edge's own: not shared with the page
                                cache, not evictable). The edge logs, and reports as
                                gvfs_index_huge_bytes, how much is on 2 MiB pages
+    --profile <edge|proxy>     the defaults of the flags an edge and the localhost proxy
+                               differ in. proxy: --arenas 2 (an arena is about 31 MB
+                               from the start; one client needs two), --poll-ms 15000
+                               (a fleet of proxies polls the upstream and the store
+                               once each), --loose-deltas stored. A flag given wins
 
 ENVIRONMENT:
     GVFS_DEBUG_INGEST=1        log pack indexing phase timings and entry statistics
