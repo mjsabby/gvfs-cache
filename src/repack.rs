@@ -43,12 +43,12 @@ use std::time::Instant;
 
 use sha1::{Digest, Sha1};
 
-use crate::delta::{apply_delta, delta_sizes, tree_delta};
+use crate::delta::{apply_delta, result_size, tree_delta};
 use crate::ingest::{Dest, Indexer, Ingested, file_slab, memory_slab};
 use crate::object::{TreeIter, commit_parents, commit_time, commit_tree};
 use crate::pack::{HeaderBytes, OBJ_BLOB, OBJ_COMMIT, OBJ_TREE, pack_header, parse_entry_header};
 use crate::slab::{NO_BASE, Slab, Tier};
-use crate::splice::Resolver;
+use crate::splice::{INFLATE_RATIO_MAX, Resolver};
 use crate::util::{Context, Oid, Result, u32_of, u64_of, us};
 use crate::zlib::{Deflater, Inflater, compress_bound};
 
@@ -532,6 +532,21 @@ impl Repacker {
             let entry = slab.entry(&rec).ctx("entry")?;
             let h = parse_entry_header(entry).ctx("entry header")?;
             let zdata = entry.get(h.header_len..).ctx("entry")?;
+            // As in `splice::inflate_rec`: what an entry declares sizes no buffer before
+            // it is checked against what its compressed bytes can inflate to and, for an
+            // object, against the size the index has.
+            let most = u64_of(zdata.len())
+                .saturating_mul(INFLATE_RATIO_MAX)
+                .saturating_add(64);
+            if h.size > most || (rec.base == NO_BASE && h.size != rec.size) {
+                crate::bail!(
+                    "object {}: its entry declares {} bytes (index: {}, {} compressed)",
+                    rec.oid,
+                    h.size,
+                    rec.size,
+                    zdata.len()
+                );
+            }
             let at = self.raw.len();
             let len = if rec.base == NO_BASE {
                 let n = us(h.size);
@@ -546,9 +561,18 @@ impl Repacker {
                 }
                 let delta = self.delta.get_mut(..dn).ctx("delta")?;
                 self.inflater.inflate_exact(zdata, delta)?;
-                let (_, result, _) = delta_sizes(delta).ctx("bad delta")?;
-                let n = us(result);
                 let &(bat, blen) = self.contents.get(known as usize).ctx("delta base")?;
+                // Nor does what a delta declares: its ops must write that much, and the
+                // index must have the same size.
+                let result = result_size(delta, blen)?;
+                if result != rec.size {
+                    crate::bail!(
+                        "object {}: its delta makes {result} bytes, the index says {}",
+                        rec.oid,
+                        rec.size
+                    );
+                }
+                let n = us(result);
                 self.raw.resize(at.saturating_add(n), 0);
                 let (done, tail) = self.raw.split_at_mut_checked(at).ctx("content")?;
                 apply_delta(
@@ -1232,6 +1256,30 @@ mod tests {
         d
     }
 
+    /// `s` with the pack entry of `slot` replaced by `entry`: the entries after it move,
+    /// and the index is patched to match (the entry's length, their offsets, the pack's
+    /// length). Every record keeps its id and size.
+    fn with_entry(s: &Slab, slot: u32, entry: &[u8]) -> Arc<Slab> {
+        let le = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        let records_at = le(s.index_bytes(), 80) as usize;
+        let old = s.rec(slot).unwrap();
+        let (start, len) = (old.offset as usize, old.entry_len as usize);
+        let pack = [&s.pack()[..start], entry, &s.pack()[start + len..]].concat();
+        let mut index = s.index_bytes().to_vec();
+        index[32..40].copy_from_slice(&(pack.len() as u64).to_le_bytes());
+        for other in 0..s.count() {
+            let at = records_at + other as usize * crate::slab::REC_LEN;
+            if other == slot {
+                index[at + 28..at + 32].copy_from_slice(&(entry.len() as u32).to_le_bytes());
+            } else if s.rec(other).unwrap().offset > old.offset {
+                // Its offset (the low 40 bits of the record's second word) moves too.
+                let word = le(&index, at + 20) + entry.len() as u64 - len as u64;
+                index[at + 20..at + 28].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        Slab::from_heap(s.meta.clone(), pack, index).unwrap()
+    }
+
     #[test]
     fn rollup_is_as_small_as_one_fetch() {
         let dir = tempdir("rollup");
@@ -1546,48 +1594,89 @@ mod tests {
         let whole = 1 - delta;
         let mut r = Resolver::with_capacity(4096);
         assert!(r.resolve(&s, whole).is_ok() && r.resolve(&s, delta).is_ok());
-        let le = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
-        let records_at = le(s.index_bytes(), 80) as usize;
-        let rec_at = |slot: u32| records_at + slot as usize * crate::slab::REC_LEN;
 
         // The whole object's header says 2^56 bytes: same stream, longer header.
         let w = s.rec(whole).unwrap();
         let entry = s.entry(&w).unwrap();
-        let h = parse_entry_header(entry).unwrap();
-        let huge = HeaderBytes::whole(OBJ_BLOB, 1 << 56);
-        let grow = huge.as_slice().len() - h.header_len;
-        let mut pack = s.pack()[..w.offset as usize].to_vec();
-        pack.extend_from_slice(huge.as_slice());
-        pack.extend_from_slice(&entry[h.header_len..]);
-        let rest = (w.offset + u64::from(w.entry_len)) as usize;
-        pack.extend_from_slice(&s.pack()[rest..]);
-        let mut index = s.index_bytes().to_vec();
-        index[32..40].copy_from_slice(&(pack.len() as u64).to_le_bytes());
-        index[40..60].copy_from_slice(&pack[pack.len() - 20..]);
-        for slot in 0..s.count() {
-            let rec = s.rec(slot).unwrap();
-            let at = rec_at(slot);
-            if slot == whole {
-                let len = rec.entry_len + grow as u32;
-                index[at + 28..at + 32].copy_from_slice(&len.to_le_bytes());
-            } else if rec.offset > w.offset {
-                // Its offset (the low 40 bits of the record's second word) moves too.
-                let word = le(&index, at + 20) + grow as u64;
-                index[at + 20..at + 28].copy_from_slice(&word.to_le_bytes());
-            }
-        }
-        let bad = Slab::from_heap(s.meta.clone(), pack, index).unwrap();
+        let stream = &entry[parse_entry_header(entry).unwrap().header_len..];
+        let huge = [HeaderBytes::whole(OBJ_BLOB, 1 << 56).as_slice(), stream].concat();
+        let bad = with_entry(&s, whole, &huge);
         let e = r.resolve(&bad, whole).expect_err("refused");
         assert!(e.to_string().contains("declares"), "{e}");
 
         // The delta's record says one byte more than the delta makes.
+        let le = |b: &[u8], at: usize| u64::from_le_bytes(b[at..at + 8].try_into().unwrap());
+        let records_at = le(s.index_bytes(), 80) as usize;
         let mut index = s.index_bytes().to_vec();
-        let at = rec_at(delta) + 32;
+        let at = records_at + delta as usize * crate::slab::REC_LEN + 32;
         let size = u32::from_le_bytes(index[at..at + 4].try_into().unwrap()) + 1;
         index[at..at + 4].copy_from_slice(&size.to_le_bytes());
         let bad = Slab::from_heap(s.meta.clone(), s.pack().to_vec(), index).unwrap();
         let e = r.resolve(&bad, delta).expect_err("refused");
         assert!(e.to_string().contains("the index says"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The repacker resolves commits and trees itself, and checks what their entries
+    /// declare as the resolver does, before a buffer is sized for it. A header that claims
+    /// more than its zlib stream can hold and a delta that declares more than its ops
+    /// write fail the repack (they were allocations of what they said: 2^56 and 2^64 - 1
+    /// bytes).
+    #[test]
+    fn the_repacker_refuses_corrupt_sizes() {
+        let dir = tempdir("sizes");
+        let c = history(&dir, 21);
+        let mut ix = Indexer::new(1);
+        let s = slab(&mut ix, fetch(&dir, None, &c[20], true));
+        let mut rp = Repacker::new();
+        let mut repack = |s: &Arc<Slab>| {
+            let input = Input {
+                slabs: std::slice::from_ref(s),
+                frozen: None,
+                exclude: &[],
+                mode: Mode::Trees,
+            };
+            let (range, commits) = ((0, 2), (Oid::ZERO, Oid::ZERO));
+            rp.repack(&mut ix, &input, Tier::H1, range, commits, Dest::Memory)
+                .map(|out| out.is_some())
+        };
+        assert!(repack(&s).unwrap());
+        let slot_of = |kind: u8, delta: bool| {
+            let found = s
+                .records()
+                .position(|r| r.kind == kind && r.is_delta() == delta);
+            found.expect("an entry of that kind") as u32
+        };
+
+        // A whole commit's header says 2^56 bytes: same stream, longer header.
+        let commit = slot_of(OBJ_COMMIT, false);
+        let entry = s.entry(&s.rec(commit).unwrap()).unwrap();
+        let stream = &entry[parse_entry_header(entry).unwrap().header_len..];
+        let huge = [HeaderBytes::whole(OBJ_COMMIT, 1 << 56).as_slice(), stream].concat();
+        let e = repack(&with_entry(&s, commit, &huge)).expect_err("refused");
+        assert!(e.to_string().contains("declares"), "{e}");
+
+        // A tree's delta declares a result of 2^64 - 1 bytes: same ops.
+        let tree = slot_of(OBJ_TREE, true);
+        let entry = s.entry(&s.rec(tree).unwrap()).unwrap();
+        let h = parse_entry_header(entry).unwrap();
+        let mut delta = vec![0u8; h.size as usize];
+        Inflater::new()
+            .inflate_exact(&entry[h.header_len..], &mut delta)
+            .unwrap();
+        let (base_size, _, ops_at) = crate::delta::delta_sizes(&delta).unwrap();
+        let mut lying = Vec::new();
+        crate::delta::put_varint(&mut lying, base_size);
+        crate::delta::put_varint(&mut lying, u64::MAX);
+        lying.extend_from_slice(&delta[ops_at..]);
+        let mut z = vec![0u8; compress_bound(lying.len())];
+        let n = Deflater::new(LEVEL)
+            .deflate_parts(&[&lying], &mut z)
+            .unwrap();
+        let header = HeaderBytes::ofs_delta(lying.len() as u64, h.base_distance);
+        let lying = [header.as_slice(), &z[..n]].concat();
+        let e = repack(&with_entry(&s, tree, &lying)).expect_err("refused");
+        assert!(e.to_string().contains("result size"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
