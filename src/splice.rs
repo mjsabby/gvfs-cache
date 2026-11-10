@@ -87,6 +87,10 @@ const SPILL_MIN: usize = 1 << 20;
 /// two threads (64 MiB: 30 ms of hashing).
 const IDX_BESIDE_TRAILER: u64 = 64 << 20;
 
+/// Plans whose pack was hashed for its trailer, in this process (`/metrics`): every
+/// prefetch pack an edge made that was not one it already had.
+pub static TRAILERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 impl Shared {
     pub fn new(v: Vec<u8>) -> Shared {
         if v.len() < SPILL_MIN {
@@ -160,6 +164,7 @@ impl PackPlan {
     /// arriving meanwhile wait for it instead of hashing again).
     pub fn trailer(&self) -> [u8; 20] {
         *self.trailer.get_or_init(|| {
+            TRAILERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut h = Sha1::new();
             h.update(self.header);
             for (s, start, len) in self.bodies() {
