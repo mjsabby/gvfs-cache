@@ -396,7 +396,11 @@ requests from 6,049 to 11,190 a second and blob batches from 2,112 to 3,155. Bat
 (POST, sizes) also have the CPU start loading the record of the id 16 places ahead
 (`gvfs-prefetch`; a hint, so answers cannot change), so a batch's cache misses overlap
 instead of following one another: sizes 1.8-1.9× again, blob batches 1.1-1.9×. Plain loads
-in its place made them 4-11% slower: a load the core must wait for stalls it.
+in its place made them 4-11% slower: a load the core must wait for stalls it. Asking for
+the record means computing its slot, and the lookup, 16 ids later, computed it again (a
+fifth of a sizes request's CPU): the loop keeps the 16 slots it has computed, and a
+lookup that only the baseline can answer reads its record there. Sizes of 4,000 ids on
+SearchGold: 726 to 634 µs of CPU (−13%).
 
 **Prefetch plans.** Every response is one pack holding what the client lacks (and, once
 per sealed day and week, that rollup whole):
@@ -747,7 +751,13 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
 
 * **Where a blob comes from.** A request id is looked up in the segments of the loaded
   `blobs.bin` (biggest first) before the slabs, which hold only commits and trees: a blob
-  id would otherwise probe every slab's index first (three times per POST). A POST notes
+  id would otherwise probe every slab's index first (three times per POST). The segments
+  after the biggest, up to 4 Mi blobs each, have an id filter as slabs have (built once
+  per segment): a lookup that goes past the biggest (a new blob, in one of the small
+  ones; an id that is no blob) costs a cache line in each segment that lacks the id, not
+  a slot computation and a record read. On RepoB (5 segments) the sizes of
+  4,000 ids of every kind went from 1,083 to 793 µs of CPU, of 4,000 blobs from 704 to
+  607 µs. A POST notes
   each blob by segment, not by cloning its pack's `Arc` (every core incremented the same
   count, a quarter of a blob batch's cycles), and dedupes them in a set sized for a batch.
   Blobs go out in request order (the store's and the proxy's cached ones interleaved),

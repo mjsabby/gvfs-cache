@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::sync::Notify;
 
 use super::blobcache::Attempt;
+use super::view::Ahead;
 use crate::blobs::{BlobManifest, BlobRec, Segment, pack_key};
 use crate::blobstream::{BlobSink, FileSpool};
 use crate::store::Store;
@@ -159,6 +160,11 @@ impl Drop for BlobPack {
 /// A segment's packs, indexed by a record's `pack` (`None`: a local pack the store lost).
 type SegmentPacks = Vec<Option<Arc<BlobPack>>>;
 
+/// The most blobs of a segment that gets an id filter ([`Segment::prepare_filter`]: two
+/// to four bytes per blob). A filter pays where lookups mostly miss, and while its lines
+/// stay in the cache: the small segments, which hold the newest blobs.
+const FILTER_MAX: u32 = 4 << 20;
+
 /// The blob packs of one `blobs.bin` generation.
 pub struct BlobSet {
     pub generation: u64,
@@ -240,6 +246,15 @@ impl BlobSet {
             segments.push((seg, list));
         }
         segments.sort_by_key(|(s, _)| std::cmp::Reverse(s.count()));
+        // A lookup probes the segments in this order. Most end in the first; the ones
+        // that go on (a new blob, in one of the small segments; an id that is no blob of
+        // the store) then cost a filter's cache line in each segment that does not have
+        // the id, not a slot computation and a record read. Built once per segment.
+        for (s, _) in segments.iter().skip(1) {
+            if s.count() <= FILTER_MAX {
+                s.prepare_filter();
+            }
+        }
         Ok(BlobSet {
             generation: bm.generation,
             complete: bm.complete(),
@@ -262,22 +277,38 @@ impl BlobSet {
     /// which every core would otherwise contend for.
     #[inline]
     pub fn locate(&self, oid: &Oid) -> Option<(u32, BlobRec)> {
+        self.locate_ahead(oid, Ahead::Unknown)
+    }
+
+    /// [`BlobSet::locate`], given what [`BlobSet::preload`] learned of `oid`: its slot in
+    /// the biggest segment is not computed again.
+    #[inline]
+    pub fn locate_ahead(&self, oid: &Oid, ahead: Ahead) -> Option<(u32, BlobRec)> {
         self.segments
             .iter()
             .enumerate()
             .find_map(|(i, (s, packs))| {
-                let r = s.find(oid)?;
+                let r = match (i, ahead) {
+                    (0, Ahead::Slot(slot)) => s.find_at(oid, slot?)?,
+                    _ => s.find(oid)?,
+                };
                 packs.get(us(u64::from(r.pack)))?.as_ref()?;
                 Some((u32::try_from(i).ok()?, r))
             })
     }
 
-    /// Starts loading what [`BlobSet::locate`] reads for `oid` in the biggest segment.
+    /// Starts loading what [`BlobSet::locate`] reads for `oid` in the biggest segment;
+    /// returns its slot there, for [`BlobSet::locate_ahead`].
     #[inline]
-    pub fn preload(&self, oid: &Oid) {
-        if let Some((s, _)) = self.segments.first() {
-            s.preload(oid);
+    pub fn preload(&self, oid: &Oid) -> Ahead {
+        let Some((s, _)) = self.segments.first() else {
+            return Ahead::Unknown;
+        };
+        let slot = s.slot(oid);
+        if let Some(slot) = slot {
+            s.preload_rec(slot);
         }
+        Ahead::Slot(slot)
     }
 
     /// The pack of a record [`BlobSet::locate`] found in segment `seg`.

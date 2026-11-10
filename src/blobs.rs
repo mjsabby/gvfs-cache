@@ -418,6 +418,8 @@ pub struct Segment {
     pilots_at: usize,
     records_at: usize,
     packs: Vec<PackRef>,
+    /// Its ids, checked before the index once built ([`Segment::prepare_filter`]).
+    filter: std::sync::OnceLock<crate::idfilter::IdFilter>,
 }
 
 impl Segment {
@@ -491,6 +493,7 @@ impl Segment {
             pilots_at,
             records_at,
             packs,
+            filter: std::sync::OnceLock::new(),
         })
     }
 
@@ -526,24 +529,45 @@ impl Segment {
         decode_rec(sub(self.region.bytes(), at, SEG_REC_LEN)?)
     }
 
-    /// Starts loading the record [`Segment::find`] would read for `oid`.
+    /// The only slot `oid` can occupy, if the index has one for it.
     #[inline]
-    pub fn preload(&self, oid: &Oid) {
-        if let Some(slot) = self.mphf().slot(oid) {
-            let at = us(u64::from(slot))
-                .saturating_mul(SEG_REC_LEN)
-                .saturating_add(self.records_at);
-            let b = self.region.bytes();
-            crate::util::prefetch(b, at);
-            crate::util::prefetch(b, at.saturating_add(SEG_REC_LEN.saturating_sub(1)));
-        }
+    pub fn slot(&self, oid: &Oid) -> Option<u32> {
+        self.mphf().slot(oid)
+    }
+
+    /// Starts loading the record at `slot` ([`Segment::slot`]).
+    #[inline]
+    pub fn preload_rec(&self, slot: u32) {
+        let at = us(u64::from(slot))
+            .saturating_mul(SEG_REC_LEN)
+            .saturating_add(self.records_at);
+        let b = self.region.bytes();
+        crate::util::prefetch(b, at);
+        crate::util::prefetch(b, at.saturating_add(SEG_REC_LEN.saturating_sub(1)));
+    }
+
+    /// The record at `slot` ([`Segment::slot`]) if it is `oid`'s: if the segment has it.
+    #[inline]
+    pub fn find_at(&self, oid: &Oid, slot: u32) -> Option<BlobRec> {
+        let r = self.rec_at(slot)?;
+        (r.oid == *oid).then_some(r)
     }
 
     /// The record of `oid`, if this segment has it.
     #[inline]
     pub fn find(&self, oid: &Oid) -> Option<BlobRec> {
-        let r = self.rec_at(self.mphf().slot(oid)?)?;
-        (r.oid == *oid).then_some(r)
+        if self.filter.get().is_some_and(|f| !f.may_contain(oid)) {
+            return None;
+        }
+        self.find_at(oid, self.slot(oid)?)
+    }
+
+    /// Builds the id filter [`Segment::find`] checks before the index (once; an edge does
+    /// it for the segments its lookups probe after the biggest: see [`crate::idfilter`]).
+    pub fn prepare_filter(&self) {
+        self.filter.get_or_init(|| {
+            crate::idfilter::IdFilter::new(us(u64::from(self.count)), self.records().map(|r| r.oid))
+        });
     }
 
     /// Every record, in slot order.
@@ -875,6 +899,49 @@ mod tests {
 
         assert!(recs[2].stored && !recs[1].stored);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A segment answers alike with and without its id filter, and from a slot computed
+    /// ahead of the lookup: every blob it has, and none it does not.
+    #[test]
+    fn a_segment_finds_the_same_with_a_filter_and_from_a_slot() {
+        let rec = |i: u32| BlobRec {
+            oid: blob_oid(&i.to_le_bytes()),
+            pack: 0,
+            stored: false,
+            hdr_len: 2,
+            offset: 12 + u64::from(i) * 100,
+            entry_len: 100,
+            size: u64::from(i),
+        };
+        let recs: Vec<BlobRec> = (0..5000).map(rec).collect();
+        let packs = vec![PackRef {
+            id: "p0".into(),
+            len: 1 << 20,
+            sha: [7; 20],
+        }];
+        let seg = Segment::from_heap(build_segment(&packs, &recs, 2).unwrap(), "s").unwrap();
+        let absent: Vec<Oid> = (5000..10_000u32).map(|i| rec(i).oid).collect();
+        let check = |seg: &Segment| {
+            for r in &recs {
+                assert_eq!(seg.find(&r.oid), Some(*r));
+                assert_eq!(seg.find_at(&r.oid, seg.slot(&r.oid).unwrap()), Some(*r));
+            }
+            for oid in &absent {
+                assert_eq!(seg.find(oid), None);
+                assert_eq!(seg.slot(oid).and_then(|slot| seg.find_at(oid, slot)), None);
+            }
+        };
+        check(&seg);
+        seg.prepare_filter();
+        check(&seg);
+        // The filter rules out nearly every id the segment lacks, before the index.
+        let filter = seg.filter.get().unwrap();
+        let passed = absent.iter().filter(|oid| filter.may_contain(oid)).count();
+        assert!(
+            passed < 100,
+            "{passed} of 5000 absent ids passed the filter"
+        );
     }
 
     #[test]

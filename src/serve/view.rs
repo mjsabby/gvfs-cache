@@ -28,6 +28,21 @@ use crate::slab::{Slab, Tier};
 use crate::splice::PackPlan;
 use crate::util::Oid;
 
+/// What a lookup started ahead of its turn learned. A loop over ids starts the lookup of
+/// an id some places on: that computes where the id's record is and asks memory for it.
+/// At the id's turn the record is read there; where it is, is not computed again (a fifth
+/// of the CPU of a sizes request was the second computation).
+#[derive(Clone, Copy, Default)]
+pub enum Ahead {
+    /// Nothing: the lookup starts from the beginning.
+    #[default]
+    Unknown,
+    /// The table the lookup ends in is the only one that can have the id (a view's
+    /// baseline), or is the first one probed (a blob set's biggest segment): this is the
+    /// id's slot there, if it has one.
+    Slot(Option<u32>),
+}
+
 pub struct View {
     /// Local snapshot number (changes with the manifest or L0).
     pub generation: u64,
@@ -256,14 +271,34 @@ impl View {
     }
 
     /// Starts loading what [`View::find`] reads for `oid` in the baseline (where an id the
-    /// newer slabs' filter rules out is).
+    /// newer slabs' filter rules out is); returns its slot there, for
+    /// [`View::find_ahead`].
     #[inline]
-    pub fn preload(&self, oid: &Oid) {
-        if !self.recent.may_contain(oid)
-            && let Some(b) = self.all.get(self.baseline)
-        {
-            b.preload(oid);
+    pub fn preload(&self, oid: &Oid) -> Ahead {
+        if self.recent.may_contain(oid) {
+            return Ahead::Unknown;
         }
+        let Some(b) = self.all.get(self.baseline) else {
+            return Ahead::Unknown;
+        };
+        let slot = b.slot(oid);
+        if let Some(slot) = slot {
+            b.preload_rec(slot);
+        }
+        Ahead::Slot(slot)
+    }
+
+    /// [`View::find`], given what [`View::preload`] learned of `oid`.
+    #[inline]
+    pub fn find_ahead(&self, oid: &Oid, ahead: Ahead) -> Option<(u16, u32)> {
+        let Ahead::Slot(slot) = ahead else {
+            return self.find(oid);
+        };
+        let slot = slot?;
+        self.all
+            .get(self.baseline)?
+            .holds(oid, slot)
+            .then(|| (u16::try_from(self.baseline).unwrap_or(u16::MAX), slot))
     }
 
     /// The live L0 slabs, oldest first.
@@ -553,5 +588,56 @@ mod tests {
         assert_eq!(answer(&supersets, 99), Some((0, 3)));
         assert_eq!(answer(&supersets, 0), Some((0, 3)));
         assert_eq!(answer(&supersets, 300), None);
+    }
+
+    /// A lookup that was started ahead of its turn finds what one that was not finds: an
+    /// object of the baseline (from its slot there), one of a newer slab, and none.
+    #[test]
+    fn a_lookup_started_ahead_finds_the_same() {
+        let base = slab(1, Tier::Base, 0, 100);
+        let week = slab(2, Tier::Week, 100, 200);
+        let tail = slab(3, Tier::M15, 200, 300);
+        let manifest = Manifest {
+            generation: 1,
+            tip: tail.meta.want,
+            max_ts: 300,
+            baseline: base.meta.clone(),
+            weekly: vec![week.meta.clone()],
+            pyramid: vec![tail.meta.clone()],
+            retained: Vec::new(),
+            flags: 0,
+            blobs_generation: 0,
+        };
+        let id = |s: &Arc<Slab>| s.ids().next().unwrap();
+        let (in_base, in_week, in_tail) = (id(&base), id(&week), id(&tail));
+        let sealed = vec![base, week, tail];
+        let view = View::new(
+            1,
+            manifest,
+            String::new(),
+            sealed,
+            Vec::new(),
+            None,
+            None,
+            &[],
+        );
+        // Lookup order: the 15m slab, the week, the baseline.
+        assert_eq!(view.find(&in_tail), Some((0, 0)));
+        assert_eq!(view.find(&in_week), Some((1, 0)));
+        assert_eq!(view.find(&in_base), Some((2, 0)));
+        let absent = Oid([0xAB; 20]);
+        assert_eq!(view.find(&absent), None);
+        for oid in [in_base, in_week, in_tail, absent] {
+            let ahead = view.preload(&oid);
+            assert_eq!(view.find_ahead(&oid, ahead), view.find(&oid), "{oid}");
+            assert_eq!(view.find_ahead(&oid, Ahead::Unknown), view.find(&oid));
+            // What only the baseline can have is looked up by its slot there; the rest
+            // (what the newer slabs' filter does not rule out) as if not started.
+            let newer = oid == in_week || oid == in_tail;
+            assert_eq!(matches!(ahead, Ahead::Unknown), newer, "{oid}");
+        }
+        // A slot that is another object's is not a hit.
+        assert_eq!(view.find_ahead(&absent, Ahead::Slot(Some(0))), None);
+        assert_eq!(view.find_ahead(&in_base, Ahead::Slot(None)), None);
     }
 }
