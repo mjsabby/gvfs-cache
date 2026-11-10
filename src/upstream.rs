@@ -1018,8 +1018,45 @@ enum AsyncBody {
     Local {
         child: tokio::process::Child,
         stdout: tokio::process::ChildStdout,
+        /// What [`drain_stderr`] kept of the child's stderr, once it has ended.
+        stderr: Option<tokio::task::JoinHandle<Vec<u8>>>,
         buf: Vec<u8>,
     },
+}
+
+/// Bytes of a local `git upload-pack`'s stderr kept for an error message: its end, where
+/// git says why it failed.
+const STDERR_KEPT: usize = 4 << 10;
+
+/// Reads a child's stderr to its end as the child runs; returns its last lines, at most
+/// [`STDERR_KEPT`] bytes. A child that writes more than a pipe holds (64 KiB: with
+/// `GIT_TRACE_PACKET=1` in the environment, `git upload-pack` traces every packet there,
+/// 844 KB for a request of 4,000 ids) waits to be read. Read only once its answer had
+/// ended, such a child never finished the answer, nor even read its request to the end.
+async fn drain_stderr(mut stderr: tokio::process::ChildStderr) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut kept = Vec::new();
+    let mut cut = false;
+    let mut buf = [0u8; 4096];
+    while let Ok(n) = stderr.read(&mut buf).await {
+        if n == 0 {
+            break;
+        }
+        kept.extend_from_slice(buf.get(..n).unwrap_or(&[]));
+        if let Some(excess) = kept.len().checked_sub(STDERR_KEPT.saturating_mul(2)) {
+            kept.drain(..excess.saturating_add(STDERR_KEPT));
+            cut = true;
+        }
+    }
+    if let Some(excess) = kept.len().checked_sub(STDERR_KEPT).filter(|&e| e > 0) {
+        kept.drain(..excess);
+        cut = true;
+    }
+    // What is left of a line whose start was dropped says nothing.
+    if cut && let Some(end) = kept.iter().position(|&b| b == b'\n') {
+        kept.drain(..=end);
+    }
+    kept
 }
 
 impl AsyncBody {
@@ -1048,7 +1085,8 @@ impl AsyncBody {
     }
 
     /// Ends the exchange after `result` (its parse): the rest of an HTTP body is read; a
-    /// local `upload-pack` must exit successfully (its stderr explains a failure).
+    /// local `upload-pack` must exit successfully (the end of its stderr explains a
+    /// failure).
     async fn finish<T>(self, result: Result<T>) -> Result<T> {
         match self {
             AsyncBody::Http(mut r) => {
@@ -1057,15 +1095,17 @@ impl AsyncBody {
                 Ok(v)
             }
             AsyncBody::Local {
-                mut child, stdout, ..
+                mut child,
+                stdout,
+                stderr,
+                ..
             } => {
-                use tokio::io::AsyncReadExt;
                 drop(stdout);
-                let mut stderr = Vec::new();
-                if let Some(mut e) = child.stderr.take() {
-                    let _ = e.read_to_end(&mut stderr).await;
-                }
                 let status = child.wait().await.ctx("waiting for upload-pack")?;
+                let stderr = match stderr {
+                    Some(drained) => drained.await.unwrap_or_default(),
+                    None => Vec::new(),
+                };
                 let stderr = String::from_utf8_lossy(&stderr);
                 match result {
                     Err(e) => Err(crate::err!("{e} ({})", stderr.trim())),
@@ -1144,6 +1184,8 @@ impl AsyncUpstream {
                     .kill_on_drop(true)
                     .spawn()
                     .ctx("running git upload-pack")?;
+                // From before the request is written: the child may write there as it reads.
+                let stderr = child.stderr.take().map(|e| tokio::spawn(drain_stderr(e)));
                 {
                     let mut stdin = child.stdin.take().ctx("upload-pack stdin")?;
                     stdin
@@ -1155,6 +1197,7 @@ impl AsyncUpstream {
                 Ok(AsyncBody::Local {
                     child,
                     stdout,
+                    stderr,
                     buf: vec![0u8; 64 << 10],
                 })
             }
@@ -1599,6 +1642,50 @@ mod tests {
             assert!(e.contains("neither /gvfs/sizes nor object-info"), "{e}");
         }
         assert_eq!(probes.load(Ordering::SeqCst), 1, "the 404 is kept");
+    }
+
+    /// A local `upload-pack`'s stderr is read as it is written, and what an error says of
+    /// it is its end: the last lines, whole, within [`STDERR_KEPT`] bytes.
+    #[test]
+    fn a_childs_stderr_is_kept_to_its_last_lines() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let kept = |script: &str| {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(script).stderr(Stdio::piped());
+            rt.block_on(async {
+                let mut child = tokio::process::Command::from(cmd).spawn().unwrap();
+                let kept = drain_stderr(child.stderr.take().unwrap()).await;
+                assert!(child.wait().await.unwrap().success());
+                String::from_utf8(kept).unwrap()
+            })
+        };
+        assert_eq!(kept("echo 'fatal: no' >&2"), "fatal: no\n");
+        // 150 KB, more than twice what a pipe holds, then the reason.
+        let long = kept(
+            "i=0; while [ $i -lt 5000 ]; do echo \"a line of the trace, number $i\" >&2; \
+             i=$((i+1)); done; echo 'fatal: the reason' >&2",
+        );
+        assert!(long.len() <= STDERR_KEPT, "{} bytes", long.len());
+        assert!(long.len() > STDERR_KEPT - 40, "{} bytes", long.len());
+        assert!(long.starts_with("a line of the trace, number 4"), "{long}");
+        assert!(long.ends_with("number 4999\nfatal: the reason\n"), "{long}");
+
+        // git's own reason still ends a failed fetch's error.
+        let dir = std::env::temp_dir().join(format!("gvfs-stderr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = dir.join("r.git");
+        git(&dir, &["init", "-q", "--bare", repo.to_str().unwrap()], b"");
+        let mut up = Upstream::open(repo.to_str().unwrap(), "main", &Auth::default()).unwrap();
+        let e = up.fetch_objects(&[Oid([0x77; 20])], &mut Vec::new());
+        let e = e.unwrap_err().to_string();
+        let reason =
+            "fatal: git upload-pack: not our ref 7777777777777777777777777777777777777777)";
+        assert!(e.ends_with(reason), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn pack_objects(dir: &std::path::Path, pack: &[u8], strict: bool) -> Vec<(String, String)> {

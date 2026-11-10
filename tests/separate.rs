@@ -1852,6 +1852,64 @@ fn a_run_leaves_other_files_in_its_cache_dir() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A local upstream whose `git upload-pack` writes much to its stderr: with
+/// `GIT_TRACE_PACKET=1` in the environment it traces every packet there, 127 KB for the
+/// sizes of 600 blobs, twice what a pipe holds. The run reads it as the child writes it.
+/// (Read only at the end, it stalled the child mid-request and the run with it, for good.)
+#[test]
+fn a_local_upload_pack_that_fills_its_stderr_does_not_stall_the_run() {
+    let root = tempdir("sep-stderr");
+    let up = Upstream::new(&root);
+    let files: Vec<(String, Option<Vec<u8>>)> = (0..600u32)
+        .map(|i| {
+            (
+                format!("d{}/f{i}.txt", i % 8),
+                Some(format!("file {i}\n").into_bytes()),
+            )
+        })
+        .collect();
+    let refs: Vec<(&str, Option<Vec<u8>>)> =
+        files.iter().map(|(p, c)| (p.as_str(), c.clone())).collect();
+    commit_files(&up, "c1", &refs);
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    let work = root.join("pipeline-work");
+    let log = root.join("pipeline.log");
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-cache"));
+    cmd.args(["pipeline", "--store", &store, "--upstream"])
+        .arg(&up.bare)
+        .args(["--tier", "15m", "--threads", "2", "--blobs", "separate"])
+        .args(["--work-dir", work.to_str().unwrap()])
+        .env("GIT_TRACE_PACKET", "1")
+        .stderr(std::fs::File::create(&log).unwrap());
+    gvfs_cache::upstream::hermetic_git_env(&mut cmd);
+    let mut child = cmd.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "the pipeline stalled:\n{}",
+                std::fs::read_to_string(&log).unwrap()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(
+        status.success(),
+        "{}",
+        std::fs::read_to_string(&log).unwrap()
+    );
+    let sizes = all_sizes(&store_dir, &manifest(&store_dir));
+    assert_eq!(sizes.len(), 600);
+    assert_eq!(sizes, git_blobs(&up.bare, &["--all"]));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The upstream client over each transport it meets: a local repository; smart HTTP with
 /// protocol v2 (blobs by id, `object-info`, as Azure DevOps allows them); and a GVFS upstream
 /// (another edge: `POST /gvfs/objects` and `POST /gvfs/sizes`). Through `AsyncUpstream` (the
