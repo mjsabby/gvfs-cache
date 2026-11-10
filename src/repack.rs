@@ -37,6 +37,7 @@
 //! directory, and re-clustering all of history would buy little).
 
 use std::cmp::Ordering;
+use std::hash::{BuildHasher, Hasher};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
@@ -134,11 +135,27 @@ struct Stats {
     rewritten: u64,
 }
 
-/// Open-addressed map from object id to object index (ids are uniform: no hashing).
-#[derive(Default)]
+/// Open-addressed map from object id to object index. An id's home slot is a mix of its
+/// first eight bytes and a key drawn for the map: ids are chosen by whoever pushes to the
+/// branch, and with their raw bits as the home, 100,000 ids that share 18 bits took 3.3 s
+/// to insert (3 ms for random ones). The map only answers lookups by id, so nothing a
+/// repack writes depends on the key.
 struct IdMap {
     slots: Vec<(Oid, u32)>,
     mask: usize,
+    key: u64,
+}
+
+impl Default for IdMap {
+    fn default() -> IdMap {
+        // The random keys std's hash maps draw in every process.
+        let random = std::collections::hash_map::RandomState::new();
+        IdMap {
+            slots: Vec::new(),
+            mask: 0,
+            key: random.build_hasher().finish(),
+        }
+    }
 }
 
 impl IdMap {
@@ -151,7 +168,7 @@ impl IdMap {
 
     fn home(&self, oid: &Oid) -> usize {
         let [a, b, c, d, e, f, g, h, ..] = oid.0;
-        (u64::from_le_bytes([a, b, c, d, e, f, g, h]) as usize) & self.mask
+        (mix64(u64::from_le_bytes([a, b, c, d, e, f, g, h]) ^ self.key) as usize) & self.mask
     }
 
     fn insert(&mut self, oid: &Oid, v: u32) {
@@ -180,6 +197,15 @@ impl IdMap {
     }
 }
 
+/// splitmix64's finalizer: every bit of `h` reaches every bit of the result.
+fn mix64(mut h: u64) -> u64 {
+    h ^= h.wrapping_shr(30);
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h.wrapping_shr(27);
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^ h.wrapping_shr(31)
+}
+
 /// The hash of directory `name` inside the directory hashed `parent` (FNV-1a, mixed).
 /// A collision only costs delta quality: copies are made of byte-identical entries only.
 fn path_hash(parent: u64, name: &[u8]) -> u64 {
@@ -187,11 +213,7 @@ fn path_hash(parent: u64, name: &[u8]) -> u64 {
     for &b in name {
         h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3);
     }
-    h ^= h.wrapping_shr(30);
-    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    h ^= h.wrapping_shr(27);
-    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
-    h ^ h.wrapping_shr(31)
+    mix64(h)
 }
 
 /// A delta that the output stores as a whole object (see [`WHOLE_MAX`]).
@@ -1356,7 +1378,65 @@ mod tests {
             },
         );
         assert_eq!(again.pack(), out.pack());
+        // So does another repacker: the key of its id map is not in what it writes.
+        let mut other = Repacker::new();
+        other.ids.key = !rp.ids.key;
+        let same = repack_mem(
+            &mut ix,
+            &mut other,
+            &Input {
+                slabs: &slabs,
+                frozen: None,
+                exclude: &[],
+                mode: Mode::Trees,
+            },
+        );
+        assert_eq!(same.pack(), out.pack());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ids that share the bits a table's size selects are spread over the table like any
+    /// others, by a key drawn per map. (A push can choose such ids: 2^18 tries each.
+    /// With their raw bits as the home slot 100,000 of them had one home, and took 3.3 s
+    /// to insert.)
+    #[test]
+    fn ids_that_share_their_low_bits_do_not_pile_up() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state.to_le_bytes()
+        };
+        let n = 100_000;
+        for crafted in [false, true] {
+            let ids: Vec<Oid> = (0..n)
+                .map(|_| {
+                    let mut id = [rand(), rand(), rand()].concat();
+                    id.truncate(20);
+                    if crafted {
+                        // The low 18 bits of the first eight bytes, little endian.
+                        id[0] = 0x55;
+                        id[1] = 0x55;
+                        id[2] = (id[2] & 0xFC) | 0x01;
+                    }
+                    Oid(id.try_into().unwrap())
+                })
+                .collect();
+            let mut map = IdMap::default();
+            map.reset(n);
+            for (i, id) in ids.iter().enumerate() {
+                map.insert(id, i as u32);
+            }
+            assert!((0..n).all(|i| map.get(&ids[i]) == Some(i as u32)));
+            // How far the entries lie from their home slots, in all: n^2 / 2 with one home.
+            let far: usize = (0..map.slots.len())
+                .filter(|&at| map.slots[at].1 != NONE)
+                .map(|at| at.wrapping_sub(map.home(&map.slots[at].0)) & map.mask)
+                .sum();
+            assert!(far < n, "crafted: {crafted}, {far} slots from home in all");
+        }
+        assert_ne!(IdMap::default().key, IdMap::default().key);
     }
 
     #[test]
