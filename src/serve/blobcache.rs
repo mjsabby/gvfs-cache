@@ -371,57 +371,58 @@ impl BlockCache {
                 blocks: &mine,
                 armed: true,
             };
-            let got = self.fetch(id, object, pack_len, &mine).await;
+            let (got, outcome) = self.fetch(id, object, pack_len, &mine).await;
             guard.armed = false;
             let mut st = lock(&self.state);
             for &b in &mine {
                 st.fetching.remove(&(Arc::clone(id), b));
             }
             let mut replaced = Vec::new();
-            match &got {
-                Ok(fetched) => {
-                    for (&b, &(len, file)) in mine.iter().zip(fetched) {
-                        st.clock = st.clock.wrapping_add(1);
-                        let used = st.clock;
-                        let key: Key = (Arc::clone(id), b);
-                        let entry = Entry {
-                            len,
-                            used,
-                            pins: 1,
-                            file,
-                        };
-                        if let Some(old) = st.blocks.insert(key.clone(), entry) {
-                            st.bytes = st.bytes.saturating_sub(old.len);
-                            if old.pins == 0 {
-                                st.lru.remove(&old.used);
-                            }
-                            replaced.push((key, old.file));
-                        }
-                        st.bytes = st.bytes.saturating_add(len);
-                        held.blocks.push((b, file));
+            // What arrived is cached, also when a later run failed.
+            for (&b, &(len, file)) in mine.iter().zip(&got) {
+                st.clock = st.clock.wrapping_add(1);
+                let used = st.clock;
+                let key: Key = (Arc::clone(id), b);
+                let entry = Entry {
+                    len,
+                    used,
+                    pins: 1,
+                    file,
+                };
+                if let Some(old) = st.blocks.insert(key.clone(), entry) {
+                    st.bytes = st.bytes.saturating_sub(old.len);
+                    if old.pins == 0 {
+                        st.lru.remove(&old.used);
                     }
+                    replaced.push((key, old.file));
                 }
-                // Those waiting for these blocks fail with this read.
-                Err(e) => attempt.fail(e),
+                st.bytes = st.bytes.saturating_add(len);
+                held.blocks.push((b, file));
+            }
+            // Those waiting for the blocks that did not arrive fail with this read.
+            if let Err(e) = &outcome {
+                attempt.fail(e);
             }
             drop(st);
             self.unlink(replaced);
             self.done.notify_waiters();
             // On an error, dropping `held` releases what it pinned.
-            got?;
+            outcome?;
         }
     }
 
-    /// Fetches `blocks` (ascending), one ranged GET per run of consecutive ones; returns
-    /// each block's length and file generation. On an error no block of the failed run is
-    /// left on disk.
+    /// Fetches `blocks` (ascending), one ranged GET per run of consecutive ones. Returns the
+    /// length and file generation of each block fetched, in order, and how the fetch ended.
+    /// When a run fails, the blocks of the runs before it are whole and are returned with
+    /// the error, for the caller to cache (they used to stay on disk untracked: never read
+    /// again, never evicted); no block of the failed run is left on disk.
     async fn fetch(
         &self,
         id: &Arc<str>,
         object: &str,
         pack_len: u64,
         blocks: &[u64],
-    ) -> Result<Vec<(u64, u64)>> {
+    ) -> (Vec<(u64, u64)>, Result<()>) {
         let mut lens = Vec::with_capacity(blocks.len());
         let mut i = 0usize;
         while let Some(&b0) = blocks.get(i) {
@@ -493,7 +494,7 @@ impl BlockCache {
                 for (b, file_gen) in whole {
                     let _ = std::fs::remove_file(self.path(&(Arc::clone(id), b), file_gen));
                 }
-                return Err(e);
+                return (lens, Err(e));
             }
             for (b, file_gen) in whole {
                 let bs = b.saturating_mul(BLOCK);
@@ -504,7 +505,7 @@ impl BlockCache {
             }
             i = j;
         }
-        Ok(lens)
+        (lens, Ok(()))
     }
 
     /// Least recently used unpinned blocks go until the cache fits its budget; returns
@@ -759,6 +760,122 @@ mod tests {
         let e = rt.block_on(read(Arc::clone(&cache)));
         assert!(e.contains("HTTP 404") && !e.contains("waited"), "{e}");
         assert_eq!(asked.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read that fetches two runs of blocks, the second of which fails: the first run's
+    /// blocks are whole on disk, and are cached. (They were left there untracked: never
+    /// read again, never evicted, and written again by every retry, 8 MiB at a time here.)
+    /// The failed run leaves nothing, and a retry fetches only that run.
+    #[test]
+    fn a_failed_run_keeps_the_blocks_of_the_runs_before_it() {
+        let (dir, cache, data) = cache_over("runs-fail", BLOCK * 64);
+        let n = data.len() as u64;
+        // Block 2 cached alone: a read of blocks 0..=4 then fetches the runs [0, 1] and
+        // [3, 4].
+        read_all(&cache, &data, 2 * BLOCK + 5, 10);
+        // The store loses the pack's tail: the second run's ranged read fails.
+        let pack = dir.join("store/blobs/p.pack");
+        let lost = std::fs::OpenOptions::new().write(true).open(pack).unwrap();
+        lost.set_len(3 * BLOCK + 100).unwrap();
+        let id: Arc<str> = Arc::from("p");
+        for fetches in [3, 4, 5] {
+            let sink = &mut |_: &[u8]| Ok(());
+            let read = cache.read(&id, "blobs/p.pack", n, 0, 5 * BLOCK, sink);
+            assert!(rt().block_on(read).is_err());
+            assert_eq!(cache.fetches.load(Ordering::Relaxed), fetches);
+            assert_eq!(cache.bytes(), 3 * BLOCK, "blocks 0, 1 and 2");
+            consistent(&cache);
+        }
+        read_all(&cache, &data, 0, 3 * BLOCK);
+        assert_eq!(cache.fetches.load(Ordering::Relaxed), 5, "all three cached");
+        consistent(&cache);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Readers waiting for a fetch of two runs, the second of which fails: the one that
+    /// needed a block of the first run reads it from the cache, the one that needed a block
+    /// of the second fails with the fetch, and neither asks the store.
+    #[test]
+    fn readers_waiting_for_the_runs_before_a_failed_one_are_served() {
+        use crate::testhttp::{Reply, serve};
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let dir = std::env::temp_dir().join(format!("gvd-bcache-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let (seen, gate) = (Arc::clone(&asked), Arc::clone(&release));
+        // A pack of three blocks, block `b` all bytes `b`, whose third the store has lost.
+        // The answer for block 0 waits for the test to have its readers waiting.
+        let port = serve(move |r| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            let range = r.header("x-ms-range").unwrap().to_string();
+            let block =
+                (0..3u64).find(|b| range == format!("bytes={}-{}", b * BLOCK, (b + 1) * BLOCK - 1));
+            match block.unwrap() {
+                0 => {
+                    while !gate.load(Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Reply::Whole("206 Partial Content".to_string(), vec![0u8; BLOCK as usize])
+                }
+                1 => Reply::Whole("206 Partial Content".to_string(), vec![1u8; BLOCK as usize]),
+                _ => Reply::status("404 Not Found"),
+            }
+        });
+        let account =
+            format!("BlobEndpoint=http://127.0.0.1:{port}/acct;AccountName=acct;AccountKey=a2V5");
+        let store = Store::Azure(crate::azure::AzureStore::new(&account, "packs").unwrap());
+        let cache = Arc::new(BlockCache::new(Arc::new(store), dir.clone(), BLOCK * 64).unwrap());
+        // The bytes of blocks `from..=to`, or the error of reading them.
+        let read = |cache: Arc<BlockCache>, from: u64, to: u64| async move {
+            let id: Arc<str> = Arc::from("p");
+            let mut got = Vec::new();
+            let sink = &mut |b: &[u8]| {
+                got.extend_from_slice(b);
+                Ok(())
+            };
+            let (at, len) = (from * BLOCK, (to + 1 - from) * BLOCK);
+            let read = cache.read(&id, "blobs/p.pack", BLOCK * 3, at, len, sink);
+            read.await.map(|()| got).map_err(|e| e.to_string())
+        };
+        let rt = rt();
+        // Block 1 cached: a read of all three then fetches the runs [0] and [2].
+        assert!(rt.block_on(read(Arc::clone(&cache), 1, 1)).unwrap() == vec![1u8; BLOCK as usize]);
+        let (all, first, last) = rt.block_on(async {
+            let started = Arc::new(AtomicUsize::new(0));
+            let mut tasks = Vec::new();
+            for (from, to) in [(0, 2), (0, 0), (2, 2)] {
+                let (cache, begun) = (Arc::clone(&cache), Arc::clone(&started));
+                tasks.push(tokio::spawn(async move {
+                    begun.fetch_add(1, Ordering::SeqCst);
+                    read(cache, from, to).await
+                }));
+                // The read of all three is the one fetching.
+                while started.load(Ordering::SeqCst) < tasks.len() {
+                    tokio::task::yield_now().await;
+                }
+            }
+            release.store(true, Ordering::SeqCst);
+            let mut results = Vec::new();
+            for t in tasks {
+                results.push(t.await.unwrap());
+            }
+            let last = results.pop().unwrap();
+            let first = results.pop().unwrap();
+            (results.pop().unwrap(), first, last)
+        });
+        let (all, last) = (all.unwrap_err(), last.unwrap_err());
+        assert!(all.contains("HTTP 404") && !all.contains("waited"), "{all}");
+        assert!(first.unwrap() == vec![0u8; BLOCK as usize]);
+        assert!(last.contains("the fetch it waited for failed"), "{last}");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            3,
+            "block 1, then the two runs"
+        );
+        assert_eq!(cache.bytes(), 2 * BLOCK);
+        consistent(&cache);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
