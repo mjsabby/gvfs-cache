@@ -882,7 +882,15 @@ not the hot path's).
   `Git-Protocol: version=2`) and advertises `filter` there, so `blob:none` fetches go over
   v0. Without v2 there is no `object-info` and no blob `want`s: blobs by id and sizes come
   through its GVFS endpoints (`/gvfs/objects`, `/gvfs/sizes`), used wherever an upstream
-  offers them. `/gvfs/objects` sends one object asked for alone (each large blob) loose,
+  offers them. Nor is there a way to ask for one ref: the answer to a poll is the
+  advertisement of every ref (10.2 MB for SearchGold's 82,779 refs, every `--poll-ms`).
+  The edge reads it up to its branch's line and drops the connection: the first ref line
+  is `HEAD`'s, and names the branch `HEAD` stands for (`symref=HEAD:refs/heads/main`), so
+  the default branch's tip is in the first kilobyte; another branch is found at its own
+  line. Measured against the SearchGold clone served over v0: 4.8 MB/s for an idle edge
+  before, and after at most 159 KB per poll (what the edge's socket had taken in when it
+  closed, on loopback), with a new connection per poll.
+  `/gvfs/objects` sends one object asked for alone (each large blob) loose,
   whatever the request accepts; the client inflates it and deflates its content again as
   a pack of one.
 * The edge's block cache lives in memory and on local disk and starts empty after a
