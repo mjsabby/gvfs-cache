@@ -94,6 +94,35 @@ pub enum LooseDeltas {
     Stored,
 }
 
+/// `--profile`: the defaults of the flags that differ between an edge, which serves many
+/// clients over a network, and the localhost proxy, which serves the one machine it runs
+/// on. A flag given says otherwise.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Profile {
+    /// `--arenas` (`None`: two per core). An arena is about 31 MB resident from the
+    /// start, and one client needs two.
+    arenas: Option<usize>,
+    /// `--poll-ms`. A fleet of proxies polls the upstream and the store once each: a
+    /// thousand at an edge's two seconds are 500 requests a second for a branch that
+    /// moves a few times a minute.
+    poll_ms: u64,
+    /// `--loose-deltas`. A proxy's clients inflate at once what it deflated for them.
+    loose_deltas: &'static str,
+}
+
+impl Profile {
+    const EDGE: Profile = Profile {
+        arenas: None,
+        poll_ms: 2000,
+        loose_deltas: "deflate",
+    };
+    const PROXY: Profile = Profile {
+        arenas: Some(2),
+        poll_ms: 15_000,
+        loose_deltas: "stored",
+    };
+}
+
 /// `--index-pages huge`: indexes at least this long are read into memory that asks for
 /// huge pages (one 2 MiB page).
 const HUGE_INDEX_MIN: u64 = 2 << 20;
@@ -235,6 +264,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "superset-tier",
             "loose-deltas",
             "index-pages",
+            "profile",
             "proxy-cache-mib",
             "proxy-cache-packs",
             "blob-cache-mib",
@@ -279,7 +309,12 @@ pub fn main(args: &[String]) -> Result<()> {
         "never" => None,
         other => crate::bail!("--superset-tier must be 24h, 168h or never, not {other:?}"),
     };
-    let loose_deltas = match f.get("loose-deltas").unwrap_or("deflate") {
+    let profile = match f.get("profile").unwrap_or("edge") {
+        "edge" => Profile::EDGE,
+        "proxy" => Profile::PROXY,
+        other => crate::bail!("--profile must be edge or proxy, not {other:?}"),
+    };
+    let loose_deltas = match f.get("loose-deltas").unwrap_or(profile.loose_deltas) {
         "deflate" => LooseDeltas::Deflate,
         "stored-trees" => LooseDeltas::StoredTrees,
         "stored" => LooseDeltas::Stored,
@@ -294,7 +329,7 @@ pub fn main(args: &[String]) -> Result<()> {
         other => crate::bail!("--index-pages must be file or huge, not {other:?}"),
     }
     let cores = crate::util::default_threads();
-    let arenas = f.num("arenas", cores.saturating_mul(2))?;
+    let arenas = f.num("arenas", profile.arenas.unwrap_or(cores.saturating_mul(2)))?;
     let arena_objects = f.num("arena-objects", 1usize << 18)?;
     let store = Store::open(
         f.require("store")?,
@@ -322,7 +357,7 @@ pub fn main(args: &[String]) -> Result<()> {
         blob_cache_bytes: f.num("blob-cache-mib", 32768u64)?.saturating_mul(1 << 20),
         bind: f.get("bind").unwrap_or("127.0.0.1:8080").to_string(),
         cache_dir,
-        poll: Duration::from_millis(f.num("poll-ms", 2000u64)?),
+        poll: Duration::from_millis(f.num("poll-ms", profile.poll_ms)?),
         workers: f.num("workers", cores)?,
         arenas,
         arena_bytes: f.num("arena-mib", 8usize)?.saturating_mul(1 << 20),
@@ -604,7 +639,8 @@ pub fn run(o: Options) -> Result<()> {
     ctx.ready.store(true, Ordering::Relaxed);
     let v = ctx.view();
     crate::log!(
-        "serving on http://{addr}: {} slabs ({} in L0), tip {}, {}, {workers} workers",
+        "serving on http://{addr}: {} slabs ({} in L0), tip {}, {}, {workers} workers, \
+         {arenas} arenas, a poll every {poll:?}",
         v.all.len(),
         v.l0_len,
         v.tip,

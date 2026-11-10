@@ -99,8 +99,8 @@ stock git, which stays the judge), and fails a run in which any test skips; only
 gvfs-cache pipeline --store azure:gvfs/searchgold --tier 15m \
     --upstream https://dev.azure.com/org/proj/_git/SearchGold --auth-command ~/get_token
 
-# The edge (or, with --bind 127.0.0.1:8080, the localhost proxy on an agent VM; there,
-# add --loose-deltas stored: its clients inflate at once what it would deflate for them).
+# The edge (or, with --bind 127.0.0.1:8080 --profile proxy, the localhost proxy on an
+# agent VM: two arenas, a poll every 15 s, rebuilt objects sent as they are).
 gvfs-cache serve --store azure:gvfs/searchgold --bind 0.0.0.0:8080 \
     --upstream https://dev.azure.com/org/proj/_git/SearchGold --auth-command ~/get_token \
     --cache-dir /nvme/gvfs-cache
