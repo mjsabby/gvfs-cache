@@ -527,7 +527,8 @@ fn parse_sizes_json(body: &[u8]) -> BTreeMap<String, u64> {
 /// An edge of a separate-blob store: unready until the mirror is done (blobs it is asked
 /// for meanwhile come through the proxy), then every blob of the history from the store
 /// as loose objects, packs and sizes; a push's blobs through the proxy until the pipeline
-/// seals them.
+/// seals them. The proxy's cache keeps `--proxy-cache-packs` packs, and none whose blobs
+/// have reached the store.
 #[test]
 fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
     let root = tempdir("sep-edge");
@@ -562,20 +563,27 @@ fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
         "100",
         "--cache-dir",
         cache.to_str().unwrap(),
+        "--proxy-cache-packs",
+        "1",
     ]);
     let (status, _, body) = server.get("/healthz");
     assert_eq!(status, 503);
     assert!(String::from_utf8_lossy(&body).contains("blobs incomplete"));
 
-    // Before the mirror, blobs come through the proxy (not a fault: not complete yet).
+    // Before the mirror, blobs come through the proxy (not a fault: not complete yet),
+    // each fetch a pack in its cache.
+    let proxied_packs = || std::fs::read_dir(cache.join("proxy")).unwrap().count();
     let text2 = rev(&up.bare, &format!("{g}:a/text.txt"));
     let (status, ct, _) = server.get(&format!("/gvfs/objects/{text2}"));
     assert_eq!((status, ct.as_str()), (200, CT_LOOSE));
     assert_eq!(server.metric("gvfs_blobs_proxied_total"), 1);
     assert_eq!(server.metric("gvfs_blobs_missing_total"), 0);
+    assert_eq!(proxied_packs(), 1);
 
     mirror(&root, &store, &up, &[]).unwrap();
     server.wait_for("complete", |s| s.get("/healthz").0 == 200);
+    // The store has that blob now: the proxy lets go of its pack.
+    server.wait_for("the proxied pack to go", |_| proxied_packs() == 0);
 
     // Every blob of history as a loose object, from the store. git re-hashes each one.
     let history = git_blobs(&up.bare, &["--all"]);
@@ -734,9 +742,14 @@ fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
         s.get(&format!("/gvfs/objects/{t}")).0 == 200
     });
     let new_id = rev(&up.bare, &format!("{t}:n/new.txt"));
+    let text4 = rev(&up.bare, &format!("{t}:a/text.txt"));
     let proxied = server.metric("gvfs_blobs_proxied_total");
     assert_eq!(server.get(&format!("/gvfs/objects/{new_id}")).0, 200);
     assert_eq!(server.metric("gvfs_blobs_proxied_total"), proxied + 1);
+    // The proxy's cache is bounded in packs (here: one): the newest fetch stays.
+    assert_eq!(server.get(&format!("/gvfs/objects/{text4}")).0, 200);
+    assert_eq!(server.metric("gvfs_blobs_proxied_total"), proxied + 2);
+    assert_eq!(proxied_packs(), 1);
     let (_, _, warm) = server.get_with(
         &format!("/gvfs/prefetch?lastPackTimestamp={cold_ts}"),
         &[agent, ("X-GVFS-Sizes", "1")],
@@ -771,12 +784,13 @@ fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
     assert_eq!(server.get(&format!("/gvfs/objects/{unnamed}")).0, 404);
     assert_eq!(sizes(&[new_id.clone(), unnamed]).0, 404);
 
-    // The pipeline seals it, blobs first; the edge then serves those blobs from the store.
+    // The pipeline seals it, blobs first; the edge then serves those blobs from the store,
+    // and the proxy keeps none of them.
     pipeline(&root, &store, &up, "15m", &[]);
     server.wait_for("the sealed window", |s| {
         s.metric("gvfs_manifest_generation") >= 2
     });
-    let text4 = rev(&up.bare, &format!("{t}:a/text.txt"));
+    server.wait_for("the proxied pack to go", |_| proxied_packs() == 0);
     let (stored, proxied) = (
         server.metric("gvfs_blobs_from_store_total"),
         server.metric("gvfs_blobs_proxied_total"),
