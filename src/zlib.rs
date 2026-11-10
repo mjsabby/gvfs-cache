@@ -207,6 +207,68 @@ pub fn adler32(data: &[u8]) -> u32 {
     zlib_rs::adler32::adler32(1, data)
 }
 
+/// The most bytes of a deflate stored block.
+const STORED_MAX: usize = 65_535;
+
+/// The length of the zlib stream [`stored_parts`] makes of `n` bytes: the header, a
+/// five-byte head per block of up to 65,535 bytes (one even for nothing), the bytes, and
+/// the Adler-32.
+pub fn stored_len(n: usize) -> usize {
+    let blocks = n.div_ceil(STORED_MAX).max(1);
+    n.saturating_add(blocks.saturating_mul(5)).saturating_add(6)
+}
+
+/// The concatenation of `parts` as one zlib stream of stored blocks (nothing is
+/// compressed) into `out`, sized with [`stored_len`]. Returns the stream's length. Any
+/// inflater reads it. Written here, not by zlib at level 0, which clears its 128 KB hash
+/// table for every stream whatever the level: 2.1 µs an object, where this is a copy.
+pub fn stored_parts(parts: &[&[u8]], out: &mut [u8]) -> Result<usize, ZError> {
+    let total = parts
+        .iter()
+        .fold(0usize, |n, part| n.saturating_add(part.len()));
+    let mut at = 0usize;
+    let mut put = |bytes: &[u8]| -> Result<(), ZError> {
+        let end = at.checked_add(bytes.len()).ok_or(ZError::NoRoom)?;
+        out.get_mut(at..end)
+            .ok_or(ZError::NoRoom)?
+            .copy_from_slice(bytes);
+        at = end;
+        Ok(())
+    };
+    put(&[0x78, 0x01])?;
+    let mut adler = 1u32;
+    let mut left = total;
+    // What the blocks have not taken yet: of the current part, then the parts after it.
+    let mut rest = parts.iter();
+    let mut part: &[u8] = &[];
+    loop {
+        let len = left.min(STORED_MAX);
+        left = left.saturating_sub(len);
+        // BFINAL and BTYPE 00 (stored) in a byte of their own, then LEN and its complement.
+        let len16 = u16::try_from(len).map_err(|_| ZError::Corrupt)?;
+        let [l0, l1] = len16.to_le_bytes();
+        let [n0, n1] = (!len16).to_le_bytes();
+        put(&[u8::from(left == 0), l0, l1, n0, n1])?;
+        let mut need = len;
+        while need > 0 {
+            if part.is_empty() {
+                part = rest.next().ok_or(ZError::Corrupt)?;
+                continue;
+            }
+            let (now, later) = part.split_at(need.min(part.len()));
+            put(now)?;
+            adler = zlib_rs::adler32::adler32(adler, now);
+            need = need.saturating_sub(now.len());
+            part = later;
+        }
+        if left == 0 {
+            break;
+        }
+    }
+    put(&adler.to_be_bytes())?;
+    Ok(at)
+}
+
 /// zlib header (`0x78 0x01`) + stored-block header (5 bytes) + `"<type> <size>\0"`.
 pub const LOOSE_PREFIX_MAX: usize = 2 + 5 + 32;
 
@@ -364,6 +426,58 @@ mod tests {
         let mut back = vec![0u8; a.len() + b.len()];
         inf.inflate_exact(&out[..n], &mut back).unwrap();
         assert_eq!(back, [&a[..], &b[..]].concat());
+    }
+
+    /// A stream of stored blocks inflates to its parts, of whatever lengths (nothing, a
+    /// block exactly, blocks and a rest, parts that end inside a block), has the length
+    /// foretold, and does not fit a byte less.
+    #[test]
+    fn stored_parts_inflate_to_their_parts() {
+        let bytes: Vec<u8> = (0..200_000u32).map(|i| (i * 7 % 253) as u8).collect();
+        let mut inf = Inflater::new();
+        for (head, body) in [
+            (0, 0),
+            (8, 0),
+            (0, 1),
+            (11, 5_800),
+            (10, 65_525),
+            (10, 65_526),
+            (12, 65_535),
+            (9, 131_061),
+            (9, 131_062),
+            (70_000, 130_000),
+        ] {
+            let (a, b) = (&bytes[..head], &bytes[head..head + body]);
+            let n = head + body;
+            let mut out = vec![0xEEu8; stored_len(n)];
+            assert_eq!(stored_parts(&[a, b], &mut out), Ok(stored_len(n)), "{n}");
+            let mut back = vec![0u8; n];
+            assert_eq!(inf.inflate_exact(&out, &mut back), Ok(out.len()), "{n}");
+            assert_eq!(back, bytes[..n]);
+            assert_eq!(out[out.len() - 4..], adler32(&bytes[..n]).to_be_bytes());
+            // The same bytes in one part, in three, and with empty parts between.
+            let mut again = vec![0u8; stored_len(n)];
+            stored_parts(&[&bytes[..n]], &mut again).unwrap();
+            assert_eq!(again, out);
+            let third = n / 3;
+            let parts: [&[u8]; 5] = [
+                &bytes[..third],
+                &[],
+                &bytes[third..2 * third],
+                &[],
+                &bytes[2 * third..n],
+            ];
+            stored_parts(&parts, &mut again).unwrap();
+            assert_eq!(again, out);
+            let short = out.len() - 1;
+            assert_eq!(
+                stored_parts(&[a, b], &mut out[..short]),
+                Err(ZError::NoRoom)
+            );
+        }
+        let mut out = [0u8; 16];
+        assert_eq!(stored_parts(&[], &mut out), Ok(11));
+        assert_eq!(inf.inflate_exact(&out[..11], &mut []), Ok(11));
     }
 
     #[test]

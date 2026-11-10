@@ -1818,6 +1818,91 @@ fn force_main(up: &Upstream, oid: &str) {
     git(&up.bare, &["update-ref", "refs/heads/main", oid]);
 }
 
+/// `--loose-deltas`: an object the store keeps as a delta is sent loose deflated again,
+/// or as it is, in stored blocks: all of them (`stored`) or the trees (`stored-trees`).
+/// Either way git reads the object, and an object stored whole is sent as before.
+#[test]
+fn objects_rebuilt_from_deltas_are_sent_stored_when_asked() {
+    let root = tempdir("loose-deltas");
+    let mut up = Upstream::new(&root);
+    for _ in 0..4 {
+        up.commit(6);
+    }
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    pipeline(&root, &store, &up, "15m", &[]);
+    for _ in 0..4 {
+        up.commit(6);
+    }
+    pipeline(&root, &store, &up, "15m", &[]);
+    let all = up.objects(&up.tip());
+    let kinds: std::collections::HashMap<String, String> =
+        types(&up.bare, &all).into_iter().collect();
+
+    let serve = |policy: &str| {
+        let cache = root.join(format!("cache-{policy}"));
+        Server::start(&[
+            "--store",
+            &store,
+            "--cache-dir",
+            cache.to_str().unwrap(),
+            "--loose-deltas",
+            policy,
+        ])
+    };
+    let servers = [serve("deflate"), serve("stored-trees"), serve("stored")];
+    let repos: Vec<_> = ["deflate", "stored-trees", "stored"]
+        .iter()
+        .map(|name| fresh_repo(&root, name))
+        .collect();
+    // Deltified objects sent stored, by kind.
+    let mut stored: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for oid in &all {
+        let answers: Vec<Vec<u8>> = servers
+            .iter()
+            .zip(&repos)
+            .map(|(server, repo)| {
+                let (status, ct, body) = server.get(&format!("/gvfs/objects/{oid}"));
+                assert_eq!((status, ct.as_str()), (200, CT_LOOSE), "{oid}");
+                let dir = repo.join("objects").join(&oid[..2]);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join(&oid[2..]), &body).unwrap();
+                body
+            })
+            .collect();
+        let [deflated, trees, everything] = <[Vec<u8>; 3]>::try_from(answers).unwrap();
+        let (deflated, trees, everything) = (&deflated, &trees, &everything);
+        let kind = kinds[oid].as_str();
+        if deflated == everything {
+            // Stored whole in its slab: spliced, whatever the flag.
+            assert_eq!(trees, deflated, "{oid}");
+            continue;
+        }
+        // Rebuilt from a delta: `stored` sends the object's bytes in stored blocks.
+        let content = git_stdin(&up.bare, &["cat-file", kind, oid], b"");
+        let head = format!("{kind} {}\0", content.len());
+        let mut expect = vec![0u8; gvfs_cache::zlib::stored_len(head.len() + content.len())];
+        gvfs_cache::zlib::stored_parts(&[head.as_bytes(), &content], &mut expect).unwrap();
+        assert!(*everything == expect, "{oid}");
+        assert!(
+            trees == if kind == "tree" { everything } else { deflated },
+            "{kind} {oid}"
+        );
+        *stored.entry(kind).or_default() += 1;
+    }
+    assert!(stored.get("tree").copied().unwrap_or(0) > 0, "{stored:?}");
+    assert!(stored.get("blob").copied().unwrap_or(0) > 0, "{stored:?}");
+    for repo in &repos {
+        git(repo, &["fsck", "--strict", "--no-dangling"]);
+        assert_eq!(cat_batch(repo, &all), cat_batch(&up.bare, &all));
+    }
+    for server in &servers {
+        server.assert_clean();
+    }
+    drop(servers);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A commit dated ten years ahead (a machine with a wrong clock) puts the newest stamp
 /// ten years past every slab kept for warm clients. They stay all the same: a client at
 /// one of their boundaries is still answered from exactly there. (The run that sealed the

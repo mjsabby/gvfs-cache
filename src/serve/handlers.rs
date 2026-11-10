@@ -902,12 +902,23 @@ async fn loose(
         ..
     } = arena;
     // A large object's chain takes milliseconds to resolve and deflate: off the worker.
+    let policy = ctx.loose_deltas;
     let mut work = || -> Result<usize, &'static str> {
         let (kind, content) = resolver
             .resolve(slab, slot)
             .map_err(|_| "object unreadable\n")?;
         let hdr = ObjectHeader::new(kind, u64_of(content.len()));
-        let bound = crate::zlib::compress_bound(content.len().saturating_add(hdr.as_slice().len()));
+        let len = content.len().saturating_add(hdr.as_slice().len());
+        let stored = match policy {
+            super::LooseDeltas::Deflate => false,
+            super::LooseDeltas::StoredTrees => kind == OBJ_TREE,
+            super::LooseDeltas::Stored => true,
+        };
+        let bound = if stored {
+            crate::zlib::stored_len(len)
+        } else {
+            crate::zlib::compress_bound(len)
+        };
         if buf.capacity() < bound {
             // A larger object than any before: grow the arena once (cold path).
             let _cold = gvfs_alloc_guard::cold_section();
@@ -915,9 +926,14 @@ async fn loose(
         }
         buf.clear();
         buf.resize(bound, 0);
-        deflater
-            .deflate_parts(&[hdr.as_slice(), content], buf)
-            .map_err(|_| "compression failed\n")
+        let parts = [hdr.as_slice(), content];
+        if stored {
+            // `--loose-deltas`: the bytes as they are, in stored blocks.
+            crate::zlib::stored_parts(&parts, buf)
+        } else {
+            deflater.deflate_parts(&parts, buf)
+        }
+        .map_err(|_| "compression failed\n")
     };
     let made = if rec.size >= RESOLVE_INLINE_MAX {
         blocking(work)
