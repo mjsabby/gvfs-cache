@@ -484,9 +484,10 @@ fn azure_pipeline_and_serve() {
     server.wait_for("the weekly manifest", |s| {
         s.metric("gvfs_manifest_generation") == 4
     });
-    // The weekly run published the new baseline's tail on the old one beside it, and the
-    // edge, which had the old one, made the new pack of the two: it did not download it
-    // (every edge downloaded every weekly baseline whole).
+    // The weekly run published the new baseline's tail on the old one beside it: the
+    // week's entries and the trailer, and the 40 bytes its index has of each new object.
+    // The edge, which had the old one, made the new pack of the two, and its index: it
+    // downloaded neither (every edge downloaded every weekly baseline whole).
     let after = manifest_of(&backend);
     assert_ne!(after.baseline.id, before.baseline.id);
     let tail = backend
@@ -495,12 +496,15 @@ fn azure_pipeline_and_serve() {
         .unwrap()
         .unwrap()
         .0;
-    assert!(
-        (tail.len() as u64) < after.baseline.pack_len - before.baseline.pack_len + 200,
-        "a tail of {} bytes",
-        tail.len()
+    let week = after.baseline.pack_len - before.baseline.pack_len + 20;
+    let records = u64::from(after.baseline.objects - before.baseline.objects) * 40;
+    assert!(records > 0);
+    assert_eq!(
+        tail.len() as u64,
+        94 + before.baseline.id.len() as u64 + week + records
     );
     assert_eq!(server.metric("gvfs_baselines_grown_total"), 1);
+    assert_eq!(server.metric("gvfs_baseline_indexes_grown_total"), 1);
     let packs = server.prefetch(packs[0].0);
     assert_eq!(packs.len(), 1);
     install_pack(&client, &packs[0].1);
@@ -1078,9 +1082,11 @@ fn an_edge_checks_its_slabs_against_the_manifest() {
 }
 
 /// An edge that has the baseline before it makes a weekly rebuild's baseline of that one
-/// and the tail the run published, also when it was not running at the time. What it
-/// makes of a tail that is not the baseline's is not served: it downloads the pack. An
-/// edge with nothing in its cache downloads it too.
+/// and the tail the run published, also when it was not running at the time: the pack,
+/// and its index of the old index and the records in the tail, which is the index in the
+/// store, byte for byte. Of a tail whose records are not the index's it makes the pack
+/// and downloads the index. What it makes of a tail that is not the baseline's is not
+/// served: it downloads the pack. An edge with nothing in its cache downloads it too.
 #[test]
 fn an_edge_makes_a_new_baseline_of_the_one_it_has() {
     let Some(backend) = Backend::new("tail") else {
@@ -1127,45 +1133,84 @@ fn an_edge_makes_a_new_baseline_of_the_one_it_has() {
         assert_complete(&repo, tip);
         server.assert_clean();
     };
+    let grown = |server: &Server| {
+        (
+            server.metric("gvfs_baselines_grown_total"),
+            server.metric("gvfs_baseline_indexes_grown_total"),
+        )
+    };
 
-    // Two edges with the first baseline in their caches, not running during the rebuild.
-    let (cache_a, cache_b) = (root.join("cache-a"), root.join("cache-b"));
-    drop((edge(&cache_a), edge(&cache_b)));
+    // Three edges with the first baseline in their caches, not running during the rebuild.
+    let caches = [
+        root.join("cache-a"),
+        root.join("cache-b"),
+        root.join("cache-d"),
+    ];
+    let [cache_a, cache_b, cache_d] = &caches;
+    drop(caches.iter().map(|c| edge(c)).collect::<Vec<_>>());
     let first = baseline();
     let tip = up.commit(5);
     let log = run("168h", t0 + 900);
     assert!(log.contains("and a tail of"), "{log}");
     let second = baseline();
     assert_ne!(second.id, first.id);
+    let s = backend.store("");
+    let index = s.get(&second.index_key()).unwrap().unwrap().0;
+    let index_at = |cache: &std::path::Path| cache.join(format!("{}.mphf", second.id));
 
-    // The first makes the new pack of the old one and the tail.
-    let a = edge(&cache_a);
-    assert_eq!(a.metric("gvfs_baselines_grown_total"), 1);
+    // The first makes the new pack of the old one and the tail, and the new index.
+    let a = edge(cache_a);
+    assert_eq!(grown(&a), (1, 1));
     served(&a, "from-a", &tip);
     let made = std::fs::read(cache_a.join(format!("{}.pack", second.id))).unwrap();
     assert_eq!(made.len() as u64, second.pack_len);
+    assert!(
+        std::fs::read(index_at(cache_a)).unwrap() == index,
+        "the index made is not the store's"
+    );
     assert!(!cache_a.join(format!("{}.tail", second.id)).exists());
     drop(a);
 
-    // The second finds a tail that makes another pack (a byte of it changed): it serves
-    // the store's.
-    let s = backend.store("");
-    let mut tail = s.get(&second.tail_key()).unwrap().unwrap().0;
-    let last = tail.len() - 30;
+    // The tail ends with the index's records of the week's objects, 40 bytes each,
+    // after the pack's last bytes.
+    let whole = s.get(&second.tail_key()).unwrap().unwrap().0;
+    let records = (second.objects - first.objects) as usize * 40;
+    assert!(records > 0 && records < whole.len());
+    let put = |tail: &[u8]| {
+        let changed = root.join("changed.tail");
+        std::fs::write(&changed, tail).unwrap();
+        s.delete(&second.tail_key()).unwrap();
+        s.upload_file(&second.tail_key(), &changed).unwrap();
+    };
+
+    // An edge that finds a record changed (a byte of a size) makes the pack, and
+    // downloads the index.
+    let mut tail = whole.clone();
+    let last = tail.len() - 7;
     tail[last] ^= 1;
-    let changed = root.join("changed.tail");
-    std::fs::write(&changed, &tail).unwrap();
-    s.delete(&second.tail_key()).unwrap();
-    s.upload_file(&second.tail_key(), &changed).unwrap();
-    let b = edge(&cache_b);
-    assert_eq!(b.metric("gvfs_baselines_grown_total"), 0);
+    put(&tail);
+    let d = edge(cache_d);
+    assert_eq!(grown(&d), (1, 0));
+    served(&d, "from-d", &tip);
+    assert!(std::fs::read(index_at(cache_d)).unwrap() == index);
+    drop(d);
+
+    // One that finds a tail that makes another pack (a byte of it changed) serves the
+    // store's.
+    let mut tail = whole.clone();
+    let last = tail.len() - records - 30;
+    tail[last] ^= 1;
+    put(&tail);
+    let b = edge(cache_b);
+    assert_eq!(grown(&b), (0, 0));
     served(&b, "from-b", &tip);
     assert!(std::fs::read(cache_b.join(format!("{}.pack", second.id))).unwrap() == made);
+    assert!(std::fs::read(index_at(cache_b)).unwrap() == index);
     drop(b);
 
     // An edge that never had the first baseline downloads the second.
     let c = edge(&root.join("cache-c"));
-    assert_eq!(c.metric("gvfs_baselines_grown_total"), 0);
+    assert_eq!(grown(&c), (0, 0));
     served(&c, "from-c", &tip);
     drop(c);
     drop(backend);

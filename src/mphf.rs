@@ -120,17 +120,31 @@ const DERIVED_SEEDS: u32 = 8;
 /// fixed seeds have all failed, the seed is a digest of the ids, which cannot be aimed
 /// at: changing an id to suit a seed changes the seed.
 pub fn build(oids: &[Oid], threads: usize) -> Result<Built> {
+    build_from(
+        oids.len(),
+        |i| oids.get(i).copied().unwrap_or(Oid::ZERO),
+        threads,
+    )
+}
+
+/// [`build`] for ids that are not in one slice: `key(i)` is the `i`th of the `n`. Under
+/// a fixed seed the table (its seed, offsets and pilots, and so every id's slot) is a
+/// function of the set of ids; under a derived one, of their order too.
+///
+/// Memory: 8 bytes an id while it builds (which ids each partition has, and where each
+/// landed), then the 4 of its slot too. The ids are hashed where they are, as each is
+/// needed. (Three hash words were kept for each first: 24 bytes more.)
+pub fn build_from(n: usize, key: impl Fn(usize) -> Oid + Sync, threads: usize) -> Result<Built> {
     let mut seed = DEFAULT_SEED;
     for attempt in 0..FIXED_SEEDS.saturating_add(DERIVED_SEEDS) {
         if attempt == FIXED_SEEDS {
             crate::log!(
-                "mphf: no fixed seed places these {} ids (made to collide?); \
-                 deriving the seed from them",
-                oids.len()
+                "mphf: no fixed seed places these {n} ids (made to collide?); \
+                 deriving the seed from them"
             );
-            seed = derived_seed(oids);
+            seed = derived_seed((0..n).map(&key));
         }
-        match try_build(oids, seed, threads.max(1))? {
+        match try_build(n, &key, seed, threads.max(1))? {
             Outcome::Built(b) => return Ok(b),
             Outcome::Duplicate => {
                 return Err(crate::util::Error::with_kind(
@@ -145,7 +159,7 @@ pub fn build(oids: &[Oid], threads: usize) -> Result<Built> {
 }
 
 /// A seed that depends on every key: the first 8 bytes of the SHA-1 of the ids in order.
-fn derived_seed(oids: &[Oid]) -> u64 {
+fn derived_seed(oids: impl Iterator<Item = Oid>) -> u64 {
     use sha1::{Digest, Sha1};
     let mut h = Sha1::new();
     for oid in oids {
@@ -200,8 +214,13 @@ impl PartScratch {
     }
 }
 
-fn try_build(oids: &[Oid], seed: u64, threads: usize) -> Result<Outcome> {
-    let n = crate::util::u64_of(oids.len());
+fn try_build(
+    keys: usize,
+    key: &(impl Fn(usize) -> Oid + Sync),
+    seed: u64,
+    threads: usize,
+) -> Result<Outcome> {
+    let n = crate::util::u64_of(keys);
     if n > u64::from(u32::MAX) {
         crate::bail!("too many objects for one slab index: {n}");
     }
@@ -209,16 +228,14 @@ fn try_build(oids: &[Oid], seed: u64, threads: usize) -> Result<Outcome> {
     let buckets = buckets_per_part(n, parts);
     let parts_us = crate::util::us(parts);
     let buckets_us = crate::util::us(buckets);
+    let part_of = |i: usize| crate::util::us(mul_hi(key_hash(&key(i), seed).part, parts));
 
-    // 1. Hash every key once; count keys per partition.
-    let mut hashes: Vec<KeyHash> = Vec::with_capacity(oids.len());
+    // 1. Count keys per partition.
     let mut counts = vec![0u32; parts_us];
-    for oid in oids {
-        let h = key_hash(oid, seed);
-        if let Some(c) = counts.get_mut(crate::util::us(mul_hi(h.part, parts))) {
+    for i in 0..keys {
+        if let Some(c) = counts.get_mut(part_of(i)) {
             *c = c.wrapping_add(1);
         }
-        hashes.push(h);
     }
     let mut offsets = Vec::with_capacity(parts_us.saturating_add(1));
     let mut acc = 0u32;
@@ -230,10 +247,9 @@ fn try_build(oids: &[Oid], seed: u64, threads: usize) -> Result<Outcome> {
 
     // 2. Group key indices by partition (stable counting sort).
     let mut cursor: Vec<u32> = offsets.iter().take(parts_us).copied().collect();
-    let mut grouped = vec![0u32; oids.len()];
-    for (i, h) in hashes.iter().enumerate() {
-        let p = crate::util::us(mul_hi(h.part, parts));
-        if let Some(c) = cursor.get_mut(p) {
+    let mut grouped = vec![0u32; keys];
+    for i in 0..keys {
+        if let Some(c) = cursor.get_mut(part_of(i)) {
             if let Some(g) = grouped.get_mut(crate::util::us(u64::from(*c))) {
                 *g = crate::util::u32_of(i);
             }
@@ -244,7 +260,7 @@ fn try_build(oids: &[Oid], seed: u64, threads: usize) -> Result<Outcome> {
     // 3. Build partitions in parallel: each thread owns a contiguous run of partitions,
     //    their pilot rows and their grouped-key positions.
     let mut pilots = vec![0u16; parts_us.saturating_mul(buckets_us)];
-    let mut local_pos = vec![0u32; oids.len()];
+    let mut local_pos = vec![0u32; keys];
     let threads = threads.min(parts_us).max(1);
     let per_thread = parts_us.div_ceil(threads);
     let failed = std::sync::atomic::AtomicBool::new(false);
@@ -266,8 +282,7 @@ fn try_build(oids: &[Oid], seed: u64, threads: usize) -> Result<Outcome> {
                 pos_rest.split_at_mut(key_hi.saturating_sub(key_lo).min(pos_rest.len()));
             pilot_rest = pilot_tail;
             pos_rest = pos_tail;
-            let (offsets, grouped, hashes, failed, duplicate) =
-                (&offsets, &grouped, &hashes, &failed, &duplicate);
+            let (offsets, grouped, failed, duplicate) = (&offsets, &grouped, &failed, &duplicate);
             s.spawn(move || {
                 let mut scratch = PartScratch::new();
                 for p in first..last {
@@ -275,11 +290,9 @@ fn try_build(oids: &[Oid], seed: u64, threads: usize) -> Result<Outcome> {
                     let hi = offsets.get(p.wrapping_add(1)).copied().unwrap_or(0) as usize;
                     let members = grouped.get(lo..hi).unwrap_or(&[]);
                     scratch.keys.clear();
-                    scratch.keys.extend(
-                        members
-                            .iter()
-                            .map(|&i| hashes.get(i as usize).copied().unwrap_or_default()),
-                    );
+                    scratch
+                        .keys
+                        .extend(members.iter().map(|&i| key_hash(&key(i as usize), seed)));
                     let row_lo = p.wrapping_sub(first).saturating_mul(buckets_us);
                     let row = pilot_mine
                         .get_mut(row_lo..row_lo.saturating_add(buckets_us))
@@ -311,7 +324,7 @@ fn try_build(oids: &[Oid], seed: u64, threads: usize) -> Result<Outcome> {
     }
 
     // 4. Slot of every key: partition base + local position.
-    let mut slots = vec![0u32; oids.len()];
+    let mut slots = vec![0u32; keys];
     for p in 0..parts_us {
         let lo = offsets.get(p).copied().unwrap_or(0);
         let hi = offsets.get(p.wrapping_add(1)).copied().unwrap_or(0);
@@ -602,6 +615,24 @@ mod tests {
         assert_eq!((a.seed, &a.pilots, &a.slots), (b.seed, &b.pilots, &b.slots));
     }
 
+    /// Under a fixed seed the table is a function of the set of ids. Given in another
+    /// order (as an index made of another gives them: the old index's in slot order,
+    /// then the new ones), the same seed, offsets and pilots come out, and each id has
+    /// the slot it had.
+    #[test]
+    fn the_order_of_the_ids_does_not_change_the_table() {
+        let oids = random_oids(50_000, 21);
+        let a = build(&oids, 3).unwrap();
+        let order: Vec<usize> = (20_000..50_000).rev().chain(0..20_000).collect();
+        let b = build_from(oids.len(), |i| oids[order[i]], 2).unwrap();
+        assert_eq!((a.seed, a.parts, a.buckets), (b.seed, b.parts, b.buckets));
+        assert_eq!(a.seed, DEFAULT_SEED);
+        assert!(a.offsets == b.offsets && a.pilots == b.pilots);
+        for (i, &was) in order.iter().enumerate() {
+            assert_eq!(b.slots[i], a.slots[was]);
+        }
+    }
+
     /// The inverse of `fmix64`.
     fn unmix64(mut k: u64) -> u64 {
         // The inverse of an odd number modulo 2^64, by Newton's iteration.
@@ -641,11 +672,12 @@ mod tests {
                 assert_eq!((h.part, h.bucket), (part, bucket));
                 oids.push(Oid(id));
             }
-            assert!(matches!(try_build(&oids, seed, 4), Ok(Outcome::Retry)));
+            let tried = try_build(oids.len(), &|i: usize| oids[i], seed, 4);
+            assert!(matches!(tried, Ok(Outcome::Retry)));
             seed = seed.wrapping_add(PHI);
         }
         let b = build(&oids, 4).unwrap();
-        assert_eq!(b.seed, derived_seed(&oids));
+        assert_eq!(b.seed, derived_seed(oids.iter().copied()));
         let mut seen = vec![false; oids.len()];
         for &s in &b.slots {
             assert!(!std::mem::replace(&mut seen[s as usize], true));
