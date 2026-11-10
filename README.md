@@ -243,7 +243,9 @@ Two more tools work on slabs directly:
   have grown into for commit expansions (`gvfs_grown_objects`, within `--grow-objects`);
 * **separate-blob stores:** blobs served from the store, proxied, missing (should stay 0)
   and unavailable; the `blobs.bin` generation, and whether it is complete
-  (`gvfs_blobs_complete`);
+  (`gvfs_blobs_complete`); what the proxy keeps of its fetches from the upstream
+  (`gvfs_proxy_cache_{packs,files,bytes}`: small ones in memory, larger ones as files,
+  within `--proxy-cache-mib` and `--proxy-cache-packs`);
 * **blob packs in object storage:** the edge's block cache
   (`gvfs_blob_cache_{hits,misses,fetches,bypass}_total`, `gvfs_blob_cache_bytes`); size it
   with `--blob-cache-mib` (default 32 GiB).

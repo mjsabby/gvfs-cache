@@ -527,8 +527,8 @@ fn parse_sizes_json(body: &[u8]) -> BTreeMap<String, u64> {
 /// An edge of a separate-blob store: unready until the mirror is done (blobs it is asked
 /// for meanwhile come through the proxy), then every blob of the history from the store
 /// as loose objects, packs and sizes; a push's blobs through the proxy until the pipeline
-/// seals them. The proxy's cache keeps `--proxy-cache-packs` packs, and none whose blobs
-/// have reached the store.
+/// seals them. The proxy's cache keeps small packs in memory and `--proxy-cache-packs`
+/// larger ones as files, and none whose blobs have reached the store.
 #[test]
 fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
     let root = tempdir("sep-edge");
@@ -571,14 +571,15 @@ fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
     assert!(String::from_utf8_lossy(&body).contains("blobs incomplete"));
 
     // Before the mirror, blobs come through the proxy (not a fault: not complete yet),
-    // each fetch a pack in its cache.
-    let proxied_packs = || std::fs::read_dir(cache.join("proxy")).unwrap().count();
+    // each fetch a pack in its cache: this one small, so in memory.
+    let proxied_packs = || server.metric("gvfs_proxy_cache_packs");
+    let proxied_files = || std::fs::read_dir(cache.join("proxy")).unwrap().count();
     let text2 = rev(&up.bare, &format!("{g}:a/text.txt"));
     let (status, ct, _) = server.get(&format!("/gvfs/objects/{text2}"));
     assert_eq!((status, ct.as_str()), (200, CT_LOOSE));
     assert_eq!(server.metric("gvfs_blobs_proxied_total"), 1);
     assert_eq!(server.metric("gvfs_blobs_missing_total"), 0);
-    assert_eq!(proxied_packs(), 1);
+    assert_eq!((proxied_packs(), proxied_files()), (1, 0));
 
     mirror(&root, &store, &up, &[]).unwrap();
     server.wait_for("complete", |s| s.get("/healthz").0 == 200);
@@ -736,6 +737,8 @@ fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
         &[
             ("n/new.txt", Some(b"brand new\n".to_vec())),
             ("a/text.txt", Some(text(4))),
+            ("n/big1.bin", Some(noise(24 << 10, 41))),
+            ("n/big2.bin", Some(noise(24 << 10, 42))),
         ],
     );
     server.wait_for("the push in L0", |s| {
@@ -746,10 +749,17 @@ fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
     let proxied = server.metric("gvfs_blobs_proxied_total");
     assert_eq!(server.get(&format!("/gvfs/objects/{new_id}")).0, 200);
     assert_eq!(server.metric("gvfs_blobs_proxied_total"), proxied + 1);
-    // The proxy's cache is bounded in packs (here: one): the newest fetch stays.
     assert_eq!(server.get(&format!("/gvfs/objects/{text4}")).0, 200);
     assert_eq!(server.metric("gvfs_blobs_proxied_total"), proxied + 2);
-    assert_eq!(proxied_packs(), 1);
+    // Both are small packs, kept in memory. A larger one is a file, and those are bounded
+    // in number (here: one): the newest fetch stays.
+    assert_eq!((proxied_packs(), proxied_files()), (2, 0));
+    for big in ["n/big1.bin", "n/big2.bin"] {
+        let id = rev(&up.bare, &format!("{t}:{big}"));
+        assert_eq!(server.get(&format!("/gvfs/objects/{id}")).0, 200);
+    }
+    assert_eq!((proxied_packs(), proxied_files()), (3, 1));
+    assert_eq!(server.metric("gvfs_proxy_cache_files"), 1);
     let (_, _, warm) = server.get_with(
         &format!("/gvfs/prefetch?lastPackTimestamp={cold_ts}"),
         &[agent, ("X-GVFS-Sizes", "1")],
@@ -791,6 +801,7 @@ fn edge_serves_blobs_from_the_store_and_l0_through_the_proxy() {
         s.metric("gvfs_manifest_generation") >= 2
     });
     server.wait_for("the proxied pack to go", |_| proxied_packs() == 0);
+    assert_eq!(proxied_files(), 0);
     let (stored, proxied) = (
         server.metric("gvfs_blobs_from_store_total"),
         server.metric("gvfs_blobs_proxied_total"),

@@ -94,11 +94,14 @@ impl FileSpool {
 
     /// Flushes and syncs the file.
     pub fn close(self) -> Result<()> {
-        let file = self
-            .w
+        self.end()?.sync_all().ctx("syncing blob pack")
+    }
+
+    /// Flushes the file without syncing it (a cache's file, which a crash may lose).
+    pub fn end(self) -> Result<std::fs::File> {
+        self.w
             .into_inner()
-            .map_err(|e| crate::err!("writing blob pack: {e}"))?;
-        file.sync_all().ctx("syncing blob pack")
+            .map_err(|e| crate::err!("writing blob pack: {e}"))
     }
 }
 
