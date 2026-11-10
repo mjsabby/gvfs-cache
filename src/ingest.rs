@@ -12,8 +12,10 @@
 //! wastes that worker's time.
 //!
 //! **Pass 2 (resolve).** Deltas form families rooted at whole objects. Workers take
-//! families from a shared counter and walk each depth-first, keeping one content buffer
-//! per depth: inflate the delta, apply it to the parent's content, hash the result.
+//! families from a shared counter and walk each depth-first: inflate the delta, apply it
+//! to the parent's content, hash the result. A worker holds an object's content only
+//! while the object has deltas left to resolve, so a chain of any depth needs two
+//! buffers, and it frees what a family of large objects needed when the family is done.
 //!
 //! The output is one [`Facts`] per entry, in pack order, for [`crate::slab::build_index`].
 
@@ -37,6 +39,11 @@ const MIN_CHUNK: usize = 2 << 20;
 const STREAM_CHUNK: usize = 64 << 10;
 /// Fewest entries given to one thread when pass 2 lists its roots (about 7 ms of lookups).
 const ROOTS_MIN_CHUNK: usize = 1 << 14;
+/// Most content a pass-2 worker keeps from one delta family to the next, in bytes and in
+/// buffers: what a family of larger objects needed, or one with more objects waiting for
+/// their deltas, is freed when the family is done.
+const SCRATCH_KEEP: usize = 4 << 20;
+const SCRATCH_BUFFERS: usize = 64;
 
 /// Pass-1 facts about one entry, in pack order.
 #[derive(Clone, Copy, Default)]
@@ -195,11 +202,13 @@ struct Resolved {
     base: u32,
 }
 
-/// Per-worker resolve state: one content buffer per chain depth.
+/// Per-worker resolve state: content buffers for the objects of the walk that still have
+/// deltas to resolve.
 struct ResolveScratch {
     inflater: Inflater,
     delta: Vec<u8>,
-    /// Content of the object at each depth of the current walk (`lens` bytes are valid).
+    /// `levels[k]` is the content of the object of `stack[k]` (`lens[k]` bytes are valid);
+    /// the buffer after the last frame's takes the next result.
     levels: Vec<Vec<u8>>,
     lens: Vec<usize>,
     stack: Vec<Frame>,
@@ -216,6 +225,27 @@ impl ResolveScratch {
             stack: Vec::new(),
             out: Vec::new(),
         }
+    }
+
+    /// Frees the content buffers past the first `SCRATCH_KEEP` bytes of them, and past the
+    /// first `SCRATCH_BUFFERS`. What one family needed is then not kept for the rest of
+    /// the pack, or by an indexer that is used again (an edge's lives as long as the
+    /// edge), and there are never more than a few buffers to look at after a family.
+    fn release(&mut self) {
+        let mut held = self.delta.capacity();
+        if held > SCRATCH_KEEP {
+            self.delta = Vec::new();
+        }
+        let mut keep = 0usize;
+        for buf in self.levels.iter().take(SCRATCH_BUFFERS) {
+            held = held.saturating_add(buf.capacity());
+            if held > SCRATCH_KEEP {
+                break;
+            }
+            keep = keep.saturating_add(1);
+        }
+        self.levels.truncate(keep);
+        self.lens.truncate(keep);
     }
 }
 
@@ -602,7 +632,9 @@ impl Indexer {
                 if failed.load(Ordering::Relaxed) {
                     break;
                 }
-                if let Err(e) = resolve_family(&ctx, root, scratch) {
+                let done = resolve_family(&ctx, root, scratch);
+                scratch.release();
+                if let Err(e) = done {
                     failed.store(true, Ordering::Relaxed);
                     return Err(e);
                 }
@@ -759,7 +791,8 @@ fn hash_object(kind: u8, content: &[u8]) -> Oid {
     Oid(h.finalize().into())
 }
 
-/// One frame of the depth-first walk: a resolved object whose content is `levels[depth]`.
+/// One frame of the depth-first walk: a resolved object with deltas left to resolve. Its
+/// content is the level buffer of the frame's place in the stack.
 #[derive(Clone, Copy)]
 struct Frame {
     entry: u32,
@@ -803,7 +836,9 @@ fn resolve_family(ctx: &ResolveCtx<'_>, root: u32, s: &mut ResolveScratch) -> Re
         ref_lo,
         ref_hi,
     });
-    while let Some(top) = stack.last_mut() {
+    // `at` is the top frame's place in the stack: its content is `levels[at]`.
+    while let Some(at) = stack.len().checked_sub(1) {
+        let Some(top) = stack.get_mut(at) else { break };
         let ofs = ctx.ofs_kids(top.entry);
         let child = if let Some(&c) = ofs.get(top.ofs_next as usize) {
             top.ofs_next = top.ofs_next.wrapping_add(1);
@@ -820,6 +855,8 @@ fn resolve_family(ctx: &ResolveCtx<'_>, root: u32, s: &mut ResolveScratch) -> Re
             stack.pop();
             continue;
         };
+        // The parent's last delta: nothing reads the parent's content after it.
+        let last = top.ofs_next as usize >= ofs.len() && top.ref_lo >= top.ref_hi;
         let (parent, depth) = (top.entry, top.depth);
         let child_sc = ctx.scanned.get(child as usize).ctx("child out of range")?;
         if !is_delta(child_sc.kind) {
@@ -828,16 +865,15 @@ fn resolve_family(ctx: &ResolveCtx<'_>, root: u32, s: &mut ResolveScratch) -> Re
         let dlen = inflate_entry(ctx, child, inflater, delta)?;
         let delta_bytes = delta.get(..dlen).ctx("delta buffer")?;
         let (_, rsz, _) = delta_sizes(delta_bytes).ctx("bad delta header")?;
-        let d = depth as usize;
-        let next_level = d.checked_add(1).ctx("depth overflow")?;
+        let next_level = at.saturating_add(1);
         while levels.len() <= next_level {
             levels.push(Vec::new());
             lens.push(0);
         }
         let (lower, upper) = levels.split_at_mut(next_level);
-        let parent_len = lens.get(d).copied().unwrap_or(0);
+        let parent_len = lens.get(at).copied().unwrap_or(0);
         let parent_bytes = lower
-            .get(d)
+            .get(at)
             .and_then(|l| l.get(..parent_len))
             .ctx("missing level")?;
         let target = room(upper.first_mut().ctx("missing level")?, us(rsz));
@@ -857,13 +893,28 @@ fn resolve_family(ctx: &ResolveCtx<'_>, root: u32, s: &mut ResolveScratch) -> Re
         });
         let (ref_lo, ref_hi) = ctx.waiting_range(&oid);
         if !ctx.ofs_kids(child).is_empty() || ref_lo < ref_hi {
-            stack.push(Frame {
+            let frame = Frame {
                 entry: child,
                 depth: depth.saturating_add(1),
                 ofs_next: 0,
                 ref_lo,
                 ref_hi,
-            });
+            };
+            if last {
+                // The child takes its parent's place in the stack, and the parent's
+                // buffer takes the next result: a chain of any depth needs two buffers.
+                // One per depth cost a worker 0.2 GiB on SearchGold's baseline, whose
+                // trees run to 5.3 MB in chains 50 deep: 8.1 GiB at 32 threads, now 2.1.
+                if let (Some(p), Some(c)) = (lower.get_mut(at), upper.first_mut()) {
+                    std::mem::swap(p, c);
+                }
+                if let Some(l) = lens.get_mut(at) {
+                    *l = us(rsz);
+                }
+                *top = frame;
+            } else {
+                stack.push(frame);
+            }
         }
     }
     Ok(())
@@ -1473,6 +1524,231 @@ pub(crate) mod tests {
                 (f[0].to_string(), f[1].to_string(), f[2].parse().unwrap())
             })
             .collect()
+    }
+
+    /// One entry as `git verify-pack -v` lists it: offset, id, type, and for a delta its
+    /// chain depth (0 for a whole object) and its base's id.
+    type Entry = (u64, String, String, u32, String);
+
+    /// Every entry of `pack`, by offset, according to `git index-pack` and `verify-pack`.
+    fn git_entries(name: &str, pack: &[u8]) -> Vec<Entry> {
+        let dir = std::env::temp_dir().join(format!("gvfs-ingest-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x.pack"), pack).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        git(&["index-pack", "-o", "x.idx", "x.pack"]);
+        let mut entries: Vec<Entry> = git(&["verify-pack", "-v", "x.idx"])
+            .lines()
+            .map(|l| l.split_whitespace().collect::<Vec<&str>>())
+            .filter(|f| f.len() >= 5 && f[0].len() == 40)
+            .map(|f| {
+                (
+                    f[4].parse().unwrap(),
+                    f[0].to_string(),
+                    f[1].to_string(),
+                    f.get(5).map_or(0, |d| d.parse().unwrap()),
+                    f.get(6).map_or(String::new(), |b| b.to_string()),
+                )
+            })
+            .collect();
+        entries.sort();
+        let _ = std::fs::remove_dir_all(&dir);
+        entries
+    }
+
+    /// The indexer's facts as [`git_entries`] gives git's.
+    fn our_entries(facts: &[Facts]) -> Vec<Entry> {
+        let mut entries: Vec<Entry> = facts
+            .iter()
+            .map(|f| {
+                (
+                    f.offset,
+                    f.oid.to_string(),
+                    crate::pack::type_name(f.kind).to_string(),
+                    u32::from(f.depth),
+                    facts
+                        .get(f.base as usize)
+                        .map_or(String::new(), |b| b.oid.to_string()),
+                )
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// Bytes of content buffer a worker holds.
+    fn held(scratch: &ResolveScratch) -> Vec<usize> {
+        std::iter::once(&scratch.delta)
+            .chain(&scratch.levels)
+            .map(Vec::capacity)
+            .filter(|&c| c > 0)
+            .collect()
+    }
+
+    /// A chain of deltas is resolved in two buffers, whatever its depth: an object's
+    /// content is given up once its last delta is applied. With a buffer per depth, kept,
+    /// SearchGold's baseline (chains 50 deep, trees up to 5.3 MB) took 0.2 GiB per worker.
+    #[test]
+    fn a_delta_chain_is_resolved_in_two_buffers() {
+        // 300 versions of a 64 KiB blob, each a REF delta of the one before it.
+        let size = 64 << 10;
+        let mut blob: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let mut b = PackBuilder::new();
+        b.whole(OBJ_BLOB, &blob);
+        for version in 1..=300u32 {
+            let base = hash_object(OBJ_BLOB, &blob);
+            let mut d = Vec::new();
+            put_varint(&mut d, size as u64);
+            put_varint(&mut d, size as u64);
+            put_insert(&mut d, &version.to_le_bytes());
+            put_copy(&mut d, 4, size - 4);
+            blob[..4].copy_from_slice(&version.to_le_bytes());
+            b.ref_delta(&base, &d);
+        }
+        let pack = b.finish();
+        let mut ix = Indexer::new(1);
+        let facts = ix.index(&pack).unwrap().to_vec();
+        assert_eq!(facts[300].oid, hash_object(OBJ_BLOB, &blob));
+        // The index has eight bits of depth.
+        let mut git = git_entries("chain", &pack);
+        for e in &mut git {
+            e.3 = e.3.min(255);
+        }
+        assert_eq!(our_entries(&facts), git);
+        let kept = held(&ix.resolve[0]);
+        assert!(
+            kept.len() == 3 && kept.iter().sum::<usize>() < 3 * size,
+            "a delta and two versions are enough: {kept:?}"
+        );
+    }
+
+    /// What a family of large objects needed is freed when the family is done: a worker
+    /// keeps `SCRATCH_KEEP` bytes of buffers at most, and works as before with them.
+    #[test]
+    fn buffers_of_a_large_family_are_freed() {
+        // Three versions of a 3 MiB blob: a base and its delta's result are 6 MiB.
+        let size = 3 << 20;
+        let mut blob: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let mut b = PackBuilder::new();
+        let mut at = b.whole(OBJ_BLOB, &blob);
+        for version in 1..=2u8 {
+            let mut next = blob.clone();
+            next[size / 2] = version;
+            at = b.ofs_delta(at, &delta_of(&blob, &next));
+            blob = next;
+        }
+        let pack = b.finish();
+        let mut ix = Indexer::new(1);
+        let ids = |ix: &mut Indexer| -> Vec<Oid> {
+            ix.index(&pack).unwrap().iter().map(|f| f.oid).collect()
+        };
+        let first = ids(&mut ix);
+        assert_eq!(first[2], hash_object(OBJ_BLOB, &blob));
+        let bytes: usize = held(&ix.resolve[0]).iter().sum();
+        assert!(bytes <= SCRATCH_KEEP, "{bytes} bytes kept");
+        assert_eq!(ids(&mut ix), first);
+    }
+
+    /// Nor does a worker keep a buffer for every object that had deltas waiting at once.
+    /// Here 200 versions of a blob each have two deltas, the next version and a dead end,
+    /// in that order, so every version waits for its dead end while the rest of the chain
+    /// is resolved. A worker looks at its buffers after every family: with one kept for
+    /// each of 100,000 such versions, the 200,000 small families after them took 13 s on
+    /// one thread, not 0.3 s.
+    #[test]
+    fn a_family_with_many_objects_waiting_keeps_few_buffers() {
+        let mut b = PackBuilder::new();
+        let mut blob = b"version 0\n".to_vec();
+        b.whole(OBJ_BLOB, &blob);
+        for version in 1..=200 {
+            let base = hash_object(OBJ_BLOB, &blob);
+            let next = [&blob[..], format!("version {version}\n").as_bytes()].concat();
+            let end = [&blob[..], format!("dead end {version}\n").as_bytes()].concat();
+            b.ref_delta(&base, &delta_of(&blob, &next));
+            b.ref_delta(&base, &delta_of(&blob, &end));
+            blob = next;
+        }
+        let pack = b.finish();
+        let mut ix = Indexer::new(1);
+        let facts = ix.index(&pack).unwrap().to_vec();
+        assert_eq!(our_entries(&facts), git_entries("waiting", &pack));
+        let buffers = ix.resolve[0].levels.len();
+        assert!(buffers <= SCRATCH_BUFFERS, "{buffers} buffers kept");
+    }
+
+    /// Families of every shape the walk tells apart, checked against git entry by entry
+    /// (id, type, chain depth, base): objects with no delta, one, or several; a last
+    /// delta that has deltas of its own, and one that has none; OFS and REF deltas mixed
+    /// under one base; REF deltas before their bases; enough families for several workers.
+    #[test]
+    fn branching_families_are_resolved_as_git_resolves_them() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut rand = move |m: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % m as u64) as usize
+        };
+        // 80 whole blobs, then 1,120 more, each an edit of an earlier object picked at
+        // random and stored as a delta of it.
+        let (roots, objects) = (80, 1200);
+        let mut content: Vec<Vec<u8>> = Vec::new();
+        let mut parent = Vec::new();
+        let mut ofs = Vec::new();
+        for i in 0..objects {
+            let p = if i < roots { i } else { rand(i) };
+            let mut c = if i < roots {
+                Vec::new()
+            } else {
+                content[p].clone()
+            };
+            c.extend_from_slice(format!("line {i} of blob {p}\n").as_bytes());
+            content.push(c);
+            parent.push(p);
+            ofs.push(rand(2) == 0);
+        }
+        let id = |i: usize| hash_object(OBJ_BLOB, &content[i]);
+        let delta = |i: usize| delta_of(&content[parent[i]], &content[i]);
+        // Half of the REF deltas first, newest first: each is in the pack before its base.
+        let early = |i: usize| i >= roots && !ofs[i] && i % 2 == 1;
+        let mut b = PackBuilder::new();
+        let mut at = vec![0u64; objects];
+        for i in (0..objects).rev().filter(|&i| early(i)) {
+            at[i] = b.ref_delta(&id(parent[i]), &delta(i));
+        }
+        for i in (0..objects).filter(|&i| !early(i)) {
+            at[i] = if i < roots {
+                b.whole(OBJ_BLOB, &content[i])
+            } else if ofs[i] {
+                b.ofs_delta(at[parent[i]], &delta(i))
+            } else {
+                b.ref_delta(&id(parent[i]), &delta(i))
+            };
+        }
+        let pack = b.finish();
+        let git = git_entries("families", &pack);
+        assert_eq!(git.len(), objects);
+        for threads in [1, 4] {
+            let mut ix = Indexer::new(threads);
+            let facts = ix.index(&pack).unwrap().to_vec();
+            assert!(ix.roots.len() >= 64, "{} families", ix.roots.len());
+            assert!(our_entries(&facts) == git, "on {threads} threads");
+        }
     }
 
     #[test]
