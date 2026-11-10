@@ -42,8 +42,8 @@ const MAX_OFFSET: u64 = (1u64 << 48) - 1;
 pub const STORED_BLOCK: usize = 65535;
 /// zlib header of a stream of stored blocks: deflate, 32K window, "fastest" level.
 const ZLIB_STORED_HEADER: [u8; 2] = [0x78, 0x01];
-/// Blobs at least this big whose upstream compression saves under 5% are re-encoded as
-/// stored blocks. Optional: readers take either encoding (DESIGN.md, Blob packs).
+/// Blobs at least this big whose first MiB deflates by under 5% are written as stored
+/// blocks. Optional: readers take either encoding (DESIGN.md, Blob packs).
 pub const STORED_MIN: u64 = 1 << 20;
 
 pub fn pack_key(id: &str) -> String {
