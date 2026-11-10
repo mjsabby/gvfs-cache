@@ -93,7 +93,8 @@ pub struct PackRef {
 /// How a blob entry's zlib stream is written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Encoding {
-    /// A zlib stream handed over as is (the upstream's compressed bytes).
+    /// A zlib stream handed over as is (the upstream's compressed bytes, or what the
+    /// copier deflated of a blob that came loose).
     Raw,
     /// The content, written as deflate stored blocks.
     Stored,

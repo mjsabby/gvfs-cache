@@ -16,6 +16,11 @@
 //!   and the result is written whole. A REF base may arrive after its delta: the delta
 //!   waits for it. Requests for large blobs are made one blob each, so their packs hold
 //!   one whole entry and need no read-back.
+//! * **A loose object** in place of a pack ([`BlobSink::loose`]: Azure DevOps answers a
+//!   request for one object, so for each large blob, with `zlib("blob <size>\0" ++
+//!   content)`) streams through as a whole entry does: inflated once, to verify the id
+//!   and the size, and written as stored blocks by the same rule. Otherwise its content
+//!   is deflated, once: its own stream begins with the header, so it cannot be kept.
 //! * The output declares as many entries as blobs were asked for; any other object, a
 //!   blob twice, a blob missing, a size or trailer mismatch fails the pack. So does a zlib
 //!   stream longer than twice its content plus 1 KiB: one padded with empty blocks, which
@@ -30,8 +35,8 @@ use zlib_rs::{Inflate, InflateFlush, Status};
 
 use crate::blobs::{BlobRec, Encoding, PackWriter, STORED_MIN};
 use crate::pack::{
-    OBJ_BLOB, OBJ_OFS_DELTA, OBJ_REF_DELTA, ObjectHeader, PACK_HEADER_LEN, PACK_TRAILER_LEN,
-    parse_entry_header, parse_pack_header, type_name,
+    OBJ_BLOB, OBJ_COMMIT, OBJ_OFS_DELTA, OBJ_REF_DELTA, OBJ_TAG, OBJ_TREE, ObjectHeader,
+    PACK_HEADER_LEN, PACK_TRAILER_LEN, parse_entry_header, parse_pack_header, type_name,
 };
 use crate::util::{Context, Oid, Result, u64_of, us};
 use crate::zlib::{Deflater, Inflater, compress_bound};
@@ -52,11 +57,13 @@ const PADDING_MAX: u64 = 1 << 10;
 pub const RESOLVE_MAX: u64 = 1 << 30;
 /// Most delta bytes waiting for a base that has not arrived.
 const WAITING_MAX: u64 = 1 << 30;
-/// zlib level of blobs rebuilt from deltas, and of the sample that chooses a large blob's
-/// encoding (git's default).
+/// zlib level of blobs rebuilt from deltas, of the content of loose objects, and of the
+/// sample that chooses a large blob's encoding (git's default).
 const LEVEL: i32 = 6;
 /// Longest entry header: a 10-byte size varint and a 20-byte base id.
 const HEADER_MAX: usize = 32;
+/// Longest loose object header, with its NUL (`"commit <a 20-digit size>\0"` is 28 bytes).
+const LOOSE_HEADER_MAX: usize = 32;
 
 /// Where a blob pack is written.
 pub trait Spool: Write {
@@ -134,11 +141,18 @@ enum Stage {
     Delta,
     Trailer,
     Done,
+    /// A loose object ([`BlobSink::loose`]): its header is to come, its content is, and
+    /// its stream has ended.
+    LooseHeader,
+    Loose,
+    LooseDone,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Choice {
     Undecided,
+    /// A zlib stream: a pack entry's own, as it came, or a loose object's content,
+    /// deflated here (its own stream begins with its header).
     Raw,
     Stored,
 }
@@ -248,6 +262,8 @@ pub struct BlobSink<S: Spool> {
     sample_c: Vec<u8>,
     delta: Vec<u8>,
     chunk: Vec<u8>,
+    /// Bytes of a loose object inflated into `chunk` and not taken yet.
+    fill: usize,
 
     // Delta resolution.
     inflater: Inflater,
@@ -293,6 +309,7 @@ impl<S: Spool> BlobSink<S> {
             sample_c: Vec::new(),
             delta: Vec::new(),
             chunk: vec![0u8; CHUNK],
+            fill: 0,
             inflater: Inflater::new(),
             deflater: Deflater::new(LEVEL),
             entry_buf: Vec::new(),
@@ -323,16 +340,40 @@ impl<S: Spool> BlobSink<S> {
         self.out.position()
     }
 
-    /// The input pack fed so far must be complete; the next bytes start a new one.
+    /// The input that follows is not a pack but one blob, loose: `zlib("blob <size>\0" ++
+    /// content)`, as Azure DevOps answers a request for a single object, whatever the
+    /// request accepts. Call it before the input's first byte. The object is checked as a
+    /// pack's entry is (its id, its size, the length of its stream), and counts as one: it
+    /// is refused at once when no blob is asked for any more.
+    pub fn loose(&mut self) -> Result<()> {
+        if self.stage != Stage::PackHeader || !self.hdr.is_empty() {
+            crate::bail!("a loose object in the middle of a pack");
+        }
+        if self.want.is_empty() {
+            crate::bail!("the upstream sent a loose object, and no blob is asked for");
+        }
+        self.z.reset(true);
+        self.fill = 0;
+        self.stage = Stage::LooseHeader;
+        Ok(())
+    }
+
+    /// The input fed so far (a pack, or a loose object) must be complete; the next bytes
+    /// start a new one.
     pub fn end_input(&mut self) -> Result<()> {
         if let Some(e) = self.failed.take() {
             return Err(e);
         }
-        if self.stage != Stage::Done {
-            crate::bail!(
+        match self.stage {
+            Stage::Done | Stage::LooseDone => {}
+            Stage::LooseHeader | Stage::Loose => crate::bail!(
+                "truncated loose object: its stream breaks off after {} bytes",
+                self.z.total_in()
+            ),
+            _ => crate::bail!(
                 "truncated pack: {} entries and the trailer missing",
                 self.left
-            );
+            ),
         }
         if !self.waiting.is_empty() {
             let n: usize = self.waiting.values().map(Vec::len).sum();
@@ -377,6 +418,8 @@ impl<S: Spool> BlobSink<S> {
                 Stage::Whole | Stage::Delta => self.body(buf)?,
                 Stage::Trailer => self.trailer(buf)?,
                 Stage::Done => crate::bail!("bytes after the pack trailer"),
+                Stage::LooseHeader | Stage::Loose => self.loose_body(buf)?,
+                Stage::LooseDone => crate::bail!("bytes after the loose object"),
             };
             buf = buf.get(used..).unwrap_or(&[]);
         }
@@ -562,6 +605,129 @@ impl<S: Spool> BlobSink<S> {
         Ok(used)
     }
 
+    /// A loose object's zlib stream, inflated into `chunk`, which is taken each time it is
+    /// full and at the stream's end: the content passes in the same pieces however the
+    /// input was cut, so what is deflated of it is the same stream every time. (zlib's
+    /// output goes by the pieces it is fed: deflated as the wire delivered it, 32 MiB of
+    /// text came out 3 to 20 bytes longer or shorter from one copy to the next.)
+    fn loose_body(&mut self, buf: &[u8]) -> Result<usize> {
+        let (in0, out0) = (self.z.total_in(), self.z.total_out());
+        let room = self.chunk.get_mut(self.fill..).ctx("inflate output")?;
+        let status = self
+            .z
+            .decompress(buf, room, InflateFlush::NoFlush)
+            .map_err(|_| crate::err!("corrupt loose object"))?;
+        let used = us(self.z.total_in().saturating_sub(in0));
+        let made = us(self.z.total_out().saturating_sub(out0));
+        self.fill = self.fill.saturating_add(made);
+        let (taken, inflated) = (self.z.total_in(), self.z.total_out());
+        if taken > inflated.saturating_mul(2).saturating_add(PADDING_MAX) {
+            crate::bail!(
+                "loose object: {taken} bytes of zlib stream for {inflated} bytes of content, \
+                 more than any encoder needs"
+            );
+        }
+        let ended = status == Status::StreamEnd;
+        if ended || self.fill == self.chunk.len() {
+            let chunk = std::mem::take(&mut self.chunk);
+            let took = self.loose_piece(chunk.get(..self.fill).unwrap_or(&[]));
+            self.chunk = chunk;
+            self.fill = 0;
+            took?;
+        } else if used == 0 && made == 0 {
+            crate::bail!("loose object: its zlib stream is stuck");
+        }
+        if ended {
+            if self.produced != self.size {
+                crate::bail!(
+                    "loose object inflates to {} bytes, not the {} it declares",
+                    self.produced,
+                    self.size
+                );
+            }
+            self.end_whole()?;
+            self.stage = Stage::LooseDone;
+        }
+        Ok(used)
+    }
+
+    /// The next inflated bytes of a loose object: its header, then its content.
+    fn loose_piece(&mut self, mut data: &[u8]) -> Result<()> {
+        if self.stage == Stage::LooseHeader {
+            // The first piece is a whole chunk, or all there is: the header is in it.
+            let header = self.loose_header(data)?;
+            data = data.get(header..).unwrap_or(&[]);
+        }
+        self.produced = self.produced.saturating_add(u64_of(data.len()));
+        if self.produced > self.size {
+            crate::bail!(
+                "loose object inflates past the {} bytes it declares",
+                self.size
+            );
+        }
+        self.obj_sha.update(data);
+        match self.choice {
+            Choice::Raw => self.deflate(data, false),
+            Choice::Stored => self.out.content(data),
+            Choice::Undecided => {
+                self.sample_c.extend_from_slice(data);
+                if self.sample_c.len() >= SAMPLE {
+                    self.decide()?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// The header a loose object begins with, at the start of `data`: `"blob <size>\0"`,
+    /// byte for byte as git writes it, since it is what the id hashes first. Starts the
+    /// blob's entry; returns the header's length.
+    fn loose_header(&mut self, data: &[u8]) -> Result<usize> {
+        let bad = "bad loose object header";
+        let head = data.get(..LOOSE_HEADER_MAX).unwrap_or(data);
+        let nul = head.iter().position(|&b| b == 0).ctx(bad)?;
+        let text = head.get(..nul).and_then(|t| std::str::from_utf8(t).ok());
+        let (name, size) = text.and_then(|t| t.split_once(' ')).ctx(bad)?;
+        let kind = [OBJ_COMMIT, OBJ_TREE, OBJ_BLOB, OBJ_TAG]
+            .into_iter()
+            .find(|&k| type_name(k) == name)
+            .ctx(bad)?;
+        let size: u64 = size.parse().ok().ctx(bad)?;
+        let header = ObjectHeader::new(kind, size);
+        // "+7" and "007" parse as 7, and are not what the id of 7 bytes hashes.
+        if head.get(..=nul) != Some(header.as_slice()) {
+            crate::bail!("{bad}");
+        }
+        if kind != OBJ_BLOB {
+            crate::bail!("the upstream sent a {name} where blobs were asked for");
+        }
+        self.size = size;
+        self.produced = 0;
+        self.entry_at = 0;
+        self.obj_sha = Sha1::new();
+        self.obj_sha.update(header.as_slice());
+        self.sample_c.clear();
+        self.choice = if size >= STORED_MIN {
+            Choice::Undecided
+        } else {
+            self.out.begin(size, Encoding::Raw)?;
+            self.deflater.begin();
+            Choice::Raw
+        };
+        self.stage = Stage::Loose;
+        Ok(nul.saturating_add(1))
+    }
+
+    /// Deflates `content` as the next bytes of the open entry (with `finish`, its last).
+    fn deflate(&mut self, content: &[u8], finish: bool) -> Result<()> {
+        if self.zbuf.len() < CHUNK {
+            self.zbuf.resize(CHUNK, 0);
+        }
+        let (out, buf) = (&mut self.out, self.zbuf.get_mut(..CHUNK));
+        self.deflater
+            .stream(content, finish, buf.unwrap_or(&mut []), |z| out.raw(z))
+    }
+
     /// Chooses a large blob's encoding from its first [`SAMPLE`] bytes and writes out
     /// what was held meanwhile.
     fn decide(&mut self) -> Result<()> {
@@ -571,8 +737,16 @@ impl<S: Spool> BlobSink<S> {
             self.choice = Choice::Stored;
         } else {
             self.out.begin(self.size, Encoding::Raw)?;
-            self.out.raw(&self.sample_z)?;
             self.choice = Choice::Raw;
+            if self.stage == Stage::Loose {
+                self.deflater.begin();
+                let held = std::mem::take(&mut self.sample_c);
+                let deflated = self.deflate(&held, false);
+                self.sample_c = held;
+                deflated?;
+            } else {
+                self.out.raw(&self.sample_z)?;
+            }
         }
         self.sample_z.clear();
         self.sample_c.clear();
@@ -582,6 +756,9 @@ impl<S: Spool> BlobSink<S> {
     fn end_whole(&mut self) -> Result<()> {
         if self.choice == Choice::Undecided {
             self.decide()?;
+        }
+        if self.stage == Stage::Loose && self.choice == Choice::Raw {
+            self.deflate(&[], true)?;
         }
         let oid = Oid(std::mem::take(&mut self.obj_sha).finalize().into());
         if !self.want.remove(&oid) {
@@ -725,13 +902,13 @@ impl<S: Spool> BlobSink<S> {
 /// Whether a blob of at least [`STORED_MIN`] is written as stored blocks: when its first
 /// [`SAMPLE`] bytes deflate by less than 5% (at [`LEVEL`], into `zbuf`). That depends on
 /// the blob's bytes alone, so every copy of a blob chooses alike: however the upstream
-/// compressed it, whole or behind a delta, and however the wire cut it into pieces. (The
-/// measure used to be the upstream's bytes for as much content as the pieces had made when
-/// a MiB was in, or, behind a delta, the whole blob deflated: one blob could go either
-/// way.) The price is a deflate of 256 KiB per large blob, about 4 ms, text or noise,
-/// where inflating and hashing a MiB take 0.5 ms: a mirror of 1.2 MiB blobs from a local
-/// upstream takes 1.5 to 1.7 times as long for it. (A sample of a whole MiB cost 16 ms,
-/// and that mirror 3.4 to 4.1 times as long.)
+/// compressed it, whole, behind a delta or loose, and however the wire cut it into
+/// pieces. (The measure used to be the upstream's bytes for as much content as the pieces
+/// had made when a MiB was in, or, behind a delta, the whole blob deflated: one blob could
+/// go either way.) The price is a deflate of 256 KiB per large blob, about 4 ms, text or
+/// noise, where inflating and hashing a MiB take 0.5 ms: a mirror of 1.2 MiB blobs from a
+/// local upstream takes 1.5 to 1.7 times as long for it. (A sample of a whole MiB cost
+/// 16 ms, and that mirror 3.4 to 4.1 times as long.)
 fn incompressible(deflater: &mut Deflater, zbuf: &mut Vec<u8>, blob: &[u8]) -> Result<bool> {
     let sample = blob.get(..SAMPLE).unwrap_or(blob);
     zbuf.resize(compress_bound(sample.len()), 0);
@@ -1323,6 +1500,270 @@ mod tests {
             let e = sink.end_input().unwrap_err().to_string();
             assert!(e.contains("more than any encoder needs"), "{e}");
         }
+    }
+
+    /// `zlib("<kind> <size>\0" ++ content)` at `level`: an object as an upstream sends it
+    /// loose (the header says whatever the test has it say).
+    fn loose_object(kind: &str, size: &str, content: &[u8], level: i32) -> Vec<u8> {
+        let head = format!("{kind} {size}\0");
+        let mut d = Deflater::new(level);
+        let mut z = vec![0u8; compress_bound(head.len() + content.len())];
+        let n = d
+            .deflate_parts(&[head.as_bytes(), content], &mut z)
+            .unwrap();
+        z.truncate(n);
+        z
+    }
+
+    fn loose_blob(content: &[u8], level: i32) -> Vec<u8> {
+        loose_object("blob", &content.len().to_string(), content, level)
+    }
+
+    /// Feeds one loose object, cut into `pieces`; the error is the sink's own.
+    fn feed_loose<S: Spool>(sink: &mut BlobSink<S>, z: &[u8], pieces: &[usize]) -> Result<()> {
+        sink.loose()?;
+        let (mut at, mut i) = (0, 0);
+        while at < z.len() {
+            let n = pieces[i % pieces.len()].min(z.len() - at);
+            if let Err(e) = sink.write_all(&z[at..at + n]) {
+                return Err(sink.failure().unwrap_or_else(|| e.into()));
+            }
+            at += n;
+            i += 1;
+        }
+        sink.end_input()
+    }
+
+    fn words(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        let mut out = Vec::with_capacity(n + 16);
+        while out.len() < n {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.extend_from_slice(format!("word{} ", x % 5000).as_bytes());
+            if x.is_multiple_of(11) {
+                out.push(b'\n');
+            }
+        }
+        out.truncate(n);
+        out
+    }
+
+    /// One blob sent loose, as Azure DevOps sends each large one, becomes a whole entry
+    /// that git indexes strictly: stored blocks for 2 MiB of noise, a zlib stream for
+    /// everything that compresses or is small. Its stream is inflated once, by the sink
+    /// (every byte of it taken in, its header and content put out, and nothing else of
+    /// the sink inflates), and the entry is the content's alone: the same bytes however
+    /// the upstream deflated the object (stored, fastest, default) and however the wire
+    /// cut it. (The object was re-encoded as a pack of one before the sink saw it:
+    /// inflated, deflated at level 6, and inflated again; and what it deflated to went by
+    /// the pieces.)
+    #[test]
+    fn a_loose_object_streams_through_as_a_whole_entry() {
+        let r = repo("loose");
+        let contents: Vec<(Vec<u8>, bool)> = vec![
+            (Vec::new(), false),
+            (b"hello\n".to_vec(), false),
+            (noise(300_000, 31), false),
+            (words(us(STORED_MIN) - 1, 5), false),
+            (noise((2 << 20) + 3, 33), true),
+            (words((3 << 20) + 17, 7), false),
+        ];
+        for (content, stored) in &contents {
+            let oid = blob_id(content);
+            let header = format!("blob {}\0", content.len());
+            let mut first: Option<Finished<Vec<u8>>> = None;
+            for level in [6, 1, 0] {
+                let z = loose_blob(content, level);
+                let cuts: [&[usize]; 5] = [
+                    &[usize::MAX],
+                    &[4096],
+                    &[13],
+                    &[57_000, 1, CHUNK, 3],
+                    &[1, 2, 3, 5, 7, 11],
+                ];
+                // Byte by byte is for the short ones: 3 MiB that way take a while.
+                let cuts = if z.len() < 1 << 20 {
+                    &cuts[..]
+                } else {
+                    &cuts[..4]
+                };
+                for cut in cuts {
+                    let mut sink = BlobSink::new(Vec::new(), &[oid]).unwrap();
+                    feed_loose(&mut sink, &z, cut).unwrap();
+                    let n = content.len();
+                    assert_eq!(sink.z.total_in(), u64_of(z.len()), "{n} bytes, cut {cut:?}");
+                    assert_eq!(sink.z.total_out(), u64_of(header.len() + n));
+                    assert!(sink.entry_buf.is_empty() && sink.base_buf.is_empty());
+                    let f = sink.finish().unwrap();
+                    assert_eq!(f.recs[0].stored, *stored, "{n} bytes");
+                    match &first {
+                        None => {
+                            check_output(&r, &f, &[(oid, content.clone())]);
+                            first = Some(f);
+                        }
+                        Some(first) => assert!(
+                            f.out == first.out,
+                            "{n} bytes, level {level}, cut {cut:?}: another pack"
+                        ),
+                    }
+                }
+            }
+            // The same blob in a pack: the same choice; stored, the same entry.
+            let whole = hand_pack(&[whole_entry(content)]);
+            let mut sink = BlobSink::new(Vec::new(), &[oid]).unwrap();
+            feed_in_pieces(&mut sink, &whole, &[CHUNK]);
+            let packed = sink.finish().unwrap();
+            let first = first.unwrap();
+            assert_eq!(packed.recs[0].stored, *stored);
+            if *stored {
+                assert!(packed.out == first.out);
+            }
+        }
+    }
+
+    /// A batch whose last request asks for one blob gets a pack, then a loose object: both
+    /// go into the one output pack, and a later pack's delta finds the loose blob as its
+    /// base (read back from the output as any other).
+    #[test]
+    fn a_loose_object_among_packs() {
+        let r = repo("loose-mix");
+        let first = b"a first blob, in a pack\n".repeat(40);
+        let base = words(40_000, 9);
+        let tail = b"and one more line\n";
+        let top = [base.clone(), tail.to_vec()].concat();
+        let (f, b, t) = (blob_id(&first), blob_id(&base), blob_id(&top));
+        let d = copy_insert_delta(base.len(), tail);
+        let mut sink = BlobSink::new(Vec::new(), &[f, b, t]).unwrap();
+        feed_in_pieces(&mut sink, &hand_pack(&[whole_entry(&first)]), &[100]);
+        feed_loose(&mut sink, &loose_blob(&base, 6), &[1000]).unwrap();
+        let delta = hand_pack(&[(HeaderBytes::ref_delta(u64_of(d.len()), &b), d)]);
+        feed_in_pieces(&mut sink, &delta, &[7]);
+        let out = sink.finish().unwrap();
+        check_output(&r, &out, &[(f, first), (b, base), (t, top)]);
+    }
+
+    /// What a loose answer can be that is not the blob asked for, whole: each fails the
+    /// pack, as its like in a pack does. Another blob's content (its id is not the one
+    /// asked for), the blob a second time, an object where no blob is asked for any more,
+    /// a stream that breaks off, a size the content does not have (either way), bytes
+    /// after the stream's end, a header git does not write, another kind of object, a
+    /// corrupt stream, and one padded without end.
+    #[test]
+    fn a_loose_object_that_is_not_the_blob_asked_for_fails_the_pack() {
+        let content = words(200_000, 3);
+        let oid = blob_id(&content);
+        let z = loose_blob(&content, 6);
+        let fed = |want: &[Oid], z: &[u8]| -> String {
+            let mut sink = BlobSink::new(Vec::new(), want).unwrap();
+            match feed_loose(&mut sink, z, &[4096]) {
+                Ok(()) => "accepted".to_string(),
+                Err(e) => e.to_string(),
+            }
+        };
+        assert_eq!(fed(&[oid], &z), "accepted");
+
+        let other = words(200_000, 4);
+        let e = fed(&[oid], &loose_blob(&other, 6));
+        let unasked = format!("blob {}, which was not asked for", blob_id(&other));
+        assert!(e.contains(&unasked), "{e}");
+        let mut sink = BlobSink::new(Vec::new(), &[oid, blob_id(&other)]).unwrap();
+        feed_loose(&mut sink, &z, &[4096]).unwrap();
+        let e = feed_loose(&mut sink, &z, &[4096]).unwrap_err().to_string();
+        assert!(e.contains("not asked for (or twice)"), "{e}");
+        let mut sink = BlobSink::new(Vec::new(), &[oid]).unwrap();
+        feed_loose(&mut sink, &z, &[4096]).unwrap();
+        let e = sink.loose().unwrap_err().to_string();
+        assert!(e.contains("no blob is asked for"), "{e}");
+
+        for cut in [z.len() - 1, z.len() - 4, z.len() / 2, 20, 1, 0] {
+            let e = fed(&[oid], &z[..cut]);
+            assert!(e.contains("truncated loose object"), "{cut}: {e}");
+        }
+        let size = content.len();
+        for (declared, why) in [
+            (size + 1, format!("inflates to {size} bytes, not the")),
+            (1 << 30, format!("inflates to {size} bytes, not the")),
+            (size - 1, format!("inflates past the {} bytes", size - 1)),
+            (0, "inflates past the 0 bytes".to_string()),
+        ] {
+            let lying = loose_object("blob", &declared.to_string(), &content, 6);
+            let e = fed(&[oid], &lying);
+            assert!(e.contains(&why), "{declared}: {e}");
+        }
+        // A megabyte and a half that says it is ten bytes fails at its first 64 KiB.
+        let big = noise(3 << 19, 41);
+        let lying = loose_object("blob", "10", &big, 6);
+        let mut sink = BlobSink::new(Vec::new(), &[blob_id(&big)]).unwrap();
+        sink.loose().unwrap();
+        let taken = lying
+            .chunks(4096)
+            .take_while(|piece| sink.write_all(piece).is_ok())
+            .count();
+        assert!(taken <= CHUNK / 4096, "{taken} writes of 4 KiB accepted");
+        assert!(sink.written() < 64, "{} bytes written", sink.written());
+
+        let mut more = z.clone();
+        more.extend_from_slice(b"junk");
+        let e = fed(&[oid], &more);
+        assert!(e.contains("bytes after the loose object"), "{e}");
+        let hello = b"hello\n";
+        for (kind, declared) in [
+            ("blub", "6"),
+            ("blob", "+6"),
+            ("blob", "06"),
+            ("blob", "6 "),
+            ("blob", ""),
+            ("blob", "six"),
+            ("blob", "99999999999999999999999"),
+            ("a kind whose name is much longer than any", "6"),
+        ] {
+            let e = fed(&[blob_id(hello)], &loose_object(kind, declared, hello, 6));
+            assert!(
+                e.contains("bad loose object header"),
+                "{kind} {declared}: {e}"
+            );
+        }
+        let mut no_nul = Deflater::new(6);
+        let mut bare = vec![0u8; 64];
+        let n = no_nul.deflate_parts(&[b"blob 6"], &mut bare).unwrap();
+        let e = fed(&[blob_id(hello)], &bare[..n]);
+        assert!(e.contains("bad loose object header"), "{e}");
+        let e = fed(&[oid], &loose_object("tree", "0", b"", 6));
+        assert!(e.contains("sent a tree where blobs were asked for"), "{e}");
+
+        let mut flipped = z.clone();
+        let mid = flipped.len() / 2;
+        flipped[mid] ^= 0x55;
+        assert_ne!(fed(&[oid], &flipped), "accepted");
+        let mut bad_sum = z.clone();
+        *bad_sum.last_mut().unwrap() ^= 1;
+        let e = fed(&[oid], &bad_sum);
+        assert!(e.contains("corrupt loose object"), "{e}");
+
+        // 1,000 bytes of empty blocks are within what a stream may be padded with.
+        assert_eq!(fed(&[oid], &padded(&z, 200)), "accepted");
+        let mut sink = BlobSink::new(Vec::new(), &[oid]).unwrap();
+        sink.loose().unwrap();
+        let taken = padded(&z, 300_000)
+            .chunks(4096)
+            .take_while(|piece| sink.write_all(piece).is_ok())
+            .count();
+        assert_eq!(taken, 0, "writes of 4 KiB accepted");
+        let e = sink.end_input().unwrap_err().to_string();
+        assert!(e.contains("more than any encoder needs"), "{e}");
+
+        // Said to be loose in the middle of a pack; and a loose object not said to be one.
+        let pack = hand_pack(&[whole_entry(&content)]);
+        let mut sink = BlobSink::new(Vec::new(), &[oid]).unwrap();
+        sink.write_all(&pack[..5]).unwrap();
+        let e = sink.loose().unwrap_err().to_string();
+        assert!(e.contains("in the middle of a pack"), "{e}");
+        let mut sink = BlobSink::new(Vec::new(), &[oid]).unwrap();
+        assert!(sink.write_all(&z).is_err());
+        let e = sink.failure().unwrap().to_string();
+        assert!(e.contains("not a pack"), "{e}");
     }
 
     /// On a clock that only the throttle's own waits advance, at `--rate-mbps 4000`: the
