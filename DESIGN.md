@@ -968,11 +968,17 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   does). A read that fetches is of a whole range, or of all that is left of one, its
   pieces handed to an async sink as they arrive (a client's socket, the pack's hash, an
   inflater): no buffer between the store and the client, and the cache sees a read's
-  length. A loose blob that is not cached reads its zlib header, then its body and
-  Adler-32 in one read. The mirror writes the tip's blobs first, in path order, so a
-  checkout's blobs share blocks; a block being fetched is fetched once (other readers'
-  tasks wait for it, and fail with it if that fetch fails). The ranged GETs go through the
-  async client, its connections pooled per account.
+  length. A loose blob that is not cached is one read of its entry's zlib stream, sent as
+  it arrives: the response begins when the stream's first two bytes are here (its
+  header, which says whether it can be spliced), and its last four, the Adler-32, are
+  kept for the trailer. (The header was a read of its own, before the body's: a request
+  to the store for two bytes where there is no cache, and with one a block fetched for
+  them, and kept, also of a blob the cache streams past. A blob of 9 MiB asked for
+  first took two requests to the store and takes one, 34 MiB three and two; without a
+  cache every loose blob took one more than it does.) The mirror writes the tip's blobs
+  first, in path order, so a checkout's blobs share blocks; a block being fetched is
+  fetched once (other readers' tasks wait for it, and fail with it if that fetch fails).
+  The ranged GETs go through the async client, its connections pooled per account.
 * **The proxy** serves blobs the store does not have, only for ids a sizes table names (a
   404 otherwise, without touching the upstream): the L0 overlay's, copied when the
   pipeline seals their trees, and blobs requested before the mirror has finished. A blob a
@@ -1010,8 +1016,9 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   up to 0.5 s, 24 to 74 of them more than 10 ms; now none waits more than 3.5 ms, which
   is what an idle edge's answers reach on this host.)
 * **Loose objects** are spliced from the entry's deflate blocks between a stored block
-  and the combined Adler-32, so nothing is inflated, and for a remote entry only its
-  first 2 and last 4 zlib bytes are read before streaming. **POST packs** append whole
+  and the combined Adler-32, so nothing is inflated; a remote entry is planned from its
+  first 2 and last 4 zlib bytes where the cache holds them, and is otherwise sent as it
+  is read, its trailer made when its last bytes arrive. **POST packs** append whole
   blob entries after the slab splice and hash the trailer as the bytes go out, so a
   remote entry is read once. A POST of a single blob gets a loose object when the client
   accepts one, unless the blob is 16 MiB or more and the client also takes packs (as

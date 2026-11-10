@@ -768,8 +768,8 @@ fn azure_separate_store() {
     assert_eq!((status, ct.as_str()), (200, CT_LOOSE));
     assert_eq!(
         counts(&edge),
-        (2, 0),
-        "the zlib header's block, then the other five in one fetch"
+        (1, 0),
+        "the entry's six blocks in one fetch, its zlib header with them"
     );
     // As a pack of its own (the pack file whole): from the blocks the loose read cached.
     let (status, _, pack) = edge.post(
@@ -785,16 +785,16 @@ fn azure_separate_store() {
         &pack,
     );
     assert_eq!(cat_batch(&one, huge_ids), cat_batch(&up.bare, huge_ids));
-    assert_eq!(counts(&edge), (2, 0));
+    assert_eq!(counts(&edge), (1, 0));
     edge.assert_clean();
     drop(edge);
     let edge = fresh_edge("b", &["--blob-cache-mib", "64"]);
     assert_eq!(edge.get(&format!("/gvfs/objects/{huge_id}")).0, 200);
-    assert_eq!(counts(&edge), (2, 1), "20 MiB is more than a quarter of 64");
+    assert_eq!(counts(&edge), (1, 1), "20 MiB is more than a quarter of 64");
     assert_eq!(
         edge.metric("gvfs_blob_cache_bytes"),
-        4 << 20,
-        "the zlib header's block only"
+        0,
+        "none of it is kept, nor a block for its zlib header"
     );
     edge.assert_clean();
     drop(edge);
