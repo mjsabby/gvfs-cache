@@ -341,6 +341,10 @@ impl View {
         if client_ts != 0 && client_ts >= self.tip_ts {
             return Slot::UpToDate;
         }
+        // Whether the client is warm is asked of its cursor, not of the start of a rollup
+        // it is sent whole: a retained day that ends at the floor starts below it, and a
+        // client sitting on that boundary, which is current there, got the cold pack.
+        let warm_client = client_ts >= self.warm_floor;
         let client_ts = crate::timeline::superset_start(&self.rollups, client_ts, self.tip_ts)
             .unwrap_or(client_ts);
         let key = self
@@ -349,7 +353,7 @@ impl View {
             .checked_sub(1);
         let warm = key.and_then(|i| Some((self.plans.get(i)?, *self.starts.get(i)?)));
         match warm {
-            Some((cell, from)) if client_ts >= self.warm_floor => Slot::Warm(cell, from),
+            Some((cell, from)) if warm_client => Slot::Warm(cell, from),
             _ => Slot::Cold,
         }
     }
@@ -482,5 +486,72 @@ fn merge(cover: &[Arc<Slab>], exclude: &[Arc<Slab>]) -> Merged {
             );
             Merged::Failed
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::arithmetic_side_effects)]
+mod tests {
+    use super::*;
+
+    /// A slab of one blob (`n` says which), covering `(start, end]`.
+    fn slab(n: u8, tier: Tier, start: u64, end: u64) -> Arc<Slab> {
+        let content = [n; 40];
+        let mut z = vec![0u8; crate::zlib::compress_bound(content.len())];
+        let len = crate::zlib::Deflater::new(1)
+            .deflate_parts(&[&content], &mut z)
+            .unwrap();
+        let mut pack = crate::pack::pack_header(1).to_vec();
+        let header = crate::pack::HeaderBytes::whole(crate::pack::OBJ_BLOB, 40);
+        pack.extend_from_slice(header.as_slice());
+        pack.extend_from_slice(&z[..len]);
+        let trailer = <sha1::Sha1 as sha1::Digest>::digest(&pack);
+        pack.extend_from_slice(&trailer);
+        let commits = (Oid([n; 20]), Oid([n + 1; 20]));
+        crate::ingest::memory_slab(&mut Indexer::new(1), pack, tier, (start, end), commits)
+            .unwrap()
+            .slab
+    }
+
+    /// A client whose cursor is the warm floor is warm. With superset deliveries it is
+    /// sent a retained day that ends there whole, from the day's start, which lies below
+    /// the floor: for that it got the cold pack.
+    #[test]
+    fn a_client_at_the_warm_floor_is_warm() {
+        let base = slab(1, Tier::Base, 0, 100);
+        let week = slab(2, Tier::Week, 100, 200);
+        let tail = slab(3, Tier::M15, 200, 300);
+        let day = slab(4, Tier::H24, 50, 100);
+        let manifest = Manifest {
+            generation: 1,
+            tip: tail.meta.want,
+            max_ts: 300,
+            baseline: base.meta.clone(),
+            weekly: vec![week.meta.clone()],
+            pyramid: vec![tail.meta.clone()],
+            retained: vec![day.meta.clone()],
+            flags: 0,
+            blobs_generation: 0,
+        };
+        let sealed = vec![base, week, tail, day];
+        let view = |supersets: Option<Tier>| {
+            let (m, slabs) = (manifest.clone(), sealed.clone());
+            View::new(1, m, String::new(), slabs, Vec::new(), supersets, None, &[])
+        };
+        // Where the answer starts, and how many objects it holds.
+        let answer = |v: &View, cursor: u64| match v.prefetch(cursor) {
+            Prefetch::Pack(plan, start) => Some((start, plan.entries)),
+            Prefetch::UpToDate => None,
+        };
+        // Exact covers: from the floor, the week and what follows it.
+        assert_eq!(answer(&view(None), 100), Some((100, 2)));
+        // Supersets: the day that ends at the floor too, not the baseline.
+        let supersets = view(Some(Tier::H24));
+        assert_eq!(answer(&supersets, 100), Some((50, 3)));
+        // Below the floor, or with no cursor: the cold pack (the baseline, the week and
+        // what follows; what a retained slab holds is in a real baseline).
+        assert_eq!(answer(&supersets, 99), Some((0, 3)));
+        assert_eq!(answer(&supersets, 0), Some((0, 3)));
+        assert_eq!(answer(&supersets, 300), None);
     }
 }
