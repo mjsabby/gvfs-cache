@@ -683,7 +683,8 @@ fn idle_runs_publish_nothing() {
 /// A run that has published has succeeded, whatever garbage collection then meets: here a
 /// file in `slabs/` that it cannot delete (its name is no store key). The run exits 0 and
 /// its log names the file (it used to exit 1 with the manifest published, and a scheduler
-/// that runs a failed run again repeated it).
+/// that runs a failed run again repeated it). The files listed after that one are
+/// collected all the same.
 #[test]
 fn a_gc_failure_does_not_fail_the_run() {
     let root = tempdir("gc-fails");
@@ -692,26 +693,27 @@ fn a_gc_failure_does_not_fail_the_run() {
     let store_dir = root.join("store");
     let store = store_spec(&store_dir);
     pipeline(&root, &store, &up, "15m", &[]);
-    let (orphan, stray) = (
+    let (orphan, stray, later) = (
         store_dir.join("slabs/aaa-orphan.pack"),
         store_dir.join("slabs/stray~"),
+        store_dir.join("slabs/zzz-orphan.pack"),
     );
-    std::fs::write(&orphan, b"x").unwrap();
-    std::fs::write(&stray, b"x").unwrap();
+    for f in [&orphan, &stray, &later] {
+        std::fs::write(f, b"x").unwrap();
+    }
     let tip = up.commit(4);
     let far = (gvfs_cache::util::now_secs() + 86_400 * 30).to_string();
     let gc_now = ["--now", far.as_str(), "--gc-grace-secs", "60"];
     let log = pipeline(&root, &store, &up, "15m", &gc_now);
     let m = manifest(&store_dir);
     assert_eq!((m.generation, m.tip.to_string()), (2, tip));
-    assert!(
-        log.contains("gc: stopped") && log.contains("slabs/stray~ was not deleted"),
-        "{log}"
-    );
-    // It got as far as that file, and stays there on the next run, which succeeds too.
-    assert!(!orphan.exists() && stray.exists());
+    let said = "gc: incomplete (1 unreferenced files were not deleted, the first: invalid store \
+                key \"slabs/stray~\")";
+    assert!(log.contains(said), "{log}");
+    // Only that file is left, and the next run, which succeeds too, says so again.
+    assert!(!orphan.exists() && !later.exists() && stray.exists());
     let log = pipeline(&root, &store, &up, "15m", &gc_now);
-    assert!(log.contains("slabs/stray~ was not deleted"), "{log}");
+    assert!(log.contains(said), "{log}");
     assert_eq!(manifest(&store_dir).generation, 2);
     let _ = std::fs::remove_dir_all(&root);
 }

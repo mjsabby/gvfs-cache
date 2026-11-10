@@ -311,9 +311,7 @@ fn step(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<(Man
     // fails it: an error exit has a scheduler run it again, and a weekly run again is a
     // second weekly. What garbage collection did not get to waits for a later run.
     if let Err(e) = gc(o, &m) {
-        crate::log!(
-            "gc: stopped ({e}); the unreferenced files it had not deleted stay until a later run"
-        );
+        crate::log!("gc: incomplete ({e}); what it did not delete stays until a later run");
     }
     if m.separate_blobs() {
         // A failure here only costs downloads next run.
@@ -796,8 +794,8 @@ pub fn open_slabs(store: &Store, work: &Path, metas: &[SlabMeta]) -> Result<Vec<
 }
 
 /// Deletes slab files no manifest references any more, once older than the grace period.
-/// It stops at the first prefix it cannot list or file it cannot delete, which the error
-/// names.
+/// A file that cannot be deleted is passed over and the rest collected; the error then
+/// says how many there were and names the first. A prefix that cannot be listed ends it.
 fn gc(o: &Options, m: &Manifest) -> Result<()> {
     let separate = m.separate_blobs();
     let mut referenced: std::collections::HashSet<String> = m
@@ -814,6 +812,8 @@ fn gc(o: &Options, m: &Manifest) -> Result<()> {
     }
     let cutoff = o.now.saturating_sub(o.gc_grace);
     let mut deleted = 0usize;
+    // The files that could not be deleted: how many, and the first one's error.
+    let mut kept: Option<(usize, crate::util::Error)> = None;
     let prefixes: &[&str] = if separate {
         &["slabs/", "blobs/"]
     } else {
@@ -822,15 +822,27 @@ fn gc(o: &Options, m: &Manifest) -> Result<()> {
     for prefix in prefixes {
         for obj in o.store.list(prefix).ctx(&format!("listing {prefix}"))? {
             if !referenced.contains(&obj.key) && obj.modified < cutoff {
-                o.store
-                    .delete(&obj.key)
-                    .ctx(&format!("{} was not deleted", obj.key))?;
-                deleted = deleted.saturating_add(1);
+                // A file that cannot be deleted does not keep the ones listed after it:
+                // it did, at every run.
+                match o.store.delete(&obj.key) {
+                    Ok(()) => deleted = deleted.saturating_add(1),
+                    Err(e) => {
+                        kept = Some(match kept {
+                            Some((n, first)) => (n.saturating_add(1), first),
+                            None => (1, e),
+                        });
+                    }
+                }
             }
         }
     }
     if deleted > 0 {
         crate::log!("gc: deleted {deleted} unreferenced slab files");
     }
-    Ok(())
+    match kept {
+        None => Ok(()),
+        Some((n, first)) => Err(crate::err!(
+            "{n} unreferenced files were not deleted, the first: {first}"
+        )),
+    }
 }

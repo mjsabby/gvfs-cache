@@ -382,7 +382,13 @@ impl FsStore {
             } else {
                 format!("{dir_part}/{name}")
             };
-            let meta = entry.metadata()?;
+            // An entry deleted since the directory was read (another run's garbage
+            // collection) is not listed: it failed the listing, and the run with it.
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(Error::from(e)).ctx(&format!("listing {key}")),
+            };
             if !meta.is_file() || !key.starts_with(prefix) {
                 continue;
             }
@@ -470,6 +476,35 @@ mod tests {
         assert_eq!(got, b"hol");
         assert!(s.list("slabs/").unwrap().is_empty());
         assert!(!valid_key("../x") && !valid_key("a//b") && valid_key("slabs/m15-1-ab.pack"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file deleted between the moment a listing reads its name and the moment it
+    /// looks at it (another run collecting garbage) is left out of the listing; it does
+    /// not fail it.
+    #[test]
+    fn a_listing_survives_files_deleted_meanwhile() {
+        let dir = std::env::temp_dir().join(format!("gvd-store-list-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let s = Store::open(&format!("fs:{}", dir.display()), "UNUSED").unwrap();
+        fs::create_dir_all(dir.join("slabs")).unwrap();
+        for round in 0..10 {
+            let files: Vec<PathBuf> = (0..2000)
+                .map(|i| dir.join(format!("slabs/r{round}-{i}.pack")))
+                .collect();
+            for f in &files {
+                fs::write(f, b"x").unwrap();
+            }
+            let deleter = std::thread::spawn(move || {
+                for f in &files {
+                    fs::remove_file(f).unwrap();
+                }
+            });
+            let listed = s.list("slabs/");
+            deleter.join().unwrap();
+            assert!(listed.is_ok(), "{}", listed.err().unwrap());
+        }
+        assert!(s.list("slabs/").unwrap().is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
 }

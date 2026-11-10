@@ -261,7 +261,8 @@ Each run is at most one compare-and-swap of `manifest.bin`:
    times a day). What counts as a change is everything but the generation, the `blobs.bin`
    generation the manifest names included. Such a run still collects garbage. Once its
    manifest is the store's, a run has succeeded: garbage collection that fails is logged,
-   with the file or listing it stopped at, and the run exits 0 (after an error exit a
+   with the first file it could not delete (it goes on to the others) or the listing it
+   could not make, and the run exits 0 (after an error exit a
    scheduler runs it again, a weekly a second time); a later run collects what it left.
 
 Crash recovery needs nothing: unpublished uploads are garbage, and the next run's range
