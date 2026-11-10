@@ -551,8 +551,18 @@ impl Indexer {
         }));
         roots.clear();
         for (i, sc) in scanned.iter().enumerate() {
-            let (wlo, whi) = ctx.waiting_range(&sc.oid);
-            if !is_delta(sc.kind) && (!ctx.ofs_kids(u32_of(i)).is_empty() || wlo < whi) {
+            // The cheap tests first: a delta is no root, and OFS children are two adjacent
+            // reads. Finding an id's waiters is two binary searches in a table far larger
+            // than the cache, 0.3 to 0.4 µs. Made for every entry they took 4.7 s of the
+            // indexer's 10.1 s on SearchGold's 12.13M-entry pack; its 5.15M deltas no
+            // longer make them.
+            if is_delta(sc.kind) {
+                continue;
+            }
+            if !ctx.ofs_kids(u32_of(i)).is_empty() || {
+                let (wlo, whi) = ctx.waiting_range(&sc.oid);
+                wlo < whi
+            } {
                 roots.push(u32_of(i));
             }
         }
