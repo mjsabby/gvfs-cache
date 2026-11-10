@@ -565,23 +565,85 @@ fn ls_refs_tip(body: &[u8], branch_ref: &str) -> Result<Option<Oid>> {
     }
 }
 
-/// The id of `branch_ref` in a v0 ref advertisement.
-fn v0_refs_tip(body: &[u8], branch_ref: &str) -> Result<Option<Oid>> {
-    let mut rd = pktline::Reader::new(body);
-    loop {
-        match rd.read()? {
-            Pkt::Data(n) => {
-                let line = rd.line(n);
-                let line = line.split(|&b| b == 0).next().unwrap_or(line);
-                if let Some((hex, name)) = line.split_at_checked(40)
-                    && name.strip_prefix(b" ") == Some(branch_ref.as_bytes())
-                {
-                    return Oid::from_hex(hex).ctx("bad ref line").map(Some);
-                }
-            }
-            Pkt::Eof => return Ok(None),
-            _ => {}
+/// Finds a branch's tip in a v0 ref advertisement as it arrives, a piece at a time, so
+/// that reading can stop there: protocol v0 (Azure DevOps) has no way to ask for one ref,
+/// and the advertisement is every ref of the repository (10 MB for SearchGold's 82,779,
+/// at every poll). The first ref line is `HEAD`'s, with the capabilities, among them the
+/// branch `HEAD` stands for (`symref=HEAD:refs/heads/main`): the tip of the default
+/// branch is in the first kilobyte. Another branch is found at its own line.
+struct V0Tip<'a> {
+    branch: &'a [u8],
+    /// Bytes of a pkt-line that has not arrived whole.
+    carry: Vec<u8>,
+}
+
+impl<'a> V0Tip<'a> {
+    fn new(branch_ref: &'a str) -> V0Tip<'a> {
+        V0Tip {
+            branch: branch_ref.as_bytes(),
+            carry: Vec::new(),
         }
+    }
+
+    /// The next piece of the advertisement; the tip, once its line is in.
+    fn feed(&mut self, piece: &[u8]) -> Result<Option<Oid>> {
+        self.carry.extend_from_slice(piece);
+        let mut at = 0usize;
+        let mut found = None;
+        while found.is_none() {
+            let Some(head) = self.carry.get(at..at.saturating_add(4)) else {
+                break;
+            };
+            let mut len_bytes = [0u8; 2];
+            if !crate::util::decode_hex(head, &mut len_bytes) {
+                crate::bail!("bad pkt-line length {:?}", String::from_utf8_lossy(head));
+            }
+            let len = usize::from(u16::from_be_bytes(len_bytes));
+            if len < 4 {
+                // A flush (or another mark): no payload.
+                at = at.saturating_add(4);
+                continue;
+            }
+            let Some(line) = self.carry.get(at.saturating_add(4)..at.saturating_add(len)) else {
+                break;
+            };
+            found = self.tip_in(line)?;
+            at = at.saturating_add(len);
+        }
+        self.carry.drain(..at);
+        Ok(found)
+    }
+
+    /// The tip if `line` is the branch's ref line, or `HEAD`'s and `HEAD` is the branch.
+    fn tip_in(&self, line: &[u8]) -> Result<Option<Oid>> {
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let mut parts = line.splitn(2, |&b| b == 0);
+        let (ref_line, caps) = (
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default(),
+        );
+        let Some((hex, name)) = ref_line.split_at_checked(40) else {
+            return Ok(None);
+        };
+        let Some(name) = name.strip_prefix(b" ") else {
+            return Ok(None);
+        };
+        let head_is_branch = || {
+            caps.split(|&b| b == b' ')
+                .any(|cap| cap.strip_prefix(b"symref=HEAD:") == Some(self.branch))
+        };
+        if name == self.branch || (name == b"HEAD" && head_is_branch()) {
+            return Oid::from_hex(hex).ctx("bad ref line").map(Some);
+        }
+        Ok(None)
+    }
+
+    /// The advertisement ended without the branch: it must have ended at a pkt-line's end.
+    fn end(&self) -> Result<()> {
+        if !self.carry.is_empty() {
+            crate::bail!("truncated pkt-line in the ref advertisement");
+        }
+        Ok(())
     }
 }
 
@@ -1326,7 +1388,23 @@ impl AsyncUpstream {
                 .await?
                 .ensure_ok("info/refs")
                 .await?;
-            v0_refs_tip(&resp.body_vec(256 << 20).await?, branch_ref)?
+            // Read up to the branch's line and no further ([`V0Tip`]): the response is
+            // dropped there, and its connection with it.
+            let mut scan = V0Tip::new(branch_ref);
+            let mut read = 0usize;
+            loop {
+                let Some(piece) = resp.chunk().await? else {
+                    scan.end()?;
+                    break None;
+                };
+                read = read.saturating_add(piece.len());
+                if read > 256 << 20 {
+                    crate::bail!("ref advertisement larger than 256 MiB");
+                }
+                if let Some(tip) = scan.feed(&piece)? {
+                    break Some(tip);
+                }
+            }
         };
         found.with_ctx_str(|| format!("{}: no {branch_ref}", self.label))
     }
@@ -1702,6 +1780,116 @@ mod tests {
             assert!(e.contains("neither /gvfs/sizes nor object-info"), "{e}");
         }
         assert_eq!(probes.load(Ordering::SeqCst), 1, "the 404 is kept");
+    }
+
+    /// A v0 ref advertisement: `HEAD` (which stands for `refs/heads/main` if `symref`)
+    /// with the capabilities, then `refs/heads/b0000 ..`, with `main` and `topic` among
+    /// them. Returns it with the offsets at which the lines of `HEAD` and `topic` end.
+    fn v0_advertisement(symref: bool) -> (Vec<u8>, usize, usize) {
+        let id = |n: u32| format!("{n:040x}");
+        let mut b = Vec::new();
+        pktline::put_str(&mut b, "# service=git-upload-pack\n");
+        pktline::flush(&mut b);
+        let caps = if symref {
+            "multi_ack side-band-64k symref=HEAD:refs/heads/main agent=x"
+        } else {
+            "multi_ack side-band-64k agent=x"
+        };
+        pktline::put(&mut b, format!("{} HEAD\0{caps}\n", id(7)).as_bytes());
+        let head_end = b.len();
+        let mut topic_end = 0;
+        let mut names: Vec<String> = (0..3000).map(|i| format!("refs/heads/b{i:04}")).collect();
+        names.push("refs/heads/main".to_string());
+        names.push("refs/heads/topic".to_string());
+        names.sort();
+        for (i, name) in names.iter().enumerate() {
+            let oid = match name.as_str() {
+                "refs/heads/main" => id(7),
+                "refs/heads/topic" => id(9),
+                _ => id(1000 + i as u32),
+            };
+            pktline::put(&mut b, format!("{oid} {name}\n").as_bytes());
+            if name == "refs/heads/topic" {
+                topic_end = b.len();
+            }
+        }
+        pktline::flush(&mut b);
+        (b, head_end, topic_end)
+    }
+
+    /// A branch's tip is found in a v0 advertisement as it arrives, however it is cut
+    /// into pieces: the default branch's at `HEAD`'s line, another's at its own.
+    #[test]
+    fn a_tip_is_found_in_a_v0_advertisement_as_it_arrives() {
+        let oid = |n: u32| Oid::from_hex(format!("{n:040x}").as_bytes()).unwrap();
+        let (adv, head_end, topic_end) = v0_advertisement(true);
+        // Fed in pieces of `size`: the tip, and how many bytes had been fed by then.
+        let find = |adv: &[u8], branch: &str, size: usize| {
+            let mut scan = V0Tip::new(branch);
+            let mut fed = 0;
+            for piece in adv.chunks(size) {
+                fed += piece.len();
+                if let Some(tip) = scan.feed(piece).unwrap() {
+                    return (Some(tip), fed);
+                }
+            }
+            scan.end().unwrap();
+            (None, fed)
+        };
+        for size in [1, 2, 3, 5, 7, 61, 4096, adv.len()] {
+            let (tip, fed) = find(&adv, "refs/heads/main", size);
+            assert_eq!(tip, Some(oid(7)));
+            assert!(fed < head_end + size, "{fed} bytes for a tip at {head_end}");
+            let (tip, fed) = find(&adv, "refs/heads/topic", size);
+            assert_eq!(tip, Some(oid(9)));
+            assert!(fed >= topic_end && fed < topic_end + size);
+            assert_eq!(find(&adv, "refs/heads/none", size), (None, adv.len()));
+            // A branch whose name another's begins with is not that one.
+            assert_eq!(find(&adv, "refs/heads/b000", size).0, None);
+            assert_eq!(find(&adv, "refs/heads/b0001", size).0, Some(oid(1001)));
+        }
+        // An upstream that does not say what `HEAD` stands for: the branch's own line.
+        let (plain, head_end, _) = v0_advertisement(false);
+        let (tip, fed) = find(&plain, "refs/heads/main", 16);
+        assert_eq!(tip, Some(oid(7)));
+        assert!(fed > head_end + 1000);
+        // An advertisement that breaks off, or is no pkt-lines.
+        let mut scan = V0Tip::new("refs/heads/none");
+        assert_eq!(scan.feed(&adv[..head_end + 10]).unwrap(), None);
+        assert!(scan.end().is_err());
+        assert!(V0Tip::new("refs/heads/main").feed(b"zzzz").is_err());
+    }
+
+    /// The edge's poll of a v0 upstream reads the advertisement up to the branch's line:
+    /// here the rest never arrives (the answer breaks off there), and the tip is known
+    /// all the same. (All of it was read at every poll: every ref of the repository.)
+    #[test]
+    fn a_v0_poll_reads_the_advertisement_up_to_its_branch() {
+        use crate::testhttp::{Reply, serve};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (adv, head_end, topic_end) = v0_advertisement(true);
+        for (branch, tip, upto) in [("main", 7u32, head_end), ("topic", 9, topic_end)] {
+            let asked = Arc::new(AtomicUsize::new(0));
+            let (seen, body) = (Arc::clone(&asked), adv.clone());
+            let port = serve(move |r| {
+                if !r.line.contains("/info/refs") {
+                    return Reply::status("404 Not Found");
+                }
+                // The first request finds out the protocol, and is answered whole.
+                match seen.fetch_add(1, Ordering::SeqCst) {
+                    0 => Reply::ok(&body),
+                    _ => Reply::Cut("200 OK".to_string(), body.clone(), upto),
+                }
+            });
+            let spec = format!("http://127.0.0.1:{port}/r");
+            let mut up = Upstream::open(&spec, branch, &Auth::default()).unwrap();
+            let want = Oid::from_hex(format!("{tip:040x}").as_bytes()).unwrap();
+            for _ in 0..3 {
+                assert_eq!(up.head().unwrap(), want, "{branch}");
+            }
+            assert_eq!(asked.load(Ordering::SeqCst), 4);
+        }
     }
 
     /// The id the fake upstreams below know blob `i` by: its size is `i`, and one in seven
