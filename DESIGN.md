@@ -712,14 +712,15 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   the client, and the cache sees a read's length. A loose blob reads its zlib header, then
   its body and Adler-32 in one read. The mirror writes the tip's blobs first, in path order, so a
   checkout's blobs share blocks; a block being fetched is fetched once (other readers'
-  tasks wait for it). The ranged GETs go through the async client, its connections pooled
-  per account.
+  tasks wait for it, and fail with it if that fetch fails). The ranged GETs go through the
+  async client, its connections pooled per account.
 * **The proxy** serves blobs the store does not have, only for ids a sizes table names (a
   404 otherwise, without touching the upstream): the L0 overlay's, copied when the
   pipeline seals their trees, and blobs requested before the mirror has finished. A blob a
   sealed tree names that a complete store lacks is a fault: still proxied (a 503 without
   an upstream), but counted in `gvfs_blobs_missing_total` and logged. The proxy fetches
-  each blob once per edge (requests for a blob being fetched wait for that fetch),
+  each blob once per edge (requests for a blob being fetched wait for that fetch, and get
+  its error if it fails, rather than ask the upstream one after another),
   verifies it as it streams in, and keeps it on local disk, one pack per fetch, up to
   `--proxy-cache-mib` and `--proxy-cache-packs` (oldest fetches go first; the newest stays
   even past the bounds, since the requests that waited for it read its blobs from the

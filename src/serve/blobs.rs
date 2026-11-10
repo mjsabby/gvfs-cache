@@ -8,10 +8,11 @@
 //! * [`Proxy`]: blobs the store does not have come from the upstream: the L0 overlay's
 //!   (the pipeline copies them when it seals their trees), and, as a fault the edge counts,
 //!   any a sealed tree names that a complete store lacks. Once per blob per edge (requests
-//!   for a blob already being fetched wait for that fetch), verified by id as they stream
-//!   in, and kept in a local cache, one pack per fetch, bounded in bytes and in packs (each
-//!   holds a descriptor and a mapping), until the store has them. Only blobs the store's
-//!   trees name are proxied ([`super::view::View::blob_size`]); anything else is a 404.
+//!   for a blob already being fetched wait for that fetch, and fail with it if it fails),
+//!   verified by id as they stream in, and kept in a local cache, one pack per fetch,
+//!   bounded in bytes and in packs (each holds a descriptor and a mapping), until the store
+//!   has them. Only blobs the store's trees name are proxied
+//!   ([`super::view::View::blob_size`]); anything else is a 404.
 //!
 //! Remote reads and the proxy's fetches are async: a request waiting on object storage or
 //! the upstream parks its task, not a thread.
@@ -23,6 +24,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::Notify;
 
+use super::blobcache::Attempt;
 use crate::blobs::{BlobManifest, BlobRec, Segment, pack_key};
 use crate::blobstream::{BlobSink, FileSpool};
 use crate::store::Store;
@@ -283,7 +285,8 @@ struct ProxyState {
     /// Fetched packs, oldest first, with their blobs (eviction order).
     order: VecDeque<(Arc<BlobPack>, Arc<[Oid]>)>,
     bytes: u64,
-    fetching: HashSet<Oid>,
+    /// The blobs being fetched, each with the fetch that will bring it.
+    fetching: HashMap<Oid, Arc<Attempt>>,
 }
 
 impl ProxyState {
@@ -402,7 +405,7 @@ impl Proxy {
                 cache: HashMap::new(),
                 order: VecDeque::new(),
                 bytes: 0,
-                fetching: HashSet::new(),
+                fetching: HashMap::new(),
             }),
             done: Notify::new(),
         })
@@ -450,13 +453,16 @@ impl Proxy {
     }
 
     /// The blobs `oids` (distinct): from the cache, else from the upstream in one request
-    /// for all of those not being fetched already (others wait for those fetches). Cold
-    /// path. What the call has in hand it keeps (an `Arc` keeps a pack open, cached or
-    /// not), so the cache evicting one pack for another never makes it start over.
+    /// for all of those not being fetched already (others wait for those fetches, and fail
+    /// with one that fails). Cold path. What the call has in hand it keeps (an `Arc` keeps a
+    /// pack open, cached or not), so the cache evicting one pack for another never makes it
+    /// start over.
     pub async fn fetch(&self, oids: &[Oid]) -> Result<Vec<(Arc<BlobPack>, BlobRec)>> {
         let mut found: HashMap<Oid, (Arc<BlobPack>, BlobRec)> = HashMap::with_capacity(oids.len());
+        // The fetches this request waited for last, by blob.
+        let mut waited: HashMap<Oid, Arc<Attempt>> = HashMap::new();
         loop {
-            let mine: Vec<Oid> = loop {
+            let (mine, attempt): (Vec<Oid>, Arc<Attempt>) = loop {
                 // Waiting is registered before the state is read: a fetch that ends in
                 // between still wakes this request.
                 let mut ended = std::pin::pin!(self.done.notified());
@@ -470,25 +476,34 @@ impl Proxy {
                             found.insert(*o, hit.clone());
                         }
                     }
-                    let missing: Vec<Oid> = oids
-                        .iter()
-                        .filter(|o| !found.contains_key(o))
-                        .copied()
-                        .collect();
-                    if missing.is_empty() {
+                    let (mut mine, mut waiting) = (Vec::new(), HashMap::new());
+                    for o in oids.iter().filter(|o| !found.contains_key(o)) {
+                        match st.fetching.get(o) {
+                            Some(a) => {
+                                waiting.insert(*o, Arc::clone(a));
+                            }
+                            // Neither cached nor being fetched: the fetch this request
+                            // waited for failed (so does the request), or was dropped.
+                            None => match waited.get(o).and_then(|a| a.failure()) {
+                                Some(e) => return Err(e),
+                                None => mine.push(*o),
+                            },
+                        }
+                    }
+                    if mine.is_empty() && waiting.is_empty() {
                         return oids
                             .iter()
                             .map(|o| found.get(o).cloned().ctx("proxied blob"))
                             .collect();
                     }
-                    let mine: Vec<Oid> = missing
-                        .into_iter()
-                        .filter(|o| !st.fetching.contains(o))
-                        .collect();
                     if !mine.is_empty() {
-                        st.fetching.extend(mine.iter().copied());
-                        break mine;
+                        let attempt = Arc::new(Attempt::default());
+                        for o in &mine {
+                            st.fetching.insert(*o, Arc::clone(&attempt));
+                        }
+                        break (mine, attempt);
                     }
+                    waited = waiting;
                 }
                 ended.await;
             };
@@ -504,11 +519,15 @@ impl Proxy {
                 st.fetching.remove(o);
             }
             let mut evicted = Vec::new();
-            if let Ok((pack, recs)) = &got {
-                for r in recs {
-                    found.insert(r.oid, (Arc::clone(pack), *r));
+            match &got {
+                Ok((pack, recs)) => {
+                    for r in recs {
+                        found.insert(r.oid, (Arc::clone(pack), *r));
+                    }
+                    evicted = st.keep(pack, recs, self.budget, self.max_packs);
                 }
-                evicted = st.keep(pack, recs, self.budget, self.max_packs);
+                // Those waiting for these blobs fail with this request.
+                Err(e) => attempt.fail(e),
             }
             drop(st);
             drop(evicted);
@@ -680,7 +699,7 @@ mod tests {
             cache: HashMap::new(),
             order: VecDeque::new(),
             bytes: 0,
-            fetching: HashSet::new(),
+            fetching: HashMap::new(),
         };
         let (p1, r1) = proxied(&dir, "p1", 100, &[1, 2]);
         let (p2, r2) = proxied(&dir, "p2", 100, &[2, 3]);
@@ -832,6 +851,128 @@ mod tests {
         assert_eq!((st.order.len(), st.cache.len()), (8, 8));
         assert!(st.bytes < 8 << 10, "{} bytes of a 10 GiB budget", st.bytes);
         drop(st);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Requests waiting for a blob whose fetch fails fail with it: one request to the
+    /// upstream, one failure, for all of them. (Each used to ask the upstream in its turn,
+    /// one after another: 40 requests here, and against a stalled upstream a timeout each.)
+    /// The failure is that fetch's alone: the next request asks again.
+    #[test]
+    fn requests_waiting_for_a_failed_fetch_fail_with_it() {
+        use crate::testhttp::{Reply, serve};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = std::env::temp_dir().join(format!("gvd-proxy-waiters-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let (seen, gate) = (Arc::clone(&asked), Arc::clone(&release));
+        let port = serve(move |r| {
+            if r.line.contains("/gvfs/config") {
+                return Reply::ok(b"{}");
+            }
+            // The first answer waits for the test to have its requests waiting.
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                while !gate.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            Reply::Whole("500 Internal Server Error".to_string(), b"no".to_vec())
+        });
+        let spec = format!("http://127.0.0.1:{port}/r");
+        let proxy = Arc::new(Proxy::new(&spec, &Auth::default(), &dir, 1 << 20, 8).unwrap());
+        let blob = Oid([0x77; 20]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let errors: Vec<String> = rt.block_on(async {
+            let started = Arc::new(AtomicUsize::new(0));
+            let mut tasks = Vec::new();
+            for _ in 0..40 {
+                let (proxy, started) = (Arc::clone(&proxy), Arc::clone(&started));
+                tasks.push(tokio::spawn(async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    let fetched = proxy.fetch(&[blob]).await;
+                    fetched.map(|_| ()).unwrap_err().to_string()
+                }));
+            }
+            // One request is fetching and the others wait for it when the upstream answers.
+            while started.load(Ordering::SeqCst) < 40 {
+                tokio::task::yield_now().await;
+            }
+            release.store(true, Ordering::SeqCst);
+            let mut errors = Vec::new();
+            for t in tasks {
+                errors.push(t.await.unwrap());
+            }
+            errors
+        });
+        assert_eq!(asked.load(Ordering::SeqCst), 1, "{errors:?}");
+        assert!(errors.iter().all(|e| e.contains("HTTP 500")), "{errors:?}");
+        let waited = |e: &&String| e.contains("the fetch it waited for failed");
+        assert_eq!(errors.iter().filter(waited).count(), 39, "{errors:?}");
+        assert!(lock(&proxy.state).fetching.is_empty());
+        let again = rt.block_on(proxy.fetch(&[blob])).map(|_| ());
+        let e = again.unwrap_err().to_string();
+        assert!(e.contains("HTTP 500") && !e.contains("waited"), "{e}");
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fetch that is dropped (its client went away) is not a failure: a request waiting
+    /// for its blob makes the fetch its own.
+    #[test]
+    fn a_dropped_fetch_is_taken_over_by_a_request_waiting_for_it() {
+        use crate::testhttp::{Reply, serve};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let dir = std::env::temp_dir().join(format!("gvd-proxy-takeover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let asked = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let (seen, gate) = (Arc::clone(&asked), Arc::clone(&release));
+        let port = serve(move |r| {
+            if r.line.contains("/gvfs/config") {
+                return Reply::ok(b"{}");
+            }
+            // The first request gets no answer while the test runs.
+            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                while !gate.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+            Reply::Whole("500 Internal Server Error".to_string(), b"no".to_vec())
+        });
+        let spec = format!("http://127.0.0.1:{port}/r");
+        let proxy = Arc::new(Proxy::new(&spec, &Auth::default(), &dir, 1 << 20, 8).unwrap());
+        let blob = Oid([0x77; 20]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let e = rt.block_on(async {
+            let fetching = Arc::clone(&proxy);
+            let fetcher = tokio::spawn(async move { fetching.fetch(&[blob]).await.map(|_| ()) });
+            while asked.load(Ordering::SeqCst) < 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            let (waiting, started) = (Arc::clone(&proxy), Arc::new(AtomicBool::new(false)));
+            let begun = Arc::clone(&started);
+            let waiter = tokio::spawn(async move {
+                begun.store(true, Ordering::SeqCst);
+                waiting.fetch(&[blob]).await.map(|_| ())
+            });
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+            fetcher.abort();
+            assert!(fetcher.await.unwrap_err().is_cancelled());
+            waiter.await.unwrap().unwrap_err().to_string()
+        });
+        assert!(e.contains("HTTP 500") && !e.contains("waited"), "{e}");
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+        assert!(lock(&proxy.state).fetching.is_empty());
+        release.store(true, Ordering::SeqCst);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
