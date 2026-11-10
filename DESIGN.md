@@ -1130,7 +1130,9 @@ not the hot path's).
 * Small blobs are stored whole (no deltas), trading storage on similar small files for
   entries that always splice alone. Chunk-level dedup (HFS) is gone: git stores whole
   files.
-* A blob request first misses every metadata slab's index, then probes the segments.
+* A request id is looked up in the segments before the slabs (Serving, above), so it is
+  an id that is no blob which pays for the other kind: a commit, a tree or an id the store
+  lacks first misses the biggest segment's index and each smaller one's filter.
 * No reachability GC of blob packs (blobs of force-pushed-away commits stay, and so does
   the second copy of a blob that two overlapping runs both copied).
 * A copy has `--gc-grace-secs` from the first garbage collection that sees one of its
