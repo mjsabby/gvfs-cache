@@ -290,7 +290,14 @@ lacks it fetches on demand from `/gvfs/objects`.
 
 **Boot**, which is also crash recovery: read the manifest, then open its slabs (retained
 ones included) in place (fs store) or download them into `--cache-dir` (Azure), and map
-them. An edge of an object store must be given `--cache-dir`, a directory on local disk:
+them. A slab's files are the slab only if they are the ones the manifest lists: the pack's
+length and trailer, the index's length and the object count are compared with its entry
+(a manifest names a slab by 8 bytes of its pack's SHA-1), and a pack that was just
+downloaded is hashed, so that what an edge serves is the pack whose SHA-1 the pipeline
+published (SearchGold's baseline: 2.4 GiB, about a second). Cached files that are not
+the slab, or a sizes table that fails its checksum, are downloaded again, once: an edge
+does not need its cache wiped by hand to start. An edge of an object store must be given
+`--cache-dir`, a directory on local disk:
 it holds the slabs (gigabytes) and the caches of blob packs, and the system's temp
 directory, otherwise the default, is memory on many hosts (a memory filesystem is warned
 about at startup). Whenever a manifest is applied, at boot too, the files of slabs it does
