@@ -36,6 +36,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::Poll;
 use std::time::Duration;
 
 use sha1::{Digest, Sha1};
@@ -50,6 +51,14 @@ const AGENT: &str = concat!("agent=gvfs-cache/", env!("CARGO_PKG_VERSION"), "\n"
 
 /// Ids per `object-info` / `/gvfs/sizes` request, and per blob batch.
 pub const BATCH: usize = 4000;
+
+/// Sizes requests in flight at once ([`AsyncUpstream::object_sizes`]). Genesis of a
+/// separate-blob store asks for the size of every blob of the history: RepoB's
+/// 5.38M blobs are 1,346 requests, which a local git answers in 89 s one at a time, 51 s
+/// with 2 in flight, 25 s with 4, 13 s with 8 and 7 s with 16. Eight and not more: an
+/// upstream that limits each identity (Azure DevOps) counts them all, and a mirror, by
+/// default, makes 4 requests at a time.
+const SIZES_IN_FLIGHT: usize = 8;
 
 /// A password in the upstream URL would not be used (credentials come from the
 /// environment), yet would be on the command line for every local user to read: refused.
@@ -288,7 +297,8 @@ impl Upstream {
     }
 
     /// The sizes of objects `oids`, in order (`None`: the upstream does not have it):
-    /// `POST /gvfs/sizes` from a GVFS upstream, else protocol v2 `object-info`.
+    /// `POST /gvfs/sizes` from a GVFS upstream, else protocol v2 `object-info`, several
+    /// requests at a time ([`AsyncUpstream::object_sizes`]).
     pub fn object_sizes(&mut self, oids: &[Oid]) -> Result<Vec<Option<u64>>> {
         self.rt.block_on(self.inner.object_sizes(oids))
     }
@@ -1158,8 +1168,8 @@ impl AsyncUpstream {
     }
 
     /// Starts one stateless request.
-    async fn rpc(&mut self, request: &[u8], v2: bool) -> Result<AsyncBody> {
-        match &mut self.transport {
+    async fn rpc(&self, request: &[u8], v2: bool) -> Result<AsyncBody> {
+        match &self.transport {
             AsyncTransport::Local { git_dir } => {
                 use tokio::io::AsyncWriteExt;
                 let mut cmd = Command::new("git");
@@ -1172,7 +1182,7 @@ impl AsyncUpstream {
                     "-c",
                     "transfer.advertiseObjectInfo=true",
                 ]);
-                cmd.arg("upload-pack").arg("--stateless-rpc").arg(&*git_dir);
+                cmd.arg("upload-pack").arg("--stateless-rpc").arg(git_dir);
                 hermetic_git_env(&mut cmd);
                 if v2 {
                     cmd.env("GIT_PROTOCOL", "version=2");
@@ -1431,30 +1441,16 @@ impl AsyncUpstream {
     }
 
     /// The sizes of objects `oids`, in order (`None`: the upstream does not have it):
-    /// `POST /gvfs/sizes` from a GVFS upstream, else protocol v2 `object-info`.
+    /// `POST /gvfs/sizes` from a GVFS upstream, else protocol v2 `object-info`, [`BATCH`]
+    /// ids a request and [`SIZES_IN_FLIGHT`] requests at a time. The first request that
+    /// fails fails the call (a 429 is waited out first, where this upstream waits).
     pub async fn object_sizes(&mut self, oids: &[Oid]) -> Result<Vec<Option<u64>>> {
-        let mut out = Vec::with_capacity(oids.len());
-        for batch in oids.chunks(BATCH) {
-            if self.is_gvfs().await? {
-                let AsyncTransport::Http(http) = &self.transport else {
-                    crate::bail!("GVFS upstreams are HTTP");
-                };
-                let mut resp = http
-                    .request(
-                        "POST",
-                        "/gvfs/sizes",
-                        &[("Content-Type", "application/json")],
-                        bytes::Bytes::from(gvfs_sizes_body(batch)),
-                    )
-                    .await?
-                    .ensure_ok("POST /gvfs/sizes")
-                    .await?;
-                let limit = batch.len().saturating_mul(128).saturating_add(1 << 16);
-                let text = resp.body_vec(limit).await?;
-                let found = parse_gvfs_sizes(&text);
-                out.extend(batch.iter().map(|o| found.get(o).copied()));
-                continue;
-            }
+        let mut out = vec![None; oids.len()];
+        if oids.is_empty() {
+            return Ok(out);
+        }
+        let gvfs = self.is_gvfs().await?;
+        if !gvfs {
             self.detect().await?;
             if !self.v2 || !self.has_cap("object-info") {
                 crate::bail!(
@@ -1462,14 +1458,78 @@ impl AsyncUpstream {
                     self.label
                 );
             }
-            let mut body = self.rpc(&object_info_request(batch), true).await?;
-            let read = body.read_all(64 << 20).await;
-            let found = read.and_then(|b| parse_object_info(&mut &b[..], batch.len()));
-            let found = body.finish(found).await?;
-            out.extend(batch.iter().map(|o| found.get(o).copied()));
+        }
+        // Each lane takes the next batch, and the part of `out` its answer goes to, until
+        // none is left: the answers land in the order of `oids` however they arrive.
+        let lanes = SIZES_IN_FLIGHT.min(oids.len().div_ceil(BATCH));
+        {
+            let work = Mutex::new(oids.chunks(BATCH).zip(out.chunks_mut(BATCH)));
+            let this = &*self;
+            let lane = || async {
+                loop {
+                    let Some((batch, sizes)) = lock(&work).next() else {
+                        return Ok(());
+                    };
+                    this.sizes_of(batch, gvfs, sizes).await?;
+                }
+            };
+            all_ok((0..lanes).map(|_| lane()).collect()).await?;
         }
         Ok(out)
     }
+
+    /// One sizes request: the sizes of `batch` (at most [`BATCH`] ids) into `sizes`.
+    async fn sizes_of(&self, batch: &[Oid], gvfs: bool, sizes: &mut [Option<u64>]) -> Result<()> {
+        let found = if gvfs {
+            let AsyncTransport::Http(http) = &self.transport else {
+                crate::bail!("GVFS upstreams are HTTP");
+            };
+            let mut resp = http
+                .request(
+                    "POST",
+                    "/gvfs/sizes",
+                    &[("Content-Type", "application/json")],
+                    bytes::Bytes::from(gvfs_sizes_body(batch)),
+                )
+                .await?
+                .ensure_ok("POST /gvfs/sizes")
+                .await?;
+            let limit = batch.len().saturating_mul(128).saturating_add(1 << 16);
+            parse_gvfs_sizes(&resp.body_vec(limit).await?)
+        } else {
+            let mut body = self.rpc(&object_info_request(batch), true).await?;
+            let read = body.read_all(64 << 20).await;
+            let found = read.and_then(|b| parse_object_info(&mut &b[..], batch.len()));
+            body.finish(found).await?
+        };
+        for (size, oid) in sizes.iter_mut().zip(batch) {
+            *size = found.get(oid).copied();
+        }
+        Ok(())
+    }
+}
+
+/// Polls `lanes` together, on the calling task, until all have ended or one has failed:
+/// the others are then dropped where they are (their requests end with them).
+async fn all_ok<F: Future<Output = Result<()>>>(lanes: Vec<F>) -> Result<()> {
+    let mut lanes: Vec<_> = lanes.into_iter().map(|l| Some(Box::pin(l))).collect();
+    std::future::poll_fn(|cx| {
+        let mut running = false;
+        for lane in lanes.iter_mut() {
+            let Some(l) = lane else { continue };
+            match l.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => *lane = None,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => running = true,
+            }
+        }
+        if running {
+            Poll::Pending
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1644,6 +1704,184 @@ mod tests {
         assert_eq!(probes.load(Ordering::SeqCst), 1, "the 404 is kept");
     }
 
+    /// The id the fake upstreams below know blob `i` by: its size is `i`, and one in seven
+    /// they do not have.
+    fn numbered(i: usize) -> Oid {
+        let mut id = [0x42u8; 20];
+        id[..4].copy_from_slice(&(i as u32).to_be_bytes());
+        if i % 7 == 3 {
+            id[19] = 0xEE;
+        }
+        Oid(id)
+    }
+
+    fn numbered_size(oid: &Oid) -> Option<u64> {
+        let i = u32::from_be_bytes(oid.0[..4].try_into().unwrap());
+        (oid.0[19] != 0xEE).then_some(u64::from(i))
+    }
+
+    /// The sizes requests a [`sizes_upstream`] got, and the most it had in flight at once.
+    #[derive(Default)]
+    struct Seen {
+        asked: std::sync::atomic::AtomicUsize,
+        in_flight: std::sync::atomic::AtomicUsize,
+        most: std::sync::atomic::AtomicUsize,
+        /// Its first answers no longer wait for others to be in flight.
+        released: std::sync::atomic::AtomicBool,
+    }
+
+    /// A fake upstream that answers sizes requests for [`numbered`] ids: a GVFS upstream
+    /// (`POST /gvfs/sizes`), or a git server speaking protocol v2 (`object-info`). Its
+    /// first answers wait until `together` requests are in flight (5 s at most), and its
+    /// `nth` request is answered with `status(nth)` when that gives one. Returns its URL.
+    fn sizes_upstream(
+        gvfs: bool,
+        together: usize,
+        status: impl Fn(usize) -> Option<&'static str> + Send + Sync + 'static,
+    ) -> (String, Arc<Seen>) {
+        use crate::testhttp::{Reply, serve};
+        use std::sync::atomic::Ordering::SeqCst;
+        let seen = Arc::new(Seen::default());
+        let saw = Arc::clone(&seen);
+        let port = serve(move |r| {
+            if r.line.contains("/gvfs/config") {
+                return match gvfs {
+                    true => Reply::ok(b"{}"),
+                    false => Reply::status("404 Not Found"),
+                };
+            }
+            if r.line.contains("/info/refs") {
+                let mut b = Vec::new();
+                for line in ["version 2\n", "agent=fake\n", "object-info\n"] {
+                    pktline::put_str(&mut b, line);
+                }
+                pktline::flush(&mut b);
+                return Reply::ok(&b);
+            }
+            let nth = saw.asked.fetch_add(1, SeqCst);
+            saw.most
+                .fetch_max(saw.in_flight.fetch_add(1, SeqCst) + 1, SeqCst);
+            let t0 = std::time::Instant::now();
+            while saw.most.load(SeqCst) < together
+                && !saw.released.load(SeqCst)
+                && t0.elapsed() < Duration::from_secs(5)
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            saw.released.store(true, SeqCst);
+            let reply = match status(nth) {
+                Some(status) => Reply::status(status),
+                None if gvfs => {
+                    let sizes: Vec<String> = String::from_utf8_lossy(&r.body)
+                        .split(|c: char| !c.is_ascii_hexdigit())
+                        .filter(|t| t.len() == 40)
+                        .filter_map(|id| {
+                            let size = numbered_size(&Oid::from_hex(id.as_bytes())?)?;
+                            Some(format!("{{\"Id\":\"{id}\",\"Size\":{size}}}"))
+                        })
+                        .collect();
+                    Reply::ok(format!("[{}]", sizes.join(",")).as_bytes())
+                }
+                None => {
+                    let mut rd = pktline::Reader::new(&r.body[..]);
+                    let mut b = Vec::new();
+                    pktline::put_str(&mut b, "size");
+                    loop {
+                        let n = match rd.read().unwrap() {
+                            Pkt::Data(n) => n,
+                            Pkt::Delim => continue,
+                            _ => break,
+                        };
+                        let Some(id) = rd.line(n).strip_prefix(b"oid ") else {
+                            continue;
+                        };
+                        let id = Oid::from_hex(id).unwrap();
+                        // As git answers: an id it does not have gets no size.
+                        let size = numbered_size(&id).map_or(String::new(), |s| s.to_string());
+                        pktline::put_str(&mut b, &format!("{id} {size}"));
+                    }
+                    pktline::flush(&mut b);
+                    Reply::ok(&b)
+                }
+            };
+            saw.in_flight.fetch_sub(1, SeqCst);
+            reply
+        });
+        (format!("http://127.0.0.1:{port}/r"), seen)
+    }
+
+    /// Sizes are asked for [`SIZES_IN_FLIGHT`] requests at a time, over `/gvfs/sizes` and
+    /// over protocol v2 `object-info`, and come back in the order of the ids whatever the
+    /// order of the answers. (One request at a time, the sizes of RepoB's 5.4M
+    /// blobs were 102 s of a 143 s genesis.)
+    #[test]
+    fn sizes_are_asked_for_several_batches_at_a_time() {
+        use std::sync::atomic::Ordering::SeqCst;
+        for gvfs in [true, false] {
+            // Every other answer comes late: after those of the requests that follow it.
+            let late = |nth: usize| {
+                let wait = if nth.is_multiple_of(2) { 20 } else { 0 };
+                std::thread::sleep(Duration::from_millis(wait));
+                None
+            };
+            let (spec, seen) = sizes_upstream(gvfs, SIZES_IN_FLIGHT, late);
+            let oids: Vec<Oid> = (0..10 * BATCH + 123).map(numbered).collect();
+            let want: Vec<Option<u64>> = oids.iter().map(numbered_size).collect();
+            let mut up = Upstream::open(&spec, "main", &Auth::default()).unwrap();
+            assert!(up.object_sizes(&oids).unwrap() == want, "gvfs: {gvfs}");
+            assert_eq!(seen.asked.load(SeqCst), 11, "gvfs: {gvfs}");
+            assert_eq!(seen.most.load(SeqCst), SIZES_IN_FLIGHT, "gvfs: {gvfs}");
+            // Fewer ids than a request holds: one request. None: no request.
+            assert_eq!(up.object_sizes(&oids[..5]).unwrap(), want[..5]);
+            assert!(up.object_sizes(&[]).unwrap().is_empty());
+            assert_eq!(seen.asked.load(SeqCst), 12, "gvfs: {gvfs}");
+        }
+    }
+
+    /// With several sizes requests in flight, a rate limit is still waited out by a job
+    /// (the request is sent again) and is still the error of a request a client waits on;
+    /// and the first request that fails fails the call, the others dropped where they are.
+    #[test]
+    fn sizes_in_flight_wait_out_rate_limits_and_stop_at_the_first_error() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let limit = "429 Too Many Requests\r\nRetry-After: 1";
+        let oids: Vec<Oid> = (0..6 * BATCH).map(numbered).collect();
+        let want: Vec<Option<u64>> = oids.iter().map(numbered_size).collect();
+        let (spec, seen) =
+            sizes_upstream(true, 0, move |nth| matches!(nth, 2 | 5).then_some(limit));
+        let mut up = Upstream::open(&spec, "main", &Auth::default()).unwrap();
+        let t0 = std::time::Instant::now();
+        assert!(up.object_sizes(&oids).unwrap() == want);
+        assert!(t0.elapsed() >= Duration::from_secs(1));
+        assert_eq!(seen.asked.load(SeqCst), 8, "two of the six asked for twice");
+
+        let (spec, _) = sizes_upstream(true, 0, move |nth| (nth == 1).then_some(limit));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut proxy = AsyncUpstream::open(&spec, &Auth::default()).unwrap();
+        let e = rt.block_on(proxy.object_sizes(&oids)).unwrap_err();
+        assert!(e.to_string().contains("POST /gvfs/sizes: HTTP 429"), "{e}");
+
+        // The third request fails at once; the others take 50 ms to be answered.
+        let failing = |nth: usize| {
+            if nth == 2 {
+                return Some("500 Internal Server Error");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            None
+        };
+        let (spec, seen) = sizes_upstream(false, 0, failing);
+        let oids: Vec<Oid> = (0..20 * BATCH).map(numbered).collect();
+        let mut up = Upstream::open(&spec, "main", &Auth::default()).unwrap();
+        let e = up.object_sizes(&oids).unwrap_err().to_string();
+        assert!(e.contains("git-upload-pack: HTTP 500"), "{e}");
+        std::thread::sleep(Duration::from_millis(200));
+        let asked = seen.asked.load(SeqCst);
+        assert!(asked <= SIZES_IN_FLIGHT, "{asked} of 20 requests made");
+    }
+
     /// A local `upload-pack`'s stderr is read as it is written, and what an error says of
     /// it is its end: the last lines, whole, within [`STDERR_KEPT`] bytes.
     #[test]
@@ -1784,6 +2022,15 @@ mod tests {
             .chain(std::iter::once(None))
             .collect();
         assert_eq!(sizes, expect);
+        // More ids than two requests hold, most of them not the upstream's: its blobs' sizes
+        // at their ids' places, from requests in flight together.
+        let mut many: Vec<Oid> = (0..2 * BATCH + 500).map(numbered).collect();
+        let (near, far) = (10, many.len() - 1);
+        (many[near], many[far]) = (blobs[0], blobs[1]);
+        let sizes = up.object_sizes(&many).unwrap();
+        assert_eq!((sizes[near], sizes[far]), (expect[0], expect[1]));
+        assert_eq!(sizes.iter().flatten().count(), 2);
+        assert_eq!(sizes.len(), many.len());
         assert_eq!(
             parse_gvfs_sizes(br#"[{"Id":"4242424242424242424242424242424242424242","Size":7}, { "Size" : 9 , "Id" : "4343434343434343434343434343434343434343" }]"#)
                 .len(),

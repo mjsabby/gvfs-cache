@@ -587,8 +587,9 @@ the mirror.
 
 * **Genesis** fetches `blob:none` (commits and trees), walks every tree for the blobs it
   references, asks the upstream for their sizes (protocol v2 `object-info`, or ADO's
-  `POST /gvfs/sizes`, 4,000 ids per request), writes the baseline's sizes table, records
-  the genesis commit in `blobs.bin` (not mirrored yet), and flags the manifest `separate`.
+  `POST /gvfs/sizes`, 4,000 ids per request, 8 requests in flight), writes the baseline's
+  sizes table, records the genesis commit in `blobs.bin` (not mirrored yet), and flags the
+  manifest `separate`.
 * **A 15m run works blobs first** (`pipeline::window_separate`): a `blob:none` fetch of
   the window; the blobs the trees in its pack reference that no segment lists; their sizes
   from the upstream (so a large blob is fetched alone); the copy, each blob verified by
