@@ -144,7 +144,8 @@ Run one job every 15 minutes with the highest tier that is due:
 * Only the new commits are fetched from the upstream; every rollup is repacked from slabs
   already in the store.
 * Concurrent runs are safe: the manifest is published with compare-and-swap, and the loser
-  starts over.
+  starts over. Runs of a `--blobs separate` store that overlap share a window's blobs:
+  each copies what the others have not published.
 * A run with nothing to do (no new commits, no rollup due) publishes nothing: the manifest
   keeps its generation and edges keep their views.
 
@@ -193,7 +194,9 @@ gvfs-cache mirror --store "$STORE" --upstream "$ADO_URL" --auth-command ~/get_to
     --jobs 16 [--rate-mbps 4000] [--max-items N]
 
 # Then schedule the pipeline as below: every run copies its window's new blobs before
-# publishing the trees that reference them, and, until the mirror has finished, what the
+# publishing the trees that reference them (--jobs at a time, default 4, and published at
+# least every --publish-secs, default 60: a run its runner stops keeps what it copied,
+# and the next copies the rest), and, until the mirror has finished, what the
 # new tip lacks if it fits in one blob pack (keep --work-dir, or --cache-dir, on a
 # persistent disk: a run reuses the store objects the previous one downloaded). Edges
 # serve blobs from the blob packs (mapped, or read by range from Azure) and proxy only
@@ -364,7 +367,7 @@ src/pipeline.rs            the scheduled job: genesis, 15m, rollups, weekly
 src/gc.rs                  garbage collection of the store, at the end of each pipeline run; gc.bin
 src/mirror.rs              --blobs separate: the resumable seed (and on-demand repair) of the blob packs
 src/separate.rs            --blobs separate: what pipeline, mirror and edge share (sizes, blob index,
-                           the history's blobs, lost-object checks)
+                           the parallel copy, the history's blobs, lost-object checks)
 src/blobs.rs, sizes.rs     blob packs, segments, blobs.bin; sizes tables and the GSZ1 section
 src/blobstream.rs, blobcopy.rs   streaming whole-blob packs from upstream fetches; copy items, publish
 src/manifest.rs, store.rs, azure.rs    manifest.bin (CAS) and the fs / Azure stores

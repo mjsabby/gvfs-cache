@@ -764,7 +764,8 @@ the mirror.
 * **A 15m run works blobs first** (`pipeline::window_separate`): a `blob:none` fetch of
   the window; the blobs the trees in its pack reference that no segment lists; their sizes
   from the upstream (so a large blob is fetched alone); the copy, each blob verified by
-  id; `blobs.bin` published; only then the slab, its sizes table (the sizes no earlier
+  id, published in `blobs.bin` as it goes (next item); only then, once `blobs.bin` lists
+  them all, the slab, its sizes table (the sizes no earlier
   table has) and the manifest. Until the mirror has finished, a run copies only the blobs
   no earlier tree references (no sizes table has them): an unchanged file in a changed
   directory, or an old version brought back, is in the mirror's plan, and copying it too
@@ -784,9 +785,37 @@ the mirror.
   pruned to what the store lists. Only those downloads are pruned, known by their names
   (`<slab id>.pack`, `.mphf`, `slabs_<slab id>.sizes`, `<segment id>.bidx`): any other
   file in the directory is left alone.
+* **A window's copy is the mirror's loop** (`separate::copy_all`): `--jobs` copies at a
+  time (default 4), each on an upstream connection of its own; finished packs published
+  at least every `--publish-secs` (default 60); a rate limit waited out; an item tried
+  three times. A run that stops before its last blob (its runner's time limit, an item
+  that failed) keeps what it published: the next run copies what `blobs.bin` still
+  lacks, then seals. The slab goes out only once `blobs.bin`, read again after the copy,
+  lists every blob the window needs, whoever copied it. (The copy took one blob at a time
+  and published once, after the last: a window that outlived its runner left every pack
+  unlisted, and each run began again. A window of 32 blobs of 16 MiB from an upstream
+  that sends each at 64 MiB/s: 8.8 s one at a time, 2.5 s with four jobs; a run killed
+  after 16 of them left the next one all 32 to fetch, and now, at `--publish-secs 1`,
+  the 17 to 20 it had not published.)
+* **Runs that overlap share a window** (the next quarter's run starts while this one
+  copies; both plan the same items). Each takes the items in an order of its own and
+  reads `blobs.bin` again at each of its publishes, leaving out what the other has
+  listed. A blob is copied twice only when both took it before either had published it
+  and the other read that: what the runs copy in about two publish intervals and an
+  item's time, a few times over the copy (the last items always). Two runs at once of a
+  window of 256 blobs, half a second each, `--jobs 4 --publish-secs 1`: 299 to 303
+  fetched in 20 s, where two serial runs fetched 512 in 134 s. A window that lasts no
+  longer than those intervals is still copied by each (32 blobs in 2.5 s: 59 to 62
+  fetched). In one order each run takes an item while the other is still copying it,
+  to the last one: every blob twice, as measured, however often they publish. A blob
+  listed twice is found once; its other copy is wasted bytes, which nothing reclaims
+  (Limits). Neither run fails the other: `blobs.bin` is swapped with retries, a fold
+  gives way to another writer, and of two manifests one wins: the other run starts
+  over, finds the window sealed and publishes nothing.
 * **The manifest names the `blobs.bin` generation** the run computed its copies against,
-  or the one it published if newer, even when it copied nothing: a run that died after
-  publishing `blobs.bin` left the blobs the next run's trees rely on.
+  or the one it read after its copy, which lists them all, even when it copied nothing:
+  a run that died after publishing `blobs.bin` left the blobs the next run's trees rely
+  on.
 * **Rollups and the weekly rebuild** union their parts' tables. **GC** keeps the sizes
   tables of listed slabs and the packs and segments `blobs.bin` lists. Anything else in
   `slabs/` and `blobs/` (a crashed copy's upload, the segments a fold merged, the table
@@ -859,7 +888,8 @@ from the upstream (ids from the slabs' trees, sizes from the sizes tables, minus
 checkout's blobs share packs and cache blocks), then the rest of the history by where the
 first tree naming each blob is stored (an upstream writes trees newest commit first, each
 commit's in path order). `--jobs` copies run in parallel, finished packs are published
-every `--publish-secs`, `--rate-mbps` paces all copies through one throttle, and
+every `--publish-secs` (`separate::copy_all`, the loop a pipeline run's window goes
+through too), `--rate-mbps` paces all copies through one throttle, and
 `--max-items` seeds in slices. Before each pack, blobs that pipeline runs copied meanwhile
 are left out (the index is reloaded after each publish), and every copied blob's size is
 checked against the sizes table clients were given. The run that copies the last item
@@ -1014,12 +1044,13 @@ not the hot path's).
   entries that always splice alone. Chunk-level dedup (HFS) is gone: git stores whole
   files.
 * A blob request first misses every metadata slab's index, then probes the segments.
-* No reachability GC of blob packs (blobs of force-pushed-away commits stay).
+* No reachability GC of blob packs (blobs of force-pushed-away commits stay, and so does
+  the second copy of a blob that two overlapping runs both copied).
 * A copy has `--gc-grace-secs` from the first garbage collection that sees one of its
-  packs unlisted to the `blobs.bin` that lists it. A window publishes after its last
-  item: if it takes longer than that while other runs collect garbage, its first packs
-  are deleted, and the `blobs.bin` it publishes lists packs the store lacks (edges
-  proxy their blobs; `mirror` repairs). The mirror publishes every `--publish-secs`.
+  packs unlisted to the `blobs.bin` that lists it. The mirror and a window publish every
+  `--publish-secs`, far inside it. A copy that could not publish for longer than that
+  while other runs collect garbage loses its first packs, and the `blobs.bin` it then
+  publishes lists packs the store lacks (edges proxy their blobs; `mirror` repairs).
 
 ## Departures from the PDF
 

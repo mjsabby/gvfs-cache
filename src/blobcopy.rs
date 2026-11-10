@@ -11,6 +11,8 @@
 //! * [`copy_item`] turns an item into one blob pack in the store. Every blob is verified
 //!   by its id as it streams through. Pack ids are fresh per copy, so a pack is never
 //!   overwritten once written (a crashed copy leaves an unlisted pack that GC removes).
+//!   The mirror's items and a window's alike run several at a time, their packs published
+//!   as the copy goes ([`crate::separate::copy_all`]).
 //! * [`publish`] indexes finished packs with a segment and appends both to `blobs.bin` by
 //!   compare-and-swap, where readers find them; [`fold`] then merges the smallest
 //!   segments as needed to keep them a geometric progression by blob count ([`fold_set`],
@@ -156,13 +158,9 @@ pub fn fetch_into<S: Spool>(up: &mut Upstream, sink: &mut BlobSink<S>, oids: &[O
 }
 
 /// Copies `item` from the upstream into a new blob pack in the store (retrying transient
-/// failures); `work` holds the spool of a batch.
-pub fn copy_item(up: &mut Upstream, store: &Store, work: &Path, item: &Item) -> Result<Copied> {
-    copy_item_with(up, store, work, item, None)
-}
-
-/// [`copy_item`], paced by a shared [`Throttle`].
-pub fn copy_item_with(
+/// failures), paced by `throttle` if the copies share one; `work` holds the spool of a
+/// batch.
+pub fn copy_item(
     up: &mut Upstream,
     store: &Store,
     work: &Path,

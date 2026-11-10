@@ -375,6 +375,8 @@ fn main() {
         blobs: None,
         blob_pack_bytes: gvfs_cache::separate::ITEM_BYTES,
         cache_dir: work.join("pipeline-cache"),
+        jobs: 4,
+        publish_every: std::time::Duration::from_secs(60),
     };
     let mut edge = Edge {
         store: Store::open(&store_spec, "").unwrap(),

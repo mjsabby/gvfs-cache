@@ -229,6 +229,9 @@ pub struct Upstream {
     rt: tokio::runtime::Runtime,
     /// `refs/heads/<branch>`.
     branch_ref: String,
+    /// What it was opened with ([`Upstream::another`]).
+    spec: String,
+    auth: Auth,
 }
 
 impl Upstream {
@@ -249,7 +252,15 @@ impl Upstream {
             inner,
             rt,
             branch_ref,
+            spec: spec.to_string(),
+            auth: auth.clone(),
         })
+    }
+
+    /// Another connection to the same upstream, with the same credentials (a renewal is
+    /// shared): each of several copies at once has its own.
+    pub fn another(&self) -> Result<Upstream> {
+        Upstream::open(&self.spec, &self.branch_ref, &self.auth)
     }
 
     /// Human-readable description for logs (no credentials).
