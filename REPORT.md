@@ -1018,8 +1018,11 @@ removed, §15), and whole large blobs leave through `sendfile`.
 * Hashing the output buffer in large chunks would hash 100-byte entries at 2.9 GB/s instead of
   2.5 GB/s (~4% of a blob batch).
 * Index files mapped with 2 MiB pages would make most of the remaining page walks go away
-  (~7-15% of a blob batch, estimated). The page cache maps them in 4 KiB pages; huge pages
-  would mean copying the indexes into anonymous memory, at the RAM that costs.
+  (~7-15% of a blob batch, estimated). The page cache maps an index with 2 MiB entries
+  only where it happens to hold it in large folios, which was none to nearly all of one
+  from start to start (§17, P13); `--index-pages huge` copies the indexes into anonymous
+  memory that asks for such pages, at the RAM that costs, and sizes requests are 7 to 11%
+  cheaper for it.
 
 **Measurement pitfalls found on the way:**
 

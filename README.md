@@ -179,6 +179,14 @@ manifest lists stay for `--gc-grace-secs` (default 2 h) after a run first finds 
 A run that fails to delete some says so in its log and still exits 0: its manifest is
 published by then, and a later run deletes them.
 
+What a runner needs goes by the baseline, which genesis and the weekly run index whole:
+for SearchGold (9.26M objects, a 2.4 GiB pack) genesis peaks at 6.8 GiB of resident
+memory and the weekly run at 7.3 GiB, of which about 2 GiB are the process's own and the
+rest the baseline's files in the page cache (32 threads; each log ends with its `peak
+RSS`). The runs between need a few hundred MiB (286 MiB for the 15-minute run after that
+genesis). The work directory holds what a run builds until it is uploaded: a baseline's
+pack and index for the weekly run, and for genesis the upstream's pack beside them.
+
 ### Real blobs in their own packs (`--blobs separate`)
 
 For repositories whose files are real content (no `Git-hfs` pointers), a store created
@@ -285,7 +293,10 @@ Two more tools work on slabs directly:
 
 Measured on SearchGold, a real GitHFS repository cloned from ADO: main has 9.22M objects
 and a 2.42 GiB pack; the full clone has 12.08M objects and 3.04 GiB. Host: AMD Ryzen 9
-9950X (16 cores / 32 threads), Linux 7.3, loopback.
+9950X (16 cores / 32 threads), Linux 7.3, loopback. Another host gives other numbers: on
+a Ryzen 9 5900XT the same requests cost 1.4 times the CPU where user code bounds them and
+2 to 4 times where the kernel does (REPORT.md §17, whose changes are measured there, each
+against the build before it).
 
 | | |
 |---|---|
