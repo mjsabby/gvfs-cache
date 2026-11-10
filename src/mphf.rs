@@ -105,11 +105,31 @@ pub struct Built {
     pub slots: Vec<u32>,
 }
 
+/// Seeds tried as constants of this file before one is derived from the keys.
+const FIXED_SEEDS: u32 = 8;
+/// Seeds tried after that, starting at [`derived_seed`].
+const DERIVED_SEEDS: u32 = 8;
+
 /// Builds the table for `oids` using up to `threads` threads. The ids must be distinct:
 /// a duplicate fails fast with an error of kind `Conflict`.
+///
+/// The seed is `DEFAULT_SEED` for any ordinary key set, so an index is a function of its
+/// keys alone. Ids are not always ordinary: whoever can push to the branch can make
+/// objects whose ids land in one bucket under a seed it knows (300 blobs per seed, 41M
+/// SHA-1 trials for all the fixed ones), and no pilot places such a bucket. When the
+/// fixed seeds have all failed, the seed is a digest of the ids, which cannot be aimed
+/// at: changing an id to suit a seed changes the seed.
 pub fn build(oids: &[Oid], threads: usize) -> Result<Built> {
     let mut seed = DEFAULT_SEED;
-    for _attempt in 0..8 {
+    for attempt in 0..FIXED_SEEDS.saturating_add(DERIVED_SEEDS) {
+        if attempt == FIXED_SEEDS {
+            crate::log!(
+                "mphf: no fixed seed places these {} ids (made to collide?); \
+                 deriving the seed from them",
+                oids.len()
+            );
+            seed = derived_seed(oids);
+        }
         match try_build(oids, seed, threads.max(1))? {
             Outcome::Built(b) => return Ok(b),
             Outcome::Duplicate => {
@@ -122,6 +142,21 @@ pub fn build(oids: &[Oid], threads: usize) -> Result<Built> {
         }
     }
     crate::bail!("minimal perfect hash construction failed")
+}
+
+/// A seed that depends on every key: the first 8 bytes of the SHA-1 of the ids in order.
+fn derived_seed(oids: &[Oid]) -> u64 {
+    use sha1::{Digest, Sha1};
+    let mut h = Sha1::new();
+    for oid in oids {
+        h.update(oid.0);
+    }
+    let digest = h.finalize();
+    let mut word = [0u8; 8];
+    for (w, d) in word.iter_mut().zip(digest.iter()) {
+        *w = *d;
+    }
+    u64::from_le_bytes(word)
 }
 
 enum Outcome {
@@ -565,5 +600,68 @@ mod tests {
         let a = build(&oids, 1).unwrap();
         let b = build(&oids, 7).unwrap();
         assert_eq!((a.seed, &a.pilots, &a.slots), (b.seed, &b.pilots, &b.slots));
+    }
+
+    /// The inverse of `fmix64`.
+    fn unmix64(mut k: u64) -> u64 {
+        // The inverse of an odd number modulo 2^64, by Newton's iteration.
+        let inverse = |x: u64| {
+            (0..6).fold(x, |i, _| {
+                i.wrapping_mul(2u64.wrapping_sub(x.wrapping_mul(i)))
+            })
+        };
+        k ^= k.wrapping_shr(33);
+        k = k.wrapping_mul(inverse(0xc4ce_b9fe_1a85_ec53));
+        k ^= k.wrapping_shr(33);
+        k = k.wrapping_mul(inverse(0xff51_afd7_ed55_8ccd));
+        k ^ k.wrapping_shr(33)
+    }
+
+    /// Ids made to order: 400 per fixed seed that share partition 0 and bucket 0 under it
+    /// (one object in 131,072 has such an id), so that no pilot places that bucket and
+    /// every fixed seed fails. The table is then built with a seed derived from the ids,
+    /// and is the same table every time.
+    #[test]
+    fn ids_aimed_at_the_fixed_seeds_still_build() {
+        let mut oids = random_oids(20_000, 11);
+        let mut words = random_oids(8 * 400, 12).into_iter();
+        let mut seed = DEFAULT_SEED;
+        for _ in 0..FIXED_SEEDS {
+            for _ in 0..400 {
+                let w = words.next().unwrap().0;
+                let word = |at: usize| u64::from_le_bytes(w[at..at + 8].try_into().unwrap());
+                // Hashes with their top byte clear: partition 0 of up to 256, and the
+                // first of up to 256 dense buckets (bit 31 clear picks the dense ones).
+                let part = word(0).wrapping_shr(8);
+                let bucket = word(8).wrapping_shr(8) & !0x8000_0000;
+                let mut id = w;
+                id[..8].copy_from_slice(&(unmix64(part) ^ seed).to_le_bytes());
+                id[8..16].copy_from_slice(&(unmix64(bucket) ^ seed.rotate_left(17)).to_le_bytes());
+                let h = key_hash(&Oid(id), seed);
+                assert_eq!((h.part, h.bucket), (part, bucket));
+                oids.push(Oid(id));
+            }
+            assert!(matches!(try_build(&oids, seed, 4), Ok(Outcome::Retry)));
+            seed = seed.wrapping_add(PHI);
+        }
+        let b = build(&oids, 4).unwrap();
+        assert_eq!(b.seed, derived_seed(&oids));
+        let mut seen = vec![false; oids.len()];
+        for &s in &b.slots {
+            assert!(!std::mem::replace(&mut seen[s as usize], true));
+        }
+        let (offsets, pilots) = view(&b);
+        let m = Mphf {
+            seed: b.seed,
+            parts: b.parts,
+            buckets: b.buckets,
+            offsets: &offsets,
+            pilots: &pilots,
+        };
+        for (i, oid) in oids.iter().enumerate() {
+            assert_eq!(m.slot(oid), Some(b.slots[i]));
+        }
+        let again = build(&oids, 2).unwrap();
+        assert_eq!((again.seed, &again.pilots), (b.seed, &b.pilots));
     }
 }

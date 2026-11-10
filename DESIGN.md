@@ -87,7 +87,11 @@ A 24-byte record (8-byte keyed fingerprint plus the same fields) would save abou
 for SearchGold. The full id was kept: the saving is small next to the 2.4 GiB pack, and
 it keeps answers exact.
 
-Object ids are already uniform, so the MPHF needs no hashing beyond mixing id words.
+Object ids are already uniform, so the MPHF needs no hashing beyond mixing id words with a
+seed the index records. The seed is a constant for any ordinary set of ids. Whoever can
+push to the branch can make objects whose ids collide under a seed it knows, so when the
+constants all fail (they never do otherwise) the seed is a digest of the ids themselves,
+which cannot be aimed at.
 
 ## Primitive 1: `ingest_git_delta` (`src/ingest.rs`)
 
