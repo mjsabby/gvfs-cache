@@ -326,6 +326,55 @@ impl AzureStore {
         )
     }
 
+    /// [`crate::store::Store::get_unless`]: a GET with `If-None-Match`, on the reader's
+    /// connection (`client`, made here at its first call and kept by the reader), which
+    /// the service answers 304 without a body while the object is the one the reader has.
+    pub fn get_unless(
+        &self,
+        client: &mut Option<Client>,
+        key: &str,
+        have: Option<&str>,
+    ) -> Result<crate::store::Fresh> {
+        use crate::store::Fresh;
+        let path = self.blob_path(key)?;
+        let have = have.filter(|etag| !etag.is_empty());
+        let extra: Vec<(&str, String)> = have
+            .map(|etag| ("If-None-Match", etag.to_string()))
+            .into_iter()
+            .collect();
+        let client = client.get_or_insert_with(|| self.client());
+        self.call(
+            client,
+            Req {
+                method: "GET",
+                path: &path,
+                query: &[],
+                headers: &extra,
+                body: b"",
+            },
+            |resp| match resp.status {
+                304 => {
+                    let _ = resp.finish();
+                    Ok(Fresh::Same)
+                }
+                404 => {
+                    let _ = resp.finish();
+                    Ok(Fresh::Gone)
+                }
+                _ => {
+                    let mut resp = resp.ensure_ok(&format!("GET {key}"))?;
+                    let etag = resp.header("etag").unwrap_or("").to_string();
+                    let body = resp.body_vec(1 << 30)?;
+                    Ok(if have == Some(etag.as_str()) {
+                        Fresh::Same
+                    } else {
+                        Fresh::New(body, etag)
+                    })
+                }
+            },
+        )
+    }
+
     pub fn put(&self, key: &str, data: &[u8], cond: &Cond) -> Result<String> {
         let path = self.blob_path(key)?;
         let mut extra = vec![("x-ms-blob-type", "BlockBlob".to_string())];

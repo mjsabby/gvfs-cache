@@ -32,6 +32,50 @@ pub struct ObjectInfo {
     pub modified: u64,
 }
 
+/// What [`Store::get_unless`] finds of an object its reader may already have.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Fresh {
+    /// Still the object the reader has.
+    Same,
+    /// No such object.
+    Gone,
+    /// Another object: its bytes and its etag.
+    New(Vec<u8>, String),
+}
+
+/// What a reader that asks for the same objects again and again keeps between its
+/// requests (an edge following `manifest.bin` and `blobs.bin`): its connection to an
+/// object store, and for a directory store what each file looked like when it last read
+/// it. A poll of an object that has not changed is then one conditional request on that
+/// connection, or one `open` and `fstat`, and none of the object's bytes. (Each poll was
+/// a GET of the whole object on a new TLS connection, compared with what the edge had
+/// afterwards, and `blobs.bin` is about 120 bytes per blob pack: megabytes, every two
+/// seconds, for a store of large blobs.)
+#[derive(Default)]
+pub struct Poll {
+    client: Option<crate::http::Client>,
+    /// When `client` last had an answer.
+    used: Option<std::time::Instant>,
+    seen: std::collections::HashMap<String, (FileMark, String)>,
+}
+
+/// How long a reader's connection is kept without a request. One that has been quiet for
+/// longer may be gone without a word (a NAT's or a load balancer's idle timeout), and a
+/// request on it would wait for the client's whole timeout to learn that: the next request
+/// makes a new one.
+const POLL_KEEP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A file's device, inode, length and times of last write and last change: another file,
+/// or the same one written again, has another.
+type FileMark = (u64, u64, u64, i64, i64, i64, i64);
+
+/// How long ago a file must have been written for its [`FileMark`] to be believed. The
+/// times a file system gives a file are a clock's that ticks every few milliseconds, so a
+/// file written again in the tick it was read in (in place and to the same length: not
+/// how a store is written, but a `cp` over its manifest is that) may look as it did. A
+/// file younger than this is read at every poll.
+const SETTLED_SECS: i64 = 2;
+
 /// Where an async read's bytes go, a piece at a time as they arrive. A piece may be awaited
 /// (sent to a client), so a ranged GET streams through to a socket without a buffer; a
 /// closure is a sink that does not wait.
@@ -76,6 +120,22 @@ impl Store {
         match self {
             Store::Fs(s) => s.get(key),
             Store::Azure(a) => a.get(key),
+        }
+    }
+
+    /// The object `key`, unless it is still the one `have` is the etag of. `poll` is the
+    /// reader's own, kept from one call to the next.
+    pub fn get_unless(&self, poll: &mut Poll, key: &str, have: Option<&str>) -> Result<Fresh> {
+        match self {
+            Store::Fs(s) => s.get_unless(&mut poll.seen, key, have, std::time::SystemTime::now()),
+            Store::Azure(a) => {
+                if poll.used.is_some_and(|at| at.elapsed() > POLL_KEEP) {
+                    poll.client = None;
+                }
+                let fresh = a.get_unless(&mut poll.client, key, have);
+                poll.used = Some(std::time::Instant::now());
+                fresh
+            }
         }
     }
 
@@ -321,6 +381,63 @@ impl FsStore {
         }
     }
 
+    /// [`Store::get_unless`]: the file is opened, and read and hashed for its etag only if
+    /// it does not look as it did when `seen` last read it, at `now`. The file is opened
+    /// and not only looked at by its path, because on a network file system that is what
+    /// asks the server what the file is now.
+    fn get_unless(
+        &self,
+        seen: &mut std::collections::HashMap<String, (FileMark, String)>,
+        key: &str,
+        have: Option<&str>,
+        now: std::time::SystemTime,
+    ) -> Result<Fresh> {
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+        let what = || format!("reading {key}");
+        let mut file = match File::open(self.path(key)?) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                seen.remove(key);
+                return Ok(Fresh::Gone);
+            }
+            Err(e) => return Err(Error::from(e)).ctx(&what()),
+        };
+        let m = file.metadata().ctx(&what())?;
+        let mark: FileMark = (
+            m.dev(),
+            m.ino(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        );
+        if have.is_some()
+            && seen
+                .get(key)
+                .is_some_and(|(was, etag)| *was == mark && Some(etag.as_str()) == have)
+        {
+            return Ok(Fresh::Same);
+        }
+        let mut data = Vec::with_capacity(crate::util::us(m.len()).min(1 << 24));
+        file.read_to_end(&mut data).ctx(&what())?;
+        let etag = Self::etag(&data);
+        let now = now
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+        if now.saturating_sub(m.mtime().max(m.ctime())) >= SETTLED_SECS {
+            seen.insert(key.to_string(), (mark, etag.clone()));
+        } else {
+            seen.remove(key);
+        }
+        Ok(if have == Some(etag.as_str()) {
+            Fresh::Same
+        } else {
+            Fresh::New(data, etag)
+        })
+    }
+
     fn put(&self, key: &str, data: &[u8], cond: Cond) -> Result<String> {
         let path = self.path(key)?;
         // Conditional writes are serialized by an exclusive lock on the store.
@@ -477,6 +594,156 @@ mod tests {
         assert!(s.list("slabs/").unwrap().is_empty());
         assert!(!valid_key("../x") && !valid_key("a//b") && valid_key("slabs/m15-1-ab.pack"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What a reader that polls a directory store is told: the object once, then that it
+    /// is the same, until the file is another. A file that has not been written for a
+    /// while is not read to learn that; one just written is.
+    #[test]
+    fn a_poll_of_a_directory_store_reads_what_changed() {
+        let dir = std::env::temp_dir().join(format!("gvd-store-poll-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let s = FsStore::new(&dir).unwrap();
+        let key = "manifest.bin";
+        let mut seen = std::collections::HashMap::new();
+        let now = std::time::SystemTime::now();
+        let later = now + std::time::Duration::from_secs(60);
+        let new = |bytes: &[u8]| Fresh::New(bytes.to_vec(), FsStore::etag(bytes));
+
+        assert_eq!(
+            s.get_unless(&mut seen, key, None, now).unwrap(),
+            Fresh::Gone
+        );
+        let one = s.put(key, b"one", Cond::None).unwrap();
+        assert_eq!(
+            s.get_unless(&mut seen, key, None, now).unwrap(),
+            new(b"one")
+        );
+        // Just written: read again, and found the same by its bytes.
+        assert!(seen.is_empty());
+        assert_eq!(
+            s.get_unless(&mut seen, key, Some(&one), now).unwrap(),
+            Fresh::Same
+        );
+        assert!(seen.is_empty());
+        // Written a while ago: read once more, then known by its look alone. (An etag
+        // that is not its bytes' shows that they were not read.)
+        assert_eq!(
+            s.get_unless(&mut seen, key, Some(&one), later).unwrap(),
+            Fresh::Same
+        );
+        seen.get_mut(key).unwrap().1 = "not read".to_string();
+        assert_eq!(
+            s.get_unless(&mut seen, key, Some("not read"), later)
+                .unwrap(),
+            Fresh::Same
+        );
+        // What the reader has is not what was seen: read.
+        assert_eq!(
+            s.get_unless(&mut seen, key, Some("other"), later).unwrap(),
+            new(b"one")
+        );
+        // Another file of the same length, written in the same instant.
+        let two = s.put(key, b"two", Cond::None).unwrap();
+        assert_eq!(
+            s.get_unless(&mut seen, key, Some(&one), later).unwrap(),
+            new(b"two")
+        );
+        // The same file written in place.
+        fs::write(dir.join(key), b"six").unwrap();
+        assert_eq!(
+            s.get_unless(&mut seen, key, Some(&two), later).unwrap(),
+            new(b"six")
+        );
+        // The same bytes in another file are the same object.
+        let six = s.put(key, b"six", Cond::None).unwrap();
+        assert_eq!(
+            s.get_unless(&mut seen, key, Some(&six), later).unwrap(),
+            Fresh::Same
+        );
+        s.delete(key).unwrap();
+        assert_eq!(
+            s.get_unless(&mut seen, key, Some(&six), later).unwrap(),
+            Fresh::Gone
+        );
+        assert!(seen.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What a reader that polls an object store sends: a conditional request on the
+    /// connection it keeps, answered without the object while the object is the same. A
+    /// connection that has been quiet for long is not used again.
+    #[test]
+    #[allow(clippy::arithmetic_side_effects)]
+    fn a_poll_of_an_object_store_is_a_conditional_request_on_one_connection() {
+        use crate::testhttp::{Reply, Request};
+        use std::sync::{Arc, Mutex};
+        let version = Arc::new(Mutex::new(1u32));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let (v, a) = (Arc::clone(&version), Arc::clone(&asked));
+        let port = crate::testhttp::serve(move |r: &Request| {
+            let version = *v.lock().unwrap();
+            let etag = format!("\"v{version}\"");
+            let unless = r.header("if-none-match").map(str::to_string);
+            let same = unless.as_deref() == Some(etag.as_str());
+            a.lock().unwrap().push((unless, r.earlier));
+            match (version, same) {
+                (0, _) => Reply::status("404 Not Found"),
+                (_, true) => Reply::status(&format!("304 Not Modified\r\nETag: {etag}")),
+                _ => Reply::Whole(
+                    format!("200 OK\r\nETag: {etag}"),
+                    format!("object {version}").into_bytes(),
+                ),
+            }
+        });
+        let account =
+            format!("BlobEndpoint=http://127.0.0.1:{port}/acct;AccountName=acct;AccountKey=a2V5");
+        let store = Store::Azure(crate::azure::AzureStore::new(&account, "packs").unwrap());
+        let key = "manifest.bin";
+        let mut poll = Poll::default();
+        let v1 = "\"v1\"".to_string();
+        let v2 = "\"v2\"".to_string();
+        assert_eq!(
+            store.get_unless(&mut poll, key, None).unwrap(),
+            Fresh::New(b"object 1".to_vec(), v1.clone())
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                store.get_unless(&mut poll, key, Some(&v1)).unwrap(),
+                Fresh::Same
+            );
+        }
+        *version.lock().unwrap() = 2;
+        assert_eq!(
+            store.get_unless(&mut poll, key, Some(&v1)).unwrap(),
+            Fresh::New(b"object 2".to_vec(), v2.clone())
+        );
+        *version.lock().unwrap() = 0;
+        assert_eq!(
+            store.get_unless(&mut poll, key, Some(&v2)).unwrap(),
+            Fresh::Gone
+        );
+        // One connection carried them all, each but the first with the reader's etag.
+        let unless = |etag: &String| Some(etag.clone());
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [
+                (None, 0),
+                (unless(&v1), 1),
+                (unless(&v1), 2),
+                (unless(&v1), 3),
+                (unless(&v1), 4),
+                (unless(&v2), 5)
+            ]
+        );
+        // After a long silence, another connection.
+        poll.used = std::time::Instant::now().checked_sub(POLL_KEEP * 2);
+        assert!(poll.used.is_some());
+        assert_eq!(
+            store.get_unless(&mut poll, key, Some(&v2)).unwrap(),
+            Fresh::Gone
+        );
+        assert_eq!(asked.lock().unwrap().last().unwrap().1, 0);
     }
 
     /// A file deleted between the moment a listing reads its name and the moment it
