@@ -403,6 +403,12 @@ per sealed day and week, that rollup whole):
 Plans are keyed by boundary: at most one per slab start per view, each built once (in a
 `cold_section`, since it allocates) and shared. The warmer thread prepares the cold plan,
 and the plan for the previous view's tip, which is what up-to-date clients ask for next.
+A request that needs a plan, or its trailer, `.idx` or sizes section, before the warmer
+got to it has it built on one thread of the blocking pool, and waits for it as a parked
+task, as does every request after it (`budget::Builds`). Each used to wait on a thread
+of its own: 700 cold clones arriving with a new SearchGold snapshot took all 512 threads
+of the pool for the 5.5 s the `.idx` takes, and a `/gvfs/config` sent meanwhile waited
+those 5.5 s. It now takes 0.1 ms (14 ms at worst), on 13 threads.
 
 **Warm traffic.** `examples/clients.rs` replays 14 days of SearchGold through the pipeline
 and the edge on a simulated clock (README, "Client traffic"). With exact covers
@@ -492,9 +498,11 @@ without the yields, a 4,000-id sizes request held up the GETs queued behind it o
 (GET p50 59 µs → 1.3 ms). At 100 µs, heavy requests keep the thread-per-request edge's
 throughput beside GETs, whose p99 is 4× better; a shorter quantum favors GETs further, at
 the heavy requests' expense. Moving such work to tokio's blocking pool does not help much, even at a lower
-priority, because its threads share the CPUs with the workers. Work that blocks or computes
-for seconds (a plan built once per view, a large object's delta chain) runs in
-`block_in_place` sections, which hand the worker's other tasks to another thread. Fetches
+priority, because its threads share the CPUs with the workers. A request's own work that
+computes for long without a place to yield (a large object's delta chain) runs in a
+`block_in_place` section, which hands the worker's other tasks to another thread; what
+many requests wait for (a plan built once per view) is built on one thread while they
+park. Fetches
 from object storage or the upstream are awaited: a request waiting on them parks its task.
 
 A POST's working set (its ids, dedupe sets, the splice plan) lives in a leased arena

@@ -19,9 +19,10 @@
 //! Any prefix before `/gvfs/` is accepted (`https://host/org/repo/gvfs/...`). Handlers use
 //! only the connection's buffers and a leased request arena: no heap allocation. Loops
 //! that compute for long (batches of ids, commit expansion, hashing a pack) yield to the
-//! runtime's other tasks every [`super::budget::QUANTUM`]; plans built once run in
-//! [`blocking`] sections; fetches from the upstream or object storage are awaited ([`cold`]
-//! sections: their clients allocate).
+//! runtime's other tasks every [`super::budget::QUANTUM`]; a request's own long
+//! computations run in [`blocking`] sections; plans built once for many are waited for as
+//! tasks ([`super::budget::Builds`]); fetches from the upstream or object storage are
+//! awaited ([`cold`] sections: their clients allocate).
 
 use std::io::Write;
 use std::sync::Arc;
@@ -660,6 +661,14 @@ async fn whole_pack(
     Ok(keep)
 }
 
+/// The answer to a prefetch whose plan (or a section of it) could not be built: counted
+/// as an error, and the connection is closed.
+async fn unbuilt(ctx: &Ctx, stream: &TcpStream) -> std::io::Result<bool> {
+    inc(&ctx.metrics.errors);
+    respond(ctx, stream, 500, "prefetch plan unavailable\n", false).await?;
+    Ok(false)
+}
+
 /// `GPRE` + version + count, then per pack: timestamp, pack length, index length (-1 for
 /// none), the pack, and its `.idx` when `want_idx` (built once per plan).
 #[allow(clippy::too_many_arguments)]
@@ -674,10 +683,21 @@ async fn prefetch(
 ) -> std::io::Result<bool> {
     let view = ctx.view();
     let sizes = want_sizes && view.blobs.is_some();
-    // A plan not built yet (a new snapshot's, before the warmer got to it) takes a while.
+    // A plan not built yet (a new snapshot's, before the warmer got to it) takes a while:
+    // it is built once, and this request waits for it as a task, with every other.
     let answer = match view.prefetch_ready(since) {
         Some(a) => a,
-        None => blocking(|| view.prefetch(since)),
+        None => {
+            let (building, key) = (Arc::clone(&view), (view.plan_key(since), 0));
+            let build = move || {
+                building.prefetch(since);
+            };
+            let built = ctx.builds.wait(key, || view.prefetch_ready(since), build);
+            match cold(built).await {
+                Some(a) => a,
+                None => return unbuilt(ctx, stream).await,
+            }
+        }
     };
     let (plan, start) = match answer {
         Prefetch::UpToDate if sizes => {
@@ -702,24 +722,37 @@ async fn prefetch(
         Prefetch::Pack(plan, start) => (plan, start),
     };
     // The sections are built once per plan, usually by the warmer before anyone asks.
+    let part = |n: usize| (Arc::as_ptr(&plan).addr(), n);
     let section: &[u8] = if sizes {
         ctx.sizes_wanted.store(true, Ordering::Relaxed);
-        if plan.sizes_ready() {
-            plan.sizes_section()
-        } else {
-            blocking(|| plan.sizes_section())
+        if !plan.sizes_ready() {
+            let building = Arc::clone(&plan);
+            let build = move || {
+                building.sizes_section();
+            };
+            let ready = || plan.sizes_ready().then_some(());
+            if cold(ctx.builds.wait(part(1), ready, build)).await.is_none() {
+                return unbuilt(ctx, stream).await;
+            }
         }
+        plan.sizes_section()
     } else {
         &[]
     };
     inc(&ctx.metrics.prefetch_packs);
     let idx = if want_idx {
         ctx.idx_wanted.store(true, Ordering::Relaxed);
-        if plan.idx_ready() {
-            plan.idx()
-        } else {
-            blocking(|| plan.idx())
+        if !plan.idx_ready() {
+            let building = Arc::clone(&plan);
+            let build = move || {
+                building.idx();
+            };
+            let ready = || plan.idx_ready().then_some(());
+            if cold(ctx.builds.wait(part(2), ready, build)).await.is_none() {
+                return unbuilt(ctx, stream).await;
+            }
         }
+        plan.idx()
     } else {
         None
     };
@@ -769,11 +802,17 @@ async fn prefetch(
         out.slab(slab, start, len).await?;
     }
     // Computed once per plan; usually ready (warmed in the background) by now.
-    let trailer = if plan.trailer_ready() {
-        plan.trailer()
-    } else {
-        blocking(|| plan.trailer())
-    };
+    if !plan.trailer_ready() {
+        let building = Arc::clone(&plan);
+        let build = move || {
+            building.trailer();
+        };
+        let ready = || plan.trailer_ready().then_some(());
+        if cold(ctx.builds.wait(part(3), ready, build)).await.is_none() {
+            return Err(super::httpd::other("the pack's trailer could not be made"));
+        }
+    }
+    let trailer = plan.trailer();
     out.bytes(&trailer).await?;
     // Mapped from a memfd when large: sent like the pack, not copied into the socket.
     if let Some(idx) = idx {

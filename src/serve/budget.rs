@@ -118,10 +118,142 @@ impl<F: Future> Future for Cold<F> {
     }
 }
 
-/// Runs `f`, which computes for long (a plan built once, a large object's delta chain), on
-/// this thread while the runtime moves the worker's other tasks to another thread (a cold
-/// section: that may start one).
+/// Runs `f`, which computes for long (a large object's delta chain, a commit closure's
+/// plan), on this thread while the runtime moves the worker's other tasks to another
+/// thread (a cold section: that may start one). For a request's own work only: what many
+/// requests wait for is built through [`Builds`].
 pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
     let _cold = gvfs_alloc_guard::cold_section();
     tokio::task::block_in_place(f)
+}
+
+/// What is being built once for every request that needs it: a prefetch plan, its SHA-1
+/// trailer, its `.idx`, its sizes section. The warmer usually has them ready; a request
+/// that finds one missing (a new snapshot's, before the warmer got to it) has it built on
+/// one thread of the blocking pool, and parks its task until it is there, as does every
+/// request after it. Each used to wait on a thread of its own inside `block_in_place`, on
+/// the cell being filled: 700 cold clones arriving with a new snapshot took the pool's 512
+/// threads, and every other request, a `/gvfs/config` among them, waited behind them for
+/// as long as the build took (5.6 s on SearchGold).
+#[derive(Default)]
+pub struct Builds {
+    /// Woken when a build ends.
+    done: tokio::sync::Notify,
+    /// The builds running, each by what it builds: an address and a part of it.
+    running: std::sync::Mutex<std::collections::HashSet<(usize, usize)>>,
+}
+
+/// A build's end, however it ends: its key is free and those waiting look again.
+struct Ended(std::sync::Arc<Builds>, (usize, usize));
+
+impl Drop for Ended {
+    fn drop(&mut self) {
+        self.0.running().remove(&self.1);
+        self.0.done.notify_waiters();
+    }
+}
+
+impl Builds {
+    fn running(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<(usize, usize)>> {
+        match self.running.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        }
+    }
+
+    /// What `ready` returns once it returns something, with `build` (which makes it so)
+    /// run on the blocking pool unless a build of `key` is running already. `None` if
+    /// builds this request started ended twice with nothing ready: it gives up rather
+    /// than start a third. A cold path: await it through [`cold`].
+    pub async fn wait<T>(
+        self: &std::sync::Arc<Self>,
+        key: (usize, usize),
+        ready: impl Fn() -> Option<T>,
+        build: impl Fn() + Clone + Send + 'static,
+    ) -> Option<T> {
+        let mut started = 0u32;
+        loop {
+            // Waiting is registered before `ready` is asked: a build that ends in between
+            // still wakes this request.
+            let mut done = std::pin::pin!(self.done.notified());
+            done.as_mut().enable();
+            if let Some(v) = ready() {
+                return Some(v);
+            }
+            if self.running().insert(key) {
+                if started == 2 {
+                    self.running().remove(&key);
+                    return None;
+                }
+                started = started.saturating_add(1);
+                let ended = Ended(std::sync::Arc::clone(self), key);
+                let build = build.clone();
+                tokio::task::spawn_blocking(move || {
+                    let _ended = ended;
+                    build();
+                });
+            }
+            done.await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A thousand requests waiting for one thing are a thousand parked tasks and one
+    /// build: here on a runtime with a single thread and a blocking pool of one, where a
+    /// waiter that needed a thread of its own would never be served. Another thing is
+    /// built beside it, once too; and a build that makes nothing ready is given up on
+    /// after two.
+    #[test]
+    #[allow(clippy::arithmetic_side_effects)]
+    fn waiters_share_one_build_and_hold_no_thread() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let builds = Arc::new(Builds::default());
+        let cells: Arc<[std::sync::OnceLock<usize>; 2]> = Arc::default();
+        let built = Arc::new(AtomicUsize::new(0));
+        let got: Vec<usize> = rt.block_on(async {
+            let mut tasks = Vec::new();
+            for i in 0..1000usize {
+                let (builds, cells, built) = (builds.clone(), cells.clone(), built.clone());
+                tasks.push(tokio::spawn(async move {
+                    let which = i % 2;
+                    let filled = cells.clone();
+                    let build = move || {
+                        std::thread::sleep(Duration::from_millis(50));
+                        built.fetch_add(1, Ordering::SeqCst);
+                        let _ = filled[which].set(which + 10);
+                    };
+                    let ready = || cells[which].get().copied();
+                    builds.wait((7, which), ready, build).await.unwrap()
+                }));
+            }
+            let mut got = Vec::new();
+            for t in tasks {
+                got.push(t.await.unwrap());
+            }
+            got
+        });
+        assert_eq!(got.len(), 1000);
+        assert!(got.iter().enumerate().all(|(i, &v)| v == i % 2 + 10));
+        assert_eq!(built.load(Ordering::SeqCst), 2, "one build of each");
+        assert!(builds.running().is_empty());
+
+        let tries = Arc::new(AtomicUsize::new(0));
+        let counted = tries.clone();
+        let build = move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        };
+        let nothing = rt.block_on(builds.wait((7, 2), || None::<()>, build));
+        assert_eq!((nothing, tries.load(Ordering::SeqCst)), (None, 2));
+        assert!(builds.running().is_empty());
+    }
 }
