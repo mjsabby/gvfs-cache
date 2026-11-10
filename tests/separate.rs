@@ -2010,8 +2010,8 @@ fn a_local_upload_pack_that_fills_its_stderr_does_not_stall_the_run() {
 /// protocol v2 (blobs by id, `object-info`, as Azure DevOps allows them); and a GVFS upstream
 /// (another edge: `POST /gvfs/objects` and `POST /gvfs/sizes`). Through `AsyncUpstream` (the
 /// blob proxy's) every blob asked for arrives, verified by id as it streams in; through the
-/// blocking `Upstream` (the pipeline's and the mirror's) as one pack git indexes. Every size
-/// is git's.
+/// blocking `Upstream` (the pipeline's and the mirror's) too, into one pack that git
+/// indexes. Every size is git's.
 #[test]
 fn async_upstream_fetches_blobs_and_sizes_over_every_transport() {
     use gvfs_cache::serve::blobs::fetch_into;
@@ -2102,8 +2102,9 @@ fn async_upstream_fetches_blobs_and_sizes_over_every_transport() {
 
         // The blocking client makes the same requests on a runtime of its own.
         let mut b = gvfs_cache::upstream::Upstream::open(&spec, "main", &auth).unwrap();
-        let mut pack = Vec::new();
-        b.fetch_objects(&oids, &mut pack).unwrap();
+        let mut sink = gvfs_cache::blobstream::BlobSink::new(Vec::new(), &oids).unwrap();
+        blobcopy::fetch_into(&mut b, &mut sink, &oids).unwrap();
+        let pack = sink.finish().unwrap().out;
         let repo = fresh_repo(&root, &format!("blocking-{label}"));
         assert_eq!(install_pack(&repo, &pack), oids.len(), "{label}");
         let ids: Vec<String> = blobs.keys().cloned().collect();
@@ -2257,5 +2258,173 @@ fn separate_store_from_an_azure_devops_like_upstream() {
     let s = Store::open(&store, "").unwrap();
     assert!(blobcopy::load(&s).unwrap().0.complete());
     assert_eq!(http.v2_posts(), 0);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The record of blob `id` in the store's segments, and how many blobs its pack holds.
+fn blob_record(store: &Store, root: &Path, id: &str) -> (gvfs_cache::blobs::BlobRec, u32) {
+    let oid = Oid::from_hex(id.as_bytes()).unwrap();
+    let (bm, _) = blobcopy::load(store).unwrap();
+    bm.segments
+        .iter()
+        .find_map(|meta| {
+            let seg = blobcopy::open_segment(store, root, meta).unwrap();
+            let rec = seg.find(&oid)?;
+            let pack = &seg.packs()[rec.pack as usize].id;
+            Some((rec, bm.packs.iter().find(|p| &p.id == pack)?.blobs))
+        })
+        .unwrap_or_else(|| panic!("blob {id} is not in the store"))
+}
+
+/// Fetches `ids` from the edge, each loose (GET) and all in one pack (POST), and has git
+/// check both: every object hashed again, every byte compared with the upstream's.
+fn served_loose_and_packed(root: &Path, server: &Server, bare: &Path, ids: &[String], tag: &str) {
+    let loose = fresh_repo(root, &format!("{tag}-loose"));
+    for id in ids {
+        let (status, ct, body) = server.get(&format!("/org/repo/gvfs/objects/{id}"));
+        assert_eq!((status, ct.as_str()), (200, CT_LOOSE), "{tag}: {id}");
+        let dir = loose.join("objects").join(&id[..2]);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&id[2..]), body).unwrap();
+    }
+    git(&loose, &["fsck", "--strict", "--no-dangling"]);
+    assert!(
+        cat_batch(&loose, ids) == cat_batch(bare, ids),
+        "{tag}: loose"
+    );
+    let (status, ct, pack) = server.post("/gvfs/objects", json_ids(ids, None).as_bytes(), CT_PACK);
+    assert_eq!((status, ct.as_str()), (200, CT_PACK), "{tag}");
+    let packed = fresh_repo(root, &format!("{tag}-pack"));
+    git_stdin(
+        &packed,
+        &["index-pack", "--stdin", "--strict", "--keep=t"],
+        &pack,
+    );
+    assert!(
+        cat_batch(&packed, ids) == cat_batch(bare, ids),
+        "{tag}: packed"
+    );
+}
+
+/// A blob of 16 MiB or more is asked for alone, and Azure DevOps answers a request for one
+/// object with the object loose. From an upstream that answers so, a blob that does not
+/// compress and one that does: the mirror copies each into a pack of its own that git
+/// indexes, the first in stored blocks and the second deflated, and an edge serves both
+/// from the store, loose and in a pack, as git reads them. Two more are pushed: the edge
+/// gets them from the upstream (loose again) and serves them the same way, then the
+/// pipeline's window copies them and the edge serves them from the store.
+#[test]
+fn large_blobs_sent_loose_are_copied_and_served() {
+    let root = tempdir("sep-loose-large");
+    let up = Upstream::new(&root);
+    let large_min = blobcopy::LARGE_MIN as usize;
+    let g = commit_files(
+        &up,
+        "c1",
+        &[
+            ("a/one.txt", Some(text(1))),
+            ("a/two.txt", Some(text(2))),
+            ("big/noise.bin", Some(noise(large_min + 4096, 7))),
+            ("big/text.bin", Some(large(large_min + 77))),
+        ],
+    );
+    git(&up.bare, &["config", "uploadpack.allowFilter", "true"]);
+    let http = SmartHttp::azure_devops(&up.bare, "secret");
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    let token = [("GVD_TEST_TOKEN", "secret")];
+    let auth = ["--token-env", "GVD_TEST_TOKEN"];
+    let extra = [&auth[..], &["--blobs", "separate"]].concat();
+    pipeline_at(&root, &store, &http.url, "15m", &extra, &token).unwrap();
+    let log = mirror_at(&root, &store, &http.url, &auth, &token).unwrap();
+    assert_eq!(http.loose(), 2, "each large blob alone, loose:\n{log}");
+
+    let check_store = |revs: &str| {
+        let stored = store_blobs(&root, &store_dir);
+        let want = git_blobs(&up.bare, &[revs]);
+        assert_eq!(stored.len(), want.len());
+        for (id, size) in &want {
+            assert_eq!(stored[id].len() as u64, *size, "blob {id}");
+            assert!(stored[id] == cat_blob(&up.bare, id), "blob {id}");
+        }
+    };
+    check_store(&g);
+    let s = Store::open(&store, "").unwrap();
+    let encodings = |commit: &str, noise: &str, text: &str| -> Vec<String> {
+        let ids = [noise, text].map(|path| rev(&up.bare, &format!("{commit}:{path}")));
+        let (noise, text) = (
+            blob_record(&s, &root, &ids[0]),
+            blob_record(&s, &root, &ids[1]),
+        );
+        assert!(noise.0.stored && noise.1 == 1, "noise: stored, alone");
+        assert!(!text.0.stored && text.1 == 1, "text: deflated, alone");
+        assert!(noise.0.entry_len > noise.0.size && text.0.entry_len < text.0.size / 2);
+        ids.to_vec()
+    };
+    let first = encodings(&g, "big/noise.bin", "big/text.bin");
+
+    let cache = root.join("cache");
+    let server = Server::start_with_env(
+        &[
+            "--store",
+            &store,
+            "--upstream",
+            &http.url,
+            auth[0],
+            auth[1],
+            "--poll-ms",
+            "100",
+            "--cache-dir",
+            cache.to_str().unwrap(),
+        ],
+        &token,
+    );
+    served_loose_and_packed(&root, &server, &up.bare, &first, "stored");
+    assert_eq!(server.metric("gvfs_blobs_proxied_total"), 0);
+
+    // A push: until the pipeline seals it, its blobs come from the upstream, loose.
+    let t = commit_files(
+        &up,
+        "c2",
+        &[
+            ("a/one.txt", Some(text(3))),
+            ("big/noise2.bin", Some(noise(large_min + 1, 8))),
+            ("big/text2.bin", Some(large(large_min + 78))),
+        ],
+    );
+    server.wait_for("the push in L0", |s| {
+        s.get(&format!("/gvfs/objects/{t}")).0 == 200
+    });
+    let second: Vec<String> = ["big/noise2.bin", "big/text2.bin"]
+        .iter()
+        .map(|path| rev(&up.bare, &format!("{t}:{path}")))
+        .collect();
+    served_loose_and_packed(&root, &server, &up.bare, &second, "proxied");
+    // Four answers through the proxy, of two fetches, each answered loose. A small blob
+    // asked for alone comes loose as well.
+    assert_eq!(server.metric("gvfs_blobs_proxied_total"), 4);
+    assert_eq!(http.loose(), 4);
+    let small = [rev(&up.bare, &format!("{t}:a/one.txt"))];
+    served_loose_and_packed(&root, &server, &up.bare, &small, "proxied-small");
+    assert_eq!(server.metric("gvfs_blobs_proxied_total"), 6);
+    assert_eq!(http.loose(), 5);
+
+    // The window's blobs come loose too: the two large ones, and its one small file, a
+    // batch of one.
+    pipeline_at(&root, &store, &http.url, "15m", &auth, &token).unwrap();
+    assert_eq!(http.loose(), 8);
+    check_store(&t);
+    assert_eq!(encodings(&t, "big/noise2.bin", "big/text2.bin"), second);
+    let small = blob_record(&s, &root, &small[0]);
+    assert!(!small.0.stored && small.1 == 1 && small.0.entry_len < small.0.size);
+    server.wait_for("the sealed window", |s| {
+        s.metric("gvfs_manifest_generation") >= 2
+    });
+    let from_store = server.metric("gvfs_blobs_from_store_total");
+    served_loose_and_packed(&root, &server, &up.bare, &second, "sealed");
+    assert_eq!(server.metric("gvfs_blobs_proxied_total"), 6);
+    assert!(server.metric("gvfs_blobs_from_store_total") >= from_store + 4);
+    server.assert_clean();
+    drop(server);
     let _ = std::fs::remove_dir_all(&root);
 }

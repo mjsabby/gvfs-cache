@@ -715,7 +715,9 @@ as deflate *stored* blocks (65,535 content bytes each, 5-byte headers, 0.008% ov
 copier measures that itself: it deflates those 256 KiB at git's default level (about 4 ms
 per blob of 1 MiB or more), so the choice depends on the blob's content alone, and a blob
 is encoded alike however the upstream compressed it, whole or as a delta, and in whatever
-pieces it arrived. A **segment** record is `id | pack u32 | offset (48 bits) | header
+pieces it arrived. A blob the upstream sent loose (Copying blobs) has no stream to keep:
+unless it is stored, its content is deflated by the copier, at git's default level. A
+**segment** record is `id | pack u32 | offset (48 bits) | header
 length (8) | stored (1) | entry length u64 | size u64`: 64-bit lengths, so entries beyond
 4 GiB are ordinary.
 
@@ -803,17 +805,34 @@ whole-blob pack:
   stored (see Blob packs);
 * a delta is inflated in memory and applied to its base, read back from the output (a REF
   base may come later: the delta waits);
+* a loose object in place of a pack streams through as a whole entry does. Azure DevOps
+  answers a request for one object with `zlib("blob <size>\0" ++ content)`, whatever the
+  request accepts, and every blob of 16 MiB or more is asked for alone. The client hands
+  that answer on as it arrives; the sink inflates it once, in 64 KiB pieces, to verify
+  the id and the size (the header must be the one git writes), and writes the content
+  stored by the same rule, else deflated, once: the loose stream begins with the header,
+  so it cannot be kept. The content is deflated 64 KiB at a time whatever pieces arrived,
+  so one blob makes one entry, byte for byte (zlib's output goes by the pieces it is fed:
+  3 to 20 bytes more or less for 32 MiB of text). (The client first made a pack of one
+  out of the answer: inflated, deflated at level 6 and hashed, then inflated again by
+  the sink, which wrote content that does not compress in stored blocks anyway. Blobs of
+  32 MiB from a local upstream that answers so, per copy: 43–55 MiB/s before, at 17 to
+  22 ms of CPU per MiB; now 380–405 MiB/s at 1.6 ms for content that does not compress,
+  where the same blobs sent as packs pass at 334–351 MiB/s; and 56–57 MiB/s at 16.7 ms
+  for text, which is the one deflate.)
 * the output declares as many entries as blobs were asked for; any other object, a blob
-  twice, a blob missing, or a bad input trailer fails the pack;
+  twice, a blob missing, or a bad input trailer fails the pack: a loose object is an
+  entry like any other, refused at once when no blob is asked for any more, and at the
+  first 64 KiB past the size it declares;
 * so does a pack that declares more entries than blobs are still asked for, at its header
   (the deltas of one would wait for bases that never come, however many there are), and
   a delta whose ops do not make the result its header declares, before a buffer is sized
   for it;
-* so does an entry whose zlib stream is longer than twice its content plus 1 KiB. No
-  encoder writes one (deflate's longest code is 15 bits): it is padded with empty blocks,
-  which a hostile or broken upstream can send without end, and which the copy would hold
-  in memory (while a large blob's encoding is undecided, and when a delta's base is read
-  back) and write to the store.
+* so does an entry, or a loose object, whose zlib stream is longer than twice its content
+  plus 1 KiB. No encoder writes one (deflate's longest code is 15 bits): it is padded
+  with empty blocks, which a hostile or broken upstream can send without end, and which
+  the copy would hold in memory (while a large blob's encoding is undecided, and when a
+  delta's base is read back) and write to the store.
 
 Work is cut into items in the order given. A blob of 16 MiB or more is an item of its
 own: one request whose single whole entry streams straight into the store (`fs`: a temp
@@ -927,7 +946,12 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   requests are async (`AsyncUpstream`: the async client for smart HTTP and GVFS
   upstreams, `tokio::process` for a local `git upload-pack`); what arrives is verified
   and written on tokio's blocking pool, fed through a bounded queue
-  (`serve::blobs::fetch_into`), so the runtime's workers keep serving meanwhile.
+  (`serve::blobs::fetch_into`), so the runtime's workers keep serving meanwhile. A loose
+  answer (Azure DevOps, for one blob) goes through that queue as it arrived, like a
+  pack's pieces. (The request's task made a pack of it first: 15 ms of CPU per MiB on a
+  worker. With one worker and four blobs of 32 MiB being proxied, other requests waited
+  up to 0.5 s, 24 to 74 of them more than 10 ms; now none waits more than 3.5 ms, which
+  is what an idle edge's answers reach on this host.)
 * **Loose objects** are spliced from the entry's deflate blocks between a stored block
   and the combined Adler-32, so nothing is inflated, and for a remote entry only its
   first 2 and last 4 zlib bytes are read before streaming. **POST packs** append whole
@@ -978,8 +1002,9 @@ not the hot path's).
   before, and after at most 159 KB per poll (what the edge's socket had taken in when it
   closed, on loopback), with a new connection per poll.
   `/gvfs/objects` sends one object asked for alone (each large blob) loose,
-  whatever the request accepts; the client inflates it and deflates its content again as
-  a pack of one.
+  whatever the request accepts: the copier takes it as it is (Copying blobs). One that
+  compresses still costs a deflate at level 6: 16.7 ms of CPU per MiB of text, 57 MiB/s
+  a copy, where a pack's entry of the same blob passes at 340.
 * The edge's block cache lives in memory and on local disk and starts empty after a
   restart. Hot small-blob packs are not prefetched whole.
 * A window run reads every segment index (48 B per blob) and the manifest's sizes tables:

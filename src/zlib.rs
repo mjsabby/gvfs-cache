@@ -196,6 +196,46 @@ impl Deflater {
         }
         Err(ZError::Corrupt)
     }
+
+    /// Starts a zlib stream that [`Deflater::stream`] writes a piece at a time.
+    pub fn begin(&mut self) {
+        self.z.reset();
+    }
+
+    /// Deflates `data` as the next bytes of the stream begun (with `finish`, its last: the
+    /// stream ends), handing what that yields to `sink` through `buf`, which must not be
+    /// empty. In fixed memory, whatever the stream's length.
+    pub fn stream(
+        &mut self,
+        mut data: &[u8],
+        finish: bool,
+        buf: &mut [u8],
+        mut sink: impl FnMut(&[u8]) -> crate::util::Result<()>,
+    ) -> crate::util::Result<()> {
+        let flush = if finish {
+            DeflateFlush::Finish
+        } else {
+            DeflateFlush::NoFlush
+        };
+        loop {
+            let (in0, out0) = (self.z.total_in(), self.z.total_out());
+            let status = self
+                .z
+                .compress(data, buf, flush)
+                .map_err(|_| ZError::Corrupt)?;
+            let used = crate::util::us(self.z.total_in().saturating_sub(in0));
+            let made = crate::util::us(self.z.total_out().saturating_sub(out0));
+            data = data.get(used..).unwrap_or(&[]);
+            sink(buf.get(..made).unwrap_or(&[]))?;
+            // A full buffer may leave more output pending.
+            if status == Status::StreamEnd || (!finish && data.is_empty() && made < buf.len()) {
+                return Ok(());
+            }
+            if used == 0 && made == 0 {
+                return Err(ZError::NoRoom.into());
+            }
+        }
+    }
 }
 
 /// Upper bound of a zlib stream for `n` input bytes.

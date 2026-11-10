@@ -24,8 +24,8 @@
 //! in either protocol, where the server advertises it (Azure DevOps speaks only v0); blobs
 //! and sizes come through `POST /gvfs/objects` and `POST /gvfs/sizes` from an upstream that
 //! speaks the GVFS protocol (Azure DevOps, another gvfs-cache; a single object Azure DevOps
-//! sends loose is re-encoded as a pack), otherwise through protocol v2 (`want <id>`,
-//! `object-info`) where the server advertises it.
+//! sends loose is handed on as it is, announced by [`PackPieces::loose`]), otherwise
+//! through protocol v2 (`want <id>`, `object-info`) where the server advertises it.
 //!
 //! [`AsyncUpstream`] makes every request, on the async client or an async `git upload-pack`,
 //! so that a fetch parks its task, not a thread: the edge's blob proxy uses it while it
@@ -39,13 +39,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Poll;
 use std::time::Duration;
 
-use sha1::{Digest, Sha1};
-use zlib_rs::{Deflate, DeflateFlush, Inflate, InflateFlush, Status};
-
 use crate::http::Url;
-use crate::pack::{HeaderBytes, OBJ_BLOB, OBJ_COMMIT, OBJ_TAG, OBJ_TREE, pack_header, type_name};
 use crate::pktline::{self, Pkt};
-use crate::util::{Context, Oid, Result, u64_of, us};
+use crate::util::{Context, Oid, Result, u64_of};
 
 const AGENT: &str = concat!("agent=gvfs-cache/", env!("CARGO_PKG_VERSION"), "\n");
 
@@ -288,12 +284,11 @@ impl Upstream {
         )
     }
 
-    /// Fetches exactly the objects `oids` (blobs) as one pack written to `out`: through
-    /// `POST /gvfs/objects` from a GVFS upstream, else as protocol v2 `want`s. Returns the
-    /// pack length.
-    pub fn fetch_objects(&mut self, oids: &[Oid], out: &mut dyn Write) -> Result<u64> {
-        self.rt
-            .block_on(self.inner.fetch_objects(oids, &mut ToWriter(out)))
+    /// Fetches exactly the objects `oids` (blobs), handed to `out` as they arrive
+    /// ([`AsyncUpstream::fetch_objects`]: one pack, or one object loose). Returns the
+    /// answer's length.
+    pub fn fetch_objects<P: PackPieces>(&mut self, oids: &[Oid], out: &mut P) -> Result<u64> {
+        self.rt.block_on(self.inner.fetch_objects(oids, out))
     }
 
     /// The sizes of objects `oids`, in order (`None`: the upstream does not have it):
@@ -310,6 +305,10 @@ struct ToWriter<'a>(&'a mut dyn Write);
 impl PackPieces for ToWriter<'_> {
     async fn put(&mut self, piece: bytes::Bytes) -> Result<()> {
         self.0.write_all(&piece).ctx("writing pack")
+    }
+
+    async fn loose(&mut self) -> Result<()> {
+        crate::bail!("the upstream sent a loose object where a pack was asked for")
     }
 }
 
@@ -798,177 +797,6 @@ impl PackStream {
     }
 }
 
-/// zlib level of objects re-encoded from loose ones (git's default).
-const LOOSE_LEVEL: i32 = 6;
-/// Longest loose object header kept (`"<type> <size>"`, before its NUL).
-const LOOSE_HEADER_MAX: usize = 32;
-/// Inflate and deflate output piece.
-const LOOSE_CHUNK: usize = 64 << 10;
-
-/// A loose object as it arrives (`zlib("<type> <size>\0" ++ content)`), re-encoded in fixed
-/// memory as a pack of that one object. Azure DevOps answers `POST /gvfs/objects` for a
-/// single object with the object, loose, whatever the request accepts. The loose stream
-/// compresses the header with the content, so the content is inflated and deflated again.
-struct LooseToPack {
-    inflate: Inflate,
-    deflate: Deflate,
-    /// The loose header, until its NUL.
-    head: Vec<u8>,
-    /// The object's size, once its header is read.
-    size: Option<u64>,
-    /// Content bytes deflated so far.
-    content: u64,
-    ended: bool,
-    /// Of every pack byte handed out: the trailer.
-    sha: Sha1,
-    inflated: Vec<u8>,
-    deflated: Vec<u8>,
-}
-
-impl LooseToPack {
-    fn new() -> LooseToPack {
-        LooseToPack {
-            inflate: Inflate::new(true, 15),
-            deflate: Deflate::new(LOOSE_LEVEL, true, 15),
-            head: Vec::new(),
-            size: None,
-            content: 0,
-            ended: false,
-            sha: Sha1::new(),
-            inflated: vec![0u8; LOOSE_CHUNK],
-            deflated: vec![0u8; LOOSE_CHUNK],
-        }
-    }
-
-    /// The next piece of the loose object; returns the pack bytes it completes.
-    fn feed(&mut self, mut input: &[u8]) -> Result<Vec<u8>> {
-        let mut out = Vec::new();
-        let mut buf = std::mem::take(&mut self.inflated);
-        let fed = self.inflate_from(&mut input, &mut buf, &mut out);
-        self.inflated = buf;
-        fed.map(|()| out)
-    }
-
-    fn inflate_from(&mut self, input: &mut &[u8], buf: &mut [u8], out: &mut Vec<u8>) -> Result<()> {
-        loop {
-            if self.ended {
-                if !input.is_empty() {
-                    crate::bail!("bytes after the loose object");
-                }
-                return Ok(());
-            }
-            let (in0, out0) = (self.inflate.total_in(), self.inflate.total_out());
-            let status = self
-                .inflate
-                .decompress(input, buf, InflateFlush::NoFlush)
-                .map_err(|_| crate::err!("corrupt loose object"))?;
-            let used = us(self.inflate.total_in().saturating_sub(in0));
-            let made = us(self.inflate.total_out().saturating_sub(out0));
-            *input = input.get(used..).unwrap_or(&[]);
-            self.take(buf.get(..made).unwrap_or(&[]), out)?;
-            self.ended = status == Status::StreamEnd;
-            // A full buffer may leave more output pending.
-            if self.ended || made == buf.len() {
-                continue;
-            }
-            if input.is_empty() {
-                return Ok(());
-            }
-            if used == 0 && made == 0 {
-                crate::bail!("corrupt loose object");
-            }
-        }
-    }
-
-    /// Inflated bytes: the header's, to its NUL, then the content's, deflated into `out`.
-    fn take(&mut self, mut data: &[u8], out: &mut Vec<u8>) -> Result<()> {
-        if self.size.is_none() {
-            let Some(nul) = data.iter().position(|&b| b == 0) else {
-                self.head.extend_from_slice(data);
-                if self.head.len() > LOOSE_HEADER_MAX {
-                    crate::bail!("bad loose object header");
-                }
-                return Ok(());
-            };
-            self.head.extend_from_slice(data.get(..nul).unwrap_or(&[]));
-            data = data.get(nul.saturating_add(1)..).unwrap_or(&[]);
-            let (kind, size) = loose_header(&self.head).ctx("bad loose object header")?;
-            self.size = Some(size);
-            self.emit(&pack_header(1), out);
-            self.emit(HeaderBytes::whole(kind, size).as_slice(), out);
-        }
-        if data.is_empty() {
-            return Ok(());
-        }
-        self.content = self.content.saturating_add(u64_of(data.len()));
-        if self.size.is_some_and(|s| self.content > s) {
-            crate::bail!("loose object larger than its header says");
-        }
-        self.deflate_into(data, false, out)
-    }
-
-    fn emit(&mut self, bytes: &[u8], out: &mut Vec<u8>) {
-        self.sha.update(bytes);
-        out.extend_from_slice(bytes);
-    }
-
-    /// Deflates `data` into `out`; `finish` ends the stream.
-    fn deflate_into(&mut self, mut data: &[u8], finish: bool, out: &mut Vec<u8>) -> Result<()> {
-        let flush = if finish {
-            DeflateFlush::Finish
-        } else {
-            DeflateFlush::NoFlush
-        };
-        let mut buf = std::mem::take(&mut self.deflated);
-        let done = loop {
-            let (in0, out0) = (self.deflate.total_in(), self.deflate.total_out());
-            let Ok(status) = self.deflate.compress(data, &mut buf, flush) else {
-                break Err(crate::err!("re-encoding a loose object failed"));
-            };
-            let used = us(self.deflate.total_in().saturating_sub(in0));
-            let made = us(self.deflate.total_out().saturating_sub(out0));
-            data = data.get(used..).unwrap_or(&[]);
-            self.emit(buf.get(..made).unwrap_or(&[]), out);
-            if status == Status::StreamEnd || (!finish && data.is_empty() && made < buf.len()) {
-                break Ok(());
-            }
-            if used == 0 && made == 0 {
-                break Err(crate::err!("re-encoding a loose object made no progress"));
-            }
-        };
-        self.deflated = buf;
-        done
-    }
-
-    /// The response has ended: the rest of the pack, and its trailer.
-    fn finish(mut self) -> Result<Vec<u8>> {
-        let size = self.size.ctx("truncated loose object")?;
-        if !self.ended {
-            crate::bail!("truncated loose object");
-        }
-        if self.content != size {
-            crate::bail!(
-                "loose object of {} bytes, its header says {size}",
-                self.content
-            );
-        }
-        let mut out = Vec::new();
-        self.deflate_into(&[], true, &mut out)?;
-        let trailer: [u8; 20] = self.sha.finalize().into();
-        out.extend_from_slice(&trailer);
-        Ok(out)
-    }
-}
-
-/// The kind and size in a loose object's `"<type> <size>"` header.
-fn loose_header(head: &[u8]) -> Option<(u8, u64)> {
-    let (name, size) = std::str::from_utf8(head).ok()?.split_once(' ')?;
-    let kind = [OBJ_COMMIT, OBJ_TREE, OBJ_BLOB, OBJ_TAG]
-        .into_iter()
-        .find(|&k| type_name(k) == name)?;
-    Some((kind, size.parse().ok()?))
-}
-
 trait OptionCtx<T> {
     fn with_ctx_str(self, f: impl FnOnce() -> String) -> Result<T>;
 }
@@ -983,6 +811,14 @@ impl<T> OptionCtx<T> for Option<T> {
 /// to other threads, with backpressure).
 pub trait PackPieces {
     fn put(&mut self, piece: bytes::Bytes) -> impl std::future::Future<Output = Result<()>>;
+
+    /// The pieces of this answer are not a pack's but one object's, loose
+    /// (`zlib("<type> <size>\0" ++ content)`): what Azure DevOps answers
+    /// `POST /gvfs/objects` for a single object with, whatever the request accepts. Called
+    /// before the first piece, and only by a fetch of objects by id
+    /// ([`AsyncUpstream::fetch_objects`]). The pieces are the upstream's bytes: whoever
+    /// takes them inflates them, once.
+    fn loose(&mut self) -> impl std::future::Future<Output = Result<()>>;
 }
 
 /// The upstream's requests, on the async client (smart HTTP, GVFS) or an async
@@ -1437,9 +1273,11 @@ impl AsyncUpstream {
             .await
     }
 
-    /// Exactly the blobs `oids` as one pack, handed to `out` in pieces: through
-    /// `POST /gvfs/objects` from a GVFS upstream (one object it sends loose is re-encoded as
-    /// a pack), else as protocol v2 `want`s. Returns the pack length.
+    /// Exactly the blobs `oids`, handed to `out` in pieces as they arrive: through
+    /// `POST /gvfs/objects` from a GVFS upstream, else as protocol v2 `want`s. The answer
+    /// is one pack, or, from Azure DevOps asked for a single object, that object loose:
+    /// `out` is told so first ([`PackPieces::loose`]) and gets it as it is. Returns the
+    /// answer's length.
     pub async fn fetch_objects<P: PackPieces>(&mut self, oids: &[Oid], out: &mut P) -> Result<u64> {
         if self.is_gvfs().await? {
             let body = gvfs_objects_body(oids);
@@ -1460,25 +1298,18 @@ impl AsyncUpstream {
                 .ensure_ok("POST /gvfs/objects")
                 .await?;
             // Azure DevOps sends a single object loose, whatever the request accepts.
-            let mut loose = resp
+            let loose = resp
                 .header("Content-Type")
-                .is_some_and(|t| t.starts_with("application/x-git-loose-object"))
-                .then(|| Box::new(LooseToPack::new()));
+                .is_some_and(|t| t.starts_with("application/x-git-loose-object"));
+            if loose {
+                out.loose().await?;
+            }
             let mut n = 0u64;
-            while let Some(c) = resp.chunk().await.ctx("reading /gvfs/objects")? {
-                let piece = match loose.as_mut() {
-                    Some(l) => bytes::Bytes::from(l.feed(&c)?),
-                    None => c,
-                };
+            while let Some(piece) = resp.chunk().await.ctx("reading /gvfs/objects")? {
                 if !piece.is_empty() {
                     n = n.saturating_add(u64_of(piece.len()));
                     out.put(piece).await?;
                 }
-            }
-            if let Some(l) = loose {
-                let tail = bytes::Bytes::from(l.finish()?);
-                n = n.saturating_add(u64_of(tail.len()));
-                out.put(tail).await?;
             }
             return Ok(n);
         }
@@ -1715,6 +1546,94 @@ mod tests {
         out.stdout
     }
 
+    /// What a fetch handed on: whether it said the answer was loose, and the answer.
+    #[derive(Default)]
+    struct Taken {
+        loose: bool,
+        bytes: Vec<u8>,
+    }
+
+    impl PackPieces for Taken {
+        async fn put(&mut self, piece: bytes::Bytes) -> Result<()> {
+            self.bytes.extend_from_slice(&piece);
+            Ok(())
+        }
+
+        async fn loose(&mut self) -> Result<()> {
+            assert!(self.bytes.is_empty(), "said after the first piece");
+            self.loose = true;
+            Ok(())
+        }
+    }
+
+    /// Azure DevOps answers a request for one object with the object, loose, whatever the
+    /// request accepts. The client hands that answer on as it came, said to be loose
+    /// before its first byte: what its sink gets are the upstream's bytes, all of them
+    /// and no others. (It made a pack of the object first: inflated, deflated again at
+    /// level 6 and hashed, 15 ms of CPU per MiB in the task that read the answer, before
+    /// the blob sink inflated the result to verify it.) Two objects come as a pack, handed
+    /// on as it came too. A sink that takes packs alone refuses a loose object.
+    #[test]
+    fn a_loose_answer_is_handed_on_as_it_arrived() {
+        use crate::testhttp::{Reply, serve};
+        let content: Vec<u8> = (0..300_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let head = format!("blob {}\0", content.len());
+        let mut loose = vec![0u8; crate::zlib::compress_bound(head.len() + content.len())];
+        let n = crate::zlib::Deflater::new(6)
+            .deflate_parts(&[head.as_bytes(), &content], &mut loose)
+            .unwrap();
+        loose.truncate(n);
+        let pack = b"PACK, and what a pack of two objects holds".to_vec();
+        let (one, two) = (loose.clone(), pack.clone());
+        let port = serve(move |r| {
+            if r.line.contains("/gvfs/config") {
+                return Reply::ok(b"{}");
+            }
+            if r.header("accept") != Some("application/x-git-packfile") {
+                return Reply::status("400 Bad Request");
+            }
+            let body = String::from_utf8_lossy(&r.body);
+            match body.split('"').filter(|t| t.len() == 40).count() {
+                1 => Reply::Whole(
+                    "200 OK\r\nContent-Type: application/x-git-loose-object".to_string(),
+                    one.clone(),
+                ),
+                _ => Reply::Whole(
+                    "200 OK\r\nContent-Type: application/x-git-packfile".to_string(),
+                    two.clone(),
+                ),
+            }
+        });
+        let spec = format!("http://127.0.0.1:{port}/r");
+        let mut up = Upstream::open(&spec, "main", &Auth::default()).unwrap();
+        let (a, b) = (Oid([0x41; 20]), Oid([0x42; 20]));
+
+        let mut taken = Taken::default();
+        let n = up.fetch_objects(&[a], &mut taken).unwrap();
+        assert!(taken.loose, "not said to be loose");
+        assert!(
+            taken.bytes == loose,
+            "{} bytes handed on (the first: {:02x?}) for an answer of {}",
+            taken.bytes.len(),
+            &taken.bytes[..taken.bytes.len().min(4)],
+            loose.len()
+        );
+        assert_eq!(n, loose.len() as u64);
+
+        let mut taken = Taken::default();
+        up.fetch_objects(&[a, b], &mut taken).unwrap();
+        assert!(!taken.loose && taken.bytes == pack);
+
+        let e = up.fetch_objects(&[a], &mut ToWriter(&mut Vec::new()));
+        let e = e.unwrap_err().to_string();
+        assert!(
+            e.contains("a loose object where a pack was asked for"),
+            "{e}"
+        );
+    }
+
     /// The `/gvfs/config` probe keeps only a definite answer. Probes that get no answer,
     /// then a 503, fail their calls with that error, and the next call asks again: the 200
     /// that follows is kept, and sizes come from `/gvfs/sizes` from then on. (Kept as "not
@@ -1745,8 +1664,8 @@ mod tests {
         let mut up = Upstream::open(&spec, "main", &Auth::default()).unwrap();
         let e = up.object_sizes(&[oid]).unwrap_err().to_string();
         assert!(e.contains("/r/gvfs/config"), "{e}");
-        let e = up.fetch_objects(&[oid], &mut Vec::new()).unwrap_err();
-        let e = e.to_string();
+        let e = up.fetch_objects(&[oid], &mut ToWriter(&mut Vec::new()));
+        let e = e.unwrap_err().to_string();
         assert!(e.contains("GET /gvfs/config: HTTP 503: busy"), "{e}");
         assert_eq!(up.object_sizes(&[oid]).unwrap(), vec![Some(7)]);
         assert_eq!(up.object_sizes(&[oid]).unwrap(), vec![Some(7)]);
@@ -2106,7 +2025,7 @@ mod tests {
         let repo = dir.join("r.git");
         git(&dir, &["init", "-q", "--bare", repo.to_str().unwrap()], b"");
         let mut up = Upstream::open(repo.to_str().unwrap(), "main", &Auth::default()).unwrap();
-        let e = up.fetch_objects(&[Oid([0x77; 20])], &mut Vec::new());
+        let e = up.fetch_objects(&[Oid([0x77; 20])], &mut ToWriter(&mut Vec::new()));
         let e = e.unwrap_err().to_string();
         let reason =
             "fatal: git upload-pack: not our ref 7777777777777777777777777777777777777777)";
@@ -2188,7 +2107,7 @@ mod tests {
         assert_eq!(kinds.len(), 3);
 
         let mut only = Vec::new();
-        up.fetch_objects(&blobs, &mut only).unwrap();
+        up.fetch_objects(&blobs, &mut ToWriter(&mut only)).unwrap();
         let mut got: Vec<String> = pack_objects(&dir, &only, true)
             .into_iter()
             .map(|o| o.0)
@@ -2224,70 +2143,6 @@ mod tests {
                 .len(),
             2
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// One object `/gvfs/objects` sends loose (as Azure DevOps answers a request for one),
-    /// fed in pieces of any size, becomes a pack of that object that git indexes strictly;
-    /// a truncated, overlong, short or mislabeled loose object is an error.
-    #[test]
-    fn loose_objects_become_one_object_packs() {
-        let dir = std::env::temp_dir().join(format!("gvfs-loose-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let loose = |kind: &str, size: usize, content: &[u8]| {
-            let head = format!("{kind} {size}\0");
-            let mut z = vec![0u8; crate::zlib::compress_bound(head.len() + content.len())];
-            let n = crate::zlib::Deflater::new(6)
-                .deflate_parts(&[head.as_bytes(), content], &mut z)
-                .unwrap();
-            z.truncate(n);
-            z
-        };
-        let convert = |z: &[u8], piece: usize| -> Result<Vec<u8>> {
-            let mut c = LooseToPack::new();
-            let mut pack = Vec::new();
-            for p in z.chunks(piece) {
-                pack.extend(c.feed(p)?);
-            }
-            pack.extend(c.finish()?);
-            Ok(pack)
-        };
-        let xml: Vec<u8> = (0..200_000u32)
-            .flat_map(|i| format!("<row id=\"{i}\" v=\"{}\"/>\n", i % 7).into_bytes())
-            .collect();
-        let noise: Vec<u8> = (0..300_000u32)
-            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
-            .collect();
-        for content in [&b""[..], &b"hello\n"[..], &xml[..], &noise[..]] {
-            let z = loose("blob", content.len(), content);
-            let mut h = Sha1::new();
-            h.update(format!("blob {}\0", content.len()));
-            h.update(content);
-            let id = Oid(h.finalize().into()).to_string();
-            for piece in [1, 13, 4096, usize::MAX] {
-                let pack = convert(&z, piece).unwrap();
-                assert_eq!(
-                    pack_objects(&dir, &pack, true),
-                    vec![(id.clone(), "blob".to_string())],
-                    "{} bytes in pieces of {piece}",
-                    content.len()
-                );
-            }
-        }
-        let z = loose("blob", 6, b"hello\n");
-        let mut extra = z.clone();
-        extra.extend_from_slice(b"junk");
-        for (bad, why) in [
-            (z[..z.len() - 2].to_vec(), "truncated"),
-            (extra, "after the loose object"),
-            (loose("blob", 7, b"hello\n"), "header says 7"),
-            (loose("blob", 5, b"hello\n"), "larger than its header"),
-            (loose("blub", 6, b"hello\n"), "bad loose object header"),
-        ] {
-            let e = convert(&bad, 4096).unwrap_err().to_string();
-            assert!(e.contains(why), "{why}: {e}");
-        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

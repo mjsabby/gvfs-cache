@@ -768,29 +768,44 @@ impl Drop for ProxySpool {
 /// What [`fetch_into`]'s network side hands its blocking side.
 enum Piece {
     Data(bytes::Bytes),
-    /// One request's pack has ended (the sink checks it before the next).
+    /// The answer whose pieces follow is one object, loose, not a pack.
+    Loose,
+    /// One request's answer has ended (the sink checks it before the next).
     EndPack,
-    /// Every pack has arrived.
+    /// Every answer has arrived.
     Done,
 }
 
-/// Hands pack pieces to [`fetch_into`]'s blocking side (waiting while its queue is full).
+/// Hands an answer's pieces, as they arrived, to [`fetch_into`]'s blocking side (waiting
+/// while its queue is full).
 struct ToSink<'a>(&'a tokio::sync::mpsc::Sender<Piece>);
+
+impl ToSink<'_> {
+    async fn send(&mut self, piece: Piece) -> Result<()> {
+        self.0
+            .send(piece)
+            .await
+            .map_err(|_| crate::err!("the blob sink stopped"))
+    }
+}
 
 impl crate::upstream::PackPieces for ToSink<'_> {
     async fn put(&mut self, piece: bytes::Bytes) -> Result<()> {
-        self.0
-            .send(Piece::Data(piece))
-            .await
-            .map_err(|_| crate::err!("the blob sink stopped"))
+        self.send(Piece::Data(piece)).await
+    }
+
+    async fn loose(&mut self) -> Result<()> {
+        self.send(Piece::Loose).await
     }
 }
 
 /// Fetches the blobs `oids` from `up` into a blob pack (id `id`), each verified by id as
 /// it streams in: a pack in memory if it is small, else a file at `path`
 /// ([`ProxySpool`]). The network side is async (the request's task waits, not a
-/// thread); verifying (inflating, hashing, re-deflating deltas) and writing run on tokio's
-/// blocking pool, fed through a bounded queue, so the runtime's workers keep serving.
+/// thread) and hands on what arrives as it is, a pack's pieces or a loose object's;
+/// verifying (inflating, hashing, deflating what came as a delta or loose) and writing
+/// run on tokio's blocking pool, fed through a bounded queue, so the runtime's workers
+/// keep serving.
 pub async fn fetch_into(
     up: &mut AsyncUpstream,
     oids: &[Oid],
@@ -812,6 +827,7 @@ pub async fn fetch_into(
                         return Err((true, e));
                     }
                 }
+                Some(Piece::Loose) => sink.loose().map_err(|e| (true, e))?,
                 Some(Piece::EndPack) => sink.end_input().map_err(|e| (true, e))?,
                 Some(Piece::Done) => break,
                 None => return Err((false, crate::err!("the fetch stopped"))),
@@ -1253,6 +1269,135 @@ mod tests {
         assert_eq!(asked.load(Ordering::SeqCst), 2);
         assert!(lock(&proxy.state).fetching.is_empty());
         release.store(true, Ordering::SeqCst);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The CPU seconds the calling thread has used.
+    fn thread_cpu() -> f64 {
+        use nix::sys::resource::{UsageWho, getrusage};
+        use nix::sys::time::TimeValLike;
+        let u = getrusage(UsageWho::RUSAGE_THREAD).unwrap();
+        (u.user_time().num_microseconds() + u.system_time().num_microseconds()) as f64 / 1e6
+    }
+
+    /// `zlib("blob <size>\0" ++ content)`, as an upstream sends a blob loose.
+    fn loose_blob(content: &[u8], level: i32) -> (Oid, Vec<u8>) {
+        use sha1::{Digest, Sha1};
+        let head = format!("blob {}\0", content.len());
+        let mut z = vec![0u8; crate::zlib::compress_bound(head.len() + content.len())];
+        let n = crate::zlib::Deflater::new(level)
+            .deflate_parts(&[head.as_bytes(), content], &mut z)
+            .unwrap();
+        z.truncate(n);
+        let mut h = Sha1::new();
+        h.update(head.as_bytes());
+        h.update(content);
+        (Oid(h.finalize().into()), z)
+    }
+
+    fn noise(n: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// A blob the proxy asks Azure DevOps for alone arrives loose. The request's task
+    /// hands the answer's pieces on as they come; inflating, hashing and writing them is
+    /// the blocking pool's work, as for a pack. Here the runtime's one thread is the
+    /// test's: fetching 24 MiB of noise costs it the reading of the answer, less CPU than
+    /// deflating a sixth of the blob takes. (It inflated all of it and deflated it again at
+    /// level 6 there, 15 ms per MiB with the worker held, before the blocking side saw a
+    /// byte.) The blob is verified all the same: git indexes its pack; an answer that
+    /// is another blob, or that breaks off, fails the fetch and leaves no file.
+    #[test]
+    fn a_loose_answer_is_not_the_request_tasks_work() {
+        use crate::testhttp::{Reply, serve};
+        let dir = std::env::temp_dir().join(format!("gvd-proxy-loose-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let content = noise(24 << 20, 5);
+        let (oid, loose) = loose_blob(&content, 0);
+        let (other, _) = loose_blob(b"another blob\n", 6);
+        let (whole, cut_at) = (loose.clone(), loose.len() / 2);
+        let port = serve(move |r| {
+            if r.line.contains("/gvfs/config") {
+                return Reply::ok(b"{}");
+            }
+            let status = "200 OK\r\nContent-Type: application/x-git-loose-object".to_string();
+            // Whichever blob is asked for, the answer is the first one; for one id, half
+            // of it.
+            let body = String::from_utf8_lossy(&r.body);
+            if body.contains(&Oid([0x33; 20]).to_string()) {
+                Reply::Cut(status, whole.clone(), cut_at)
+            } else {
+                Reply::Whole(status, whole.clone())
+            }
+        });
+        let spec = format!("http://127.0.0.1:{port}/r");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut up = AsyncUpstream::open(&spec, &Auth::default()).unwrap();
+        let path = dir.join("p.pack");
+
+        // What deflating a sixth of the blob costs this thread, here and now.
+        let began = thread_cpu();
+        let mut z = vec![0u8; crate::zlib::compress_bound(4 << 20)];
+        crate::zlib::Deflater::new(6)
+            .deflate_parts(&[&content[..4 << 20]], &mut z)
+            .unwrap();
+        let a_sixth = thread_cpu() - began;
+
+        let began = thread_cpu();
+        let (pack, recs) = rt
+            .block_on(fetch_into(&mut up, &[oid], &path, "p"))
+            .unwrap();
+        let spent = thread_cpu() - began;
+        assert!(
+            spent < a_sixth,
+            "the request's thread used {spent:.3} s of CPU; deflating a sixth of the blob \
+             takes {a_sixth:.3} s"
+        );
+        assert_eq!(recs.len(), 1);
+        let rec = recs[0];
+        assert_eq!((rec.oid, rec.size), (oid, content.len() as u64));
+        assert!(rec.stored, "noise is written as stored blocks");
+        let bytes = pack.bytes().unwrap();
+        let (at, len) = rec.zlib();
+        let mut back = vec![0u8; content.len()];
+        crate::zlib::Inflater::new()
+            .inflate_exact(&bytes[at as usize..(at + len) as usize], &mut back)
+            .unwrap();
+        assert!(back == content);
+        git(
+            &dir,
+            &[
+                "index-pack",
+                "--strict",
+                "-o",
+                "p.idx",
+                path.to_str().unwrap(),
+            ],
+        );
+        drop(pack);
+        assert!(!path.exists(), "the pack goes with its last user");
+
+        for (asked, why) in [(other, "which was not asked for"), (Oid([0x33; 20]), "")] {
+            let e = rt
+                .block_on(fetch_into(&mut up, &[asked], &path, "p"))
+                .map(|_| ())
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains(why), "{e}");
+            assert!(!path.exists(), "a fetch that failed left its file");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

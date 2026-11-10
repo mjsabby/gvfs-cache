@@ -35,7 +35,7 @@ use crate::object::TreeIter;
 use crate::pack::OBJ_TREE;
 use crate::slab::Slab;
 use crate::store::{Cond, Store};
-use crate::upstream::{BATCH, Upstream};
+use crate::upstream::{BATCH, PackPieces, Upstream};
 use crate::util::{Context, Oid, Result, hex_string, le_u32, u32_of, u64_of};
 
 /// Blobs at least this big are items of their own: one request, streamed to the store.
@@ -132,9 +132,24 @@ pub fn fresh_id(oids: &[Oid]) -> String {
     hex_string(&h.finalize())
 }
 
-/// One fetch into the sink; the sink's own error wins over the transport's report of it.
-fn fetch_into<S: Spool>(up: &mut Upstream, sink: &mut BlobSink<S>, oids: &[Oid]) -> Result<()> {
-    if let Err(e) = up.fetch_objects(oids, sink) {
+/// What a fetch brings, written to a blob sink on the calling thread.
+struct IntoSink<'a, S: Spool>(&'a mut BlobSink<S>);
+
+impl<S: Spool> PackPieces for IntoSink<'_, S> {
+    async fn put(&mut self, piece: bytes::Bytes) -> Result<()> {
+        self.0.write_all(&piece).ctx("writing pack")
+    }
+
+    async fn loose(&mut self) -> Result<()> {
+        self.0.loose()
+    }
+}
+
+/// One fetch of the blobs `oids` into the sink, as the upstream answers it: a pack, or
+/// (Azure DevOps, asked for one object) the object loose, which the sink takes as it is.
+/// The sink's own error wins over the transport's report of it.
+pub fn fetch_into<S: Spool>(up: &mut Upstream, sink: &mut BlobSink<S>, oids: &[Oid]) -> Result<()> {
+    if let Err(e) = up.fetch_objects(oids, &mut IntoSink(sink)) {
         return Err(sink.failure().unwrap_or(e));
     }
     sink.end_input()
