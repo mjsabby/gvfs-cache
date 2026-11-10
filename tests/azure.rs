@@ -398,9 +398,12 @@ fn azure_pipeline_and_serve() {
         v
     };
     assert!(other.exists());
-    let listed = || {
+    let manifest_of = |backend: &Backend| {
         let (bytes, _) = backend.store("").get("manifest.bin").unwrap().unwrap();
-        let m = gvfs_cache::manifest::Manifest::decode(&bytes).unwrap();
+        gvfs_cache::manifest::Manifest::decode(&bytes).unwrap()
+    };
+    let listed = || {
+        let m = manifest_of(&backend);
         let mut v: Vec<String> = m
             .slabs()
             .flat_map(|x| [format!("{}.pack", x.id), format!("{}.mphf", x.id)])
@@ -416,10 +419,28 @@ fn azure_pipeline_and_serve() {
     assert_complete(&client, &up.tip());
 
     up.commit(5);
+    let before = manifest_of(&backend);
     run("168h", t0 + 2700, &["--gc-grace-secs", "0"]);
     server.wait_for("the weekly manifest", |s| {
         s.metric("gvfs_manifest_generation") == 4
     });
+    // The weekly run published the new baseline's tail on the old one beside it, and the
+    // edge, which had the old one, made the new pack of the two: it did not download it
+    // (every edge downloaded every weekly baseline whole).
+    let after = manifest_of(&backend);
+    assert_ne!(after.baseline.id, before.baseline.id);
+    let tail = backend
+        .store("")
+        .get(&after.baseline.tail_key())
+        .unwrap()
+        .unwrap()
+        .0;
+    assert!(
+        (tail.len() as u64) < after.baseline.pack_len - before.baseline.pack_len + 200,
+        "a tail of {} bytes",
+        tail.len()
+    );
+    assert_eq!(server.metric("gvfs_baselines_grown_total"), 1);
     let packs = server.prefetch(packs[0].0);
     assert_eq!(packs.len(), 1);
     install_pack(&client, &packs[0].1);
@@ -453,6 +474,7 @@ fn azure_pipeline_and_serve() {
     let mut referenced: Vec<String> = m
         .slabs()
         .flat_map(|x| [x.pack_key(), x.index_key()])
+        .chain([m.baseline.tail_key()])
         .collect();
     referenced.sort();
     assert_eq!(keys, referenced);
@@ -782,6 +804,101 @@ fn an_edge_checks_its_slabs_against_the_manifest() {
         "{err}"
     );
     assert!(!pack.exists(), "the pack refused is not kept");
+    drop(backend);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An edge that has the baseline before it makes a weekly rebuild's baseline of that one
+/// and the tail the run published, also when it was not running at the time. What it
+/// makes of a tail that is not the baseline's is not served: it downloads the pack. An
+/// edge with nothing in its cache downloads it too.
+#[test]
+fn an_edge_makes_a_new_baseline_of_the_one_it_has() {
+    let Some(backend) = Backend::new("tail") else {
+        return;
+    };
+    let root = tempdir("azure-tail");
+    let env = [("GVD_AZ_CS", backend.cs.as_str())];
+    let store = format!("azure:{}", backend.spec);
+    let mut up = Upstream::new(&root);
+    up.commit(5);
+    let upstream = up.bare.to_str().unwrap().to_string();
+    let t0 = gvfs_cache::util::now_secs();
+    let run = |tier: &str, now: u64| {
+        let now = now.to_string();
+        let args = ["--store-auth-env", "GVD_AZ_CS", "--now", now.as_str()];
+        pipeline_at(&root, &store, &upstream, tier, &args, &env)
+            .unwrap_or_else(|log| panic!("pipeline {tier}: {log}"))
+    };
+    run("15m", t0);
+    let edge = |cache: &std::path::Path| {
+        Server::start_with_env(
+            &[
+                "--store",
+                store.as_str(),
+                "--store-auth-env",
+                "GVD_AZ_CS",
+                "--cache-dir",
+                cache.to_str().unwrap(),
+            ],
+            &env,
+        )
+    };
+    let baseline = || {
+        let (bytes, _) = backend.store("").get("manifest.bin").unwrap().unwrap();
+        gvfs_cache::manifest::Manifest::decode(&bytes)
+            .unwrap()
+            .baseline
+    };
+    let served = |server: &Server, name: &str, tip: &str| {
+        let packs = server.prefetch(0);
+        assert_eq!(packs.len(), 1);
+        let repo = fresh_repo(&root, name);
+        install_pack(&repo, &packs[0].1);
+        assert_complete(&repo, tip);
+        server.assert_clean();
+    };
+
+    // Two edges with the first baseline in their caches, not running during the rebuild.
+    let (cache_a, cache_b) = (root.join("cache-a"), root.join("cache-b"));
+    drop((edge(&cache_a), edge(&cache_b)));
+    let first = baseline();
+    let tip = up.commit(5);
+    let log = run("168h", t0 + 900);
+    assert!(log.contains("and a tail of"), "{log}");
+    let second = baseline();
+    assert_ne!(second.id, first.id);
+
+    // The first makes the new pack of the old one and the tail.
+    let a = edge(&cache_a);
+    assert_eq!(a.metric("gvfs_baselines_grown_total"), 1);
+    served(&a, "from-a", &tip);
+    let made = std::fs::read(cache_a.join(format!("{}.pack", second.id))).unwrap();
+    assert_eq!(made.len() as u64, second.pack_len);
+    assert!(!cache_a.join(format!("{}.tail", second.id)).exists());
+    drop(a);
+
+    // The second finds a tail that makes another pack (a byte of it changed): it serves
+    // the store's.
+    let s = backend.store("");
+    let mut tail = s.get(&second.tail_key()).unwrap().unwrap().0;
+    let last = tail.len() - 30;
+    tail[last] ^= 1;
+    let changed = root.join("changed.tail");
+    std::fs::write(&changed, &tail).unwrap();
+    s.delete(&second.tail_key()).unwrap();
+    s.upload_file(&second.tail_key(), &changed).unwrap();
+    let b = edge(&cache_b);
+    assert_eq!(b.metric("gvfs_baselines_grown_total"), 0);
+    served(&b, "from-b", &tip);
+    assert!(std::fs::read(cache_b.join(format!("{}.pack", second.id))).unwrap() == made);
+    drop(b);
+
+    // An edge that never had the first baseline downloads the second.
+    let c = edge(&root.join("cache-c"));
+    assert_eq!(c.metric("gvfs_baselines_grown_total"), 0);
+    served(&c, "from-c", &tip);
+    drop(c);
     drop(backend);
     let _ = std::fs::remove_dir_all(&root);
 }

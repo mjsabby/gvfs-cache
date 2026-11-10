@@ -127,6 +127,10 @@ impl Profile {
 /// huge pages (one 2 MiB page).
 const HUGE_INDEX_MIN: u64 = 2 << 20;
 
+/// Baselines this edge made of the one before and a tail, instead of downloading them
+/// ([`crate::tail`]; `/metrics`).
+static GROWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Shared by every connection.
 pub struct Ctx {
     view: RwLock<Arc<View>>,
@@ -1552,30 +1556,70 @@ impl StoreSync {
 
     /// Slab `meta` from the cache directory, once the files of it that are not there are
     /// downloaded. A pack that was is hashed: it must be the pack whose SHA-1 the manifest
-    /// lists, not only end with it.
+    /// lists, not only end with it. A baseline's pack is made of the one this edge has
+    /// and its tail, if the store holds one ([`StoreSync::grown`]).
     fn download(
         &self,
         meta: &crate::slab::SlabMeta,
         pack: &Path,
         index: &Path,
     ) -> Result<Arc<Slab>> {
-        let new = hydrate(&self.store, &meta.pack_key(), pack)?;
-        hydrate(&self.store, &meta.index_key(), index)?;
-        let slab = Slab::open(pack, index, meta.clone())?;
-        if new {
-            use sha1::Digest;
-            let bytes = slab.pack();
-            let body = bytes.get(..bytes.len().saturating_sub(20)).unwrap_or(&[]);
-            let sha: [u8; 20] = sha1::Sha1::digest(body).into();
-            if sha != meta.pack_sha {
-                let _ = std::fs::remove_file(pack);
-                crate::bail!(
-                    "the pack downloaded is not the one listed: its SHA-1 is {}",
-                    crate::util::hex_string(&sha)
-                );
+        if meta.tier == Tier::Base && !pack.exists() {
+            let grown = self.grown(meta, pack).and_then(|made| {
+                if !made {
+                    return Ok(None);
+                }
+                hydrate(&self.store, &meta.index_key(), index)?;
+                listed(meta, pack, index, true).map(Some)
+            });
+            match grown {
+                Ok(Some(slab)) => {
+                    GROWN.fetch_add(1, Ordering::Relaxed);
+                    return Ok(slab);
+                }
+                Ok(None) => {}
+                // What was made of a tail and is not the baseline is not kept: the
+                // store's pack is the baseline.
+                Err(e) => crate::log!(
+                    "serve: baseline {} was not made of the one before it ({e}): \
+                     downloading it",
+                    meta.id
+                ),
             }
         }
-        Ok(slab)
+        let new = hydrate(&self.store, &meta.pack_key(), pack)?;
+        hydrate(&self.store, &meta.index_key(), index)?;
+        listed(meta, pack, index, new)
+    }
+
+    /// Makes the pack of baseline `meta` of the baseline this edge has and the tail the
+    /// weekly run published beside the new one ([`crate::tail`]): megabytes to download
+    /// where the pack is gigabytes. False if the store has no tail for it, or the tail
+    /// continues a pack that is not in the cache.
+    fn grown(&self, meta: &crate::slab::SlabMeta, pack: &Path) -> Result<bool> {
+        let t0 = Instant::now();
+        let tail = self.cache_dir.join(format!("{}.tail", meta.id));
+        match self.store.download_file(&meta.tail_key(), &tail) {
+            Ok(()) => {}
+            Err(e) if e.is_not_found() => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        let size = std::fs::metadata(&tail).map_or(0, |m| m.len());
+        let old = |id: &str| Some(self.cache_dir.join(format!("{id}.pack")));
+        let made = crate::tail::grow(&tail, old, meta, pack);
+        let _ = std::fs::remove_file(&tail);
+        let Some(head) = made? else {
+            return Ok(false);
+        };
+        crate::log!(
+            "serve: baseline {} ({}) made of {} and a tail of {} in {:.2}s",
+            meta.id,
+            crate::util::human_bytes(meta.pack_len),
+            head.old_id,
+            crate::util::human_bytes(size),
+            t0.elapsed().as_secs_f64()
+        );
+        Ok(true)
     }
 
     /// Follows the store for the life of the process, a poll every `poll`.
@@ -1965,10 +2009,10 @@ impl Live {
 
 /// Whether `<id>.<ext>` in the edge's cache is a slab's file that the manifest, whose slab
 /// ids are `keep`, no longer lists. Only names the edge gives its downloads count
-/// (`<slab id>.pack`, `.mphf`, `.sizes`): `--cache-dir` is the operator's choice, and what
-/// else it holds is not the edge's to delete. (Any `*.pack` there went.)
+/// (`<slab id>.pack`, `.mphf`, `.sizes`, `.tail`): `--cache-dir` is the operator's
+/// choice, and what else it holds is not the edge's to delete. (Any `*.pack` there went.)
 fn stale_slab_file(id: &str, ext: &str, keep: &std::collections::HashSet<&str>) -> bool {
-    matches!(ext, "pack" | "mphf" | "sizes")
+    matches!(ext, "pack" | "mphf" | "sizes" | "tail")
         && crate::slab::SlabMeta::is_id(id)
         && !keep.contains(id)
 }
@@ -2024,6 +2068,31 @@ fn in_memory(path: &Path) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Slab `meta` of the files `pack` and `index` in the cache. A pack that is `new` there
+/// (downloaded, or made of a tail) is hashed: it must be the pack whose SHA-1 the manifest
+/// lists, not only have its length and end with it. One that is not is not kept.
+fn listed(meta: &crate::slab::SlabMeta, pack: &Path, index: &Path, new: bool) -> Result<Arc<Slab>> {
+    let checked = Slab::open(pack, index, meta.clone()).and_then(|slab| {
+        if new {
+            use sha1::Digest;
+            let bytes = slab.pack();
+            let body = bytes.get(..bytes.len().saturating_sub(20)).unwrap_or(&[]);
+            let sha: [u8; 20] = sha1::Sha1::digest(body).into();
+            if sha != meta.pack_sha {
+                crate::bail!(
+                    "the pack is not the one listed: its SHA-1 is {}",
+                    crate::util::hex_string(&sha)
+                );
+            }
+        }
+        Ok(slab)
+    });
+    if checked.is_err() && new {
+        let _ = std::fs::remove_file(pack);
+    }
+    checked
 }
 
 /// Downloads `key` to `path` unless a complete copy is already there. Returns whether it
@@ -2095,7 +2164,8 @@ pub fn metrics_text(ctx: &Ctx) -> String {
          gvfs_grown_objects {}\n\
          gvfs_index_bytes {}\n\
          gvfs_index_copied_bytes {}\n\
-         gvfs_index_huge_bytes {}\n",
+         gvfs_index_huge_bytes {}\n\
+         gvfs_baselines_grown_total {}\n",
         get(&m.prefetch),
         get(&m.object_get),
         get(&m.object_post),
@@ -2140,7 +2210,8 @@ pub fn metrics_text(ctx: &Ctx) -> String {
         ctx.arenas.grown(),
         get(&m.index_bytes),
         get(&m.index_copied),
-        get(&m.index_huge)
+        get(&m.index_huge),
+        get(&GROWN)
     )
 }
 
@@ -2237,7 +2308,9 @@ mod tests {
             ("m15-12-0123456789abcdef", "pack", true),
             ("m15-12-0123456789abcdef", "mphf", true),
             ("week-7-fedcba9876543210", "sizes", true),
+            ("base-9-fedcba9876543210", "tail", true),
             (listed, "pack", false),
+            (listed, "tail", false),
             (git_pack.as_str(), "pack", false),
             ("data", "pack", false),
             ("m15-12", "mphf", false),

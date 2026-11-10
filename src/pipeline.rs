@@ -23,7 +23,8 @@
 //! 4. **Weekly** (`--tier 168h`): the pyramid is repacked into the week's delta (kept for
 //!    warm clients; the pyramid's slabs are retained). The new baseline is the old one byte
 //!    for byte plus the delta's objects, with each directory's newest version stored as a
-//!    delta against the old baseline's version. It waits for its week ([`weekly_wait`]).
+//!    delta against the old baseline's version. It waits for its week ([`weekly_wait`]),
+//!    and publishes the new baseline's tail on the old one beside it ([`crate::tail`]).
 //! 5. Publish with `If-Match` (lost race: start over), then delete unreferenced slab files
 //!    older than the grace period (a crashed run's uploads; slabs no longer listed). A run
 //!    that changed nothing (no new commits, no rollup due) publishes nothing: the manifest
@@ -821,6 +822,7 @@ fn weekly(o: &mut Options, e: &mut Engines, work: &Path, m: &mut Manifest) -> Re
     )? {
         Some(baseline) => {
             upload(&o.store, work, &baseline)?;
+            publish_tail(&o.store, work, old, &baseline);
             if m.separate_blobs() {
                 crate::separate::union_sizes(&o.store, work, &[&m.baseline, &delta], &baseline)?;
             }
@@ -843,6 +845,40 @@ fn weekly(o: &mut Options, e: &mut Engines, work: &Path, m: &mut Manifest) -> Re
     m.weekly.drain(..excess);
     m.pyramid.clear();
     Ok(())
+}
+
+/// Publishes, beside the new baseline `new`, its tail on the old one ([`crate::tail`]):
+/// an edge that has `old` makes the new pack of the two and downloads megabytes, not the
+/// baseline. A tail that cannot be published is said and is no error of the run: edges
+/// then download the pack whole, as they did.
+fn publish_tail(store: &Store, work: &Path, old: &Slab, new: &SlabMeta) {
+    let pack = work.join(format!("{}.pack", new.id));
+    let tail = work.join(format!("{}.tail", new.id));
+    let published = crate::tail::write(&old.meta, old.pack(), new, &pack, &tail).and_then(|made| {
+        if made {
+            store.upload_file(&new.tail_key(), &tail)?;
+        }
+        Ok(made)
+    });
+    let size = std::fs::metadata(&tail).map_or(0, |m| m.len());
+    match published {
+        Ok(true) => crate::log!(
+            "weekly: baseline {} is {} and a tail of {}",
+            new.id,
+            old.meta.id,
+            crate::util::human_bytes(size)
+        ),
+        Ok(false) => crate::log!(
+            "weekly: warning: baseline {} is not {} and more: no tail, edges download it whole",
+            new.id,
+            old.meta.id
+        ),
+        Err(e) => crate::log!(
+            "weekly: warning: the tail of baseline {} was not published ({e}): edges \
+             download it whole",
+            new.id
+        ),
+    }
 }
 
 /// One slab covering `run` (consecutive, oldest first), repacked from the store.
@@ -912,6 +948,8 @@ fn gc(o: &Options, m: &Manifest) -> Result<()> {
         .slabs()
         .flat_map(|s| [s.pack_key(), s.index_key()])
         .collect();
+    // The baseline's tail on the one before it, for the edges that still have that one.
+    referenced.insert(m.baseline.tail_key());
     if separate {
         referenced.extend(m.slabs().map(SlabMeta::sizes_key));
         // Blob packs and segments: only what `blobs.bin` lists now is kept; a copy that has
