@@ -722,16 +722,24 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   an upstream), but counted in `gvfs_blobs_missing_total` and logged. The proxy fetches
   each blob once per edge (requests for a blob being fetched wait for that fetch, and get
   its error if it fails, rather than ask the upstream one after another),
-  verifies it as it streams in, and keeps it on local disk, one pack per fetch, up to
-  `--proxy-cache-mib` and `--proxy-cache-packs` (oldest fetches go first; the newest stays
-  even past the bounds, since the requests that waited for it read its blobs from the
-  cache). A cached pack holds a descriptor and a mapping whatever its size, and a pack of
-  one small blob is a few hundred bytes, so the bytes alone bound neither: 256 packs by
-  default, which fits a 1,024-descriptor limit beside the edge's connections and slabs.
+  verifies it as it streams in, and keeps it, one pack per fetch (oldest fetches go
+  first; the newest stays even past the bounds, since the requests that waited for it
+  read its blobs from the cache). A pack of at most 16 KiB is kept in memory, up to
+  64 MiB and 65,536 of them: one blob asked for alone, a source file or a pointer, is
+  such a pack, ranges that short are copied into the response rather than sent with
+  `sendfile(2)`, and a file each would cost a descriptor and a mapping each. A larger
+  pack is a file under `--cache-dir` (written, not synced: the directory is emptied at
+  start), up to `--proxy-cache-mib` and `--proxy-cache-packs` of them: a quarter of the
+  descriptors the edge keeps for itself, 256 under a limit of 1,024 and 8,192 under
+  524,288. (The bytes alone bounded neither descriptors nor mappings; bounded in packs
+  whatever their size, single-blob requests for more blobs than the bound evicted one
+  another, each then a fetch from the upstream: 9 ms where a cached blob takes 70 µs.)
   When a new `blobs.bin` is loaded, the packs whose blobs it all lists go too (the
   pipeline has copied what a window sealed, and requests look in the store first). A
   request keeps the packs it already holds, so eviction never makes it start over, and
-  lets go of them when it ends: an evicted pack's file goes with its last request. The
+  lets go of them when it ends: an evicted pack's file goes with its last request, and a
+  fetch that fails or is abandoned leaves none. `gvfs_proxy_cache_{packs,files,bytes}`
+  report what is kept. The
   proxy keeps 8 upstream connections for its next fetches. An
   upstream failure is a 503, which clients retry; gvfs-helper treats a 404 as fatal. Its
   requests are async (`AsyncUpstream`: the async client for smart HTTP and GVFS

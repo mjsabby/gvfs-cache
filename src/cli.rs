@@ -125,11 +125,13 @@ SERVE OPTIONS:
                                to every client except git itself (gvfs-helper discards it)
     --proxy-cache-mib <N>      --blobs separate: blobs proxied from the upstream kept on
                                local disk (default: 10240; the newest fetch stays even
-                               if larger)
-    --proxy-cache-packs <N>    --blobs separate: fetches from the upstream kept at once,
-                               each a pack with a file descriptor and a mapping of its
-                               own (default: 256); the oldest go first, and a pack goes
-                               once the store has its blobs
+                               if larger). A fetch of at most 16 KiB is kept in memory
+                               instead, up to 64 MiB of them
+    --proxy-cache-packs <N>    --blobs separate: larger fetches from the upstream kept
+                               at once, each a file with a descriptor and a mapping of
+                               its own (default: a quarter of the descriptors the edge
+                               keeps for itself, 256 to 16384); the oldest go first,
+                               and a fetch goes once the store has its blobs
     --blob-cache-mib <N>       --blobs separate: 4 MiB blocks of blob packs in object
                                storage kept on local disk (default: 32768)
     --superset-tier <24h|168h|never>     send each sealed day and week (24h, default) or

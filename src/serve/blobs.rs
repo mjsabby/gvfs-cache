@@ -9,9 +9,9 @@
 //!   (the pipeline copies them when it seals their trees), and, as a fault the edge counts,
 //!   any a sealed tree names that a complete store lacks. Once per blob per edge (requests
 //!   for a blob already being fetched wait for that fetch, and fail with it if it fails),
-//!   verified by id as they stream in, and kept in a local cache, one pack per fetch,
-//!   bounded in bytes and in packs (each holds a descriptor and a mapping), until the store
-//!   has them. Only blobs the store's trees name are proxied
+//!   verified by id as they stream in, and kept, one pack per fetch, until the store has
+//!   them: small packs in memory, larger ones as files, bounded in bytes and in number
+//!   (each holds a descriptor and a mapping). Only blobs the store's trees name are proxied
 //!   ([`super::view::View::blob_size`]); anything else is a 404.
 //!
 //! Remote reads and the proxy's fetches are async: a request waiting on object storage or
@@ -31,14 +31,21 @@ use crate::store::Store;
 use crate::upstream::{AsyncUpstream, Auth, BATCH};
 use crate::util::{Context, Oid, Result, sub, us};
 
-/// One blob pack: mapped (local) or in object storage (remote).
+/// One blob pack: mapped or in memory (local), or in object storage (remote).
 pub struct BlobPack {
     pub id: String,
     pub len: u64,
-    local: Option<(File, gvfs_mmap::Map)>,
+    local: Option<Local>,
     remote: Option<Remote>,
     /// Removed when the last user drops it (a proxied pack evicted from the cache).
     unlink: Option<PathBuf>,
+}
+
+/// Where a local pack's bytes are.
+enum Local {
+    Mapped(File, gvfs_mmap::Map),
+    /// A small proxied pack ([`HEAP_MAX`]).
+    Heap(Box<[u8]>),
 }
 
 /// Where a remote pack's bytes come from.
@@ -56,10 +63,21 @@ impl BlobPack {
         Ok(BlobPack {
             id: id.to_string(),
             len: crate::util::u64_of(map.bytes().len()),
-            local: Some((file, map)),
+            local: Some(Local::Mapped(file, map)),
             remote: None,
             unlink: None,
         })
+    }
+
+    /// A pack held in memory.
+    fn heap(bytes: Vec<u8>, id: &str) -> BlobPack {
+        BlobPack {
+            id: id.to_string(),
+            len: crate::util::u64_of(bytes.len()),
+            local: Some(Local::Heap(bytes.into_boxed_slice())),
+            remote: None,
+            unlink: None,
+        }
     }
 
     /// A pack in object storage, read through `cache` when there is one.
@@ -82,14 +100,22 @@ impl BlobPack {
         }
     }
 
-    /// The mapped bytes of a local pack.
+    /// The bytes of a local pack.
     #[inline]
     pub fn bytes(&self) -> Option<&[u8]> {
-        self.local.as_ref().map(|(_, m)| m.bytes())
+        match &self.local {
+            Some(Local::Mapped(_, map)) => Some(map.bytes()),
+            Some(Local::Heap(bytes)) => Some(bytes),
+            None => None,
+        }
     }
 
+    /// The file of a mapped pack (to `sendfile(2)` from).
     pub fn file(&self) -> Option<&File> {
-        self.local.as_ref().map(|(f, _)| f)
+        match &self.local {
+            Some(Local::Mapped(file, _)) => Some(file),
+            _ => None,
+        }
     }
 
     /// `len` bytes at `at`, handed to `sink` in pieces as they arrive (a remote pack:
@@ -280,22 +306,61 @@ impl BlobSet {
     }
 }
 
-struct ProxyState {
-    cache: HashMap<Oid, (Arc<BlobPack>, BlobRec)>,
-    /// Fetched packs, oldest first, with their blobs (eviction order).
+/// A proxied pack of at most this many bytes is kept in memory and never becomes a file.
+/// Ranges this short are copied into the response, not sent with `sendfile(2)`, so a file
+/// gives the edge nothing, while its descriptor and its mapping are what the cache has
+/// fewest of: with a file each, single-blob requests for more blobs than
+/// `--proxy-cache-packs` evicted one another, and every one became a fetch from the
+/// upstream (9 ms each from a local one, where a cached blob takes 70 µs).
+const HEAP_MAX: usize = 16 << 10;
+/// What the packs kept in memory may add up to (within `--proxy-cache-mib`), and their
+/// number: beside its bytes each costs a few hundred bytes of bookkeeping.
+const HEAP_BYTES: u64 = 64 << 20;
+const HEAP_PACKS: usize = 1 << 16;
+
+/// Cached packs of one kind, oldest first (eviction order), with their blobs.
+#[derive(Default)]
+struct Kept {
     order: VecDeque<(Arc<BlobPack>, Arc<[Oid]>)>,
     bytes: u64,
+}
+
+struct ProxyState {
+    cache: HashMap<Oid, (Arc<BlobPack>, BlobRec)>,
+    /// Fetched packs: those in files, which the byte budget and `--proxy-cache-packs`
+    /// bound, and the small ones in memory, which have bounds of their own.
+    files: Kept,
+    heap: Kept,
     /// The blobs being fetched, each with the fetch that will bring it.
     fetching: HashMap<Oid, Arc<Attempt>>,
 }
 
+/// Takes `pack`, no longer kept, out of `cache`: its blobs' entries (an id a newer pack
+/// holds too keeps that entry).
+fn forget(cache: &mut HashMap<Oid, (Arc<BlobPack>, BlobRec)>, pack: &Arc<BlobPack>, ids: &[Oid]) {
+    for id in ids {
+        if cache.get(id).is_some_and(|(p, _)| Arc::ptr_eq(p, pack)) {
+            cache.remove(id);
+        }
+    }
+}
+
 impl ProxyState {
-    /// Caches the blobs of `pack`, just fetched, then evicts the oldest packs beyond
-    /// `budget` bytes or `max_packs` packs and returns them (the caller drops them outside
-    /// the lock: the last reference to one unlinks its file). The pack just fetched always
-    /// stays, since the requests that waited for its blobs look for them here when they
-    /// wake: the cache can exceed its bounds by one fetch. An id a newer pack holds too
-    /// keeps that entry.
+    fn new() -> ProxyState {
+        ProxyState {
+            cache: HashMap::new(),
+            files: Kept::default(),
+            heap: Kept::default(),
+            fetching: HashMap::new(),
+        }
+    }
+
+    /// Caches the blobs of `pack`, just fetched, then evicts the oldest packs of its kind
+    /// beyond their bounds (files: `budget` bytes and `max_packs` packs) and returns them
+    /// (the caller drops them outside the lock: the last reference to one unlinks its
+    /// file). The pack just fetched always stays, since the requests that waited for its
+    /// blobs look for them here when they wake: the cache can exceed its bounds by one
+    /// fetch. An id a newer pack holds too keeps that entry.
     fn keep(
         &mut self,
         pack: &Arc<BlobPack>,
@@ -303,36 +368,56 @@ impl ProxyState {
         budget: u64,
         max_packs: usize,
     ) -> Vec<Arc<BlobPack>> {
+        let ProxyState {
+            cache, files, heap, ..
+        } = self;
         for r in recs {
-            self.cache.insert(r.oid, (Arc::clone(pack), *r));
+            cache.insert(r.oid, (Arc::clone(pack), *r));
         }
-        self.bytes = self.bytes.saturating_add(pack.len);
-        self.order
+        let (kept, budget, max_packs) = match pack.file() {
+            Some(_) => (files, budget, max_packs),
+            None => (heap, budget.min(HEAP_BYTES), HEAP_PACKS),
+        };
+        kept.bytes = kept.bytes.saturating_add(pack.len);
+        kept.order
             .push_back((Arc::clone(pack), recs.iter().map(|r| r.oid).collect()));
         let mut evicted = Vec::new();
-        while (self.bytes > budget || self.order.len() > max_packs) && self.order.len() > 1 {
-            let Some((old, ids)) = self.order.pop_front() else {
+        while (kept.bytes > budget || kept.order.len() > max_packs) && kept.order.len() > 1 {
+            let Some((old, ids)) = kept.order.pop_front() else {
                 break;
             };
-            self.forget(&old, &ids);
+            kept.bytes = kept.bytes.saturating_sub(old.len);
+            forget(cache, &old, &ids);
             evicted.push(old);
         }
         evicted
     }
 
-    /// Takes `pack`, no longer in the eviction order, out of the cache: its bytes, and its
-    /// blobs' entries (an id a newer pack holds too keeps that entry).
-    fn forget(&mut self, pack: &Arc<BlobPack>, ids: &[Oid]) {
-        for id in ids {
-            if self
-                .cache
-                .get(id)
-                .is_some_and(|(p, _)| Arc::ptr_eq(p, pack))
-            {
-                self.cache.remove(id);
-            }
+    /// Lets go of the kept packs `stored` picks. Returns how many went.
+    fn release(&mut self, stored: &HashSet<*const BlobPack>) -> usize {
+        let ProxyState {
+            cache, files, heap, ..
+        } = self;
+        let mut released = 0usize;
+        for kept in [files, heap] {
+            let mut order = std::mem::take(&mut kept.order);
+            order.retain(|(pack, ids)| {
+                let stays = !stored.contains(&Arc::as_ptr(pack));
+                if !stays {
+                    kept.bytes = kept.bytes.saturating_sub(pack.len);
+                    forget(cache, pack, ids);
+                    released = released.saturating_add(1);
+                }
+                stays
+            });
+            kept.order = order;
         }
-        self.bytes = self.bytes.saturating_sub(pack.len);
+        released
+    }
+
+    /// Every kept pack with its blobs.
+    fn kept(&self) -> impl Iterator<Item = &(Arc<BlobPack>, Arc<[Oid]>)> {
+        self.files.order.iter().chain(&self.heap.order)
     }
 }
 
@@ -346,7 +431,7 @@ pub struct Proxy {
     auth: Auth,
     dir: PathBuf,
     budget: u64,
-    /// Most packs cached: each holds a descriptor and a mapping, whatever its size.
+    /// Most packs cached as files: each holds a descriptor and a mapping.
     max_packs: usize,
     idle: Mutex<Vec<AsyncUpstream>>,
     state: Mutex<ProxyState>,
@@ -383,8 +468,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Proxy {
-    /// Fetched blobs are kept under `dir` (emptied now) up to `budget` bytes and
-    /// `max_packs` packs (one per fetch).
+    /// Fetched blobs are kept (one pack per fetch) up to `budget` bytes: packs of at most
+    /// [`HEAP_MAX`] bytes in memory, the others as files under `dir` (emptied now), at
+    /// most `max_packs` of them.
     pub fn new(
         upstream: &str,
         auth: &Auth,
@@ -401,12 +487,7 @@ impl Proxy {
             budget,
             max_packs,
             idle: Mutex::new(Vec::new()),
-            state: Mutex::new(ProxyState {
-                cache: HashMap::new(),
-                order: VecDeque::new(),
-                bytes: 0,
-                fetching: HashMap::new(),
-            }),
+            state: Mutex::new(ProxyState::new()),
             done: Notify::new(),
         })
     }
@@ -417,6 +498,18 @@ impl Proxy {
         lock(&self.state).cache.get(oid).cloned()
     }
 
+    /// The packs kept, those of them kept as files (a descriptor and a mapping each), and
+    /// the bytes of them all (`/metrics`).
+    pub fn kept(&self) -> (usize, usize, u64) {
+        let st = lock(&self.state);
+        let files = st.files.order.len();
+        (
+            files.saturating_add(st.heap.order.len()),
+            files,
+            st.files.bytes.saturating_add(st.heap.bytes),
+        )
+    }
+
     /// Lets go of the cached packs whose blobs are all in `set`, the store's blobs as just
     /// loaded: the pipeline has copied what a window sealed, and requests look in the store
     /// first. Returns how many went. (They used to stay, a descriptor and a mapping each,
@@ -424,8 +517,7 @@ impl Proxy {
     /// misses one in its store fetches it again.
     pub fn release_stored(&self, set: &BlobSet) -> usize {
         // Looked up outside the lock, which a request takes for every cached blob it reads.
-        let packs: Vec<(Arc<BlobPack>, Arc<[Oid]>)> =
-            lock(&self.state).order.iter().cloned().collect();
+        let packs: Vec<(Arc<BlobPack>, Arc<[Oid]>)> = lock(&self.state).kept().cloned().collect();
         let stored: HashSet<*const BlobPack> = packs
             .iter()
             .filter(|(_, ids)| ids.iter().all(|o| set.find(o).is_some()))
@@ -434,19 +526,7 @@ impl Proxy {
         if stored.is_empty() {
             return 0;
         }
-        let mut released = 0usize;
-        let mut st = lock(&self.state);
-        let mut order = std::mem::take(&mut st.order);
-        order.retain(|(pack, ids)| {
-            let stays = !stored.contains(&Arc::as_ptr(pack));
-            if !stays {
-                st.forget(pack, ids);
-                released = released.saturating_add(1);
-            }
-            stays
-        });
-        st.order = order;
-        drop(st);
+        let released = lock(&self.state).release(&stored);
         // Dropped outside the lock: the last reference to a pack unlinks its file.
         drop(packs);
         released
@@ -556,21 +636,95 @@ impl Proxy {
         let mut up = self.connection()?;
         let id = crate::blobcopy::fresh_id(oids);
         let path = self.dir.join(format!("{id}.pack"));
-        match fetch_into(&mut up, oids, &path, &id).await {
-            Ok((pack, recs)) => {
-                self.reuse(up);
-                crate::log!(
-                    "serve: proxied {} blobs ({}) from the upstream in {:.2}s",
-                    recs.len(),
-                    crate::util::human_bytes(pack.len),
-                    t0.elapsed().as_secs_f64()
-                );
-                Ok((Arc::new(pack), recs))
+        let (pack, recs) = fetch_into(&mut up, oids, &path, &id).await?;
+        self.reuse(up);
+        crate::log!(
+            "serve: proxied {} blobs ({}) from the upstream in {:.2}s",
+            recs.len(),
+            crate::util::human_bytes(pack.len),
+            t0.elapsed().as_secs_f64()
+        );
+        Ok((Arc::new(pack), recs))
+    }
+}
+
+/// A proxied pack as it arrives: in memory while it is small, in a file at `path` from
+/// [`HEAP_MAX`] bytes on. The file is a cache's (never synced), and goes if the pack does
+/// not become whole: a fetch that failed, or one whose request went away mid-flight.
+struct ProxySpool {
+    path: PathBuf,
+    mem: Vec<u8>,
+    file: Option<FileSpool>,
+}
+
+impl ProxySpool {
+    fn new(path: &Path) -> ProxySpool {
+        ProxySpool {
+            path: path.to_path_buf(),
+            mem: Vec::new(),
+            file: None,
+        }
+    }
+
+    /// The pack, whole: in memory, or mapped from its file, which goes with its last user.
+    fn pack(mut self, id: &str) -> Result<BlobPack> {
+        let Some(file) = self.file.take() else {
+            return Ok(BlobPack::heap(std::mem::take(&mut self.mem), id));
+        };
+        let opened = file.end().and_then(|_| BlobPack::open(&self.path, id));
+        match opened {
+            Ok(mut pack) => {
+                pack.unlink = Some(std::mem::take(&mut self.path));
+                Ok(pack)
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(&self.path);
                 Err(e)
             }
+        }
+    }
+}
+
+impl std::io::Write for ProxySpool {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.file.is_none() && self.mem.len().saturating_add(buf.len()) > HEAP_MAX {
+            let mut file = FileSpool::create(&self.path).map_err(std::io::Error::other)?;
+            // Kept before it is written to: a file that fails halfway still goes.
+            let mem = std::mem::take(&mut self.mem);
+            let written = file.write_all(&mem);
+            self.file = Some(file);
+            written?;
+        }
+        match &mut self.file {
+            Some(file) => file.write(buf),
+            None => {
+                self.mem.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match &mut self.file {
+            Some(file) => file.flush(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl crate::blobstream::Spool for ProxySpool {
+    fn read_back(&mut self, at: u64, buf: &mut [u8]) -> Result<()> {
+        match &mut self.file {
+            Some(file) => file.read_back(at, buf),
+            None => self.mem.read_back(at, buf),
+        }
+    }
+}
+
+impl Drop for ProxySpool {
+    fn drop(&mut self) {
+        if self.file.is_some() {
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 }
@@ -596,8 +750,9 @@ impl crate::upstream::PackPieces for ToSink<'_> {
     }
 }
 
-/// Fetches the blobs `oids` from `up` into a blob pack at `path` (id `id`), each verified
-/// by id as it streams in. The network side is async (the request's task waits, not a
+/// Fetches the blobs `oids` from `up` into a blob pack (id `id`), each verified by id as
+/// it streams in: a pack in memory if it is small, else a file at `path`
+/// ([`ProxySpool`]). The network side is async (the request's task waits, not a
 /// thread); verifying (inflating, hashing, re-deflating deltas) and writing run on tokio's
 /// blocking pool, fed through a bounded queue, so the runtime's workers keep serving.
 pub async fn fetch_into(
@@ -612,8 +767,7 @@ pub async fn fetch_into(
     // `Err((true, e))`: the sink failed (which explains a failed send); `(false, _)`: the
     // network side stopped first.
     let sink = tokio::task::spawn_blocking(move || {
-        let spool = FileSpool::create(&path).map_err(|e| (true, e))?;
-        let mut sink = BlobSink::new(spool, &want).map_err(|e| (true, e))?;
+        let mut sink = BlobSink::new(ProxySpool::new(&path), &want).map_err(|e| (true, e))?;
         loop {
             match rx.blocking_recv() {
                 Some(Piece::Data(b)) => {
@@ -628,9 +782,7 @@ pub async fn fetch_into(
             }
         }
         let f = sink.finish().map_err(|e| (true, e))?;
-        f.out.close().map_err(|e| (true, e))?;
-        let mut pack = BlobPack::open(&path, &id).map_err(|e| (true, e))?;
-        pack.unlink = Some(path);
+        let pack = f.out.pack(&id).map_err(|e| (true, e))?;
         Ok((pack, f.recs))
     });
     let sent: Result<()> = async {
@@ -689,18 +841,14 @@ mod tests {
 
     /// Evicting a pack leaves the entries of its ids that a newer pack holds; an evicted
     /// pack's file goes with its last user; the newest pack stays, whatever its size; and
-    /// the packs kept are bounded in number as well as in bytes.
+    /// the packs kept as files are bounded in number as well as in bytes. Packs in memory
+    /// are not among them: they neither count against those bounds nor go for them.
     #[test]
     fn proxy_eviction_keeps_newer_entries() {
         let dir = std::env::temp_dir().join(format!("gvd-proxy-evict-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut st = ProxyState {
-            cache: HashMap::new(),
-            order: VecDeque::new(),
-            bytes: 0,
-            fetching: HashMap::new(),
-        };
+        let mut st = ProxyState::new();
         let (p1, r1) = proxied(&dir, "p1", 100, &[1, 2]);
         let (p2, r2) = proxied(&dir, "p2", 100, &[2, 3]);
         assert!(st.keep(&p1, &r1, 150, 8).is_empty());
@@ -715,7 +863,7 @@ mod tests {
             "the newer pack's entry stays"
         );
         assert_eq!(at(&st, 3).as_deref(), Some("p2"));
-        assert_eq!(st.bytes, 100);
+        assert_eq!(st.files.bytes, 100);
         let p1_file = dir.join("p1.pack");
         drop((evicted, p1, r1));
         assert!(!p1_file.exists(), "unlinked with its last user");
@@ -723,8 +871,21 @@ mod tests {
         let (p3, r3) = proxied(&dir, "p3", 400, &[4]);
         assert_eq!(st.keep(&p3, &r3, 150, 8).len(), 1);
         assert_eq!(at(&st, 4).as_deref(), Some("p3"));
-        assert_eq!((st.order.len(), st.bytes), (1, 400));
-        // Within its bytes, the cache is bounded in packs: the oldest go first, and the
+        assert_eq!((st.files.order.len(), st.files.bytes), (1, 400));
+        // Packs in memory, more of them than files may be kept, and older than those.
+        let in_memory = |i: u8| {
+            let (_, recs) = proxied(&dir, &format!("m{i}"), 1, &[i]);
+            (
+                Arc::new(BlobPack::heap(vec![0u8; 50], &format!("m{i}"))),
+                recs,
+            )
+        };
+        for i in 20..30u8 {
+            let (p, r) = in_memory(i);
+            assert!(st.keep(&p, &r, 1 << 20, 3).is_empty());
+        }
+        assert_eq!((st.heap.order.len(), st.heap.bytes), (10, 500));
+        // Within its bytes, the cache is bounded in files: the oldest go first, and the
         // newest stays even where none may.
         let mut evicted = st.keep(&p2, &r2, 1 << 20, 8);
         for i in 5..9u8 {
@@ -734,11 +895,65 @@ mod tests {
         let gone: Vec<&str> = evicted.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(gone, ["p3", "p2", "q5"]);
         assert_eq!((at(&st, 4), at(&st, 2), at(&st, 5)), (None, None, None));
-        assert_eq!((st.order.len(), st.cache.len(), st.bytes), (3, 3, 30));
+        assert_eq!((st.files.order.len(), st.files.bytes), (3, 30));
         let (p9, r9) = proxied(&dir, "q9", 10, &[9]);
         assert_eq!(st.keep(&p9, &r9, 1 << 20, 0).len(), 3);
         assert_eq!(at(&st, 9).as_deref(), Some("q9"));
-        assert_eq!((st.order.len(), st.cache.len(), st.bytes), (1, 1, 10));
+        assert_eq!((st.files.order.len(), st.files.bytes), (1, 10));
+        assert_eq!((st.heap.order.len(), st.cache.len()), (10, 11));
+        // Their own bound is in bytes too: the budget, where it is the smaller.
+        let (p, r) = in_memory(30);
+        let evicted = st.keep(&p, &r, 120, 3);
+        let gone: Vec<&str> = evicted.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(gone.len(), 9, "{gone:?}");
+        assert_eq!((st.heap.order.len(), st.heap.bytes), (2, 100));
+        assert_eq!(at(&st, 9).as_deref(), Some("q9"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A proxied pack is in memory while it is small and a file from then on. The file
+    /// goes with the pack's last user, or at once if the pack does not become whole: its
+    /// fetch failed, or the request that made it went away. (A fetch abandoned mid-flight
+    /// left its file, which nothing removed until the edge started again.)
+    #[test]
+    fn a_proxied_pack_is_a_file_only_once_it_is_large() {
+        use crate::blobstream::Spool;
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("gvd-proxy-spool-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.pack");
+        let mut back = [0u8; 4];
+
+        let mut small = ProxySpool::new(&path);
+        small.write_all(&[7u8; 100]).unwrap();
+        small.read_back(10, &mut back).unwrap();
+        assert_eq!(back, [7; 4]);
+        let pack = small.pack("p").unwrap();
+        assert!(pack.file().is_none() && pack.bytes() == Some(&[7u8; 100][..]));
+        assert!(!path.exists());
+
+        let mut large = ProxySpool::new(&path);
+        large.write_all(&[1u8; HEAP_MAX]).unwrap();
+        assert!(!path.exists(), "still in memory");
+        large.write_all(&[2u8; 10]).unwrap();
+        assert!(path.exists());
+        large.read_back(HEAP_MAX as u64 - 2, &mut back).unwrap();
+        assert_eq!(back, [1, 1, 2, 2]);
+        let pack = large.pack("p").unwrap();
+        assert_eq!(pack.len, HEAP_MAX as u64 + 10);
+        assert!(pack.file().is_some() && path.exists());
+        drop(pack);
+        assert!(!path.exists(), "gone with its last user");
+
+        let mut abandoned = ProxySpool::new(&path);
+        abandoned.write_all(&vec![3u8; 2 * HEAP_MAX]).unwrap();
+        assert!(path.exists());
+        drop(abandoned);
+        assert!(
+            !path.exists(),
+            "a pack that did not become whole leaves no file"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -780,15 +995,28 @@ mod tests {
         String::from_utf8(out.stdout).unwrap()
     }
 
-    /// A repository of `count` small files in one commit: its git directory and the files'
-    /// blob ids.
-    fn repo_of_small_files(dir: &Path, count: usize) -> (PathBuf, Vec<Oid>) {
+    /// A repository of `small` small files and `large` files of 24 KiB of noise (a pack
+    /// each of more than [`HEAP_MAX`]) in one commit: its git directory and the blob ids
+    /// of the small files, then of the large ones.
+    fn repo_of_files(dir: &Path, small: usize, large: usize) -> (PathBuf, Vec<Oid>, Vec<Oid>) {
         let work = dir.join("w");
         std::fs::create_dir_all(&work).unwrap();
         git(dir, &["init", "-q", "-b", "main", work.to_str().unwrap()]);
-        for i in 0..count {
+        for i in 0..small {
             let text = format!("file {i}\n").repeat(50);
-            std::fs::write(work.join(format!("f{i}.txt")), text).unwrap();
+            std::fs::write(work.join(format!("f{i:03}.txt")), text).unwrap();
+        }
+        for i in 0..large {
+            let mut x = 0x9E37_79B9_7F4A_7C15u64 + i as u64;
+            let noise: Vec<u8> = (0..24 << 10)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    x as u8
+                })
+                .collect();
+            std::fs::write(work.join(format!("g{i:03}.bin")), noise).unwrap();
         }
         git(&work, &["add", "."]);
         git(
@@ -804,23 +1032,28 @@ mod tests {
                 "c",
             ],
         );
-        let ids = git(&work, &["ls-tree", "-r", "HEAD"])
+        let mut ids: Vec<Oid> = git(&work, &["ls-tree", "-r", "HEAD"])
             .lines()
             .map(|l| Oid::from_hex(l.split_whitespace().nth(2).unwrap().as_bytes()).unwrap())
             .collect();
-        (work.join(".git"), ids)
+        let large = ids.split_off(small);
+        (work.join(".git"), ids, large)
     }
 
-    /// Blobs fetched one at a time are a pack each, and each cached pack holds a file, a
-    /// descriptor and a mapping: the cache keeps `max_packs` of them, the newest, however
-    /// far below its byte budget they are. (Bounded in bytes alone, 40 fetches kept 40 of
-    /// each for a few KiB, and so on up to the descriptor limit, where every fetch fails.)
+    /// Blobs fetched one at a time are a pack each. A small one is kept in memory: it
+    /// holds no file, no descriptor and no mapping, so however many there are they do not
+    /// push one another out. (With a file each, and the files bounded in number, a client
+    /// asking for more blobs than the bound fetched every one from the upstream, every
+    /// time.) A larger one is a file with a descriptor and a mapping: the cache keeps
+    /// `max_packs` of those, the newest, however far below its byte budget they are.
+    /// (Bounded in bytes alone, every fetch kept its file, descriptor and mapping, and so
+    /// on up to the descriptor limit, where every fetch fails.)
     #[test]
     fn single_blob_fetches_hold_a_bounded_number_of_descriptors_and_mappings() {
         let dir = std::env::temp_dir().join(format!("gvd-proxy-fds-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let (up, ids) = repo_of_small_files(&dir, 40);
+        let (up, small, large) = repo_of_files(&dir, 40, 12);
         let cache = dir.join("proxy");
         let proxy =
             Proxy::new(up.to_str().unwrap(), &Auth::default(), &cache, 10 << 30, 8).unwrap();
@@ -828,7 +1061,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        for id in &ids {
+        for id in small.iter().chain(&large) {
             rt.block_on(proxy.fetch(std::slice::from_ref(id))).unwrap();
         }
         // Of this cache's files only: other tests open and map files of their own meanwhile.
@@ -844,12 +1077,23 @@ mod tests {
             .count();
         let files = std::fs::read_dir(&cache).unwrap().count();
         assert_eq!((descriptors, mappings, files), (8, 8, 8));
-        let (old, new) = ids.split_at(ids.len() - 8);
+        assert!(small.iter().all(|o| proxy.cached(o).is_some()));
+        let (old, new) = large.split_at(large.len() - 8);
         assert!(old.iter().all(|o| proxy.cached(o).is_none()));
         assert!(new.iter().all(|o| proxy.cached(o).is_some()));
         let st = lock(&proxy.state);
-        assert_eq!((st.order.len(), st.cache.len()), (8, 8));
-        assert!(st.bytes < 8 << 10, "{} bytes of a 10 GiB budget", st.bytes);
+        let kept = (st.heap.order.len(), st.files.order.len(), st.cache.len());
+        assert_eq!(kept, (40, 8, 48));
+        assert!(
+            st.heap.bytes < 40 << 10,
+            "{} bytes in memory",
+            st.heap.bytes
+        );
+        assert!(
+            st.files.bytes > 8 * (24 << 10),
+            "{} in files",
+            st.files.bytes
+        );
         drop(st);
         let _ = std::fs::remove_dir_all(&dir);
     }

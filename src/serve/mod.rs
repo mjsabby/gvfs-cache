@@ -142,8 +142,9 @@ pub struct Options {
     pub upstream_spec: Option<(String, String, crate::upstream::Auth)>,
     /// Bytes of proxied blobs kept on local disk (`--proxy-cache-mib`).
     pub proxy_cache_bytes: u64,
-    /// Proxied packs (one per fetch from the upstream) kept at once (`--proxy-cache-packs`).
-    pub proxy_cache_packs: usize,
+    /// Proxied packs kept as files at once (`--proxy-cache-packs`; `None`: as many as the
+    /// descriptor limit suggests, [`default_proxy_packs`]).
+    pub proxy_cache_packs: Option<usize>,
     /// Bytes of remote blob-pack blocks kept on local disk (`--blob-cache-mib`).
     pub blob_cache_bytes: u64,
     pub bind: String,
@@ -271,7 +272,10 @@ pub fn main(args: &[String]) -> Result<()> {
         upstream,
         upstream_spec,
         proxy_cache_bytes: f.num("proxy-cache-mib", 10240u64)?.saturating_mul(1 << 20),
-        proxy_cache_packs: f.num("proxy-cache-packs", PROXY_CACHE_PACKS)?,
+        proxy_cache_packs: match f.get("proxy-cache-packs") {
+            Some(_) => Some(f.num("proxy-cache-packs", 0usize)?),
+            None => None,
+        },
         blob_cache_bytes: f.num("blob-cache-mib", 32768u64)?.saturating_mul(1 << 20),
         bind: f.get("bind").unwrap_or("127.0.0.1:8080").to_string(),
         cache_dir,
@@ -423,19 +427,20 @@ pub fn run(o: Options) -> Result<()> {
         pending: None,
     };
     let first = live.snapshot(manifest, etag);
+    // Connections, and the proxy's files, may not take the descriptors the edge needs for
+    // its other files and sockets.
+    let fds = raise_fd_limit();
     let proxy = match (&upstream_spec, separate) {
         (Some((u, _, auth)), true) => Some(blobs::Proxy::new(
             u,
             auth,
             &sync.cache_dir.join("proxy"),
             proxy_cache_bytes,
-            proxy_cache_packs,
+            proxy_cache_packs.unwrap_or_else(|| default_proxy_packs(fds)),
         )?),
         _ => None,
     };
     let workers = workers.max(1);
-    // Connections may not take the descriptors the edge needs for its own files and sockets.
-    let fds = raise_fd_limit();
     let max_conns = match max_conns {
         Some(n) => {
             if n > fds.saturating_sub(fd_reserve(fds)) {
@@ -604,12 +609,16 @@ pub fn default_max_conns(fds: usize, max_idle: usize) -> usize {
 const CONN_BUFS: usize = 256;
 /// Bytes of each connection's output buffer (the batch a response coalesces).
 const OUT_BYTES: usize = 256 << 10;
-/// `--proxy-cache-packs` by default. A cached pack holds a descriptor and a mapping
-/// whatever its size, and a pack of one small blob is a few hundred bytes: the byte budget
-/// alone let the proxy take every descriptor the edge has. 256 leaves three quarters of a
-/// 1,024-descriptor limit to the 64 connections served under it ([`default_max_conns`]),
-/// the slabs and a directory store's blob packs.
-pub const PROXY_CACHE_PACKS: usize = 256;
+/// `--proxy-cache-packs` by default: a quarter of the descriptors the edge keeps for its
+/// own use ([`fd_reserve`]), within its limit and well within the mappings a process may
+/// have (`vm.max_map_count`, 65,530 by default). A proxied pack kept as a file holds one
+/// of each, and the byte budget alone let them take every descriptor the edge has. 256
+/// under a limit of 1,024 descriptors, which leaves three quarters to the 64 connections
+/// served under it ([`default_max_conns`]), the slabs and a directory store's blob packs;
+/// 8,192 under 524,288.
+pub fn default_proxy_packs(fds: usize) -> usize {
+    (fd_reserve(fds).min(fds) / 4).clamp(256, 16384)
+}
 
 /// Accepts connections for the life of the process: one task each, at most `--max-conns`
 /// at once (past that, new ones wait in the listen queue until one closes).
@@ -1799,6 +1808,7 @@ pub fn metrics_text(ctx: &Ctx) -> String {
     let a = gvfs_alloc_guard::stats();
     let v = ctx.view();
     let get = |c: &std::sync::atomic::AtomicU64| c.load(Ordering::Relaxed);
+    let proxied = ctx.proxy.as_ref().map_or((0, 0, 0), blobs::Proxy::kept);
     format!(
         "gvfs_requests_total{{endpoint=\"prefetch\"}} {}\n\
          gvfs_requests_total{{endpoint=\"objects_get\"}} {}\n\
@@ -1831,6 +1841,9 @@ pub fn metrics_text(ctx: &Ctx) -> String {
          gvfs_blob_cache_fetches_total {}\n\
          gvfs_blob_cache_bypass_total {}\n\
          gvfs_blob_cache_bytes {}\n\
+         gvfs_proxy_cache_packs {}\n\
+         gvfs_proxy_cache_files {}\n\
+         gvfs_proxy_cache_bytes {}\n\
          gvfs_connections_idle {}\n\
          gvfs_connections_idle_closed_total {}\n\
          gvfs_connections_idle_overflow_total {}\n\
@@ -1869,6 +1882,9 @@ pub fn metrics_text(ctx: &Ctx) -> String {
         ctx.blob_cache.as_ref().map_or(0, |c| get(&c.fetches)),
         ctx.blob_cache.as_ref().map_or(0, |c| get(&c.bypassed)),
         ctx.blob_cache.as_ref().map_or(0, |c| c.bytes()),
+        proxied.0,
+        proxied.1,
+        proxied.2,
         ctx.idle.load(Ordering::Relaxed).max(0),
         get(&m.idle_closed),
         get(&m.idle_overflow),
