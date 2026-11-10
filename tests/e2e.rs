@@ -1580,6 +1580,8 @@ fn pack_object_count(pack: &[u8]) -> usize {
 
 /// A commit's expansion may grow its arena only up to `--max-request-objects` objects (413
 /// beyond); requests that do not expand commits are not affected; the default allows it.
+/// And it follows parents for at most `--max-commit-depth` levels, whatever `commitDepth`
+/// asks.
 #[test]
 fn commit_expansion_is_capped() {
     let root = tempdir("capped");
@@ -1630,6 +1632,31 @@ fn commit_expansion_is_capped() {
         .count();
     assert_eq!(pack_object_count(&body), trees_and_commits);
     server.assert_clean();
+    drop(server);
+
+    let shallow = Server::start(&[
+        "--store",
+        &store,
+        "--cache-dir",
+        cache.to_str().unwrap(),
+        "--max-commit-depth",
+        "2",
+    ]);
+    let (status, _, body) = shallow.post("/gvfs/objects", commit.as_bytes(), pack);
+    assert_eq!(status, 200);
+    let two_levels = fresh_repo(&root, "two-levels");
+    install_pack(&two_levels, &body);
+    let has = |back: u32| {
+        git_cmd(&two_levels)
+            .args(["cat-file", "-e", &rev(&up.bare, &format!("{tip}~{back}"))])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(has(0) && has(1), "the commit and its parent");
+    assert!(!has(2), "three levels were asked for, two are allowed");
+    shallow.assert_clean();
     let _ = std::fs::remove_dir_all(&root);
 }
 
