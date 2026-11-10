@@ -1001,18 +1001,20 @@ impl LiveTip {
             .map(|x| x.slab))
     }
 
-    /// The L0 slabs once manifest `m` (whose slabs are `sealed`) replaces `old`. Those the
-    /// manifest covers stay until they age out, the ones after its tip stay live. If the tip
-    /// falls inside an L0 slab, what follows it is repacked out of that slab; if the branch
-    /// was rewritten, L0 starts over from the manifest.
+    /// The L0 slabs once manifest `m` (whose slabs are `sealed`) replaces `old`, at `now`
+    /// (the clock, in seconds). Those the manifest covers stay until they age out, the
+    /// ones after its tip stay live. If the tip falls inside an L0 slab, what follows it
+    /// is repacked out of that slab; if the branch was rewritten, L0 starts over from the
+    /// manifest.
     pub fn prune(
         &mut self,
         l0: &[Arc<Slab>],
         old: &Manifest,
         m: &Manifest,
         sealed: &[Arc<Slab>],
+        now: u64,
     ) -> Result<Vec<Arc<Slab>>> {
-        let out = match self.pruned(l0, old, m, sealed)? {
+        let out = match self.pruned(l0, old, m, sealed, now)? {
             Some(out) => out,
             None => {
                 // L0 starts over from the manifest (the branch was rewritten, or the
@@ -1039,6 +1041,7 @@ impl LiveTip {
         old: &Manifest,
         m: &Manifest,
         sealed: &[Arc<Slab>],
+        now: u64,
     ) -> Result<Option<Vec<Arc<Slab>>>> {
         let mut out = l0.to_vec();
         if !l0.is_empty() && m.tip != old.tip {
@@ -1079,7 +1082,7 @@ impl LiveTip {
                 return Ok(None);
             }
         }
-        retain_l0(&mut out, m.max_ts);
+        retain_l0(&mut out, m.max_ts, now);
         Ok(Some(out))
     }
 }
@@ -1087,9 +1090,33 @@ impl LiveTip {
 /// Drops the sealed L0 slabs (ending at or before `max_ts`, the manifest's tip) that ended
 /// more than [`L0_RETAIN`] before the newest boundary. Unsealed ones hold the live tip and
 /// always stay, however long the pipeline is away.
-pub fn retain_l0(l0: &mut Vec<Arc<Slab>>, max_ts: u64) {
-    let newest = l0.last().map_or(max_ts, |s| s.meta.end_ts.max(max_ts));
-    l0.retain(|s| keep_l0(s.meta.end_ts, max_ts, newest));
+///
+/// The boundaries are stamps, which are commit times: a commit dated in the future puts
+/// every later one ahead of the clock, a second apart per commit, and six hours of them
+/// are then 21,600 commits' L0 slabs, in memory. So the newest boundary counts as no
+/// later than `now` (the clock, in seconds), and no more than [`L0_SEALED_MAX`] sealed
+/// slabs stay, the oldest going first.
+pub fn retain_l0(l0: &mut Vec<Arc<Slab>>, max_ts: u64, now: u64) {
+    retain_ends(l0, max_ts, now, |s| s.meta.end_ts);
+}
+
+/// The most sealed L0 slabs kept for warm clients: more than six hours hold at a move of
+/// the branch every six seconds.
+pub const L0_SEALED_MAX: usize = 4096;
+
+/// [`retain_l0`], of slabs (oldest first) that end at `end`.
+fn retain_ends<T>(l0: &mut Vec<T>, max_ts: u64, now: u64, end: impl Fn(&T) -> u64) {
+    let newest = l0.last().map_or(max_ts, |s| end(s).max(max_ts)).min(now);
+    l0.retain(|s| keep_l0(end(s), max_ts, newest));
+    let sealed = l0.iter().filter(|s| end(s) <= max_ts).count();
+    let mut excess = sealed.saturating_sub(L0_SEALED_MAX);
+    if excess > 0 {
+        l0.retain(|s| {
+            let goes = end(s) <= max_ts && excess > 0;
+            excess = excess.saturating_sub(usize::from(goes));
+            !goes
+        });
+    }
 }
 
 fn keep_l0(end_ts: u64, max_ts: u64, newest: u64) -> bool {
@@ -1694,9 +1721,13 @@ impl Live {
         // the pruning (which may repack an L0 slab) has not failed: until then this edge's
         // slabs are those of the view it serves, which a later view is made of.
         let view = ctx.view();
-        let pruned = self
-            .tip
-            .prune(&self.l0, &view.manifest, &opened.manifest, &opened.sealed);
+        let pruned = self.tip.prune(
+            &self.l0,
+            &view.manifest,
+            &opened.manifest,
+            &opened.sealed,
+            crate::util::now_secs(),
+        );
         let what = "applying the store's manifest";
         let l0 = match self
             .apply_retry
@@ -1782,7 +1813,7 @@ impl Live {
             );
             self.l0.push(slab);
         }
-        retain_l0(&mut self.l0, view.manifest.max_ts);
+        retain_l0(&mut self.l0, view.manifest.max_ts, crate::util::now_secs());
         let next = self.snapshot(view.manifest.clone(), view.etag.clone());
         ctx.metrics.l0_ingests.fetch_add(1, Ordering::Relaxed);
         ctx.publish(Arc::new(next));
@@ -2107,5 +2138,38 @@ mod tests {
         // Sealed: kept for L0_RETAIN after the newest boundary, then dropped.
         assert!(keep_l0(max_ts, max_ts, max_ts + L0_RETAIN));
         assert!(!keep_l0(max_ts, max_ts, max_ts + L0_RETAIN + 1));
+    }
+
+    /// A commit dated in the future puts the boundaries after it ahead of the clock, one
+    /// second apart per commit. The sealed slabs from before it age by the clock (they
+    /// all went at once), and those after it, which six hours of stamps would keep for
+    /// 21,600 commits, are bounded in number.
+    #[test]
+    fn sealed_l0_slabs_age_by_the_clock_once_stamps_are_ahead_of_it() {
+        let now = 1_800_000_000u64;
+        let ahead = now + 3650 * 86_400;
+        // Slabs sealed over the last six hours, then one that ends at the date.
+        let mut l0: Vec<u64> = (0..=6).rev().map(|h| now - h * 3600).collect();
+        l0.push(ahead);
+        let before = l0.clone();
+        // The manifest has sealed them all: none goes, the newest counted as now.
+        retain_ends(&mut l0, ahead, now, |end| *end);
+        assert_eq!(l0, before);
+        // An hour later, the oldest has aged out.
+        retain_ends(&mut l0, ahead, now + 3600, |end| *end);
+        assert_eq!(l0, before[1..]);
+        // Without the clock, the stamps alone drop every one of them but the last.
+        let mut by_stamps = before.clone();
+        retain_ends(&mut by_stamps, ahead, u64::MAX, |end| *end);
+        assert_eq!(by_stamps, [ahead]);
+        // Ten thousand moves of the branch, sealed: the newest L0_SEALED_MAX stay.
+        let mut l0: Vec<u64> = (0..10_000).map(|i| ahead + i).collect();
+        let max_ts = ahead + 9_990;
+        retain_ends(&mut l0, max_ts, now, |end| *end);
+        let sealed: Vec<u64> = l0.iter().copied().filter(|end| *end <= max_ts).collect();
+        assert_eq!(sealed.len(), L0_SEALED_MAX);
+        assert_eq!(sealed.last().copied(), Some(max_ts));
+        // The unsealed ones all stay.
+        assert_eq!(l0.len(), L0_SEALED_MAX + 9);
     }
 }

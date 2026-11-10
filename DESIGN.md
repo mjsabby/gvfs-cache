@@ -306,6 +306,19 @@ restart) is answered from the closest boundary at or before it, which is exact u
 next boundary falls between the two stamps. Prefetch is an optimization: whatever a client
 lacks it fetches on demand from `/gvfs/objects`.
 
+A commit dated in the future (a machine with a wrong clock) puts every stamp after it
+ahead of the clock, one apart per commit, until the clock passes its date. The stamps
+stay what they are: both sides must give a commit the same one, and neither knows the
+other's clock. What goes by distances between stamps is bounded instead. The slabs kept
+for warm clients, in the manifest and of an edge's L0, age against the clock when the
+newest stamp is ahead of it (`min(newest stamp, now)`), and are bounded in number: four
+times what a tier's retention holds at its own period in the manifest (384 15m slabs, 672
+of an hour), 4,096 sealed L0 slabs on an edge. (By stamps alone, a commit dated two days
+ahead dropped every retained slab in the run that sealed it, and one dated ten years
+ahead then kept every slab made for ten years: 96 more a day in the manifest, and on
+every edge.) The pipeline says so at each run while the newest stamp is more than a day
+ahead.
+
 ## The server (`src/serve/`)
 
 **Boot**, which is also crash recovery: read the manifest, then open its slabs (retained

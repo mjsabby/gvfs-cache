@@ -139,6 +139,8 @@ struct Edge {
     generation: u64,
     l0_updates: u64,
     supersets: Option<Tier>,
+    /// The simulated clock.
+    now: u64,
 }
 
 impl Edge {
@@ -168,7 +170,10 @@ impl Edge {
             .collect();
         self.opened = opened;
         if let Some(old) = &self.manifest {
-            self.l0 = self.live.prune(&self.l0, old, &m, &self.sealed).unwrap();
+            self.l0 = self
+                .live
+                .prune(&self.l0, old, &m, &self.sealed, self.now)
+                .unwrap();
         }
         self.manifest = Some(m);
         self.publish(etag);
@@ -185,7 +190,7 @@ impl Edge {
         if let Some(moved) = self.live.advance(&mut self.up, m, &self.l0, head).unwrap() {
             self.l0.truncate(moved.keep);
             self.l0.extend(moved.slab);
-            retain_l0(&mut self.l0, m.max_ts);
+            retain_l0(&mut self.l0, m.max_ts, self.now);
             self.l0_updates += 1;
             let etag = self
                 .view
@@ -385,6 +390,7 @@ fn main() {
             "168h" => Some(Tier::Week),
             _ => None,
         },
+        now: t0,
     };
 
     let h = 3600;
@@ -460,6 +466,7 @@ fn main() {
     let mut tiers: HashMap<&'static str, u64> = HashMap::new();
     let mut cold_slabs_max = 0usize;
     for (t, kind, i) in events {
+        edge.now = t;
         match kind {
             0 => {
                 let c = commits[i].1;
