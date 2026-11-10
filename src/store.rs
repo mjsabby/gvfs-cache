@@ -9,7 +9,10 @@
 //! by another run) replaces the object, which is then another to a conditional delete.
 //!
 //! * `fs:<dir>` — a directory; conditional writes and deletes, and the renames that put
-//!   uploads in place, are serialized with `flock(2)`.
+//!   uploads in place, are serialized with `flock(2)`. Every file is written under a
+//!   temporary name beside its own and renamed, so that it appears whole; a writer that
+//!   is killed leaves the temporary one, which no listing has but the one garbage
+//!   collection makes of them ([`Store::list_temps`]).
 //! * `azure:<container>[/<prefix>]` — Azure Blob Storage over its REST API.
 
 use std::fs::{self, File};
@@ -184,8 +187,22 @@ impl Store {
 
     pub fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>> {
         match self {
-            Store::Fs(s) => s.list(prefix),
+            Store::Fs(s) => s.entries(prefix, false),
             Store::Azure(a) => a.list(prefix),
+        }
+    }
+
+    /// The files that writers to a directory store have under temporary names in the
+    /// directory `dir` (`"slabs/"`, `"blobs/"`; `""` is the store's own): an upload
+    /// that is being written, or what is left of one whose process was killed.
+    /// [`Store::list`] never has them. This is for garbage collection, which alone sees
+    /// them, and deletes the dead ones as it deletes any file that nothing lists. An
+    /// object store has none and is not asked: what a killed upload had sent is no
+    /// object (blocks that were never committed, which Azure discards after a week).
+    pub fn list_temps(&self, dir: &str) -> Result<Vec<ObjectInfo>> {
+        match self {
+            Store::Fs(s) => s.entries(dir, true),
+            Store::Azure(_) => Ok(Vec::new()),
         }
     }
 
@@ -543,7 +560,11 @@ impl FsStore {
         Ok(Self::etag(data))
     }
 
-    fn list(&self, prefix: &str) -> Result<Vec<ObjectInfo>> {
+    /// The files under `prefix`: the store's objects ([`Store::list`]) or, with `temps`,
+    /// the temp files of its writers and nothing else ([`Store::list_temps`]). Those are
+    /// the names [`crate::fsutil::temp_path`] makes beside a key. Any other name that
+    /// begins with a dot is neither kind: the store's lock, or not this program's.
+    fn entries(&self, prefix: &str, temps: bool) -> Result<Vec<ObjectInfo>> {
         let dir_part = prefix.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         let dir = if dir_part.is_empty() {
             self.root.clone()
@@ -559,16 +580,22 @@ impl FsStore {
         for entry in entries {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
             let key = if dir_part.is_empty() {
-                name
+                name.clone()
             } else {
                 format!("{dir_part}/{name}")
             };
+            let wanted = if temps {
+                crate::fsutil::is_temp_name(&name) && valid_key(&key)
+            } else {
+                !name.starts_with('.')
+            };
+            if !wanted {
+                continue;
+            }
             // An entry deleted since the directory was read (another run's garbage
-            // collection) is not listed: it failed the listing, and the run with it.
+            // collection; a temp file its writer has renamed into place) is not listed:
+            // it failed the listing, and the run with it.
             let meta = match entry.metadata() {
                 Ok(m) => m,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -608,7 +635,8 @@ impl FsStore {
     /// network file system that asks the server which file has the name now. A file put
     /// there by anything else between the look and the unlink (a `cp` into the store) is
     /// not protected, nor is one where the file system's locks do not reach the other
-    /// machines.
+    /// machines. A writer's temp file is a file as any other here: renamed into place
+    /// since it was listed (under that lock) it is gone, and written to since, another.
     fn delete_if(&self, key: &str, version: &str) -> Result<bool> {
         let path = self.path(key)?;
         let what = || format!("deleting {key}");
@@ -749,6 +777,78 @@ mod tests {
         assert!(!s.delete_if(key, &before).unwrap());
         assert_eq!(fs::read(&path).unwrap(), b"stream");
         assert_eq!(files("slabs"), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The temp files of a directory store's writers are in no listing but their own,
+    /// which has them and no other name that begins with a dot. Their version there
+    /// deletes one that is as it was listed, not one that has grown since, and one that
+    /// was renamed into place meanwhile is gone.
+    #[test]
+    fn temp_files_have_a_listing_of_their_own() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("gvd-store-temps-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let s = Store::open(&format!("fs:{}", dir.display()), "UNUSED").unwrap();
+        let object = |key: &str| {
+            let mut w = s.writer(key).unwrap();
+            w.write_all(b"object").unwrap();
+            w.finish().unwrap();
+        };
+        object("slabs/a.pack");
+        object("blobs/b.pack");
+        s.put("manifest.bin", b"manifest", Cond::None).unwrap();
+        let keys = |listed: Vec<ObjectInfo>| -> Vec<String> {
+            listed.into_iter().map(|o| o.key).collect()
+        };
+        let listing = |s: &Store| -> Vec<String> {
+            let mut all = keys(s.list("").unwrap());
+            all.extend(keys(s.list("slabs/").unwrap()));
+            all.extend(keys(s.list("blobs/").unwrap()));
+            all
+        };
+        let objects = listing(&s);
+        assert_eq!(objects, ["manifest.bin", "slabs/a.pack", "blobs/b.pack"]);
+        for sub in ["", "slabs/", "blobs/"] {
+            assert!(s.list_temps(sub).unwrap().is_empty());
+        }
+
+        // An upload in flight, the manifest as it is replaced, and names that no writer
+        // of the store makes.
+        let mut upload = s.writer("slabs/c.pack").unwrap();
+        upload.write_all(b"the first of it").unwrap();
+        upload.flush().unwrap();
+        let replacing = crate::fsutil::temp_path(&dir.join("manifest.bin"));
+        fs::write(&replacing, b"man").unwrap();
+        let name = |path: &Path| path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(crate::fsutil::is_temp_name(&name(&replacing)));
+        for other in [".stray", "slabs/.c.pack.tmp-1", "slabs/.c.pack.tmp-x-1"] {
+            assert!(!crate::fsutil::is_temp_name(&name(Path::new(other))));
+            fs::write(dir.join(other), b"other").unwrap();
+        }
+        fs::write(dir.join("slabs/.a b.tmp-1-2"), b"no key").unwrap();
+        assert_eq!(listing(&s), objects);
+        assert_eq!(keys(s.list_temps("").unwrap()), [name(&replacing)]);
+        assert!(s.list_temps("blobs/").unwrap().is_empty());
+        let temps = s.list_temps("slabs/").unwrap();
+        assert_eq!(temps.len(), 1);
+        let (key, listed) = (temps[0].key.clone(), temps[0].version.clone());
+        assert!(key.starts_with("slabs/.c.pack.tmp-") && temps[0].size == 15);
+
+        upload.write_all(b", and the rest").unwrap();
+        upload.flush().unwrap();
+        assert!(!s.delete_if(&key, &listed).unwrap());
+        let grown = s.list_temps("slabs/").unwrap().remove(0);
+        assert_eq!((grown.key.as_str(), grown.size), (key.as_str(), 29));
+        upload.finish().unwrap();
+        assert!(s.delete_if(&key, &grown.version).unwrap());
+        assert_eq!(fs::read(dir.join("slabs/c.pack")).unwrap().len(), 29);
+        assert!(s.list_temps("slabs/").unwrap().is_empty());
+        // One that nobody writes any more is deleted as it was listed.
+        let root = s.list_temps("").unwrap().remove(0);
+        assert!(s.delete_if(&root.key, &root.version).unwrap());
+        assert!(!replacing.exists());
+        assert_eq!(fs::read(dir.join("manifest.bin")).unwrap(), b"manifest");
         fs::remove_dir_all(&dir).unwrap();
     }
 

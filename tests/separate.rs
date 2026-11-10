@@ -1467,6 +1467,116 @@ fn mirror_survives_being_killed() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A run killed while it streams a blob into a directory store leaves the temp file it
+/// was writing: megabytes that no listing of the store has. The mirror, run again, copies
+/// the blob under another name. The pipeline's collection notes the file, leaves it a
+/// second short of the grace period, and deletes it at it. (No collection saw it: every
+/// kill left such a file for good.)
+#[test]
+fn what_a_killed_upload_leaves_in_the_store_is_collected() {
+    use std::time::{Duration, Instant};
+    let root = tempdir("sep-killed-upload");
+    let up = Upstream::new(&root);
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    let files = [
+        ("a/small.txt", Some(b"small\n".to_vec())),
+        ("big/noise.bin", Some(noise((16 << 20) + 7, 5))),
+    ];
+    let g = commit_files(&up, "c1", &files);
+    pipeline(&root, &store, &up, "15m", &["--blobs", "separate"]);
+    // Every file in `blobs/`, by its name there, with its length.
+    let in_blobs = || -> Vec<(String, u64)> {
+        let Ok(entries) = std::fs::read_dir(store_dir.join("blobs")) else {
+            return Vec::new();
+        };
+        let mut found: Vec<(String, u64)> = entries
+            .flatten()
+            .filter_map(|e| {
+                Some((
+                    e.file_name().to_string_lossy().into_owned(),
+                    e.metadata().ok()?.len(),
+                ))
+            })
+            .collect();
+        found.sort();
+        found
+    };
+
+    // The mirror at 16 Mbit/s, which is 8 s for the blob: killed once half a megabyte
+    // of it is in the store.
+    let work = root.join("mirror-work");
+    std::fs::create_dir_all(&work).unwrap();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-cache"));
+    cmd.args(["mirror", "--store", &store, "--upstream"])
+        .arg(&up.bare)
+        .args(["--work-dir", work.to_str().unwrap(), "--jobs", "1"])
+        .args(["--rate-mbps", "16"])
+        .stderr(std::process::Stdio::null());
+    gvfs_cache::upstream::hermetic_git_env(&mut cmd);
+    let mut child = cmd.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let (temp, left) = loop {
+        let mut writing = in_blobs()
+            .into_iter()
+            .filter(|(name, _)| name.starts_with('.'));
+        if let Some(found) = writing.find(|(_, len)| *len >= 1 << 19) {
+            break found;
+        }
+        let ended = child.try_wait().unwrap();
+        assert!(
+            ended.is_none(),
+            "the mirror ended before its upload: {ended:?}"
+        );
+        assert!(Instant::now() < deadline, "no upload in a minute");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(gvfs_cache::fsutil::is_temp_name(&temp), "{temp}");
+    let temp = store_dir.join("blobs").join(temp);
+    let left = std::fs::metadata(&temp).map_or(left, |m| m.len());
+    assert!(left >= 1 << 19);
+
+    let log = mirror(&root, &store, &up, &[]).unwrap();
+    let s = Store::open(&store, "").unwrap();
+    let (bm, _) = blobcopy::load(&s).unwrap();
+    assert!(bm.complete(), "{log}");
+    assert_eq!(std::fs::metadata(&temp).unwrap().len(), left);
+    let listed = s.list("blobs/").unwrap();
+    assert!(listed.iter().all(|o| !o.key.contains("/.")), "{listed:?}");
+
+    let far = gvfs_cache::util::now_secs() + 86_400;
+    for (at, there) in [(far, true), (far + 59, true), (far + 60, false)] {
+        let now = at.to_string();
+        pipeline(
+            &root,
+            &store,
+            &up,
+            "15m",
+            &["--now", &now, "--gc-grace-secs", "60"],
+        );
+        assert_eq!(temp.exists(), there, "at {at}, noted at {far}");
+    }
+    // What is in `blobs/` now is what `blobs.bin` lists, and every blob is there.
+    let (bm, _) = blobcopy::load(&s).unwrap();
+    let mut want: Vec<String> = bm
+        .packs
+        .iter()
+        .map(|p| format!("{}.pack", p.id))
+        .chain(bm.segments.iter().map(|m| format!("{}.bidx", m.id)))
+        .collect();
+    want.sort();
+    let names: Vec<String> = in_blobs().into_iter().map(|(name, _)| name).collect();
+    assert_eq!(names, want);
+    let stored = store_blobs(&root, &store_dir);
+    for (id, at) in commit_blobs(&up.bare, &["-1", &g]) {
+        let content = stored.get(&id).unwrap_or_else(|| panic!("{at} missing"));
+        assert!(*content == cat_blob(&up.bare, &id), "{at} differs");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 fn work_git(up: &Upstream, args: &[&str]) -> String {
     let mut all = vec!["-c", "user.name=t", "-c", "user.email=t@t"];
     all.extend_from_slice(args);

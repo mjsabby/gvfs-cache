@@ -19,6 +19,20 @@ pub fn temp_path(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.tmp-{}-{seq}", std::process::id()))
 }
 
+/// Whether `name` is a file name [`temp_path`] makes: `.<name>.tmp-<pid>-<seq>`. A writer
+/// that is killed leaves its file under such a name.
+pub fn is_temp_name(name: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    name.strip_prefix('.')
+        .and_then(|rest| rest.rsplit_once(".tmp-"))
+        .is_some_and(|(of, tail)| {
+            !of.is_empty()
+                && tail
+                    .split_once('-')
+                    .is_some_and(|(pid, seq)| digits(pid) && digits(seq))
+        })
+}
+
 pub fn sync_dir(path: &Path) {
     if let Some(dir) = path.parent()
         && let Ok(d) = File::open(dir)

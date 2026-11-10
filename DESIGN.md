@@ -363,16 +363,47 @@ the second the note is not this file's. (An upload to a directory left a file of
 name as it was, and a pass deleted by name: the slab was deleted, the manifest listed
 it, and both runs had exited 0.)
 
+A directory store has one more kind of file that nothing lists. Each of its writers
+puts its file under a temporary name beside its own (`.<name>.tmp-<pid>-<seq>`) and
+renames it when it is whole: a streamed upload; an upload that cannot be a hard link
+and is a copy (a work directory on another file system than the store); `manifest.bin`,
+`blobs.bin` and `gc.bin` as they are replaced. A process killed in between leaves that
+file. No listing of a directory store has a name that begins with a dot, so no pass
+saw it, and it stayed for good: what a run had copied of a baseline when it was killed,
+each time. A pass now lists these files too, in `slabs/`, in `blobs/` (a store with
+separate blobs) and in the store's own directory (where it looks at nothing else), by a
+listing of their own (`Store::list_temps`: every other reader of the store is told what
+it was). They go through the same notes:
+
+* A temp file that is being written is another at each pass, by its length: it is noted
+  anew and never due, so an upload in flight is not taken, however long it lasts. (One
+  that writes nothing for a whole grace period is taken for dead: its rename then
+  fails, and the upload with it, to be made again. No file appears in part.)
+* One that a killed process left stays as it is, and is deleted a grace period after
+  the pass that first saw it: as it was listed, under the store's lock. One that has
+  grown since stays; one that its writer has renamed into place since is gone. (In the
+  store's own directory a temp file is there only while its writer holds that lock:
+  the one a delete finds there is dead.)
+* The temp name of an upload that is a hard link lasts from the link to the rename.
+  Deleting the name of a dead one leaves the file to whoever else has it.
+
+Only names of that shape count: any other file whose name begins with a dot (the
+store's `.lock`; what another program has put there) is left alone. An object store has
+nothing of the kind to collect: what a killed upload had sent to Azure is blocks that
+were never committed, no blob that a listing has, and the service discards them after a
+week.
+
 `gc.bin` is `"GVDGCOL1" | version u32 | count u32 | (since u64 | key_len u16 | key |
 version_len u16 | version)* | SHA-256`, about 100 bytes a file, for the files that are
 unlisted and not yet deleted (`gvfs-cache inspect manifest` says how many). A pass costs
-one read of it, one listing (two for a store with separate blobs), the deletes, and one
-write if it is to hold something else: a compare-and-swap. A pass that loses the swap to
-another run's, or cannot write, has deleted only what was due, and what it noted the
-next pass notes: later, never sooner. A pass that cannot read `gc.bin` deletes nothing;
-a `gc.bin` that does not decode counts as absent, and what is unlisted is noted anew. A
-store from before `gc.bin` gets one at its first pass, which deletes nothing. Edges
-never read it.
+one read of it, one listing (two for a store with separate blobs; a directory store's
+directories are read once more for the temp files, and its own once), the deletes, and
+one write if it is to hold something else: a compare-and-swap. A pass that loses the
+swap to another run's, or cannot write, has deleted only what was due, and what it noted
+the next pass notes: later, never sooner. A pass that cannot read `gc.bin` deletes
+nothing; a `gc.bin` that does not decode counts as absent, and what is unlisted is noted
+anew. A store from before `gc.bin` gets one at its first pass, which deletes nothing.
+Edges never read it.
 
 **Timestamps come from commits** (`src/timeline.rs`). A slab covers `(start_ts, end_ts]`:
 the stamps of the commits it was fetched between. Commits are stamped like a Lamport clock
