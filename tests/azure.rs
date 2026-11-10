@@ -510,8 +510,15 @@ fn azure_separate_store() {
             ("a/text.txt", Some(text(3))),
         ],
     );
+    // In the runner's cache from before: a download of a table the store has dropped
+    // since, and a file that is not a download.
+    let runner_cache = root.join("pipeline-work/gvfs-cache-store-cache");
+    std::fs::create_dir_all(&runner_cache).unwrap();
+    for old in ["slabs_m15-1-0123456789abcdef.sizes", "notes.txt"] {
+        std::fs::write(runner_cache.join(old), b"old").unwrap();
+    }
     run(&[]);
-    // The runner's cache holds only what the store lists.
+    // The runner's cache holds only what the store lists, and what is not its own.
     let s = backend.store("");
     let (bytes, _) = s.get("manifest.bin").unwrap().unwrap();
     let m = gvfs_cache::manifest::Manifest::decode(&bytes).unwrap();
@@ -527,9 +534,11 @@ fn azure_separate_store() {
         })
         .chain(bm.segments.iter().map(|g| format!("{}.bidx", g.id)))
         .collect();
-    let cached: Vec<String> = std::fs::read_dir(root.join("pipeline-work/gvfs-cache-store-cache"))
+    assert!(runner_cache.join("notes.txt").exists());
+    let cached: Vec<String> = std::fs::read_dir(&runner_cache)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|f| f != "notes.txt")
         .collect();
     assert!(
         !cached.is_empty() && !cached.iter().any(|f| f.ends_with(".pack")),

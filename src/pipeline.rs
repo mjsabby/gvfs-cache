@@ -82,7 +82,7 @@ pub struct Options {
     pub blob_pack_bytes: u64,
     /// Downloaded copies of immutable store objects (`--blobs separate`: the sizes tables
     /// and segment indexes a window run reads), kept across runs and pruned to what the
-    /// store lists.
+    /// store lists. Other files in the directory are left alone.
     pub cache_dir: PathBuf,
 }
 

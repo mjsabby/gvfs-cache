@@ -82,7 +82,8 @@ PIPELINE OPTIONS:
     --cache-dir <DIR>          separate stores: store objects a run downloads (sizes
                                tables, segment indexes, the slabs the tip's tree is read
                                from), kept for the next run and pruned to what the store
-                               lists (default: <work-dir>/gvfs-cache-store-cache)
+                               lists; other files in DIR are left alone (default:
+                               <work-dir>/gvfs-cache-store-cache)
 
 MIRROR OPTIONS:
     --jobs <N>                 parallel copies, one upstream connection each (default: 4)

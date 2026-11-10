@@ -32,7 +32,7 @@ use crate::manifest::Manifest;
 use crate::object::{TreeIter, commit_tree};
 use crate::pack::{OBJ_BLOB, OBJ_COMMIT, OBJ_TREE};
 use crate::sizes::Sizes;
-use crate::slab::{Slab, SlabMeta};
+use crate::slab::{Slab, SlabMeta, Tier};
 use crate::splice::Resolver;
 use crate::store::Store;
 use crate::upstream::Upstream;
@@ -197,6 +197,9 @@ pub fn copy_needed(
 
 /// Keeps in a pipeline runner's store cache (`--cache-dir`: downloaded copies of immutable
 /// store objects, reused across runs) only what manifest `m` and `blobs.bin` `bm` list.
+/// What it removes are downloads, known by their names ([`is_download`]): the directory is
+/// the operator's choice and may hold other files, which are not this program's to delete.
+/// (It removed every file the store did not list.)
 pub fn prune_cache(dir: &Path, m: &Manifest, bm: &BlobManifest) -> Result<usize> {
     let mut keep: HashSet<String> = HashSet::new();
     for s in m.slabs() {
@@ -219,7 +222,7 @@ pub fn prune_cache(dir: &Path, m: &Manifest, bm: &BlobManifest) -> Result<usize>
         let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         // Dot files are downloads in progress.
-        if name.starts_with('.') || keep.contains(&name) {
+        if name.starts_with('.') || keep.contains(&name) || !is_download(&name) {
             continue;
         }
         if std::fs::remove_file(entry.path()).is_ok() {
@@ -227,6 +230,34 @@ pub fn prune_cache(dir: &Path, m: &Manifest, bm: &BlobManifest) -> Result<usize>
         }
     }
     Ok(removed)
+}
+
+/// Whether `name` is one a runner gives a store object it downloads into its cache: a
+/// slab's pack or index (`<slab id>.pack`, `.mphf`: [`crate::pipeline::open_slabs`]), its
+/// sizes table (`slabs_<slab id>.sizes`: [`local_copy`]) or a segment index (`<id>.bidx`,
+/// the 40 hex digits of its SHA-1: [`crate::blobcopy::open_segment`]). A slab id is
+/// `<tier>-<end_ts>-<16 hex digits>` ([`SlabMeta::make_id`]).
+fn is_download(name: &str) -> bool {
+    let hex = |s: &str, n: usize| {
+        s.len() == n && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    };
+    let slab = |id: &str| {
+        let mut parts = id.splitn(3, '-');
+        let (Some(tier), Some(end_ts), Some(sha)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return false;
+        };
+        Tier::ALL.iter().any(|t| t.name() == tier)
+            && !end_ts.is_empty()
+            && end_ts.bytes().all(|b| b.is_ascii_digit())
+            && hex(sha, 16)
+    };
+    match name.rsplit_once('.') {
+        Some((id, "pack" | "mphf")) => slab(id),
+        Some((id, "sizes")) => id.strip_prefix("slabs_").is_some_and(slab),
+        Some((id, "bidx")) => hex(id, 40),
+        _ => false,
+    }
 }
 
 /// Every blob the trees of `slabs` reference, distinct, in the order they are best copied:
@@ -522,4 +553,108 @@ pub fn drop_lost(store: &Store, work: &Path, threads: usize, lost: &Lost) -> Res
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
+mod tests {
+    use super::*;
+    use crate::blobs::SegmentMeta;
+
+    fn slab(tier: Tier, end: u64) -> SlabMeta {
+        SlabMeta {
+            id: SlabMeta::make_id(tier, end, &[end as u8; 20]),
+            tier,
+            start_ts: 0,
+            end_ts: end,
+            have: Oid::ZERO,
+            want: Oid([end as u8; 20]),
+            objects: 1,
+            pack_len: 1,
+            index_len: 1,
+            pack_sha: [end as u8; 20],
+        }
+    }
+
+    /// Pruning the runner's cache removes the downloads the store no longer lists (a slab's
+    /// pack, index and sizes table, a segment index), which it knows by their names, and
+    /// nothing else: whatever else `--cache-dir` holds stays. (It removed every file the
+    /// store did not list: in a directory shared with anything else, all of that.)
+    #[test]
+    fn pruning_the_cache_removes_only_its_own_downloads() {
+        let dir = std::env::temp_dir().join(format!("gvd-cache-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let (base, hour, week) = (
+            slab(Tier::Base, 10),
+            slab(Tier::H1, 20),
+            slab(Tier::Week, 15),
+        );
+        let (dropped, older) = (slab(Tier::M15, 12), slab(Tier::Base, 5));
+        let segment = |c: char| SegmentMeta {
+            id: c.to_string().repeat(40),
+            blobs: 1,
+            index_len: 1,
+            packs: Vec::new(),
+        };
+        let m = Manifest {
+            generation: 3,
+            tip: Oid([1; 20]),
+            max_ts: 20,
+            baseline: base.clone(),
+            weekly: vec![week.clone()],
+            pyramid: vec![hour.clone()],
+            retained: Vec::new(),
+            flags: crate::manifest::FLAG_SEPARATE_BLOBS,
+            blobs_generation: 2,
+        };
+        let bm = BlobManifest {
+            segments: vec![segment('a')],
+            ..BlobManifest::default()
+        };
+        let downloads = |s: &SlabMeta| {
+            [
+                format!("{}.pack", s.id),
+                format!("{}.mphf", s.id),
+                format!("slabs_{}.sizes", s.id),
+            ]
+        };
+        let mut listed: Vec<String> = [&base, &hour, &week]
+            .into_iter()
+            .flat_map(downloads)
+            .collect();
+        listed.push(format!("{}.bidx", segment('a').id));
+        let mut stale: Vec<String> = [&dropped, &older].into_iter().flat_map(downloads).collect();
+        stale.push(format!("{}.bidx", segment('b').id));
+        let others = [
+            "notes.txt".to_string(),
+            format!("pack-{}.pack", "c".repeat(40)),
+            "data.pack".to_string(),
+            "m15-12.mphf".to_string(),
+            "report.sizes".to_string(),
+            "index.bidx".to_string(),
+            format!(".{}.bidx.tmp-1-0", "d".repeat(40)),
+        ];
+        for name in listed.iter().chain(&stale).chain(&others) {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        std::fs::write(dir.join("sub").join(&stale[0]), b"x").unwrap();
+
+        assert_eq!(prune_cache(&dir, &m, &bm).unwrap(), stale.len());
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let mut want: Vec<String> = listed.into_iter().chain(others).collect();
+        want.push("sub".to_string());
+        want.sort();
+        assert_eq!(left, want);
+        assert!(dir.join("sub").join(&stale[0]).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
