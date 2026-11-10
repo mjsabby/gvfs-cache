@@ -91,6 +91,12 @@ PIPELINE OPTIONS:
                                from), kept for the next run and pruned to what the store
                                lists; other files in DIR are left alone (default:
                                <work-dir>/gvfs-cache-store-cache)
+    --jobs <N>                 separate stores: parallel copies of a window's blobs, one
+                               upstream connection each (default: 4)
+    --publish-secs <N>         separate stores: publish the blob packs a window has
+                               copied at least this often (default: 60); a run that
+                               stops before its last blob keeps them, and the next
+                               copies only what is still missing, then seals the slab
 
 MIRROR OPTIONS:
     --jobs <N>                 parallel copies, one upstream connection each (default: 4)

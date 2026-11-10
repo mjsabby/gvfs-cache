@@ -10,24 +10,31 @@
 //! `gvfs-cache mirror` makes it true for the history up to genesis (every blob of every
 //! tree in the slabs). A pipeline run keeps it by working blobs first: it copies the blobs
 //! that the trees in its window's pack reference and the store lacks, publishes them in
-//! `blobs.bin`, and only then publishes the trees. (Until the mirror has finished, a run
-//! copies only those no earlier tree references, which no sizes table has: the rest are in
-//! the plan of the mirror, whose last run checks every blob of the trees it planned from.
-//! Every blob in a sizes table is then either the mirror's or new in the window that
-//! introduced it, and that window copied it.) That is enough because an upstream
-//! leaves out of a pack only objects its haves reach, and the haves are the store's own
-//! earlier tips: a tree it leaves out is in the store, and so are its blobs (by induction
-//! from the mirrored genesis). Whatever the upstream (plain git, bitmaps), a reused old
-//! version (a revert, an old branch merged) is either in the pack's trees or in the store.
+//! `blobs.bin`, and only then publishes the trees. Both copy through [`copy_all`]: several
+//! blobs at a time, published as the copy goes, so `blobs.bin` may list blobs no tree
+//! references yet (a run that stopped early left them: harmless, and the next run's to
+//! keep). (Until the mirror has finished, a run copies only those no earlier tree
+//! references, which no sizes table has: the rest are in the plan of the mirror, whose
+//! last run checks every blob of the trees it planned from. Every blob in a sizes table
+//! is then either the mirror's or new in the window that introduced it, and that window
+//! copied it.) That is enough because an upstream leaves out of a pack only objects its
+//! haves reach, and the haves are the store's own earlier tips: a tree it leaves out is
+//! in the store, and so are its blobs (by induction from the mirrored genesis). Whatever
+//! the upstream (plain git, bitmaps), a reused old version (a revert, an old branch
+//! merged) is either in the pack's trees or in the store.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasher;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::time::{Duration, Instant};
 
-use crate::blobcopy::{Copied, copy_item, mode_kind, plan, publish};
+use crate::blobcopy::{Copied, Item, copy_item, mode_kind, plan, publish};
 use crate::blobs::{BlobManifest, BlobRec, Segment};
+use crate::blobstream::Throttle;
 use crate::manifest::Manifest;
 use crate::object::{TreeIter, commit_tree};
 use crate::pack::{OBJ_BLOB, OBJ_COMMIT, OBJ_TREE};
@@ -36,7 +43,7 @@ use crate::slab::{Slab, SlabMeta};
 use crate::splice::Resolver;
 use crate::store::Store;
 use crate::upstream::Upstream;
-use crate::util::{Context, Oid, Result, u32_of, u64_of, us};
+use crate::util::{Context, Oid, Result, human_bytes, u32_of, u64_of, us};
 
 /// Default bytes of small blobs per blob pack (`--blob-pack-mib`).
 pub const ITEM_BYTES: u64 = 2 << 30;
@@ -139,17 +146,256 @@ impl BlobIndex {
     }
 }
 
-/// Copies the blobs `need` into new blob packs (sizes asked of the upstream first, so
-/// large blobs stream alone) and publishes them in `blobs.bin` as one segment. Returns the
-/// published `blobs.bin` (`None` if nothing was needed) and every copied blob's size, as
-/// verified by hashing its content.
+/// A batch is published once it holds this many packs, whatever the time.
+const PUBLISH_ITEMS: usize = 256;
+
+/// How blobs are copied into the store, by `mirror` (the history's) and by a pipeline run
+/// (its window's): several at a time, each on an upstream connection of its own, and
+/// what has been copied published as the copy goes ([`copy_all`]).
+pub struct Copies<'a> {
+    /// Whose copy it is: begins its log lines (`mirror`, `window`).
+    pub who: &'a str,
+    pub store: &'a Store,
+    /// Scratch space: a spool per job.
+    pub work: &'a Path,
+    /// Where the segment indexes read are kept (downloads, pruned to what `blobs.bin`
+    /// lists).
+    pub cache: &'a Path,
+    pub threads: usize,
+    /// Copies in flight at once (`--jobs`).
+    pub jobs: usize,
+    /// Finished packs are published at least this often (`--publish-secs`).
+    pub publish_every: Duration,
+    /// A cap on the download rate of all copies together, in bytes per second.
+    pub rate: Option<u64>,
+}
+
+/// The size each blob of a copy is to have: what clients were told, or will be. A blob
+/// whose content has another size fails its copy, before its pack is published.
+pub struct SizeOf<'a> {
+    /// Who gave the sizes, for that error: `the sizes table says`.
+    pub said: &'a str,
+    pub get: &'a (dyn Fn(&Oid) -> Option<u64> + Sync),
+}
+
+/// `item` without the blobs `index` lists now; `None` if it lists them all.
+fn unlisted<'a>(
+    item: &'a Item,
+    index: &BlobIndex,
+    sizes: &SizeOf,
+) -> Result<Option<Cow<'a, Item>>> {
+    let oids = item.oids();
+    let listed = oids.iter().filter(|o| index.find(o).is_some()).count();
+    if listed == 0 {
+        return Ok(Some(Cow::Borrowed(item)));
+    }
+    if listed == oids.len() {
+        return Ok(None);
+    }
+    let left: Vec<Oid> = oids
+        .iter()
+        .filter(|o| index.find(o).is_none())
+        .copied()
+        .collect();
+    let mut bytes = 0u64;
+    for o in &left {
+        let Some(size) = (sizes.get)(o) else {
+            crate::bail!("no size for blob {o}");
+        };
+        bytes = bytes.saturating_add(size);
+    }
+    Ok(Some(Cow::Owned(Item::Batch { oids: left, bytes })))
+}
+
+/// Every copied blob has the size it is to have.
+fn check_sizes(c: &Copied, sizes: &SizeOf) -> Result<()> {
+    for r in &c.recs {
+        match (sizes.get)(&r.oid) {
+            Some(s) if s == r.size => {}
+            Some(s) => crate::bail!(
+                "blob {}: {} {s} bytes, its content has {}",
+                r.oid,
+                sizes.said,
+                r.size
+            ),
+            None => crate::bail!("no size for blob {}", r.oid),
+        }
+    }
+    Ok(())
+}
+
+/// What a job did with an item.
+enum Done {
+    Copied(Copied),
+    /// Every blob of it was listed meanwhile.
+    Skipped,
+}
+
+fn read<T: Clone>(l: &RwLock<T>) -> T {
+    match l.read() {
+        Ok(g) => g.clone(),
+        Err(p) => p.into_inner().clone(),
+    }
+}
+
+fn write<T>(l: &RwLock<T>, v: T) {
+    match l.write() {
+        Ok(mut g) => *g = v,
+        Err(p) => *p.into_inner() = v,
+    }
+}
+
+/// Copies `items`, in the order given, with [`Copies::jobs`] jobs, each on a connection
+/// `connect` opens, and publishes finished packs in `blobs.bin` as it goes: at least every
+/// [`Copies::publish_every`], and whatever has finished when a copy fails or the last one
+/// ends. A run that stops early (killed at its runner's time limit, an item that failed
+/// after its retries) therefore keeps what it published, and the next one copies the rest.
+///
+/// Each item is first checked against the newest index this run has seen (`index` at
+/// first, then `blobs.bin` as read again after each publish): blobs another writer has
+/// listed meanwhile are left out, an item that has none left is skipped. A rate limit is
+/// waited out by the job that met it ([`Upstream`]). The first failure stops the jobs from
+/// taking more items, and is returned once the packs that finished are published.
+pub fn copy_all(
+    c: &Copies,
+    connect: &dyn Fn() -> Result<Upstream>,
+    items: &[Item],
+    sizes: &SizeOf,
+    index: Arc<BlobIndex>,
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut ups = Vec::new();
+    for _ in 0..c.jobs.clamp(1, items.len()) {
+        ups.push(connect()?);
+    }
+    let throttle = c.rate.map(|r| Arc::new(Throttle::new(r)));
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let listed = RwLock::new(index);
+    let total_bytes: u64 = items.iter().map(Item::bytes).sum();
+    let (tx, rx) = mpsc::channel::<Result<Done>>();
+    std::thread::scope(|sc| -> Result<()> {
+        for (w, mut up) in ups.into_iter().enumerate() {
+            let tx = tx.clone();
+            let (next, stop, throttle, listed) = (&next, &stop, &throttle, &listed);
+            let spool = c.work.join(format!("spool-{w}"));
+            sc.spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed)) else {
+                        break;
+                    };
+                    let r = (|| -> Result<Done> {
+                        let index: Arc<BlobIndex> = read(listed);
+                        let Some(item) = unlisted(item, &index, sizes)? else {
+                            return Ok(Done::Skipped);
+                        };
+                        let copied = copy_item(&mut up, c.store, &spool, &item, throttle.as_ref())?;
+                        check_sizes(&copied, sizes)?;
+                        Ok(Done::Copied(copied))
+                    })();
+                    let failed = r.is_err();
+                    if tx.send(r).is_err() || failed {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(tx);
+        let t0 = Instant::now();
+        let mut pending: Vec<Copied> = Vec::new();
+        let mut last = Instant::now();
+        let mut failure = None;
+        let (mut done_items, mut done_bytes, mut skipped) = (0usize, 0u64, 0usize);
+        let mut flush = |pending: &mut Vec<Copied>, skipped: usize| -> Result<()> {
+            let bm = publish(c.store, c.work, pending, c.threads, |_| Ok(()))?;
+            done_items = done_items.saturating_add(pending.len());
+            done_bytes = done_bytes.saturating_add(
+                pending
+                    .iter()
+                    .flat_map(|c| c.recs.iter().map(|r| r.size))
+                    .sum::<u64>(),
+            );
+            let secs = t0.elapsed().as_secs_f64().max(0.001);
+            crate::log!(
+                "{}: {done_items}/{} items, {} of {} ({:.1} MB/s){}; blobs.bin generation {}",
+                c.who,
+                items.len(),
+                human_bytes(done_bytes),
+                human_bytes(total_bytes),
+                done_bytes as f64 / secs / 1e6,
+                if skipped > 0 {
+                    format!("; {skipped} items listed meanwhile, skipped")
+                } else {
+                    String::new()
+                },
+                bm.generation
+            );
+            pending.clear();
+            // What other writers published meanwhile is left out of the next items.
+            match BlobIndex::load(c.store, c.cache, &bm) {
+                Ok(i) => {
+                    write(&listed, Arc::new(i));
+                    prune_segments(c.cache, &bm);
+                }
+                Err(e) => crate::log!("{}: reloading the blob index failed ({e})", c.who),
+            }
+            Ok(())
+        };
+        loop {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(Ok(Done::Copied(c))) => pending.push(c),
+                Ok(Ok(Done::Skipped)) => skipped = skipped.saturating_add(1),
+                Ok(Err(e)) => {
+                    stop.store(true, Ordering::Relaxed);
+                    failure.get_or_insert(e);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+            if !pending.is_empty()
+                && (last.elapsed() >= c.publish_every || pending.len() >= PUBLISH_ITEMS)
+            {
+                if let Err(e) = flush(&mut pending, skipped) {
+                    stop.store(true, Ordering::Relaxed);
+                    return Err(e);
+                }
+                last = Instant::now();
+            }
+        }
+        // What finished is published even when a copy failed: a rerun skips it.
+        if !pending.is_empty() {
+            flush(&mut pending, skipped)?;
+        }
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    })
+}
+
+/// Copies the blobs `need`, which a pipeline run's window references and `index` (the
+/// `blobs.bin` it read) lacks, through [`copy_all`]: their sizes are asked of the upstream
+/// first (so that large blobs stream alone), and each job's connection is another of
+/// `up`'s. Returns the `blobs.bin` that lists every one of them (`None` if nothing was
+/// needed) and their sizes, as verified by hashing their content.
+///
+/// The items are taken in an order of this run's own. Runs that overlap (the next
+/// quarter's, started while this one still copies) plan the same items, and in one order
+/// each would take an item while the other was still copying it, to the last one:
+/// everything twice, however often they published. In orders of their own, a run mostly
+/// comes to items the other has published, and skips them. What is still copied twice is
+/// what both took before either had published it and the other had read that: about what
+/// the runs copy in two publish intervals, a few times over a long copy (and all of a
+/// window that lasts no longer). A blob listed twice is found once; its other copy is
+/// wasted bytes.
 pub fn copy_needed(
     up: &mut Upstream,
-    store: &Store,
-    work: &Path,
+    c: &Copies,
     need: &[Oid],
     item_bytes: u64,
-    threads: usize,
+    index: Arc<BlobIndex>,
 ) -> Result<(Option<BlobManifest>, HashMap<Oid, u64>)> {
     let mut got = HashMap::with_capacity(need.len());
     if need.is_empty() {
@@ -163,35 +409,48 @@ pub fn copy_needed(
         };
         wants.push((*oid, size));
     }
-    let items = plan(&wants, item_bytes);
-    let spool = work.join("blob-spool");
-    let mut copied: Vec<Copied> = Vec::with_capacity(items.len());
-    for item in &items {
-        copied.push(copy_item(up, store, &spool, item)?);
-    }
-    for c in &copied {
-        for r in &c.recs {
-            got.insert(r.oid, r.size);
-        }
-    }
-    for (oid, size) in &wants {
-        match got.get(oid) {
-            Some(s) if s == size => {}
-            Some(s) => {
-                crate::bail!("blob {oid}: the upstream reported {size} bytes, its content has {s}")
-            }
-            None => crate::bail!("blob {oid} was not copied"),
-        }
-    }
-    let bytes: u64 = wants.iter().map(|w| w.1).sum();
-    let bm = publish(store, work, &copied, threads, |_| Ok(()))?;
+    let mut items = plan(&wants, item_bytes);
+    let order = std::collections::hash_map::RandomState::new();
+    items.sort_by_cached_key(|item| order.hash_one(item.oids().first()));
+    let reported: HashMap<Oid, u64> = wants.iter().copied().collect();
     crate::log!(
-        "copied {} blobs ({}) into {} blob packs; blobs.bin generation {}",
+        "{}: {} blobs ({}) to copy in {} items ({} large), {} at a time",
+        c.who,
         wants.len(),
-        crate::util::human_bytes(bytes),
-        copied.len(),
-        bm.generation
+        human_bytes(wants.iter().map(|w| w.1).sum()),
+        items.len(),
+        items
+            .iter()
+            .filter(|i| matches!(i, Item::Large { .. }))
+            .count(),
+        c.jobs.clamp(1, items.len())
     );
+    let sizes = SizeOf {
+        said: "the upstream reported",
+        get: &|oid| reported.get(oid).copied(),
+    };
+    copy_all(c, &|| up.another(), &items, &sizes, index)?;
+
+    // Every blob must now be listed, whoever copied it: only then may the trees that
+    // reference them be published, naming this `blobs.bin`.
+    let (bm, _) = crate::blobcopy::load(c.store)?;
+    let index = BlobIndex::load(c.store, c.cache, &bm)?;
+    let mut missing = 0usize;
+    for (oid, size) in &wants {
+        match index.find(oid) {
+            Some((_, rec)) if rec.size == *size => {
+                got.insert(*oid, rec.size);
+            }
+            Some((_, rec)) => crate::bail!(
+                "blob {oid}: the upstream reported {size} bytes, its content has {}",
+                rec.size
+            ),
+            None => missing = missing.saturating_add(1),
+        }
+    }
+    if missing > 0 {
+        crate::bail!("{missing} blobs of the window are still missing after the copy");
+    }
     Ok((Some(bm), got))
 }
 

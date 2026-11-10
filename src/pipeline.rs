@@ -50,9 +50,13 @@
 //!   the ones `blobs.bin` lacks (verified by id as they stream through), publishes them in
 //!   `blobs.bin`, and only then publishes its slab, recording the `blobs.bin` generation
 //!   it needs. A run that dies in between leaves unreferenced blobs, never trees without
-//!   their blobs. Until the mirror has finished, old versions are the mirror's to copy,
-//!   except those the new tip has, within one blob pack's bytes, so that a tip the mirror
-//!   has copied stays whole.
+//!   their blobs. The copy is the mirror's ([`crate::separate::copy_all`]): `--jobs` blobs
+//!   at a time, and what is copied published at least every `--publish-secs`, so that a
+//!   run cut short (a runner's time limit, an item that failed) keeps it: the next run
+//!   copies what `blobs.bin` still lacks, then seals. Runs that overlap take the items
+//!   in orders of their own and leave out what another has published. Until the mirror
+//!   has finished, old versions are the mirror's to copy, except those the new tip has,
+//!   within one blob pack's bytes, so that a tip the mirror has copied stays whole.
 //! * Rollups and weekly rebuilds union their parts' sizes tables.
 
 use std::path::{Path, PathBuf};
@@ -96,6 +100,12 @@ pub struct Options {
     /// and segment indexes a window run reads), kept across runs and pruned to what the
     /// store lists. Other files in the directory are left alone.
     pub cache_dir: PathBuf,
+    /// `--blobs separate`: copies of a window's blobs in flight at once (`--jobs`), each on
+    /// an upstream connection of its own.
+    pub jobs: usize,
+    /// `--blobs separate`: a window's copied blob packs are published at least this often
+    /// (`--publish-secs`).
+    pub publish_every: std::time::Duration,
 }
 
 /// How long after a week's end the next weekly rebuild is due: a day less than a week, so
@@ -213,6 +223,8 @@ pub fn main(args: &[String]) -> Result<()> {
             "blobs",
             "blob-pack-mib",
             "cache-dir",
+            "jobs",
+            "publish-secs",
         ],
     )?;
     let work_dir = f
@@ -259,6 +271,8 @@ pub fn main(args: &[String]) -> Result<()> {
             .get("cache-dir")
             .map(PathBuf::from)
             .unwrap_or_else(|| work_dir.join("gvfs-cache-store-cache")),
+        jobs: f.num("jobs", 4usize)?.max(1),
+        publish_every: std::time::Duration::from_secs(f.num("publish-secs", 60u64)?),
     };
     let (m, published) = run(&mut opts)?;
     if published {
@@ -571,8 +585,9 @@ fn genesis_separate(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) ->
 
 /// A 15m run of a `--blobs separate` store, blobs first: the window's commits and trees
 /// (`blob:none`); the blobs their trees reference that `blobs.bin` lacks (and, until the
-/// mirror has finished, those the new tip lacks: [`tip_gaps`]), copied and published; then
-/// the slab with its sizes table.
+/// mirror has finished, those the new tip lacks: [`tip_gaps`]), copied and published as
+/// the copy goes ([`crate::separate::copy_needed`]); then, once `blobs.bin` lists them
+/// all, the slab with its sizes table.
 fn window_separate(
     o: &mut Options,
     e: &mut Engines,
@@ -611,7 +626,7 @@ fn window_separate(
     std::fs::create_dir_all(&cache).ctx(&format!("creating {}", cache.display()))?;
     let known = crate::separate::known_sizes(&o.store, &cache, m)?;
     let (bm, _) = crate::blobcopy::load(&o.store)?;
-    let index = crate::separate::BlobIndex::load(&o.store, &cache, &bm)?;
+    let index = Arc::new(crate::separate::BlobIndex::load(&o.store, &cache, &bm)?);
     let mirrored = bm.complete();
     let mut need: Vec<Oid> = referenced
         .iter()
@@ -622,13 +637,22 @@ fn window_separate(
         let gaps = tip_gaps(o, m, &raw.slab, head, &index, &known, &need)?;
         need.extend(gaps);
     }
+    let copies = crate::separate::Copies {
+        who: "window",
+        store: &o.store,
+        work,
+        cache: &cache,
+        threads: o.threads,
+        jobs: o.jobs,
+        publish_every: o.publish_every,
+        rate: None,
+    };
     let (published, copied) = crate::separate::copy_needed(
         &mut o.upstream,
-        &o.store,
-        work,
+        &copies,
         &need,
         o.blob_pack_bytes,
-        o.threads,
+        Arc::clone(&index),
     )?;
     // The sizes the window introduces: every referenced blob no earlier table has.
     let mut pairs = Vec::new();
@@ -671,7 +695,8 @@ fn window_separate(
     m.max_ts = ts;
     m.tip = head;
     // The trees need every blob of the generation `need` was computed against, whether or
-    // not this run copied any (a run that died after publishing `blobs.bin` left them).
+    // not this run copied any (a run that died after publishing `blobs.bin` left them),
+    // and after a copy the generation read then, which lists the rest.
     m.blobs_generation = m.blobs_generation.max(bm.generation);
     if let Some(p) = published {
         m.blobs_generation = m.blobs_generation.max(p.generation);

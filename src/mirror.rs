@@ -12,7 +12,8 @@
 //! Every blob is verified by its id as it streams in, and its size against the sizes table
 //! clients were given. `--jobs` copies run in parallel, one upstream connection each.
 //! Finished packs are published every `--publish-secs` (one segment per batch,
-//! compare-and-swap of `blobs.bin`), so a crash loses at most that much work.
+//! compare-and-swap of `blobs.bin`), so a crash loses at most that much work
+//! ([`crate::separate::copy_all`], which a pipeline run's window goes through too).
 //! `--rate-mbps` caps the combined download rate (a rate, not an average: the copies do
 //! not make up for a pause); `--max-items` stops after that many items (seeding in
 //! slices). The run that copies the last item checks that every blob of the store's trees
@@ -28,24 +29,18 @@
 //! then on every blob of every tree in the store is in it: a window's pack leaves out only
 //! what its haves reach, and the blobs of those trees are in the store already.
 
-use std::borrow::Cow;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock, mpsc};
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::blobcopy::{Copied, Item, copy_item_with, plan, publish, update};
+use crate::blobcopy::{Item, plan, update};
 use crate::blobs::BlobManifest;
-use crate::blobstream::Throttle;
 use crate::manifest::{MANIFEST_KEY, Manifest};
-use crate::separate::{BlobIndex, KnownSizes, history_blobs, known_sizes};
+use crate::separate::{BlobIndex, Copies, SizeOf, copy_all, history_blobs, known_sizes};
 use crate::slab::SlabMeta;
 use crate::store::Store;
 use crate::upstream::{Auth, Upstream};
-use crate::util::{Context, Oid, Result, human_bytes};
-
-/// A batch is published once it holds this many packs, whatever the time.
-const PUBLISH_ITEMS: usize = 256;
+use crate::util::{Context, Result, human_bytes};
 
 pub struct Options {
     pub store: Store,
@@ -207,7 +202,22 @@ pub fn run(o: &Options) -> Result<BlobManifest> {
         items.len(),
         t0.elapsed().as_secs_f64()
     );
-    copy_all(o, &work.path, &cache, &items, &known, index)?;
+    let copies = Copies {
+        who: "mirror",
+        store: &o.store,
+        work: &work.path,
+        cache: &cache,
+        threads: o.threads,
+        jobs: o.jobs,
+        publish_every: o.publish_every,
+        rate: o.rate,
+    };
+    let sizes = SizeOf {
+        said: "the sizes table says",
+        get: &|oid| known.get(oid),
+    };
+    let connect = || Upstream::open(&o.upstream, &o.branch, &o.auth);
+    copy_all(&copies, &connect, &items, &sizes, Arc::new(index))?;
     if items.len() < planned {
         crate::log!(
             "stopped after {} of {planned} items (--max-items); run again to continue",
@@ -244,192 +254,4 @@ impl<T> WithCtx<T> for Option<T> {
     fn with_ctx(self, f: impl FnOnce() -> String) -> Result<T> {
         self.ok_or_else(|| crate::util::Error::new(f()))
     }
-}
-
-/// `item` without the blobs `index` lists now; `None` if it lists them all.
-fn unlisted<'a>(
-    item: &'a Item,
-    index: &BlobIndex,
-    known: &KnownSizes,
-) -> Result<Option<Cow<'a, Item>>> {
-    let oids = item.oids();
-    let listed = oids.iter().filter(|o| index.find(o).is_some()).count();
-    if listed == 0 {
-        return Ok(Some(Cow::Borrowed(item)));
-    }
-    if listed == oids.len() {
-        return Ok(None);
-    }
-    let left: Vec<Oid> = oids
-        .iter()
-        .filter(|o| index.find(o).is_none())
-        .copied()
-        .collect();
-    let mut bytes = 0u64;
-    for o in &left {
-        bytes = bytes.saturating_add(known.get(o).with_ctx(|| format!("no size for blob {o}"))?);
-    }
-    Ok(Some(Cow::Owned(Item::Batch { oids: left, bytes })))
-}
-
-/// Every copied blob has the size the sizes tables (what clients were told) give it.
-fn check_sizes(c: &Copied, known: &KnownSizes) -> Result<()> {
-    for r in &c.recs {
-        match known.get(&r.oid) {
-            Some(s) if s == r.size => {}
-            Some(s) => crate::bail!(
-                "blob {}: the sizes table says {s} bytes, its content has {}",
-                r.oid,
-                r.size
-            ),
-            None => crate::bail!("blob {} has no size in any sizes table", r.oid),
-        }
-    }
-    Ok(())
-}
-
-/// What a worker did with an item.
-enum Done {
-    Copied(Copied),
-    /// Every blob of it was listed meanwhile.
-    Skipped,
-}
-
-fn read<T: Clone>(l: &RwLock<T>) -> T {
-    match l.read() {
-        Ok(g) => g.clone(),
-        Err(p) => p.into_inner().clone(),
-    }
-}
-
-fn write<T>(l: &RwLock<T>, v: T) {
-    match l.write() {
-        Ok(mut g) => *g = v,
-        Err(p) => *p.into_inner() = v,
-    }
-}
-
-/// Copies `items` with `--jobs` workers, publishing finished packs as it goes. Each item is
-/// first checked against the newest index this run has seen (`cache` holds its segments).
-fn copy_all(
-    o: &Options,
-    work: &Path,
-    cache: &Path,
-    items: &[Item],
-    known: &KnownSizes,
-    index: BlobIndex,
-) -> Result<()> {
-    if items.is_empty() {
-        return Ok(());
-    }
-    let throttle = o.rate.map(|r| Arc::new(Throttle::new(r)));
-    let next = AtomicUsize::new(0);
-    let stop = AtomicBool::new(false);
-    let listed = RwLock::new(Arc::new(index));
-    let total_bytes: u64 = items.iter().map(Item::bytes).sum();
-    let (tx, rx) = mpsc::channel::<Result<Done>>();
-    std::thread::scope(|sc| -> Result<()> {
-        for w in 0..o.jobs.min(items.len()) {
-            let tx = tx.clone();
-            let (next, stop, throttle, listed) = (&next, &stop, &throttle, &listed);
-            let spool = work.join(format!("spool-{w}"));
-            sc.spawn(move || {
-                let mut up = match Upstream::open(&o.upstream, &o.branch, &o.auth) {
-                    Ok(u) => u,
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        return;
-                    }
-                };
-                while !stop.load(Ordering::Relaxed) {
-                    let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed)) else {
-                        break;
-                    };
-                    let r = (|| -> Result<Done> {
-                        let index: Arc<BlobIndex> = read(listed);
-                        let Some(item) = unlisted(item, &index, known)? else {
-                            return Ok(Done::Skipped);
-                        };
-                        let c =
-                            copy_item_with(&mut up, &o.store, &spool, &item, throttle.as_ref())?;
-                        check_sizes(&c, known)?;
-                        Ok(Done::Copied(c))
-                    })();
-                    let failed = r.is_err();
-                    if tx.send(r).is_err() || failed {
-                        break;
-                    }
-                }
-            });
-        }
-        drop(tx);
-        let t0 = Instant::now();
-        let mut pending: Vec<Copied> = Vec::new();
-        let mut last = Instant::now();
-        let mut failure = None;
-        let (mut done_items, mut done_bytes, mut skipped) = (0usize, 0u64, 0usize);
-        let mut flush = |pending: &mut Vec<Copied>, skipped: usize| -> Result<()> {
-            let bm = publish(&o.store, work, pending, o.threads, |_| Ok(()))?;
-            done_items = done_items.saturating_add(pending.len());
-            done_bytes = done_bytes.saturating_add(
-                pending
-                    .iter()
-                    .flat_map(|c| c.recs.iter().map(|r| r.size))
-                    .sum::<u64>(),
-            );
-            let secs = t0.elapsed().as_secs_f64().max(0.001);
-            crate::log!(
-                "mirror: {done_items}/{} items, {} of {} ({:.1} MB/s){}; blobs.bin generation {}",
-                items.len(),
-                human_bytes(done_bytes),
-                human_bytes(total_bytes),
-                done_bytes as f64 / secs / 1e6,
-                if skipped > 0 {
-                    format!("; {skipped} items listed meanwhile, skipped")
-                } else {
-                    String::new()
-                },
-                bm.generation
-            );
-            pending.clear();
-            // What pipeline runs published meanwhile is left out of the next items.
-            match BlobIndex::load(&o.store, cache, &bm) {
-                Ok(i) => {
-                    write(&listed, Arc::new(i));
-                    crate::separate::prune_segments(cache, &bm);
-                }
-                Err(e) => crate::log!("mirror: reloading the blob index failed ({e})"),
-            }
-            Ok(())
-        };
-        loop {
-            match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(Ok(Done::Copied(c))) => pending.push(c),
-                Ok(Ok(Done::Skipped)) => skipped = skipped.saturating_add(1),
-                Ok(Err(e)) => {
-                    stop.store(true, Ordering::Relaxed);
-                    failure.get_or_insert(e);
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-            if !pending.is_empty()
-                && (last.elapsed() >= o.publish_every || pending.len() >= PUBLISH_ITEMS)
-            {
-                if let Err(e) = flush(&mut pending, skipped) {
-                    stop.store(true, Ordering::Relaxed);
-                    return Err(e);
-                }
-                last = Instant::now();
-            }
-        }
-        // What finished is published even when a copy failed: a rerun skips it.
-        if !pending.is_empty() {
-            flush(&mut pending, skipped)?;
-        }
-        match failure {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    })
 }

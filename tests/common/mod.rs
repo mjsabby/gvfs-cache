@@ -606,6 +606,13 @@ struct SmartHttpState {
     /// Requests still to be answered 429 ([`SmartHttp::rate_limit`]), and those that were.
     limited: std::sync::atomic::AtomicUsize,
     rate_limited: std::sync::atomic::AtomicUsize,
+    /// Milliseconds each `/gvfs/objects` answer waits first ([`SmartHttp::objects_delay`]).
+    objects_delay: std::sync::atomic::AtomicU64,
+    /// The ids each `/gvfs/objects` request asked for, in the order the requests came.
+    objects_asked: std::sync::Mutex<Vec<Vec<String>>>,
+    /// `/gvfs/objects` requests being answered, and the most there have been at once.
+    objects_in_flight: std::sync::atomic::AtomicUsize,
+    objects_most: std::sync::atomic::AtomicUsize,
 }
 
 pub const SMART_HTTP_PREFIX: &str = "/org/proj/_git/repo";
@@ -636,6 +643,10 @@ impl SmartHttp {
             loose: AtomicUsize::new(0),
             limited: AtomicUsize::new(0),
             rate_limited: AtomicUsize::new(0),
+            objects_delay: std::sync::atomic::AtomicU64::new(0),
+            objects_asked: Mutex::new(Vec::new()),
+            objects_in_flight: AtomicUsize::new(0),
+            objects_most: AtomicUsize::new(0),
         });
         let (repo, shared) = (repo.to_path_buf(), state.clone());
         std::thread::spawn(move || {
@@ -694,6 +705,26 @@ impl SmartHttp {
         self.state
             .rate_limited
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// From now on, every `/gvfs/objects` answer waits `ms` first: a slow upstream.
+    pub fn objects_delay(&self, ms: u64) {
+        self.state
+            .objects_delay
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The ids each `/gvfs/objects` request asked for, in the order the requests came.
+    pub fn objects_asked(&self) -> Vec<Vec<String>> {
+        self.state.objects_asked.lock().unwrap().clone()
+    }
+
+    /// The most `/gvfs/objects` requests that were being answered at once since this was
+    /// last asked.
+    pub fn objects_at_once(&self) -> usize {
+        self.state
+            .objects_most
+            .swap(0, std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -856,27 +887,38 @@ fn smart_http_connection(
             && target == format!("{SMART_HTTP_PREFIX}/gvfs/objects")
         {
             let ids = hex_ids(&body);
-            if let [id] = ids.as_slice() {
-                state.loose.fetch_add(1, Ordering::Relaxed);
-                let kind = git(repo, &["cat-file", "-t", id]);
-                let content = git_cmd(repo)
-                    .args(["cat-file", kind.trim(), id])
-                    .output()?
-                    .stdout;
-                let head = format!("{} {}\0", kind.trim(), content.len());
-                let mut z = vec![0u8; gvfs_cache::zlib::compress_bound(head.len() + content.len())];
-                let n = gvfs_cache::zlib::Deflater::new(6)
-                    .deflate_parts(&[head.as_bytes(), &content], &mut z)
-                    .unwrap();
-                reply(&mut out, "application/x-git-loose-object", &z[..n])?;
-            } else {
-                let pack = git_stdin(
-                    repo,
-                    &["pack-objects", "--stdout", "-q"],
-                    ids.join("\n").as_bytes(),
-                );
-                reply(&mut out, "application/x-git-packfile", &pack)?;
-            }
+            state.objects_asked.lock().unwrap().push(ids.clone());
+            let at_once = state.objects_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            state.objects_most.fetch_max(at_once, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(
+                state.objects_delay.load(Ordering::Relaxed),
+            ));
+            let sent = (|| -> std::io::Result<()> {
+                if let [id] = ids.as_slice() {
+                    state.loose.fetch_add(1, Ordering::Relaxed);
+                    let kind = git(repo, &["cat-file", "-t", id]);
+                    let content = git_cmd(repo)
+                        .args(["cat-file", kind.trim(), id])
+                        .output()?
+                        .stdout;
+                    let head = format!("{} {}\0", kind.trim(), content.len());
+                    let bound = gvfs_cache::zlib::compress_bound(head.len() + content.len());
+                    let mut z = vec![0u8; bound];
+                    let n = gvfs_cache::zlib::Deflater::new(6)
+                        .deflate_parts(&[head.as_bytes(), &content], &mut z)
+                        .unwrap();
+                    reply(&mut out, "application/x-git-loose-object", &z[..n])
+                } else {
+                    let pack = git_stdin(
+                        repo,
+                        &["pack-objects", "--stdout", "-q"],
+                        ids.join("\n").as_bytes(),
+                    );
+                    reply(&mut out, "application/x-git-packfile", &pack)
+                }
+            })();
+            state.objects_in_flight.fetch_sub(1, Ordering::SeqCst);
+            sent?;
         } else {
             out.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")?;
         }
