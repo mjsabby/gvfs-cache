@@ -132,8 +132,11 @@ impl AClient {
                 crate::http::without_query(path)
             )
         };
-        for _ in 0..2 {
-            let (mut sender, fresh) = match self.pooled() {
+        for attempt in 0..2 {
+            // A retry is on a new connection: when one pooled connection has died idle (a
+            // middlebox dropped the flow), the others its age probably have too.
+            let pooled = if attempt == 0 { self.pooled() } else { None };
+            let (mut sender, fresh) = match pooled {
                 Some(s) => (s, false),
                 None => (self.connect().await.ctx(&what())?, true),
             };
@@ -252,6 +255,54 @@ mod tests {
         assert!(
             text.contains("/acct/c/key") && !text.contains("s3cret"),
             "{text}"
+        );
+    }
+
+    /// Pooled connections that die when next used (idle flows a middlebox dropped): the
+    /// retry is made on a new connection, not on another pooled one, which is as dead.
+    #[test]
+    fn a_retry_is_on_a_new_connection_not_another_pooled_one() {
+        use crate::testhttp::{Reply, serve};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // A connection answers its first request (the first four once all four have
+        // arrived, so each has a connection of its own) and is gone at its second.
+        let firsts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&firsts);
+        let port = serve(move |r| {
+            if r.earlier > 0 {
+                return Reply::Close;
+            }
+            seen.fetch_add(1, Ordering::SeqCst);
+            while seen.load(Ordering::SeqCst) < 4 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Reply::ok(b"ok")
+        });
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/a")).unwrap();
+        let c = AClient::new(url, Duration::from_secs(5));
+        let get = |c: AClient| async move {
+            let mut r = c.request("GET", "/x", &[], Bytes::new()).await?;
+            r.body_vec(16).await
+        };
+        rt.block_on(async {
+            let tasks: Vec<_> = (0..4).map(|_| tokio::spawn(get(c.clone()))).collect();
+            for t in tasks {
+                assert_eq!(t.await.unwrap().unwrap(), b"ok");
+            }
+            assert_eq!(lock(&c.idle).len(), 4);
+            // Each request finds a dead connection in the pool first.
+            for _ in 0..3 {
+                assert_eq!(get(c.clone()).await.unwrap(), b"ok");
+            }
+        });
+        assert_eq!(
+            firsts.load(Ordering::SeqCst),
+            7,
+            "4 connections, then 3 new ones"
         );
     }
 }

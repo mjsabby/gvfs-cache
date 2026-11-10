@@ -10,6 +10,8 @@ pub struct Request {
     pub line: String,
     head: String,
     pub body: Vec<u8>,
+    /// How many requests its connection carried before this one.
+    pub earlier: usize,
 }
 
 impl Request {
@@ -65,7 +67,7 @@ fn connection(mut conn: std::net::TcpStream, answer: &dyn Fn(&Request) -> Reply)
             true
         }
     };
-    loop {
+    for earlier in 0.. {
         let end = loop {
             if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
                 break p + 4;
@@ -79,6 +81,7 @@ fn connection(mut conn: std::net::TcpStream, answer: &dyn Fn(&Request) -> Reply)
             line: head.lines().next().unwrap_or_default().to_string(),
             head,
             body: Vec::new(),
+            earlier,
         };
         let len: usize = request
             .header("content-length")
