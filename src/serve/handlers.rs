@@ -88,6 +88,11 @@ pub struct Metrics {
     /// Connections being served (not the free slots' complement: the accept loop holds
     /// the next connection's slot while it waits for one).
     pub conns_open: AtomicU64,
+    /// Bytes of the indexes lookups read, of those read into memory (`--index-pages
+    /// huge`), and of those on 2 MiB pages, as last measured ([`super::pages`]).
+    pub index_bytes: AtomicU64,
+    pub index_copied: AtomicU64,
+    pub index_huge: AtomicU64,
 }
 
 fn inc(c: &AtomicU64) {

@@ -47,6 +47,7 @@ pub mod budget;
 pub mod conn;
 pub mod handlers;
 pub mod httpd;
+pub mod pages;
 pub mod view;
 
 use std::collections::HashMap;
@@ -92,6 +93,10 @@ pub enum LooseDeltas {
     /// which inflate at once what was deflated for them.
     Stored,
 }
+
+/// `--index-pages huge`: indexes at least this long are read into memory that asks for
+/// huge pages (one 2 MiB page).
+const HUGE_INDEX_MIN: u64 = 2 << 20;
 
 /// Shared by every connection.
 pub struct Ctx {
@@ -229,6 +234,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "prefetch-idx",
             "superset-tier",
             "loose-deltas",
+            "index-pages",
             "proxy-cache-mib",
             "proxy-cache-packs",
             "blob-cache-mib",
@@ -281,6 +287,12 @@ pub fn main(args: &[String]) -> Result<()> {
             crate::bail!("--loose-deltas must be deflate, stored-trees or stored, not {other:?}")
         }
     };
+    match f.get("index-pages").unwrap_or("file") {
+        "file" => {}
+        // From the first index opened: an index of less than a huge page gains nothing.
+        "huge" => crate::slab::huge_indexes(HUGE_INDEX_MIN),
+        other => crate::bail!("--index-pages must be file or huge, not {other:?}"),
+    }
     let cores = crate::util::default_threads();
     let arenas = f.num("arenas", cores.saturating_mul(2))?;
     let arena_objects = f.num("arena-objects", 1usize << 18)?;
@@ -544,6 +556,7 @@ pub fn run(o: Options) -> Result<()> {
     if let Err(e) = live.sync_upstream(&ctx) {
         crate::log!("serve: live tip not caught up at boot ({e}); serving sealed slabs");
     }
+    note_indexes(&ctx, &ctx.view(), true);
     let warmer = Arc::new(Warmer::default());
     warmer.offer(ctx.view());
 
@@ -1661,6 +1674,34 @@ fn live_failed(ctx: &Ctx, e: &crate::util::Error) {
     crate::log!("serve: live sync failed: {e}");
 }
 
+/// Measures where the indexes of `view` lie ([`pages`]) for the metrics, and says it if
+/// `say`: at start, and when the baseline or the biggest blob segment is another.
+fn note_indexes(ctx: &Ctx, view: &View, say: bool) {
+    let p = pages::measure(view);
+    let m = &ctx.metrics;
+    m.index_bytes.store(p.bytes, Ordering::Relaxed);
+    m.index_copied.store(p.copied, Ordering::Relaxed);
+    m.index_huge.store(p.huge, Ordering::Relaxed);
+    if !say || p.bytes == 0 {
+        return;
+    }
+    let percent = p.huge.saturating_mul(100).checked_div(p.bytes).unwrap_or(0);
+    let how = if p.copied > 0 {
+        format!(
+            "; {} read into memory (--index-pages huge)",
+            crate::util::human_bytes(p.copied)
+        )
+    } else if percent < 90 {
+        "; --index-pages huge asks for them".to_string()
+    } else {
+        String::new()
+    };
+    crate::log!(
+        "serve: indexes: {}, {percent}% on 2 MiB pages{how}",
+        crate::util::human_bytes(p.bytes)
+    );
+}
+
 impl Live {
     /// The sizes the trees of a new L0 slab introduce (those `known` does not have), asked
     /// of the upstream.
@@ -1725,10 +1766,17 @@ impl Live {
                     // The view's slabs are this thread's own: the view is the same but for
                     // its blobs, plans included.
                     self.generation = self.generation.saturating_add(1);
-                    let next = ctx
-                        .view()
-                        .with_blobs(self.generation, Some(Arc::clone(&set)));
-                    ctx.publish(Arc::new(next));
+                    let view = ctx.view();
+                    let next = Arc::new(view.with_blobs(self.generation, Some(Arc::clone(&set))));
+                    ctx.publish(Arc::clone(&next));
+                    // Most lookups end in the biggest segment: where a new one lies.
+                    let biggest = |v: &View| {
+                        let set = v.blobs.as_ref()?;
+                        set.indexes().next().map(|s| s.id.clone())
+                    };
+                    if biggest(&view) != biggest(&next) {
+                        note_indexes(ctx, &next, true);
+                    }
                     // Requests find these blobs in the store from here on.
                     let released = ctx.proxy.as_ref().map_or(0, |p| p.release_stored(&set));
                     if released > 0 {
@@ -1787,6 +1835,9 @@ impl Live {
         ctx.metrics.manifest_loads.fetch_add(1, Ordering::Relaxed);
         let next = Arc::new(next);
         ctx.publish(next.clone());
+        if view.manifest.baseline.id != next.manifest.baseline.id {
+            note_indexes(ctx, &next, true);
+        }
         warmer.offer(next);
         // The tip may now be behind the upstream: the upstream's turn catches up.
         self.last_head = Oid::ZERO;
@@ -2005,7 +2056,10 @@ pub fn metrics_text(ctx: &Ctx) -> String {
          gvfs_connections_open {}\n\
          gvfs_connections_full_total {}\n\
          gvfs_buffer_spare_bytes {}\n\
-         gvfs_grown_objects {}\n",
+         gvfs_grown_objects {}\n\
+         gvfs_index_bytes {}\n\
+         gvfs_index_copied_bytes {}\n\
+         gvfs_index_huge_bytes {}\n",
         get(&m.prefetch),
         get(&m.object_get),
         get(&m.object_post),
@@ -2047,7 +2101,10 @@ pub fn metrics_text(ctx: &Ctx) -> String {
         get(&m.conns_open),
         get(&m.conns_full),
         ctx.spare.left(),
-        ctx.arenas.grown()
+        ctx.arenas.grown(),
+        get(&m.index_bytes),
+        get(&m.index_copied),
+        get(&m.index_huge)
     )
 }
 

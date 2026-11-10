@@ -415,6 +415,21 @@ fifth of a sizes request's CPU): the loop keeps the 16 slots it has computed, an
 lookup that only the baseline can answer reads its record there. Sizes of 4,000 ids on
 SearchGold: 726 to 634 µs of CPU (−13%).
 
+A lookup reads one record at random in an index of hundreds of megabytes: on 4 KiB pages
+that is a TLB miss besides the cache miss (51 ns a lookup against 34 on 2 MiB pages).
+Indexes are mapped from their files, and the kernel maps a file 2 MiB at a time only
+where the page cache happens to hold it so, which depends on how fragmented memory was
+when the file was written: 88% of SearchGold's baseline index one day, none of it
+another, none of RepoB's. `--index-pages huge` reads each index of 2 MiB or more
+into anonymous memory that asks for huge pages (`MADV_HUGEPAGE`; no `unsafe`), which the
+kernel gives wherever it has them: 99% of SearchGold's 358 MiB here, and sizes of 4,000
+blobs went from 590 to 524 µs of CPU (−11%), on RepoB from 593 to 549 µs
+(−7%); batches of objects, which copy more than they look up, did not change. The price
+is that the indexes are the edge's own memory, not the page cache's: not shared with
+another process, not evictable, and read once more at each start. It is off by default.
+Either way the edge says at start how much of its indexes lies on 2 MiB pages, and
+reports it (`gvfs_index_bytes`, `gvfs_index_huge_bytes`, `gvfs_index_copied_bytes`).
+
 **Prefetch plans.** Every response is one pack holding what the client lacks (and, once
 per sealed day and week, that rollup whole):
 

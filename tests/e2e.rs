@@ -1818,6 +1818,82 @@ fn force_main(up: &Upstream, oid: &str) {
     git(&up.bare, &["update-ref", "refs/heads/main", oid]);
 }
 
+/// `--index-pages huge`: an index of 2 MiB or more is read into memory that asks for huge
+/// pages, and answers as the file's mapping does. The edge reports where its indexes lie.
+#[test]
+fn an_index_read_into_memory_answers_as_its_file() {
+    let root = tempdir("index-pages");
+    let up = Upstream::new(&root);
+    // 60,000 files: an index of 2.4 MB of records.
+    let mut history = b"commit refs/heads/main\ncommitter t <t@t> 1790000000 +0000\n\
+                        data 5\nmany\n"
+        .to_vec();
+    for i in 0..60_000u32 {
+        let content = format!("file {i}\n");
+        history.extend_from_slice(
+            format!(
+                "M 100644 inline d{}/f{i}\ndata {}\n{content}\n",
+                i % 240,
+                content.len()
+            )
+            .as_bytes(),
+        );
+    }
+    git_stdin(&up.bare, &["fast-import", "--quiet"], &history);
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    pipeline(&root, &store, &up, "15m", &[]);
+    let m = manifest(&store_dir);
+    let index_len = m.baseline.index_len;
+    assert!(index_len >= 2 << 20, "{index_len}");
+
+    let all = up.objects(&up.tip());
+    let ids: Vec<String> = all.iter().step_by(13).cloned().collect();
+    let want = git_stdin(
+        &up.bare,
+        &[
+            "cat-file",
+            "--batch-check={\"Id\":\"%(objectname)\",\"Size\":%(objectsize)}",
+        ],
+        ids.join("\n").as_bytes(),
+    );
+    let want = format!(
+        "[{}]",
+        String::from_utf8(want)
+            .unwrap()
+            .trim_end()
+            .replace('\n', ",")
+    );
+    for (policy, copied) in [("file", 0), ("huge", index_len)] {
+        let cache = root.join(format!("cache-{policy}"));
+        let server = Server::start(&[
+            "--store",
+            &store,
+            "--cache-dir",
+            cache.to_str().unwrap(),
+            "--index-pages",
+            policy,
+        ]);
+        assert_eq!(server.metric("gvfs_index_bytes"), index_len, "{policy}");
+        assert_eq!(server.metric("gvfs_index_copied_bytes"), copied, "{policy}");
+        assert!(server.metric("gvfs_index_huge_bytes") <= index_len);
+        let (status, _, body) = server.post(
+            "/gvfs/sizes",
+            json_ids(&ids, None).as_bytes(),
+            "application/json",
+        );
+        assert_eq!(status, 200);
+        assert!(String::from_utf8(body).unwrap() == want, "{policy}");
+        let (status, _, _) = server.get(&format!("/gvfs/objects/{}", "0".repeat(40)));
+        assert_eq!(status, 404);
+        let cold = fresh_repo(&root, &format!("cold-{policy}"));
+        install_pack(&cold, &server.prefetch(0)[0].1);
+        assert_complete(&cold, &up.tip());
+        server.assert_clean();
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// `--loose-deltas`: an object the store keeps as a delta is sent loose deflated again,
 /// or as it is, in stored blocks: all of them (`stored`) or the trees (`stored-trees`).
 /// Either way git reads the object, and an object stored whole is sent as before.
