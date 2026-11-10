@@ -3,7 +3,11 @@
 //! [`crate::aclient`]. No SDK.
 //!
 //! Large slab files are uploaded as 16 MiB blocks (8 in parallel) committed atomically
-//! with Put Block List, and downloaded as parallel 16 MiB ranged reads.
+//! with Put Block List, and downloaded as parallel 16 MiB ranged reads. A request that
+//! fails is made again (4 tries in all, backing off), and so is one whose response breaks
+//! off: whole where the body is read whole (a download's range, the manifest, a listing),
+//! from the byte it reached where the body is streamed (the edge's ranged reads). A
+//! connection lost mid-download costs one range, not the file.
 
 use std::io::Read;
 use std::os::unix::fs::FileExt;
@@ -179,7 +183,11 @@ impl AzureStore {
     }
 
     /// Sends one signed request with retries on transient failures; returns the response
-    /// to `handle` (which may stream its body).
+    /// to `handle` (which may stream its body). A response whose body breaks off as
+    /// `handle` reads it whole ([`ErrorKind::Incomplete`]) is a transient failure too: the
+    /// request is made again, and `handle` starts over. (It was `handle`'s error, and the
+    /// operation's: one reset in a slab's download, and the edge's next poll, or the
+    /// pipeline's next run, began again at byte 0.)
     fn call<T>(
         &self,
         client: &mut Client,
@@ -206,7 +214,10 @@ impl AzureStore {
                     last = Some(crate::err!("{method} {path}: HTTP {}", resp.status));
                     let _ = resp.finish();
                 }
-                Ok(resp) => return handle(resp),
+                Ok(resp) => match handle(resp) {
+                    Err(e) if e.kind == ErrorKind::Incomplete => last = Some(e),
+                    done => return done,
+                },
                 Err(e) => last = Some(e),
             }
         }
@@ -219,8 +230,10 @@ impl AzureStore {
             .get_or_init(|| Box::new(crate::aclient::AClient::new(self.endpoint.clone(), TIMEOUT)))
     }
 
-    /// [`AzureStore::read_range`] on the async client: one ranged GET (retried on transient
-    /// failures before any byte reached `sink`), streamed to `sink`.
+    /// [`AzureStore::read_range`] on the async client: a ranged GET streamed to `sink`,
+    /// with retries on transient failures ([`ATTEMPTS`] tries in all). A try that fails
+    /// before its response is made again; one whose body breaks off is made again for the
+    /// rest, from the byte after the last that reached `sink`.
     pub async fn read_range_async<S: crate::store::Sink>(
         &self,
         key: &str,
@@ -233,12 +246,14 @@ impl AzureStore {
         }
         let blob = self.blob_path(key)?;
         let last = offset.saturating_add(len).saturating_sub(1);
-        let extra = [("x-ms-range", format!("bytes={offset}-{last}"))];
+        let mut got = 0u64;
         let mut failed = None;
         for attempt in 0..ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(backoff(attempt)).await;
             }
+            let from = offset.saturating_add(got);
+            let extra = [("x-ms-range", format!("bytes={from}-{last}"))];
             let (headers, query_string) = self.signed("GET", &blob, &[], &extra, 0);
             let hdrs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
             let path = format!("{blob}{query_string}");
@@ -258,11 +273,15 @@ impl AzureStore {
                 }
             };
             let mut resp = resp.ensure_ok(&format!("ranged GET {key}")).await?;
-            let mut got = 0u64;
             // The sink's work (a block written to the cache) is the worker's: yield as it
             // goes, as the edge's handlers do.
             let mut budget = crate::serve::budget::Budget::new();
-            while let Some(chunk) = resp.chunk().await.ctx(&format!("reading {key}"))? {
+            let broke = loop {
+                let chunk = match resp.chunk().await {
+                    Ok(Some(chunk)) => chunk,
+                    Ok(None) => break None,
+                    Err(e) => break Some(e),
+                };
                 got = got.saturating_add(crate::util::u64_of(chunk.len()));
                 if got > len {
                     crate::bail!("ranged GET {key}: more bytes than asked for");
@@ -271,11 +290,13 @@ impl AzureStore {
                 if budget.spend(crate::serve::budget::byte_units(chunk.len())) {
                     budget.pause().await;
                 }
+            };
+            match broke {
+                // Broken off: what `sink` has stays, and the rest is asked for.
+                Some(e) if got < len => failed = Some(crate::err!("reading {key}: {e}")),
+                _ if got != len => crate::bail!("ranged GET {key}: {got} of {len} bytes"),
+                _ => return Ok(()),
             }
-            if got != len {
-                crate::bail!("ranged GET {key}: {got} of {len} bytes");
-            }
-            return Ok(());
         }
         Err(failed.unwrap_or_else(|| crate::err!("GET {blob} failed")))
     }
@@ -430,7 +451,9 @@ impl AzureStore {
         })
     }
 
-    /// One ranged GET of `len` bytes from `offset`, streamed to `sink`.
+    /// One ranged GET of `len` bytes from `offset`, streamed to `sink`. A body that breaks
+    /// off is its error, not resumed as [`AzureStore::read_range_async`] resumes one (the
+    /// binary reads ranges through that one only).
     pub fn read_range(
         &self,
         key: &str,
@@ -900,8 +923,111 @@ pub fn string_to_sign(
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects
+)]
 mod tests {
     use super::*;
+    use crate::testhttp::{Reply, Request};
+    use std::sync::{Arc, Mutex};
+
+    /// A store whose account is a fake on this machine holding one object, `data`, under
+    /// every key. It answers ranged GETs as the Blob service does, except that an answer
+    /// breaks off halfway when `cut` says so (given how many requests came before it, and
+    /// whether its range was asked for before). Returns the store and the ranges asked for.
+    fn fake_account(
+        data: &[u8],
+        cut: impl Fn(usize, bool) -> bool + Send + Sync + 'static,
+    ) -> (AzureStore, Arc<Mutex<Vec<String>>>) {
+        let data = data.to_vec();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&asked);
+        let port = crate::testhttp::serve(move |r: &Request| {
+            let range = r.header("x-ms-range").unwrap_or("bytes=0-");
+            let (from, to) = range
+                .strip_prefix("bytes=")
+                .unwrap()
+                .split_once('-')
+                .unwrap();
+            let from: usize = from.parse().unwrap();
+            let to = to
+                .parse()
+                .map_or(data.len(), |t: usize| t + 1)
+                .min(data.len());
+            let status = format!(
+                "206 Partial Content\r\nContent-Range: bytes {from}-{}/{}\r\nETag: \"e1\"",
+                to - 1,
+                data.len()
+            );
+            let body = data[from..to].to_vec();
+            let mut seen = seen.lock().unwrap();
+            let again = seen.iter().any(|a| a == range);
+            seen.push(range.to_string());
+            if cut(seen.len() - 1, again) {
+                let half = body.len() / 2;
+                Reply::Cut(status, body, half)
+            } else {
+                Reply::Whole(status, body)
+            }
+        });
+        let account =
+            format!("BlobEndpoint=http://127.0.0.1:{port}/acct;AccountName=acct;AccountKey=a2V5");
+        (AzureStore::new(&account, "packs").unwrap(), asked)
+    }
+
+    fn object(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i * 31 % 251) as u8).collect()
+    }
+
+    /// Responses that break off (the connection is lost mid-body) are asked for again
+    /// within the operation: a download whose every range breaks off once still writes the
+    /// whole file, and so does a small object read whole. (The break was the operation's
+    /// error: a slab's download began again at byte 0 on the edge's next poll.)
+    #[test]
+    fn a_download_whose_responses_break_off_is_completed() {
+        let dir = std::env::temp_dir().join(format!("gvd-azure-cut-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Two ranges: the first 16 MiB, then the rest.
+        let data = object(20 << 20);
+        let (store, asked) = fake_account(&data, |_, again| !again);
+        let path = dir.join("slab.pack");
+        store.download_file("slabs/x.pack", &path).unwrap();
+        assert!(std::fs::read(&path).unwrap() == data);
+        let (first, rest) = ("bytes=0-16777215", "bytes=16777216-20971519");
+        assert_eq!(*asked.lock().unwrap(), [first, first, rest, rest]);
+
+        let small = object(1000);
+        let (store, asked) = fake_account(&small, |_, again| !again);
+        let (body, etag) = store.get("manifest.bin").unwrap().unwrap();
+        assert!(body == small && etag == "\"e1\"");
+        assert_eq!(asked.lock().unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The edge's ranged read streams to its sink, so a response that breaks off is not
+    /// asked for again whole: the rest is, from the byte after the last the sink has.
+    #[test]
+    fn a_ranged_read_that_breaks_off_resumes_where_it_stopped() {
+        let data = object(1000);
+        // The first two answers break off halfway.
+        let (store, asked) = fake_account(&data, |earlier, _| earlier < 2);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut got = Vec::new();
+        let sink = &mut |piece: &[u8]| {
+            got.extend_from_slice(piece);
+            Ok(())
+        };
+        rt.block_on(store.read_range_async("blobs/p.pack", 100, 800, sink))
+            .unwrap();
+        assert!(got == data[100..900]);
+        let ranges = ["bytes=100-899", "bytes=500-899", "bytes=700-899"];
+        assert_eq!(*asked.lock().unwrap(), ranges);
+    }
 
     #[test]
     fn dates_roundtrip() {

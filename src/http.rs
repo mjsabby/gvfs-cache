@@ -318,12 +318,15 @@ impl Response<'_> {
             .map(|(_, v)| v.as_str())
     }
 
-    /// Reads the whole body (bounded by `limit`).
+    /// Reads the whole body (bounded by `limit`). A body that breaks off (its connection
+    /// fails, or closes before the body's end) is an [`ErrorKind::Incomplete`] error.
     pub fn body_vec(&mut self, limit: usize) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         let mut buf = [0u8; 16 << 10];
         loop {
-            let n = self.read(&mut buf)?;
+            let n = self.read(&mut buf).map_err(|e| {
+                Error::with_kind(ErrorKind::Incomplete, format!("response body: {e}"))
+            })?;
             if n == 0 {
                 return Ok(out);
             }
