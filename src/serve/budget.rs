@@ -134,7 +134,7 @@ pub fn blocking<R>(f: impl FnOnce() -> R) -> R {
 /// request after it. Each used to wait on a thread of its own inside `block_in_place`, on
 /// the cell being filled: 700 cold clones arriving with a new snapshot took the pool's 512
 /// threads, and every other request, a `/gvfs/config` among them, waited behind them for
-/// as long as the build took (5.6 s on SearchGold).
+/// as long as the build took (then 5.6 s on SearchGold).
 #[derive(Default)]
 pub struct Builds {
     /// Woken when a build ends.

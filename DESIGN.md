@@ -257,7 +257,7 @@ Each run is at most one compare-and-swap of `manifest.bin`:
    files no manifest references once they are older than `--gc-grace-secs`. A run that
    changed nothing (no new commits, no rollup due) publishes nothing: the manifest keeps
    its generation, so no edge builds a new view and hashes its cold pack again (1.3 s on
-   SearchGold, and 4.6 s for its `.idx`: the runs of a quiet branch would cost that 96
+   SearchGold, its `.idx` beside it: the runs of a quiet branch would cost that 96
    times a day). What counts as a change is everything but the generation, the `blobs.bin`
    generation the manifest names included. Such a run still collects garbage. Once its
    manifest is the store's, a run has succeeded: garbage collection that fails is logged,
@@ -420,8 +420,8 @@ A request that needs a plan, or its trailer, `.idx` or sizes section, before the
 got to it has it built on one thread of the blocking pool, and waits for it as a parked
 task, as does every request after it (`budget::Builds`). Each used to wait on a thread
 of its own: 700 cold clones arriving with a new SearchGold snapshot took all 512 threads
-of the pool for the 5.5 s the `.idx` takes, and a `/gvfs/config` sent meanwhile waited
-those 5.5 s. It now takes 0.1 ms (14 ms at worst), on 13 threads.
+of the pool for the 5.5 s the `.idx` then took, and a `/gvfs/config` sent meanwhile
+waited those 5.5 s. It now takes 0.1 ms (14 ms at worst), on 13 threads.
 
 **Warm traffic.** `examples/clients.rs` replays 14 days of SearchGold through the pipeline
 and the edge on a simulated clock (README, "Client traffic"). With exact covers
@@ -456,15 +456,24 @@ socket buffer page the kernel zeroes first plus the copy, ~9× a sendfile'd byte
 prefetch's edge CPU: 87.8 ms with the `.idx`, 51.4 ms now). Building it:
 
 * each slab sorts its ids and computes its entries' CRC-32s once (`SortedSlab`, kept with
-  the open slab; 74 MB for SearchGold's baseline);
+  the open slab; 74 MB for SearchGold's baseline). The entries are read in slot order,
+  which is no order of the pack's: a large slab's are hashed on 8 threads, each asking
+  for the entry 16 places on while it hashes one (0.6 s for that baseline; one thread
+  without the hint took 3.1 s);
 * a plan's index is one k-way merge of its slabs' sorted runs, with each slab's offsets
   shifted to where its body lands, then the 64-bit offset table, the pack checksum (the
-  plan's trailer), and the index checksum.
+  plan's trailer), and the index checksum. The CRC-32s are kept in id order, the record
+  16 places on in a run is asked for ahead, and a run's next entry takes the last one's
+  place at the top of the heap: 0.5 s for SearchGold's cold plan (1.5 s when each entry
+  cost two cache misses one after the other). The tables need no trailer, so for a large
+  pack they are merged while another thread hashes it.
 
 The result is byte-identical to `git index-pack`'s output: verified on every prefetch in
 the tests, and on SearchGold's 2.6 GB baseline (9.22M objects, 2.65M 64-bit offsets). That
-index is 267 MiB, built in 4.3 s; `index-pack` on the client takes 40 s and 141 CPU-s. The
-warmer prepares it for each new cold plan once any client has asked for one.
+index is 267 MiB; `index-pack` on the client takes 40 s and 141 CPU-s. The
+warmer prepares it for each new cold plan once any client has asked for one: pack and
+index are ready 1.3 s after an edge starts on SearchGold, the time its trailer takes
+(5.5 s before the changes above).
 
 **Endpoints.**
 

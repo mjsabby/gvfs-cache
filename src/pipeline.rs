@@ -298,7 +298,7 @@ fn step(o: &mut Options, e: &mut Engines, work: &Path, head: Oid) -> Result<(Man
         .retain(|s| s.end_ts.saturating_add(retention(s.tier, keep_weeks)) >= max_ts);
 
     // A run that changed nothing publishes nothing: a new generation has every edge build a
-    // view and hash its cold pack again (1.3 s on SearchGold, and 4.6 s for its `.idx`),
+    // view and hash its cold pack again (1.3 s on SearchGold, its `.idx` beside it),
     // up to 96 times a day while the branch is quiet. Everything but the generation counts
     // as a change, the `blobs.bin` generation the trees need included.
     let published = m != read;
