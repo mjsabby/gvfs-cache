@@ -1144,7 +1144,13 @@ async fn objects_post(
         out.bytes(&header).await?;
     }
     // Small pieces are hashed and copied without an `.await` (see `Out::put`).
-    for p in &arena.splice.pieces {
+    for (i, p) in arena.splice.pieces.iter().enumerate() {
+        if let Some(Piece::Slab { slab, start, len }) =
+            arena.splice.pieces.get(i.saturating_add(PIECES_AHEAD))
+            && let Some(s) = view.all.get(usize::from(*slab))
+        {
+            preload_entry(s.pack(), us(*start), us(*len));
+        }
         let bytes = piece_bytes(p, &view.all, &arena.splice.bytes)
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
         if bytes.len() <= HASH_STEP {
@@ -1172,13 +1178,10 @@ async fn objects_post(
         BlobSrc::Proxied(k) => arena.proxied.get(us(u64::from(k))),
     };
     for (i, (_, src, rec)) in arena.blobs.iter().enumerate() {
-        // The first two lines of an entry ahead (most are small; a large one's reads stream).
         if let Some((_, s, r)) = arena.blobs.get(i.saturating_add(AHEAD))
             && let Some(b) = pack_of(*s, r).and_then(|p| p.bytes())
         {
-            let at = us(r.offset);
-            crate::util::prefetch(b, at);
-            crate::util::prefetch(b, at.saturating_add(64));
+            preload_entry(b, us(r.offset), us(r.entry_len));
         }
         let pack = pack_of(*src, rec)
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
@@ -1649,6 +1652,24 @@ async fn fetch_unresolved(
 
 /// How far ahead of the id it is on a batched lookup starts loading another's record.
 const AHEAD: usize = 16;
+
+/// How far ahead of the piece it is sending a batch starts loading another's bytes (a
+/// piece is one entry, or a run of entries that are neighbours in their slab).
+const PIECES_AHEAD: usize = 8;
+
+/// Starts loading the pack bytes of an entry that a batch will hash and copy shortly:
+/// every cache line of a small one (up to ten), the first ten of a large one, whose reads
+/// the hardware then follows by itself. Unasked, the trailer's SHA-1 waited on memory at
+/// each entry: on a batch of 4,000 pointer blobs it ran at 0.7 GB/s, where it hashes
+/// bytes that are in cache at 2.0.
+#[inline]
+fn preload_entry(pack: &[u8], at: usize, len: usize) {
+    // The lines `len` bytes can lie on, wherever they start.
+    let lines = len.wrapping_shr(6).saturating_add(1).min(10);
+    for line in 0..lines {
+        crate::util::prefetch(pack, at.saturating_add(line.saturating_mul(64)));
+    }
+}
 
 /// The size of an object no slab and no blob pack has: a blob the trees name (sizes
 /// tables), or one the proxy holds; exactly the blobs a GET serves ([`find_blob`]). Any
