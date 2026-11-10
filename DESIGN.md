@@ -299,6 +299,18 @@ Each run is at most one compare-and-swap of `manifest.bin`:
 Crash recovery needs nothing: unpublished uploads are garbage, and the next run's range
 starts at the manifest tip. The fs store implements CAS with `flock`; Azure uses ETags.
 
+Garbage collection (`src/gc.rs`) lists the store and then deletes, and another run may
+work in between. A rollup that a run uploaded before it died is in the store, unlisted;
+a later run that makes the same rollup makes the same id (ids are content-addressed),
+uploads it and publishes it. So each delete is conditional on the object still being the
+one that was listed: on Azure `If-Match` with the listing's ETag, in a directory the
+file's inode, length and time of last write, looked at again under the lock that uploads
+are renamed into place under. And an upload always makes a new object, also where the
+key has one: a directory store renames the new file over the old, which readers that
+have it mapped keep. (An upload to a directory left a file of that name as it was, and a
+collection deleted by name: a slab uploaded again between another run's listing and its
+deletes was deleted, listed, and both runs exited 0.)
+
 **Timestamps come from commits** (`src/timeline.rs`). A slab covers `(start_ts, end_ts]`:
 the stamps of the commits it was fetched between. Commits are stamped like a Lamport clock
 seeded with committer times, `max(committer time, 1 + the largest stamp of its parents)`,

@@ -282,6 +282,41 @@ fn azure_store_operations() {
     // The prefix isolates repositories in one container.
     assert!(backend.store("/repo2").list("slabs/").unwrap().is_empty());
 
+    // An object uploaded again is another object: the listing gives it another version,
+    // and a delete that names the version listed before leaves it (garbage collection
+    // lists, then deletes; a run may upload the same slab in between).
+    let version = |key: &str| {
+        let listed = store.list(key).unwrap();
+        assert_eq!(listed.len(), 1, "{key}");
+        assert!(!listed[0].version.is_empty());
+        listed[0].version.clone()
+    };
+    let twice = "slabs/twice.mphf";
+    store.upload_file(twice, &root.join("small.mphf")).unwrap();
+    let first = version(twice);
+    store.upload_file(twice, &root.join("small.mphf")).unwrap();
+    let second = version(twice);
+    assert_ne!(first, second);
+    assert!(!store.delete_if(twice, &first).unwrap());
+    assert_eq!(store.get(twice).unwrap().unwrap().0, b"small");
+    assert!(store.delete_if(twice, &second).unwrap());
+    assert!(store.get(twice).unwrap().is_none());
+    // Gone: no error (Azure answers 404, Azurite that the condition failed).
+    store.delete_if(twice, &second).unwrap();
+    // So is a blob whose block list is committed again.
+    let blocks = "blobs/twice.pack";
+    let mut versions = Vec::new();
+    for _ in 0..2 {
+        let mut w = store.writer(blocks).unwrap();
+        std::io::Write::write_all(&mut w, &big[..(16 << 20) + 1]).unwrap();
+        w.finish().unwrap();
+        versions.push(version(blocks));
+    }
+    assert_ne!(versions[0], versions[1]);
+    assert!(!store.delete_if(blocks, &versions[0]).unwrap());
+    assert!(store.delete_if(blocks, &versions[1]).unwrap());
+    assert!(store.list("blobs/").unwrap().is_empty());
+
     // Streaming uploads: blocks staged as they fill, the object appears only when finished.
     for (key, len) in [
         ("blobs/stream.pack", (40usize << 20) + 777),

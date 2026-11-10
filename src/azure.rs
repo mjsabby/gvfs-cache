@@ -684,6 +684,7 @@ impl AzureStore {
                         .as_deref()
                         .and_then(parse_http_date)
                         .unwrap_or(0),
+                    version: tag(blob, "Etag").unwrap_or_default(),
                 });
             }
             marker = tag(&xml, "NextMarker").unwrap_or_default();
@@ -710,6 +711,42 @@ impl AzureStore {
                     return resp.finish();
                 }
                 resp.ensure_ok(&format!("DELETE {key}"))?.finish()
+            },
+        )
+    }
+
+    /// [`crate::store::Store::delete_if`]: a DELETE with `If-Match` and the ETag the
+    /// listing gave the blob, which the service refuses (412) once the blob has another:
+    /// every upload gives it one, Put Blob and Put Block List alike. A blob that is gone
+    /// is a 404 (to Azurite a 412, with a condition).
+    pub fn delete_if(&self, key: &str, version: &str) -> Result<bool> {
+        let path = self.blob_path(key)?;
+        if version.is_empty() {
+            crate::bail!("{key}: its listing had no ETag to delete it by");
+        }
+        // A listing gives the ETag bare; a header takes it quoted.
+        let etag = if version.starts_with('"') {
+            version.to_string()
+        } else {
+            format!("\"{version}\"")
+        };
+        let mut c = self.client();
+        self.call(
+            &mut c,
+            Req {
+                method: "DELETE",
+                path: &path,
+                query: &[],
+                headers: &[("If-Match", etag)],
+                body: b"",
+            },
+            |resp| match resp.status {
+                404 => resp.finish().map(|()| true),
+                412 => resp.finish().map(|()| false),
+                _ => resp
+                    .ensure_ok(&format!("DELETE {key}"))?
+                    .finish()
+                    .map(|()| true),
             },
         )
     }
@@ -1076,6 +1113,69 @@ mod tests {
         assert!(got == data[100..900]);
         let ranges = ["bytes=100-899", "bytes=500-899", "bytes=700-899"];
         assert_eq!(*asked.lock().unwrap(), ranges);
+    }
+
+    /// A listing gives each blob's ETag, and a conditional delete sends it back, quoted,
+    /// as `If-Match`: the service answers 412 for a blob that has another since (it is
+    /// not deleted, and that is no error) and 404 for one that is gone.
+    #[test]
+    fn a_conditional_delete_sends_the_etag_its_listing_gave() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&asked);
+        let port = crate::testhttp::serve(move |r: &Request| {
+            if r.line.starts_with("GET ") {
+                let blob = |name: &str, etag: &str| {
+                    format!(
+                        "<Blob><Name>{name}</Name><Properties><Last-Modified>Sat, 24 Oct 2026 \
+                         17:15:10 GMT</Last-Modified><Etag>{etag}</Etag><Content-Length>7\
+                         </Content-Length></Properties></Blob>"
+                    )
+                };
+                let xml = format!(
+                    "<EnumerationResults><Blobs>{}{}</Blobs><NextMarker /></EnumerationResults>",
+                    blob("slabs/a.pack", "0x8DE1"),
+                    blob("slabs/b.pack", "0x8DE2")
+                );
+                return Reply::ok(xml.as_bytes());
+            }
+            let etag = r.header("if-match").unwrap_or("none").to_string();
+            let status = match etag.as_str() {
+                "\"0x8DE1\"" => "202 Accepted",
+                "\"0x8DE2\"" => "412 Precondition Failed",
+                "\"0x8DE3\"" => "404 Not Found",
+                _ => "403 Forbidden",
+            };
+            seen.lock().unwrap().push((r.line.clone(), etag));
+            Reply::status(status)
+        });
+        let account =
+            format!("BlobEndpoint=http://127.0.0.1:{port}/acct;AccountName=acct;AccountKey=a2V5");
+        let store = AzureStore::new(&account, "packs").unwrap();
+        let listed = store.list("slabs/").unwrap();
+        let versions: Vec<(&str, &str, u64)> = listed
+            .iter()
+            .map(|o| (o.key.as_str(), o.version.as_str(), o.size))
+            .collect();
+        assert_eq!(
+            versions,
+            [("slabs/a.pack", "0x8DE1", 7), ("slabs/b.pack", "0x8DE2", 7)]
+        );
+        assert!(store.delete_if("slabs/a.pack", "0x8DE1").unwrap());
+        assert!(!store.delete_if("slabs/b.pack", "0x8DE2").unwrap());
+        assert!(store.delete_if("slabs/c.pack", "\"0x8DE3\"").unwrap());
+        assert!(store.delete_if("slabs/d.pack", "0x8DE4").is_err());
+        // Without an ETag there is no condition to send: nothing is.
+        assert!(store.delete_if("slabs/e.pack", "").is_err());
+        let line = |key: &str| format!("DELETE /acct/packs/slabs/{key}.pack HTTP/1.1");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            [
+                (line("a"), "\"0x8DE1\"".to_string()),
+                (line("b"), "\"0x8DE2\"".to_string()),
+                (line("c"), "\"0x8DE3\"".to_string()),
+                (line("d"), "\"0x8DE4\"".to_string()),
+            ]
+        );
     }
 
     #[test]

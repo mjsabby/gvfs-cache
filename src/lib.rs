@@ -50,6 +50,7 @@ pub mod store;
 
 pub mod cli;
 pub mod fsutil;
+pub mod gc;
 
 pub mod delta;
 pub mod hfs;

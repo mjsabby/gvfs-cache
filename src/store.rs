@@ -1,12 +1,15 @@
 //! Object storage for slabs and the manifest.
 //!
 //! The pipeline needs only what every object store offers: whole and ranged reads, listing
-//! by prefix, deletes, and two conditional writes for the manifest — *create only if
-//! absent* (`If-None-Match: *`, genesis) and *replace only if unchanged* (`If-Match`,
-//! every later publication). Slab files are immutable and content-addressed, so they are
-//! plain uploads.
+//! by prefix, deletes, and three conditional operations. Two are writes, for the manifest:
+//! *create only if absent* (`If-None-Match: *`, genesis) and *replace only if unchanged*
+//! (`If-Match`, every later publication). The third is garbage collection's: *delete only
+//! if it is still the object that was listed* ([`Store::delete_if`]). Slab files are
+//! immutable and content-addressed, so they are plain uploads; one made again (the same id,
+//! by another run) replaces the object, which is then another to a conditional delete.
 //!
-//! * `fs:<dir>` — a directory; conditional writes are serialized with `flock(2)`.
+//! * `fs:<dir>` — a directory; conditional writes and deletes, and the renames that put
+//!   uploads in place, are serialized with `flock(2)`.
 //! * `azure:<container>[/<prefix>]` — Azure Blob Storage over its REST API.
 
 use std::fs::{self, File};
@@ -30,6 +33,10 @@ pub struct ObjectInfo {
     pub size: u64,
     /// Unix seconds of the last write.
     pub modified: u64,
+    /// What tells this object from one written under its key later, for
+    /// [`Store::delete_if`]: an object store's ETag; of a file, its inode, its length and
+    /// its time of last write.
+    pub version: String,
 }
 
 /// What [`Store::get_unless`] finds of an object its reader may already have.
@@ -147,10 +154,14 @@ impl Store {
         }
     }
 
-    /// Uploads an immutable file (a slab).
+    /// Uploads an immutable file (a slab): a new object, in place of any the key has. (To
+    /// a directory it left a file of that name as it was, the bytes being the same: the
+    /// file a garbage collection had listed before, and deleted after the run that made
+    /// this upload had published it.) A directory store renames the new file over the old
+    /// one, which readers that have it open or mapped keep.
     pub fn upload_file(&self, key: &str, path: &Path) -> Result<()> {
         match self {
-            Store::Fs(s) => crate::fsutil::link_or_copy(path, &s.path(key)?),
+            Store::Fs(s) => s.upload(key, path),
             Store::Azure(a) => a.upload_file(key, path),
         }
     }
@@ -182,6 +193,17 @@ impl Store {
         match self {
             Store::Fs(s) => s.delete(key),
             Store::Azure(a) => a.delete(key),
+        }
+    }
+
+    /// Deletes `key` if it still is the object a listing gave as `version`
+    /// ([`ObjectInfo::version`]). `false`: the object listed is not there, another having
+    /// been written under the key since; that one stays. An object that is gone counts as
+    /// deleted (an object store may answer `false` for it instead).
+    pub fn delete_if(&self, key: &str, version: &str) -> Result<bool> {
+        match self {
+            Store::Fs(s) => s.delete_if(key, version),
+            Store::Azure(a) => a.delete_if(key, version),
         }
     }
 
@@ -258,6 +280,7 @@ impl Store {
                     w: Some(std::io::BufWriter::with_capacity(1 << 20, file)),
                     tmp,
                     path,
+                    root: s.root.clone(),
                 }))
             }
             Store::Azure(a) => Ok(StoreWriter::Azure(a.writer(key)?)),
@@ -276,6 +299,8 @@ pub struct FsWriter {
     w: Option<std::io::BufWriter<File>>,
     tmp: PathBuf,
     path: PathBuf,
+    /// The store's directory.
+    root: PathBuf,
 }
 
 impl FsWriter {
@@ -283,9 +308,7 @@ impl FsWriter {
         let w = self.w.take().ctx("upload already finished")?;
         let file = w.into_inner().map_err(|e| crate::err!("writing: {e}"))?;
         file.sync_all()?;
-        fs::rename(&self.tmp, &self.path).ctx(&format!("writing {}", self.path.display()))?;
-        crate::fsutil::sync_dir(&self.path);
-        Ok(())
+        install(&self.root, &self.tmp, &self.path)
     }
 
     fn out(&mut self) -> std::io::Result<&mut std::io::BufWriter<File>> {
@@ -350,6 +373,33 @@ pub struct FsStore {
     pub root: PathBuf,
 }
 
+/// The lock of the store in `root`, held until it is dropped. What it serializes:
+/// conditional writes; and a conditional delete against the renames that put uploads in
+/// place.
+fn lock(root: &Path) -> Result<nix::fcntl::Flock<File>> {
+    let lock_file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(root.join(".lock"))
+        .ctx("opening store lock")?;
+    nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive)
+        .map_err(|(_, e)| crate::err!("locking store: {e}"))
+}
+
+/// Puts an upload's file `tmp` in place as `path`, by a rename under the store's lock:
+/// [`FsStore::delete_if`] looks at a file and unlinks it under the same lock, so the file
+/// it unlinks is the one it looked at, never one put there in between.
+fn install(root: &Path, tmp: &Path, path: &Path) -> Result<()> {
+    let renamed = lock(root)
+        .and_then(|_held| fs::rename(tmp, path).ctx(&format!("writing {}", path.display())));
+    if renamed.is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+    crate::fsutil::sync_dir(path);
+    renamed
+}
+
 impl FsStore {
     pub fn new(root: &Path) -> Result<FsStore> {
         fs::create_dir_all(root).ctx(&format!("creating store directory {}", root.display()))?;
@@ -363,6 +413,31 @@ impl FsStore {
             crate::bail!("invalid store key {key:?}");
         }
         Ok(self.root.join(key))
+    }
+
+    /// [`Store::upload_file`]: a link to `src` (a copy across file systems), renamed over
+    /// whatever file the key has.
+    fn upload(&self, key: &str, src: &Path) -> Result<()> {
+        let path = self.path(key)?;
+        let tmp = crate::fsutil::stage(src, &path)?;
+        install(&self.root, &tmp, &path)
+    }
+
+    /// [`ObjectInfo::version`] of a file: its inode, its length and its time of last
+    /// write. A file renamed over it is another inode; an inode's number is used again
+    /// once it is free, by a file written at another time. Not the device, which on a
+    /// shared file system is each mount's own number, nor the time of last change, which
+    /// moves when a link to the file goes (the one in the work directory of the run that
+    /// uploaded it).
+    fn version(m: &fs::Metadata) -> String {
+        use std::os::unix::fs::MetadataExt;
+        format!(
+            "{:x}-{:x}-{:x}.{:09}",
+            m.ino(),
+            m.len(),
+            m.mtime(),
+            m.mtime_nsec()
+        )
     }
 
     fn etag(data: &[u8]) -> String {
@@ -441,14 +516,7 @@ impl FsStore {
     fn put(&self, key: &str, data: &[u8], cond: Cond) -> Result<String> {
         let path = self.path(key)?;
         // Conditional writes are serialized by an exclusive lock on the store.
-        let lock_file = File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(self.root.join(".lock"))
-            .ctx("opening store lock")?;
-        let _lock = nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive)
-            .map_err(|(_, e)| crate::err!("locking store: {e}"))?;
+        let _lock = lock(&self.root)?;
         let current = self.get(key)?;
         match (&cond, &current) {
             (Cond::IfNoneMatch, Some(_)) => {
@@ -519,6 +587,7 @@ impl FsStore {
                 key,
                 size: meta.len(),
                 modified,
+                version: Self::version(&meta),
             });
         }
         out.sort_by(|a, b| a.key.cmp(&b.key));
@@ -530,6 +599,32 @@ impl FsStore {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(Error::from(e)).ctx(&format!("deleting {key}")),
+        }
+    }
+
+    /// [`Store::delete_if`]: the file is looked at again, and unlinked if it is the one
+    /// the listing saw, under the lock that uploads are renamed into place under
+    /// ([`install`]). It is opened to be looked at, as a poll opens the manifest: on a
+    /// network file system that asks the server which file has the name now. A file put
+    /// there by anything else between the look and the unlink (a `cp` into the store) is
+    /// not protected, nor is one where the file system's locks do not reach the other
+    /// machines.
+    fn delete_if(&self, key: &str, version: &str) -> Result<bool> {
+        let path = self.path(key)?;
+        let what = || format!("deleting {key}");
+        let _lock = lock(&self.root)?;
+        let seen = match File::open(&path).and_then(|file| file.metadata()) {
+            Ok(m) => Self::version(&m),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+            Err(e) => return Err(Error::from(e)).ctx(&what()),
+        };
+        if seen != version {
+            return Ok(false);
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(Error::from(e)).ctx(&what()),
         }
     }
 }
@@ -593,6 +688,67 @@ mod tests {
         assert_eq!(got, b"hol");
         assert!(s.list("slabs/").unwrap().is_empty());
         assert!(!valid_key("../x") && !valid_key("a//b") && valid_key("slabs/m15-1-ab.pack"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An upload to a directory store leaves a new file where the key had one, and a
+    /// delete that names what a listing saw takes only that file: a collection that
+    /// listed a slab's file before a run uploaded the slab again leaves the run's. A
+    /// reader of the old file keeps it. (The upload left the old file, which the
+    /// collection then deleted, by its name.)
+    #[test]
+    fn an_upload_is_a_new_file_and_a_delete_takes_only_the_one_listed() {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("gvd-store-replace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let s = Store::open(&format!("fs:{}", dir.display()), "UNUSED").unwrap();
+        let key = "slabs/a.pack";
+        let path = dir.join(key);
+        let (one, two) = (dir.join("one.bin"), dir.join("two.bin"));
+        fs::write(&one, b"first").unwrap();
+        fs::write(&two, b"again").unwrap();
+        let listed = || s.list("slabs/").unwrap().remove(0).version;
+
+        s.upload_file(key, &one).unwrap();
+        let first = listed();
+        let mut reader = File::open(&path).unwrap();
+        s.upload_file(key, &two).unwrap();
+        let second = listed();
+        assert_ne!(first, second);
+        assert_eq!(fs::read(&path).unwrap(), b"again");
+        let mut held = String::new();
+        reader.read_to_string(&mut held).unwrap();
+        assert_eq!(held, "first");
+        // What was listed first is not there: the second stays. Listed, it goes; and a
+        // file that is gone counts as deleted.
+        assert!(!s.delete_if(key, &first).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"again");
+        assert!(s.delete_if(key, &second).unwrap());
+        assert!(!path.exists());
+        assert!(s.delete_if(key, &second).unwrap());
+
+        // The same file uploaded twice (a run that starts over builds the same slab in
+        // the same work directory): the store's file is a link to it, and the second
+        // upload makes another file all the same, leaving no temp file behind.
+        s.upload_file(key, &one).unwrap();
+        let (linked, inode) = (listed(), fs::metadata(&path).unwrap().ino());
+        assert_eq!(inode, fs::metadata(&one).unwrap().ino());
+        s.upload_file(key, &one).unwrap();
+        assert_ne!(fs::metadata(&path).unwrap().ino(), inode);
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+        assert!(!s.delete_if(key, &linked).unwrap());
+        let files = |sub: &str| fs::read_dir(dir.join(sub)).unwrap().count();
+        assert_eq!(files("slabs"), 1);
+
+        // So is a streamed upload another file.
+        let before = listed();
+        let mut w = s.writer(key).unwrap();
+        w.write_all(b"stream").unwrap();
+        w.finish().unwrap();
+        assert!(!s.delete_if(key, &before).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"stream");
+        assert_eq!(files("slabs"), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -778,6 +778,102 @@ fn a_gc_failure_does_not_fail_the_run() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A copy of the directory `from` as `to`.
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+}
+
+/// A store with a baseline and two 15m slabs, and in it the files of their 1h rollup,
+/// which no manifest lists: what a run that died after uploading the rollup leaves.
+/// Returns the store's directory and the rollup (made by such a run on a copy of the
+/// store).
+fn store_with_an_orphan_rollup(
+    root: &std::path::Path,
+    up: &mut Upstream,
+) -> (std::path::PathBuf, gvfs_cache::slab::SlabMeta) {
+    let store_dir = root.join("store");
+    let store = store_spec(&store_dir);
+    up.commit(4);
+    pipeline(root, &store, up, "15m", &[]);
+    for _ in 0..2 {
+        up.commit(4);
+        pipeline(root, &store, up, "15m", &[]);
+    }
+    let copy = root.join("copy");
+    copy_dir(&store_dir, &copy);
+    pipeline(root, &store_spec(&copy), up, "1h", &[]);
+    let rollup = manifest(&copy).pyramid[0].clone();
+    assert_eq!(rollup.tier, Tier::H1);
+    for key in [rollup.pack_key(), rollup.index_key()] {
+        std::fs::copy(copy.join(&key), store_dir.join(&key)).unwrap();
+    }
+    (store_dir, rollup)
+}
+
+/// The store serves a cold clone that has everything: every slab its manifest lists is
+/// there.
+fn assert_store_serves(root: &std::path::Path, store: &str, tip: &str) {
+    let server = Server::start(&["--store", store]);
+    let packs = server.prefetch(0);
+    assert_eq!(packs.len(), 1);
+    let cold = fresh_repo(root, "cold");
+    install_pack(&cold, &packs[0].1);
+    assert_complete(&cold, tip);
+    server.assert_clean();
+}
+
+/// Two runs and one slab id. An earlier run died after uploading a rollup. Run A's
+/// garbage collection lists the store and finds the rollup's files due. Run B then makes
+/// the same rollup (ids are content-addressed), uploads it and publishes a manifest that
+/// lists it. Run A deletes what it listed: not the rollup, whose files are B's now, not
+/// the ones A listed. (B's upload left the files that were there, and A deleted them by
+/// name: both runs exited 0, the manifest listed a slab that was gone, and no edge could
+/// start.)
+#[test]
+fn a_slab_uploaded_again_outlives_the_collection_that_listed_it() {
+    let root = tempdir("gc-race");
+    let mut up = Upstream::new(&root);
+    let (store_dir, rollup) = store_with_an_orphan_rollup(&root, &mut up);
+    let store = store_spec(&store_dir);
+    let mut files = [rollup.pack_key(), rollup.index_key()];
+    files.sort();
+
+    let s = gvfs_cache::store::Store::open(&store, "").unwrap();
+    let far = gvfs_cache::util::now_secs() + 86_400 * 30;
+    let pass = gvfs_cache::gc::Pass::survey(&s, &manifest(&store_dir), far, 60).unwrap();
+    let mut due: Vec<&str> = pass.due().collect();
+    due.sort_unstable();
+    assert_eq!(due, files);
+
+    let far = far.to_string();
+    pipeline(
+        &root,
+        &store,
+        &up,
+        "1h",
+        &["--now", &far, "--gc-grace-secs", "60"],
+    );
+    let m = manifest(&store_dir);
+    assert_eq!(m.pyramid, [rollup]);
+
+    let swept = pass.sweep(&s).unwrap();
+    for key in &files {
+        assert!(store_dir.join(key).exists(), "{key} is listed, and gone");
+    }
+    assert_eq!((swept.deleted, swept.replaced), (0, 2));
+    assert_store_serves(&root, &store, &up.tip());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Superset deliveries (`--superset-tier`, default 24h). Once the tip moves past a sealed
 /// day, a client inside it, or current at its end, receives the day whole with what
 /// follows: once, labelled with its interval. Stock client maintenance
