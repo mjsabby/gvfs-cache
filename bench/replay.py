@@ -264,11 +264,15 @@ class Replay:
         self.L("FAIL", what)
 
     def pipeline(self, t):
+        """Runs the tick's pipeline; returns whether it published a manifest (a run with
+        nothing to do says it publishes nothing, and then no edge has anything to reload)."""
         tier = cron_tier(t)
         if SCHED[base(self.name)] == "auto":
             cmds = [self.im.pipeline_cmd(self.up, "auto", t)]
         else:
             cmds = [self.im.pipeline_cmd(self.up, tier, t)]
+        log = self.im.pipeline_log
+        logged = os.path.getsize(log) if os.path.exists(log) else 0
         t0 = time.perf_counter()
         for c in cmds:
             self.im.run(c, env=self.im.pipeline_env(t))
@@ -279,6 +283,9 @@ class Replay:
         b[1] += dtm
         b[2] = max(b[2], dtm)
         self.pipe["max_s"] = max(self.pipe["max_s"], dtm)
+        with open(log, "rb") as f:
+            f.seek(logged)
+            return b"nothing to publish" not in f.read()
 
     def generation(self):
         m = self.srv.metrics()
@@ -507,8 +514,8 @@ class Replay:
                 cur = tip
             if t in tickset:
                 g = self.generation()
-                self.pipeline(t)
-                self.wait_reload(g, cron_tier(t))
+                if self.pipeline(t):
+                    self.wait_reload(g, cron_tier(t))
             if t in due:
                 if caught != cur:
                     if self.wait_live(cur):
