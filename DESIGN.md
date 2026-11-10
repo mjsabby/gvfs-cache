@@ -658,7 +658,9 @@ are left out (the index is reloaded after each publish), and every copied blob's
 checked against the sizes table clients were given. The run that copies the last item
 checks that every blob is listed and records `blobs.bin` as mirrored: edges serve from
 then on. A restart re-plans and skips what was published; a killed run's unpublished
-uploads are never listed and GC removes them (tested by `SIGKILL` at several points).
+uploads are never listed and GC removes them (tested by `SIGKILL` at several points). The
+throttle is a token bucket, so `--rate-mbps` caps the rate, not the average since the
+start: a pause (a 429 waited out) earns a quarter of a second of credit, not its length.
 
 **Repair is on demand.** Nothing repairs a store by itself: once mirrored there is nothing
 to repair unless storage loses data or a bug drops something, so no pipeline run pays for

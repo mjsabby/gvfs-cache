@@ -150,37 +150,56 @@ pub struct Finished<S> {
     pub recs: Vec<BlobRec>,
 }
 
-/// A byte-rate cap shared by concurrent copies (`mirror --rate-mbps`).
+/// A byte-rate cap shared by concurrent copies (`mirror --rate-mbps`): a token bucket of
+/// `bytes_per_sec` that keeps at most `BURST_NANOS` of unused time, so a pause is not
+/// credit. (A cap on the average since the start made it credit: after a 15-minute wait
+/// on a 429 at 4,000 Mbps, about 450 GB passed at whatever rate the upstream gave.)
 pub struct Throttle {
     bytes_per_sec: u64,
     start: std::time::Instant,
-    total: std::sync::atomic::AtomicU64,
+    /// When the bytes counted so far are paid for at the rate, in nanoseconds after
+    /// `start`. One atomic: the copies' threads share the bucket without a lock.
+    due: std::sync::atomic::AtomicU64,
 }
+
+/// The unused time a [`Throttle`] keeps as credit, a quarter of a second: after a pause
+/// that much passes at once (125 MB at 4,000 Mbps), then the rate holds again. The gaps
+/// between two reads of a copy (a late wake-up, a flush to the store) are milliseconds, so
+/// the copies still reach the rate.
+const BURST_NANOS: u64 = 250_000_000;
 
 impl Throttle {
     pub fn new(bytes_per_sec: u64) -> Throttle {
         Throttle {
             bytes_per_sec: bytes_per_sec.max(1),
             start: std::time::Instant::now(),
-            total: std::sync::atomic::AtomicU64::new(0),
+            due: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Counts `n` bytes and sleeps while the copies are ahead of the rate.
     pub fn account(&self, n: usize) {
-        let total = self
-            .total
-            .fetch_add(u64_of(n), std::sync::atomic::Ordering::Relaxed)
-            .saturating_add(u64_of(n));
-        let due_ms = total
-            .saturating_mul(1000)
-            .checked_div(self.bytes_per_sec)
-            .unwrap_or(0);
-        let due = std::time::Duration::from_millis(due_ms);
-        let elapsed = self.start.elapsed();
-        if due > elapsed {
-            std::thread::sleep(due.saturating_sub(elapsed));
+        let wait = self.charge(n, self.start.elapsed());
+        if !wait.is_zero() {
+            std::thread::sleep(wait);
         }
+    }
+
+    /// Counts `n` bytes taken at `now` (the time since `start`); returns how far ahead of
+    /// the rate the copies then are, which is how long the caller is to wait.
+    fn charge(&self, n: usize, now: std::time::Duration) -> std::time::Duration {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = u64::try_from(now.as_nanos()).unwrap_or(u64::MAX);
+        let cost = u128::from(u64_of(n))
+            .saturating_mul(1_000_000_000)
+            .checked_div(u128::from(self.bytes_per_sec))
+            .unwrap_or(0);
+        let cost = u64::try_from(cost).unwrap_or(u64::MAX);
+        // Unused time beyond the burst is lost: `due` never lags the clock by more.
+        let floor = now.saturating_sub(BURST_NANOS);
+        let pay = |due: u64| due.max(floor).saturating_add(cost);
+        let due = pay(self.due.update(Relaxed, Relaxed, pay));
+        std::time::Duration::from_nanos(due.saturating_sub(now))
     }
 }
 
@@ -1039,5 +1058,67 @@ mod tests {
         let f = sink.finish().unwrap();
         assert_eq!(f.recs.len(), 1);
         assert!(f.recs[0].stored);
+    }
+
+    /// On a clock that only the throttle's own waits advance, at `--rate-mbps 4000`: the
+    /// rate holds from the first byte; after a 15-minute pause (a 429 waited out) a quarter
+    /// of a second's bytes pass at once, where the pause used to be 450 GB of credit; then
+    /// the rate holds again.
+    #[test]
+    fn throttle_caps_the_rate_not_the_average_since_the_start() {
+        use std::time::Duration;
+        const RATE: u64 = 4000 * 1_000_000 / 8;
+        const WRITE: usize = 64 << 10;
+        let t = Throttle::new(RATE);
+        // 10 GB in 64 KiB writes, each followed by the wait the throttle asks for.
+        let ten_gb = |now: &mut Duration| {
+            let began = *now;
+            for _ in 0..10_000_000_000 / WRITE as u64 {
+                *now += t.charge(WRITE, *now);
+            }
+            (*now - began).as_secs_f64()
+        };
+        let mut now = Duration::ZERO;
+        let secs = ten_gb(&mut now);
+        assert!((secs - 20.0).abs() < 0.001, "{secs}");
+
+        now += Duration::from_secs(900);
+        let mut free = 0u64;
+        let wait = loop {
+            let wait = t.charge(WRITE, now);
+            if !wait.is_zero() {
+                break wait;
+            }
+            free += WRITE as u64;
+        };
+        assert!(
+            free <= RATE / 4 && free > RATE / 4 - 2 * WRITE as u64,
+            "{free} bytes passed without a wait"
+        );
+        now += wait;
+        let secs = ten_gb(&mut now);
+        assert!((secs - 20.0).abs() < 0.001, "{secs}");
+    }
+
+    /// The real clock, and one bucket for all copies: after a pause of 0.4 s, four threads
+    /// take 1.5 MiB between them at 4 MiB/s. The burst pays for 1 MiB; the rest takes
+    /// 0.125 s. (As credit, the pause paid for 1.6 MiB: no wait at all.)
+    #[test]
+    fn throttled_copies_share_one_bucket() {
+        use std::time::{Duration, Instant};
+        let t = Throttle::new(4 << 20);
+        std::thread::sleep(Duration::from_millis(400));
+        let began = Instant::now();
+        std::thread::scope(|s| {
+            for _ in 0..4 {
+                s.spawn(|| {
+                    for _ in 0..24 {
+                        t.account(16 << 10);
+                    }
+                });
+            }
+        });
+        let took = began.elapsed();
+        assert!(took >= Duration::from_millis(120), "{took:?}");
     }
 }

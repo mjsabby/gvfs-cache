@@ -13,9 +13,10 @@
 //! clients were given. `--jobs` copies run in parallel, one upstream connection each.
 //! Finished packs are published every `--publish-secs` (one segment per batch,
 //! compare-and-swap of `blobs.bin`), so a crash loses at most that much work.
-//! `--rate-mbps` caps the combined download rate; `--max-items` stops after that many items
-//! (seeding in slices). The run that copies the last item checks that every blob of the
-//! store's trees is listed, then records `blobs.bin` as mirrored.
+//! `--rate-mbps` caps the combined download rate (a rate, not an average: the copies do
+//! not make up for a pause); `--max-items` stops after that many items (seeding in
+//! slices). The run that copies the last item checks that every blob of the store's trees
+//! is listed, then records `blobs.bin` as mirrored.
 //!
 //! It is also the repair, run on demand (nothing runs it automatically): it first takes out
 //! of `blobs.bin` the packs and segments the store no longer holds
