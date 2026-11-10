@@ -116,6 +116,8 @@ SERVE OPTIONS:
     --grow-objects <N>         room commit expansions may grow their arenas by, together, in
                                objects (default: arenas x arena-objects, i.e. as much again
                                as the arenas hold; ~250 bytes each); beyond: 503
+    --max-commit-depth <N>     levels of parents a POST's commitDepth may ask for (default:
+                               16; a request for more gets that many)
     --cache-server <NAME=URL>  advertised in /gvfs/config (repeatable)
     --alloc-guard <count|strict|trace>   hot-path allocation policy (default: count)
     --prefetch-idx <auto|always|never>   send each prefetch pack's .idx; auto (default):

@@ -420,7 +420,10 @@ warmer prepares it for each new cold plan once any client has asked for one.
 * `GET /gvfs/prefetch`: one pack, plus its `.idx` for clients other than git.
 * `GET /gvfs/objects/<id>`: a loose object. gvfs-helper requires loose for GET.
 * `POST /gvfs/objects`: one pack. A single non-commit with a loose `Accept` is answered
-  loose. A commit expands to `commitDepth` levels of parents plus every tree of each.
+  loose. A commit expands to `commitDepth` levels of parents plus every tree of each, for
+  at most `--max-commit-depth` levels (16 by default; stock clients ask for 1). A level
+  costs what its commit changed: 10 objects on SearchGold, about 500 trees and 15 ms of CPU
+  on RepoB, whose directories are wide.
 * `POST /gvfs/sizes`.
 * `/healthz` and `/metrics`.
 
@@ -476,7 +479,9 @@ arenas share a budget (`--grow-objects`, default as much again as all arenas hol
 bytes an object; the `gvfs_grown_objects` gauge), charged as their room doubles. An
 expansion past it gets a 503 at once rather than wait holding its arena, so expansions never
 queue behind each other and never park arenas that blob batches need; a SearchGold tip
-(431k objects) takes 2^18, so every arena can expand one at once. The lease's end shrinks
+(431k objects) takes 2^18, so every arena can expand one at once. What an expansion costs
+before it is refused is the walk so far, which `--max-commit-depth` keeps near one tip's
+(0.9 s of CPU for RepoB's 838k objects). The lease's end shrinks
 what grew, then returns its charge. The server speaks plain HTTP/1.1: put TLS and HTTP/2 on
 the load balancer in front of an edge. The localhost proxy needs neither.
 

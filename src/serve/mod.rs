@@ -100,6 +100,8 @@ pub struct Ctx {
     pub max_idle: i64,
     pub arenas: ArenaPool,
     pub arena_wait: Duration,
+    /// The most levels of parents a commit's expansion follows (`--max-commit-depth`).
+    pub max_commit_depth: u64,
     pub config_json: Vec<u8>,
     pub metrics: Metrics,
     pub ready: AtomicBool,
@@ -152,6 +154,8 @@ pub struct Options {
     /// (`--grow-objects`), and the most one may plan (`--max-request-objects`).
     pub grow_objects: usize,
     pub max_request_objects: usize,
+    /// Levels of parents a `commitDepth` may ask for (`--max-commit-depth`).
+    pub max_commit_depth: u64,
     pub cache_servers: Vec<(String, String)>,
     pub idle_timeout: Duration,
     pub write_timeout: Duration,
@@ -188,6 +192,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "arena-objects",
             "grow-objects",
             "max-request-objects",
+            "max-commit-depth",
             "cache-server",
             "alloc-guard",
             "idle-secs",
@@ -272,6 +277,7 @@ pub fn main(args: &[String]) -> Result<()> {
         // As much again as the arenas hold.
         grow_objects: f.num("grow-objects", arenas.saturating_mul(arena_objects))?,
         max_request_objects: f.num("max-request-objects", 1usize << 22)?,
+        max_commit_depth: f.num("max-commit-depth", 16u64)?.max(1),
         cache_servers,
         // At most a year: deadlines are instants, which must not overflow.
         idle_timeout: Duration::from_secs(f.num("idle-secs", 30u64)?.min(365 * 86400)),
@@ -323,6 +329,7 @@ pub fn run(o: Options) -> Result<()> {
         arena_objects,
         grow_objects,
         max_request_objects,
+        max_commit_depth,
         cache_servers,
         idle_timeout,
         write_timeout,
@@ -455,6 +462,7 @@ pub fn run(o: Options) -> Result<()> {
             max_request_objects,
         ),
         arena_wait: Duration::from_secs(10),
+        max_commit_depth,
         config_json: config_json(&cache_servers),
         metrics: Metrics::default(),
         ready: AtomicBool::new(false),

@@ -1004,9 +1004,12 @@ async fn objects_post(
         return Ok(false);
     };
     let mut budget = Budget::new();
+    // Stock clients ask for one level. Each further one costs what its commit changed:
+    // 10 objects on SearchGold, but 500 trees (15 ms) on a repository of wide directories,
+    // where the 1,000 levels this used to allow took 16.8 s of CPU for one request.
     let depth = scan_number(&b.out, b"\"commitDepth")
         .unwrap_or(1)
-        .clamp(1, 1000);
+        .clamp(1, ctx.max_commit_depth);
     if !scan_ids(&b.out, &mut arena.oids, &mut budget).await {
         respond(ctx, stream, 413, "too many objects\n", keep).await?;
         return Ok(keep);
