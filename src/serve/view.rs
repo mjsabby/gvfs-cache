@@ -296,6 +296,16 @@ impl View {
         }
     }
 
+    /// Where the plan a client at `client_ts` is answered from is kept, as a number: the
+    /// same for every client that shares the plan (they wait for one build of it).
+    pub fn plan_key(&self, client_ts: u64) -> usize {
+        match self.slot(client_ts) {
+            Slot::UpToDate => 0,
+            Slot::Warm(cell, _) => std::ptr::from_ref(cell).addr(),
+            Slot::Cold => std::ptr::from_ref(&self.cold_plan).addr(),
+        }
+    }
+
     /// Where the plan for a client at `client_ts` lives.
     fn slot(&self, client_ts: u64) -> Slot<'_> {
         let client_ts = self.unretracted(client_ts);

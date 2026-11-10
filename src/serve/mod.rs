@@ -112,6 +112,8 @@ pub struct Ctx {
     pub idx_wanted: AtomicBool,
     /// A client asked for sizes: the warmer builds the next cold plan's `GSZ1` section too.
     pub sizes_wanted: AtomicBool,
+    /// Plans and their sections being built for the requests waiting for them.
+    pub builds: Arc<budget::Builds>,
     /// Read-through of blobs the store lacks (`--blobs separate` stores with an upstream).
     pub proxy: Option<blobs::Proxy>,
     /// Local blocks of blob packs in object storage.
@@ -500,6 +502,7 @@ pub fn run(o: Options) -> Result<()> {
         prefetch_idx,
         idx_wanted: AtomicBool::new(prefetch_idx == IdxPolicy::Always),
         sizes_wanted: AtomicBool::new(false),
+        builds: Arc::default(),
         proxy,
         blob_cache: sync.blob_cache.clone(),
     });
