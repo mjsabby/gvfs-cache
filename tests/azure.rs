@@ -693,3 +693,74 @@ fn an_object_store_edge_needs_a_cache_dir() {
         "{err}"
     );
 }
+
+/// An edge of an object store serves the slabs its manifest lists: cached files that are
+/// not one (here a pack cut short, then an index) are downloaded again rather than keep
+/// the edge from starting, and a pack the store returns with the listed length and trailer
+/// but other bytes is refused, and not kept.
+#[test]
+fn an_edge_checks_its_slabs_against_the_manifest() {
+    let Some(backend) = Backend::new("listed") else {
+        return;
+    };
+    let root = tempdir("azure-listed");
+    let env = [("GVD_AZ_CS", backend.cs.as_str())];
+    let store = format!("azure:{}", backend.spec);
+    let mut up = Upstream::new(&root);
+    up.commit(5);
+    let upstream = up.bare.to_str().unwrap();
+    let auth = ["--store-auth-env", "GVD_AZ_CS"];
+    pipeline_at(&root, &store, upstream, "15m", &auth, &env).unwrap_or_else(|log| panic!("{log}"));
+    let cache = root.join("cache");
+    let args = [
+        "--store",
+        store.as_str(),
+        "--store-auth-env",
+        "GVD_AZ_CS",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ];
+    let server = Server::start_with_env(&args, &env);
+    let cold = server.prefetch(0);
+    drop(server);
+
+    let s = backend.store("");
+    let (bytes, _) = s.get("manifest.bin").unwrap().unwrap();
+    let base = gvfs_cache::manifest::Manifest::decode(&bytes)
+        .unwrap()
+        .baseline;
+    for ext in ["pack", "mphf"] {
+        let path = cache.join(format!("{}.{ext}", base.id));
+        let len = std::fs::metadata(&path).unwrap().len();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(len / 2).unwrap();
+        let server = Server::start_with_env(&args, &env);
+        assert!(server.prefetch(0) == cold);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len);
+        server.assert_clean();
+    }
+
+    let pack = cache.join(format!("{}.pack", base.id));
+    let mut bytes = std::fs::read(&pack).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 1;
+    let other = root.join("other.pack");
+    std::fs::write(&other, &bytes).unwrap();
+    s.delete(&base.pack_key()).unwrap();
+    s.upload_file(&base.pack_key(), &other).unwrap();
+    std::fs::remove_dir_all(&cache).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_gvfs-cache"))
+        .args(["serve", "--bind", "127.0.0.1:0"])
+        .args(args)
+        .envs(env)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success() && err.contains("is not the one listed"),
+        "{err}"
+    );
+    assert!(!pack.exists(), "the pack refused is not kept");
+    drop(backend);
+    let _ = std::fs::remove_dir_all(&root);
+}

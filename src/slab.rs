@@ -434,8 +434,35 @@ pub struct Slab {
 }
 
 impl Slab {
-    /// Maps `<dir>/<id>.pack` and `<id>.mphf` (immutable files) and validates them.
+    /// Maps the pack and the index (immutable files) of the slab `meta` lists and validates
+    /// them: against each other, and against `meta`. A manifest names a slab by 8 bytes of
+    /// its pack's SHA-1; these are the slab only if they are the pack and index it lists.
     pub fn open(pack_path: &Path, index_path: &Path, meta: SlabMeta) -> Result<Arc<Slab>> {
+        let slab = Slab::map(pack_path, index_path, meta)?;
+        let (m, pack) = (&slab.meta, slab.pack());
+        let listed = u64_of(pack.len()) == m.pack_len
+            && pack.get(pack.len().saturating_sub(20)..) == Some(&m.pack_sha[..])
+            && u64_of(slab.index.bytes().len()) == m.index_len
+            && slab.count == m.objects;
+        if !listed {
+            crate::bail!(
+                "slab {}: {} and {} are not the files listed for it ({} objects, a pack of {} \
+                 bytes, an index of {}; listed: {}, {}, {})",
+                m.id,
+                pack_path.display(),
+                index_path.display(),
+                slab.count,
+                pack.len(),
+                slab.index.bytes().len(),
+                m.objects,
+                m.pack_len,
+                m.index_len
+            );
+        }
+        Ok(slab)
+    }
+
+    fn map(pack_path: &Path, index_path: &Path, meta: SlabMeta) -> Result<Arc<Slab>> {
         let pack_file = File::open(pack_path).ctx(&format!("opening {}", pack_path.display()))?;
         let pack = gvfs_mmap::Map::open(&pack_file, false).ctx("mapping pack")?;
         let index_file =
@@ -468,7 +495,7 @@ impl Slab {
             index_len: 0,
             pack_sha: [0; 20],
         };
-        Slab::open(&index.with_extension("pack"), index, meta)
+        Slab::map(&index.with_extension("pack"), index, meta)
     }
 
     /// A slab held in memory: an L0 slab, the pack a plan repacks for warm clients, tests.
@@ -725,44 +752,46 @@ mod tests {
         assert_eq!(Tier::from_u8(6), Some(Tier::Week));
     }
 
+    /// A slab of one whole blob of `size` bytes of noise (which does not compress), and its
+    /// pack.
+    #[allow(clippy::arithmetic_side_effects)]
+    fn noise_slab(size: u32) -> (Arc<Slab>, Vec<u8>) {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let content: Vec<u8> = (0..size)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let mut z = vec![0u8; crate::zlib::compress_bound(content.len())];
+        let n = crate::zlib::Deflater::new(1)
+            .deflate_parts(&[&content], &mut z)
+            .unwrap();
+        let mut pack = crate::pack::pack_header(1).to_vec();
+        let header = crate::pack::HeaderBytes::whole(crate::pack::OBJ_BLOB, u64::from(size));
+        pack.extend_from_slice(header.as_slice());
+        pack.extend_from_slice(&z[..n]);
+        let trailer = <sha1::Sha1 as sha1::Digest>::digest(&pack);
+        pack.extend_from_slice(&trailer);
+        let range = (0, 1);
+        let commits = (Oid::ZERO, Oid::ZERO);
+        let mut indexer = crate::ingest::Indexer::new(1);
+        let slab =
+            crate::ingest::memory_slab(&mut indexer, pack.clone(), Tier::M15, range, commits)
+                .unwrap()
+                .slab;
+        assert!(slab.pack() == pack);
+        (slab, pack)
+    }
+
     /// A memory slab whose pack the edge would `sendfile(2)` has a file to send it from,
     /// holding the pack's bytes; a small one, which the edge copies, stays on the heap.
     #[test]
-    #[allow(clippy::arithmetic_side_effects)]
     fn a_memory_slab_of_some_size_has_a_file() {
         use std::os::unix::fs::FileExt;
-        let slab_of = |size: u32| {
-            // One whole blob of noise, which does not compress.
-            let mut x = 0x9E37_79B9_7F4A_7C15u64;
-            let content: Vec<u8> = (0..size)
-                .map(|_| {
-                    x ^= x << 13;
-                    x ^= x >> 7;
-                    x ^= x << 17;
-                    x as u8
-                })
-                .collect();
-            let mut z = vec![0u8; crate::zlib::compress_bound(content.len())];
-            let n = crate::zlib::Deflater::new(1)
-                .deflate_parts(&[&content], &mut z)
-                .unwrap();
-            let mut pack = crate::pack::pack_header(1).to_vec();
-            let header = crate::pack::HeaderBytes::whole(crate::pack::OBJ_BLOB, u64::from(size));
-            pack.extend_from_slice(header.as_slice());
-            pack.extend_from_slice(&z[..n]);
-            let trailer = <sha1::Sha1 as sha1::Digest>::digest(&pack);
-            pack.extend_from_slice(&trailer);
-            let range = (0, 1);
-            let commits = (Oid::ZERO, Oid::ZERO);
-            let mut indexer = crate::ingest::Indexer::new(1);
-            let slab =
-                crate::ingest::memory_slab(&mut indexer, pack.clone(), Tier::M15, range, commits)
-                    .unwrap()
-                    .slab;
-            assert!(slab.pack() == pack);
-            (slab, pack)
-        };
-        let (large, pack) = slab_of(40_000);
+        let (large, pack) = noise_slab(40_000);
         let mut from_file = vec![0u8; pack.len()];
         large
             .pack_file()
@@ -770,7 +799,51 @@ mod tests {
             .read_exact_at(&mut from_file, 0)
             .unwrap();
         assert!(from_file == pack);
-        let (small, _) = slab_of(100);
+        let (small, _) = noise_slab(100);
         assert!(small.pack_file().is_none());
+    }
+
+    /// A slab's files open as the slab a manifest lists only if they are the pack and the
+    /// index it lists: another slab's, however sound, are refused. Tools open them as they
+    /// are.
+    #[test]
+    #[allow(clippy::arithmetic_side_effects)]
+    fn files_open_only_as_the_slab_listed() {
+        let dir = std::env::temp_dir().join(format!("gvd-listed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (slab, pack) = noise_slab(1000);
+        let (pack_path, index_path) = (dir.join("s.pack"), dir.join("s.mphf"));
+        std::fs::write(&pack_path, &pack).unwrap();
+        std::fs::write(&index_path, slab.index_bytes()).unwrap();
+        let meta = slab.meta.clone();
+        let opened = Slab::open(&pack_path, &index_path, meta.clone()).unwrap();
+        assert!(opened.pack() == pack);
+        let mut other_sha = meta.pack_sha;
+        other_sha[19] ^= 1;
+        let others = [
+            SlabMeta {
+                pack_len: meta.pack_len + 1,
+                ..meta.clone()
+            },
+            SlabMeta {
+                pack_sha: other_sha,
+                ..meta.clone()
+            },
+            SlabMeta {
+                index_len: meta.index_len - 1,
+                ..meta.clone()
+            },
+            SlabMeta {
+                objects: meta.objects + 1,
+                ..meta.clone()
+            },
+        ];
+        for other in others {
+            let e = Slab::open(&pack_path, &index_path, other).err().unwrap();
+            assert!(e.to_string().contains("not the files listed"), "{e}");
+        }
+        assert_eq!(Slab::open_file(&index_path).unwrap().records().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

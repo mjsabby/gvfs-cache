@@ -1266,18 +1266,7 @@ impl Live {
                 None => {
                     let s = self.open(meta)?;
                     if m.separate_blobs() {
-                        let path = match self.store.local_path(&meta.sizes_key()) {
-                            Some(p) => p,
-                            None => {
-                                let p = self.cache_dir.join(format!("{}.sizes", meta.id));
-                                hydrate(&self.store, &meta.sizes_key(), &p)?;
-                                p
-                            }
-                        };
-                        s.set_sizes(Arc::new(
-                            crate::sizes::Sizes::open(&path)
-                                .ctx(&format!("sizes of slab {}", meta.id))?,
-                        ));
+                        s.set_sizes(Arc::new(self.sizes(meta)?));
                     }
                     s
                 }
@@ -1286,6 +1275,28 @@ impl Live {
             sealed.push(slab);
         }
         Ok((sealed, keep))
+    }
+
+    /// The sizes table of slab `meta` (a table carries its own checksum). A cached one
+    /// that does not open is downloaded again, once, as a slab's files are.
+    fn sizes(&self, meta: &crate::slab::SlabMeta) -> Result<crate::sizes::Sizes> {
+        use crate::sizes::Sizes;
+        let (what, key) = (format!("sizes of slab {}", meta.id), meta.sizes_key());
+        if let Some(path) = self.store.local_path(&key) {
+            return Sizes::open(&path).ctx(&what);
+        }
+        let path = self.cache_dir.join(format!("{}.sizes", meta.id));
+        let new = hydrate(&self.store, &key, &path).ctx(&what)?;
+        match Sizes::open(&path) {
+            Err(e) if !new && std::fs::File::open(&path).is_ok() => {
+                crate::log!("serve: {what} from the cache failed ({e}): downloading them again");
+                let _ = std::fs::remove_file(&path);
+                hydrate(&self.store, &key, &path).ctx(&what)?;
+                Sizes::open(&path)
+            }
+            sizes => sizes,
+        }
+        .ctx(&what)
     }
 
     /// A snapshot of the sealed slabs plus the L0 slabs.
@@ -1304,20 +1315,57 @@ impl Live {
     }
 
     fn open(&self, meta: &crate::slab::SlabMeta) -> Result<Arc<Slab>> {
-        let (pack, index) = match (
+        let what = format!("opening slab {}", meta.id);
+        if let (Some(pack), Some(index)) = (
             self.store.local_path(&meta.pack_key()),
             self.store.local_path(&meta.index_key()),
         ) {
-            (Some(p), Some(i)) => (p, i),
-            _ => {
-                let p = self.cache_dir.join(format!("{}.pack", meta.id));
-                let i = self.cache_dir.join(format!("{}.mphf", meta.id));
-                hydrate(&self.store, &meta.pack_key(), &p)?;
-                hydrate(&self.store, &meta.index_key(), &i)?;
-                (p, i)
+            return Slab::open(&pack, &index, meta.clone()).ctx(&what);
+        }
+        let pack = self.cache_dir.join(format!("{}.pack", meta.id));
+        let index = self.cache_dir.join(format!("{}.mphf", meta.id));
+        // Cached files that can be read and are not the slab (a disk that lost part of
+        // one) are downloaded again, once: an edge must not need its cache wiped by hand
+        // to start, or to take the next manifest.
+        let cached = std::fs::File::open(&pack).is_ok() && std::fs::File::open(&index).is_ok();
+        match self.download(meta, &pack, &index) {
+            Err(e) if cached => {
+                crate::log!("serve: {what} from the cache failed ({e}): downloading it again");
+                let _ = std::fs::remove_file(&pack);
+                let _ = std::fs::remove_file(&index);
+                self.download(meta, &pack, &index)
             }
-        };
-        Slab::open(&pack, &index, meta.clone()).ctx(&format!("opening slab {}", meta.id))
+            slab => slab,
+        }
+        .ctx(&what)
+    }
+
+    /// Slab `meta` from the cache directory, once the files of it that are not there are
+    /// downloaded. A pack that was is hashed: it must be the pack whose SHA-1 the manifest
+    /// lists, not only end with it.
+    fn download(
+        &self,
+        meta: &crate::slab::SlabMeta,
+        pack: &Path,
+        index: &Path,
+    ) -> Result<Arc<Slab>> {
+        let new = hydrate(&self.store, &meta.pack_key(), pack)?;
+        hydrate(&self.store, &meta.index_key(), index)?;
+        let slab = Slab::open(pack, index, meta.clone())?;
+        if new {
+            use sha1::Digest;
+            let bytes = slab.pack();
+            let body = bytes.get(..bytes.len().saturating_sub(20)).unwrap_or(&[]);
+            let sha: [u8; 20] = sha1::Sha1::digest(body).into();
+            if sha != meta.pack_sha {
+                let _ = std::fs::remove_file(pack);
+                crate::bail!(
+                    "the pack downloaded is not the one listed: its SHA-1 is {}",
+                    crate::util::hex_string(&sha)
+                );
+            }
+        }
+        Ok(slab)
     }
 
     /// One poll: the store, then the upstream branch. Neither needs the other to work: an
@@ -1529,10 +1577,11 @@ fn in_memory(path: &Path) -> Option<&'static str> {
     }
 }
 
-/// Downloads `key` to `path` unless a complete copy is already there.
-fn hydrate(store: &Store, key: &str, path: &Path) -> Result<()> {
+/// Downloads `key` to `path` unless a complete copy is already there. Returns whether it
+/// did.
+fn hydrate(store: &Store, key: &str, path: &Path) -> Result<bool> {
     if path.exists() {
-        return Ok(());
+        return Ok(false);
     }
     let t0 = std::time::Instant::now();
     store.download_file(key, path)?;
@@ -1542,7 +1591,7 @@ fn hydrate(store: &Store, key: &str, path: &Path) -> Result<()> {
         crate::util::human_bytes(size),
         t0.elapsed().as_secs_f64()
     );
-    Ok(())
+    Ok(true)
 }
 
 /// The `/metrics` text (cold path).
