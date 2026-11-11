@@ -22,19 +22,23 @@
 //! in the store, and so are its blobs (by induction from the mirrored genesis). Whatever
 //! the upstream (plain git, bitmaps), a reused old version (a revert, an old branch
 //! merged) is either in the pack's trees or in the store.
+//!
+//! Runs that copy at once (two runs of one window, two mirrors, a mirror and a window)
+//! claim the blobs they copy ([`crate::claims`]): each blob is copied by one of them.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::BuildHasher;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::sync::{Arc, Condvar, Mutex, RwLock, mpsc};
 use std::time::{Duration, Instant};
 
 use crate::blobcopy::{Copied, Item, copy_item, mode_kind, plan, publish};
 use crate::blobs::{BlobManifest, BlobRec, Segment};
 use crate::blobstream::Throttle;
+use crate::claims::Ledger;
 use crate::manifest::Manifest;
 use crate::object::{TreeIter, commit_tree};
 use crate::pack::{OBJ_BLOB, OBJ_COMMIT, OBJ_TREE};
@@ -149,6 +153,54 @@ impl BlobIndex {
 /// A batch is published once it holds this many packs, whatever the time.
 const PUBLISH_ITEMS: usize = 256;
 
+/// A copy claims items ahead of its jobs ([`crate::claims`]). When fewer are claimed and
+/// not begun than it has jobs, it claims the next ones: up to [`CLAIM_ITEMS`] claimed
+/// and not begun per job, [`CLAIM_BYTES`] in one claim, and [`CLAIM_BLOBS`] blobs
+/// claimed and not begun (but an item, if none is). So a job that ends an item finds
+/// the next one claimed, and a claim, which is a write to the store, is made once for
+/// several items where they are small (blobs of 16 MiB: 13 at a time with four jobs).
+/// What a run has claimed and not begun no other run takes meanwhile, and if the run
+/// dies the others wait `--claim-secs` for it. And every write of `claims.bin` has the
+/// id of every blob claimed, 20 bytes each: one item ahead, where an item is a pack of
+/// 100,000 small blobs.
+const CLAIM_ITEMS: usize = 4;
+const CLAIM_BYTES: u64 = 256 << 20;
+const CLAIM_BLOBS: usize = 4096;
+
+/// How many of the items a copy comes to next (`coming`, in their order) it claims now,
+/// for `jobs` jobs, with `ready` items of `ahead` blobs claimed and not begun
+/// ([`CLAIM_ITEMS`]).
+fn claim_ahead<'i>(
+    coming: impl Iterator<Item = &'i Item>,
+    jobs: usize,
+    ready: usize,
+    ahead: usize,
+) -> usize {
+    if ready >= jobs {
+        return 0;
+    }
+    let room = jobs.saturating_mul(CLAIM_ITEMS).saturating_sub(ready);
+    let (mut n, mut bytes, mut blobs) = (0usize, 0u64, ahead);
+    for item in coming.take(room) {
+        bytes = bytes.saturating_add(item.bytes());
+        blobs = blobs.saturating_add(item.oids().len());
+        if (bytes > CLAIM_BYTES && n > 0) || (blobs > CLAIM_BLOBS && (n > 0 || ready > 0)) {
+            break;
+        }
+        n = n.saturating_add(1);
+    }
+    n
+}
+
+/// A copy that is through its items goes back to the blobs that other runs' claims hold:
+/// at once, [`LOOK_FIRST`] later, and then after twice as long each time it finds them
+/// as they were, up to [`LOOK_EVERY`]. What it waits for changes when another run
+/// publishes (every `--publish-secs`, and when it has no more to copy): a run about to
+/// end is found within a quarter of a second, and one that copies on for an hour is
+/// asked for two objects it need not send, every two seconds.
+const LOOK_FIRST: Duration = Duration::from_millis(250);
+const LOOK_EVERY: Duration = Duration::from_secs(2);
+
 /// How blobs are copied into the store, by `mirror` (the history's) and by a pipeline run
 /// (its window's): several at a time, each on an upstream connection of its own, and
 /// what has been copied published as the copy goes ([`copy_all`]).
@@ -168,6 +220,9 @@ pub struct Copies<'a> {
     pub publish_every: Duration,
     /// A cap on the download rate of all copies together, in bytes per second.
     pub rate: Option<u64>,
+    /// How long the run's claim on the blobs it is copying holds without being written
+    /// again (`--claim-secs`): what other runs wait for those blobs if this one dies.
+    pub claim: Duration,
 }
 
 /// The size each blob of a copy is to have: what clients were told, or will be. A blob
@@ -245,17 +300,239 @@ fn write<T>(l: &RwLock<T>, v: T) {
     }
 }
 
+/// The items a copy has claimed and no job has begun, each with its claim's number
+/// ([`Ledger::release`]).
+struct Queue<'a> {
+    ready: VecDeque<(u64, Cow<'a, Item>)>,
+    /// No more will come.
+    closed: bool,
+}
+
+/// What the threads of a copy share: its jobs, the one that claims, and the one that
+/// publishes.
+struct Shared<'a> {
+    queue: Mutex<Queue<'a>>,
+    /// Told when the queue changes, when a copy fails and when the copy ends.
+    wake: Condvar,
+    /// A copy failed: no job takes another item, and no more are claimed.
+    stop: AtomicBool,
+    /// The last pack is published, or will not be: the claims are given up.
+    ended: AtomicBool,
+    /// The numbers of the claims to give up: their packs are listed, or their copies
+    /// failed.
+    released: Mutex<Vec<u64>>,
+    /// What `blobs.bin` listed when the run last read it.
+    listed: RwLock<Arc<BlobIndex>>,
+    /// Blobs of the items that `blobs.bin` listed when the run came to them: other
+    /// runs' copies.
+    elsewhere: AtomicUsize,
+    /// How many items the jobs have taken.
+    taken: AtomicUsize,
+    /// The run has no item left to claim but those other runs' claims hold: what its
+    /// jobs have finished is published without waiting for `--publish-secs`, since
+    /// those runs may be waiting for it likewise.
+    waiting: AtomicBool,
+}
+
+/// Waits on `cv`, for `most` at most.
+fn wait<'g, T>(
+    cv: &Condvar,
+    held: std::sync::MutexGuard<'g, T>,
+    most: Duration,
+) -> std::sync::MutexGuard<'g, T> {
+    match cv.wait_timeout(held, most) {
+        Ok((held, _)) => held,
+        Err(p) => p.into_inner().0,
+    }
+}
+
+/// How long a thread of a copy waits for its cue before it looks for itself.
+const TICK: Duration = Duration::from_millis(200);
+
+impl<'a> Shared<'a> {
+    /// The next item for a job, waited for: `None` once none is to come, or a copy has
+    /// failed.
+    fn next(&self) -> Option<(u64, Cow<'a, Item>)> {
+        let mut queue = lock(&self.queue);
+        loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return None;
+            }
+            if let Some(next) = queue.ready.pop_front() {
+                self.taken.fetch_add(1, Ordering::Relaxed);
+                // One fewer is ready: the claimer's cue.
+                self.wake.notify_all();
+                return Some(next);
+            }
+            if queue.closed {
+                return None;
+            }
+            queue = wait(&self.wake, queue, TICK);
+        }
+    }
+
+    /// Wakes the threads that wait: none of them is between looking and waiting.
+    fn tell(&self) {
+        let _queue = lock(&self.queue);
+        self.wake.notify_all();
+    }
+}
+
+/// Ends the thread that claims when the copy is over, however it ends.
+struct Ended<'s, 'a>(&'s Shared<'a>);
+
+impl Drop for Ended<'_, '_> {
+    fn drop(&mut self) {
+        self.0.ended.store(true, Ordering::Relaxed);
+        self.0.tell();
+    }
+}
+
+/// The thread of a copy that claims ([`crate::claims`]), until the copy has ended. It
+/// keeps the jobs in items: it goes through `items` in their order, claims of each what
+/// is free ([`Ledger::claim`]) and queues it for the jobs, a few items ahead of them
+/// ([`CLAIM_ITEMS`]). What other runs' claims hold it comes back to once it is through
+/// the items ([`LOOK_FIRST`]): listed by then, it is done; still held, it waits on;
+/// neither (the run that held it failed, or died and its claim has lapsed), this run
+/// claims and copies it. It gives up what the publisher has listed and what failed,
+/// with a write of its own if no claim is due to carry it, and writes the run's claim
+/// again before it can lapse ([`Ledger::due`]).
+fn claim_items<'a>(
+    c: &Copies,
+    items: &'a [Item],
+    sizes: &SizeOf,
+    jobs: usize,
+    ledger: &mut Ledger<'a>,
+    s: &Shared<'a>,
+) -> Result<()> {
+    let mut next = 0usize;
+    // What other runs' claims held of the items when this run came to them, and the
+    // part of that it is going through again.
+    let mut later: Vec<Item> = Vec::new();
+    let mut again: VecDeque<Item> = VecDeque::new();
+    // When it last went back to `later`, and how long it waits before the next time.
+    let (mut looked, mut pause) = (Instant::now(), Duration::ZERO);
+    let (mut said, mut gave_back) = (false, false);
+    while !s.ended.load(Ordering::Relaxed) {
+        ledger.release(&std::mem::take(&mut *lock(&s.released)));
+        let stopped = s.stop.load(Ordering::Relaxed);
+        if stopped && !gave_back {
+            // A copy failed, and the run ends with the items its jobs are in: what none
+            // has begun is given up now, for the other runs.
+            let unbegun: Vec<u64> = lock(&s.queue).ready.drain(..).map(|(n, _)| n).collect();
+            ledger.release(&unbegun);
+            gave_back = true;
+        }
+        // The items claimed and not begun, and their blobs.
+        let (ready, ahead) = {
+            let queue = lock(&s.queue);
+            let blobs = queue.ready.iter().map(|(_, item)| item.oids().len());
+            (queue.ready.len(), blobs.sum::<usize>())
+        };
+        let mut through = next >= items.len() && again.is_empty();
+        if !stopped && ready < jobs {
+            if through && !later.is_empty() && looked.elapsed() >= pause {
+                ledger.look()?;
+                again.extend(later.drain(..));
+                looked = Instant::now();
+                // The next time after twice as long: sooner, if any of it is settled
+                // this time.
+                pause = pause.saturating_mul(2).clamp(LOOK_FIRST, LOOK_EVERY);
+            }
+            let back = next >= items.len();
+            let coming = items.get(next..).unwrap_or(&[]).iter().chain(&again);
+            let mut chunk: Vec<Cow<'a, Item>> = Vec::new();
+            for _ in 0..claim_ahead(coming, jobs, ready, ahead) {
+                match items.get(next) {
+                    Some(item) => {
+                        chunk.push(Cow::Borrowed(item));
+                        next = next.saturating_add(1);
+                    }
+                    None => chunk.extend(again.pop_front().map(Cow::Owned)),
+                }
+            }
+            if !chunk.is_empty() {
+                let taken = ledger.claim(&chunk, sizes)?;
+                if !Arc::ptr_eq(&read(&s.listed), ledger.index()) {
+                    write(&s.listed, Arc::clone(ledger.index()));
+                }
+                s.elsewhere.fetch_add(taken.listed, Ordering::Relaxed);
+                if back && (taken.listed > 0 || !taken.ready.is_empty()) {
+                    pause = LOOK_FIRST;
+                }
+                later.extend(taken.later);
+                if !taken.ready.is_empty() {
+                    s.waiting.store(false, Ordering::Relaxed);
+                    lock(&s.queue).ready.extend(taken.ready);
+                    s.wake.notify_all();
+                }
+                continue;
+            }
+            through = next >= items.len() && again.is_empty();
+            if through {
+                s.waiting.store(!later.is_empty(), Ordering::Relaxed);
+            }
+            if through && later.is_empty() {
+                let mut queue = lock(&s.queue);
+                if !queue.closed {
+                    queue.closed = true;
+                    s.wake.notify_all();
+                }
+            } else if through
+                && !said
+                && let (blobs @ 1.., until) = ledger.waits(&later)
+            {
+                crate::log!(
+                    "{}: {blobs} blobs are other runs', claimed until {until} for now: \
+                     waiting for them to be listed, or for the claims to lapse",
+                    c.who
+                );
+                said = true;
+            }
+        }
+        if ledger.due() {
+            ledger.sync()?;
+            continue;
+        }
+        // Its cue: a job took an item, a claim is to be given up, the copy has failed
+        // or ended. Or the time to go back to what other runs hold.
+        let queue = lock(&s.queue);
+        if s.ended.load(Ordering::Relaxed)
+            || s.stop.load(Ordering::Relaxed) != stopped
+            || queue.ready.len() != ready
+            || !lock(&s.released).is_empty()
+        {
+            continue;
+        }
+        let most = match through && !later.is_empty() && !stopped && ready < jobs {
+            true => pause.saturating_sub(looked.elapsed()).min(TICK),
+            false => TICK,
+        };
+        drop(wait(&s.wake, queue, most));
+    }
+    Ok(())
+}
+
 /// Copies `items`, in the order given, with [`Copies::jobs`] jobs, each on a connection
 /// `connect` opens, and publishes finished packs in `blobs.bin` as it goes: at least every
-/// [`Copies::publish_every`], and whatever has finished when a copy fails or the last one
-/// ends. A run that stops early (killed at its runner's time limit, an item that failed
-/// after its retries) therefore keeps what it published, and the next one copies the rest.
+/// [`Copies::publish_every`], and whatever has finished when a copy fails, when the run
+/// has only other runs' blobs left to wait for, or when the last one ends. A run that
+/// stops early (killed at its runner's time limit, an item that failed after its
+/// retries) therefore keeps what it published, and the next one copies the rest.
 ///
-/// Each item is first checked against the newest index this run has seen (`index` at
-/// first, then `blobs.bin` as read again after each publish): blobs another writer has
-/// listed meanwhile are left out, an item that has none left is skipped. A rate limit is
-/// waited out by the job that met it ([`Upstream`]). The first failure stops the jobs from
-/// taking more items, and is returned once the packs that finished are published.
+/// Other runs may be copying into the store at once (another run of the window, a
+/// mirror), and may have planned the same blobs. Before a job gets an item the run
+/// claims its blobs in `claims.bin` ([`crate::claims`], [`claim_items`]), leaving out
+/// those that `blobs.bin` lists by now (`index` was what it listed when the run planned)
+/// and those that another run's claim holds: these it waits for, and copies itself if
+/// that run does not. So a blob is copied by one run, and the runs share the items. A
+/// pack's claim is given up once the pack is published, in that order, and every claim
+/// when the copy ends.
+///
+/// A rate limit is waited out by the job that met it ([`Upstream`]). The first failure
+/// stops the jobs from taking more items, gives up the claims of the item that failed
+/// and of those no job has begun (no other run waits for them to lapse), and is returned
+/// once the packs that finished are published.
 pub fn copy_all(
     c: &Copies,
     connect: &dyn Fn() -> Result<Upstream>,
@@ -266,29 +543,50 @@ pub fn copy_all(
     if items.is_empty() {
         return Ok(());
     }
+    let jobs = c.jobs.clamp(1, items.len());
     let mut ups = Vec::new();
-    for _ in 0..c.jobs.clamp(1, items.len()) {
+    for _ in 0..jobs {
         ups.push(connect()?);
     }
     let throttle = c.rate.map(|r| Arc::new(Throttle::new(r)));
-    let next = AtomicUsize::new(0);
-    let stop = AtomicBool::new(false);
-    let listed = RwLock::new(index);
+    let mut ledger = Ledger::new(
+        c.store,
+        c.cache,
+        c.who,
+        c.claim.as_secs(),
+        Arc::clone(&index),
+    );
+    let shared = Shared {
+        queue: Mutex::new(Queue {
+            ready: VecDeque::new(),
+            closed: false,
+        }),
+        wake: Condvar::new(),
+        stop: AtomicBool::new(false),
+        ended: AtomicBool::new(false),
+        released: Mutex::new(Vec::new()),
+        listed: RwLock::new(index),
+        elsewhere: AtomicUsize::new(0),
+        taken: AtomicUsize::new(0),
+        waiting: AtomicBool::new(false),
+    };
     let total_bytes: u64 = items.iter().map(Item::bytes).sum();
-    let (tx, rx) = mpsc::channel::<Result<Done>>();
+    let (tx, rx) = mpsc::channel::<(u64, Result<Done>)>();
     std::thread::scope(|sc| -> Result<()> {
         for (w, mut up) in ups.into_iter().enumerate() {
             let tx = tx.clone();
-            let (next, stop, throttle, listed) = (&next, &stop, &throttle, &listed);
+            let (shared, throttle) = (&shared, &throttle);
             let spool = c.work.join(format!("spool-{w}"));
             sc.spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let Some(item) = items.get(next.fetch_add(1, Ordering::Relaxed)) else {
-                        break;
-                    };
+                while let Some((claim, item)) = shared.next() {
                     let r = (|| -> Result<Done> {
-                        let index: Arc<BlobIndex> = read(listed);
-                        let Some(item) = unlisted(item, &index, sizes)? else {
+                        // Listed since it was claimed, if the claim had lapsed (a run
+                        // that stood still for longer than `--claim-secs`) and another
+                        // run took its blobs.
+                        let index: Arc<BlobIndex> = read(&shared.listed);
+                        let Some(item) = unlisted(&item, &index, sizes)? else {
+                            let blobs = item.oids().len();
+                            shared.elsewhere.fetch_add(blobs, Ordering::Relaxed);
                             return Ok(Done::Skipped);
                         };
                         let copied = copy_item(&mut up, c.store, &spool, &item, throttle.as_ref())?;
@@ -296,82 +594,127 @@ pub fn copy_all(
                         Ok(Done::Copied(copied))
                     })();
                     let failed = r.is_err();
-                    if tx.send(r).is_err() || failed {
+                    if tx.send((claim, r)).is_err() || failed {
                         break;
                     }
                 }
             });
         }
         drop(tx);
-        let t0 = Instant::now();
-        let mut pending: Vec<Copied> = Vec::new();
-        let mut last = Instant::now();
-        let mut failure = None;
-        let (mut done_items, mut done_bytes, mut skipped) = (0usize, 0u64, 0usize);
-        let mut flush = |pending: &mut Vec<Copied>, skipped: usize| -> Result<()> {
-            let bm = publish(c.store, c.work, pending, c.threads, |_| Ok(()))?;
-            done_items = done_items.saturating_add(pending.len());
-            done_bytes = done_bytes.saturating_add(
-                pending
-                    .iter()
-                    .flat_map(|c| c.recs.iter().map(|r| r.size))
-                    .sum::<u64>(),
-            );
-            let secs = t0.elapsed().as_secs_f64().max(0.001);
-            crate::log!(
-                "{}: {done_items}/{} items, {} of {} ({:.1} MB/s){}; blobs.bin generation {}",
-                c.who,
-                items.len(),
-                human_bytes(done_bytes),
-                human_bytes(total_bytes),
-                done_bytes as f64 / secs / 1e6,
-                if skipped > 0 {
-                    format!("; {skipped} items listed meanwhile, skipped")
-                } else {
-                    String::new()
-                },
-                bm.generation
-            );
-            pending.clear();
-            // What other writers published meanwhile is left out of the next items.
-            match BlobIndex::load(c.store, c.cache, &bm) {
-                Ok(i) => {
-                    write(&listed, Arc::new(i));
-                    prune_segments(c.cache, &bm);
-                }
-                Err(e) => crate::log!("{}: reloading the blob index failed ({e})", c.who),
+        let (shared, ledger) = (&shared, &mut ledger);
+        let claimer = sc.spawn(move || {
+            let claimed = claim_items(c, items, sizes, jobs, ledger, shared);
+            if claimed.is_err() {
+                shared.stop.store(true, Ordering::Relaxed);
             }
-            Ok(())
-        };
-        loop {
-            match rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(Ok(Done::Copied(c))) => pending.push(c),
-                Ok(Ok(Done::Skipped)) => skipped = skipped.saturating_add(1),
-                Ok(Err(e)) => {
-                    stop.store(true, Ordering::Relaxed);
-                    failure.get_or_insert(e);
+            lock(&shared.queue).closed = true;
+            shared.tell();
+            if claimed.is_ok() {
+                // The copy has ended: what it published is listed, and the rest will
+                // not be copied by this run.
+                ledger.release_all();
+                if ledger.due()
+                    && let Err(e) = ledger.sync()
+                {
+                    crate::log!(
+                        "{}: its claims were not given up ({e}): they lapse in {}s",
+                        c.who,
+                        c.claim.as_secs()
+                    );
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            if !pending.is_empty()
-                && (last.elapsed() >= c.publish_every || pending.len() >= PUBLISH_ITEMS)
-            {
-                if let Err(e) = flush(&mut pending, skipped) {
-                    stop.store(true, Ordering::Relaxed);
-                    return Err(e);
+            claimed
+        });
+        let ended = Ended(shared);
+        let copied = (|| -> Result<()> {
+            let t0 = Instant::now();
+            // The packs to publish, and their claims' numbers.
+            let mut pending: Vec<Copied> = Vec::new();
+            let mut claims: Vec<u64> = Vec::new();
+            let mut last = Instant::now();
+            let mut failure = None;
+            // How many of the items the jobs have taken they are done with.
+            let mut finished = 0usize;
+            let (mut done_items, mut done_bytes) = (0usize, 0u64);
+            let mut flush = |pending: &mut Vec<Copied>, claims: &mut Vec<u64>| -> Result<()> {
+                let bm = publish(c.store, c.work, pending, c.threads, |_| Ok(()))?;
+                // Listed: only now are their claims given up, never before
+                // (`crate::claims`).
+                lock(&shared.released).append(claims);
+                done_items = done_items.saturating_add(pending.len());
+                done_bytes = done_bytes.saturating_add(
+                    pending
+                        .iter()
+                        .flat_map(|c| c.recs.iter().map(|r| r.size))
+                        .sum::<u64>(),
+                );
+                let secs = t0.elapsed().as_secs_f64().max(0.001);
+                let elsewhere = shared.elsewhere.load(Ordering::Relaxed);
+                crate::log!(
+                    "{}: {done_items}/{} items, {} of {} ({:.1} MB/s){}; blobs.bin generation {}",
+                    c.who,
+                    items.len(),
+                    human_bytes(done_bytes),
+                    human_bytes(total_bytes),
+                    done_bytes as f64 / secs / 1e6,
+                    if elsewhere > 0 {
+                        format!("; {elsewhere} blobs listed by other runs")
+                    } else {
+                        String::new()
+                    },
+                    bm.generation
+                );
+                pending.clear();
+                Ok(())
+            };
+            loop {
+                let got = rx.recv_timeout(TICK);
+                finished = finished.saturating_add(usize::from(got.is_ok()));
+                match got {
+                    Ok((claim, Ok(Done::Copied(c)))) => {
+                        pending.push(c);
+                        claims.push(claim);
+                    }
+                    Ok((claim, Ok(Done::Skipped))) => lock(&shared.released).push(claim),
+                    Ok((claim, Err(e))) => {
+                        shared.stop.store(true, Ordering::Relaxed);
+                        // Given up at once: no other run waits for the claim of a
+                        // copy that failed to lapse.
+                        lock(&shared.released).push(claim);
+                        shared.tell();
+                        failure.get_or_insert(e);
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                last = Instant::now();
+                // The run has copied what it could claim, and waits for other runs'
+                // blobs: they may be waiting for these.
+                let idle = shared.waiting.load(Ordering::Relaxed)
+                    && shared.taken.load(Ordering::Relaxed) == finished;
+                if !pending.is_empty()
+                    && (idle || last.elapsed() >= c.publish_every || pending.len() >= PUBLISH_ITEMS)
+                {
+                    if let Err(e) = flush(&mut pending, &mut claims) {
+                        shared.stop.store(true, Ordering::Relaxed);
+                        return Err(e);
+                    }
+                    last = Instant::now();
+                }
             }
-        }
-        // What finished is published even when a copy failed: a rerun skips it.
-        if !pending.is_empty() {
-            flush(&mut pending, skipped)?;
-        }
-        match failure {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+            // What finished is published even when a copy failed: a rerun skips it.
+            if !pending.is_empty() {
+                flush(&mut pending, &mut claims)?;
+            }
+            match failure {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
+        })();
+        drop(ended);
+        let claimed = claimer
+            .join()
+            .unwrap_or_else(|_| Err(crate::err!("the thread that claims failed")));
+        copied.and(claimed)
     })
 }
 
@@ -382,14 +725,12 @@ pub fn copy_all(
 /// needed) and their sizes, as verified by hashing their content.
 ///
 /// The items are taken in an order of this run's own. Runs that overlap (the next
-/// quarter's, started while this one still copies) plan the same items, and in one order
-/// each would take an item while the other was still copying it, to the last one:
-/// everything twice, however often they published. In orders of their own, a run mostly
-/// comes to items the other has published, and skips them. What is still copied twice is
-/// what both took before either had published it and the other had read that: about what
-/// the runs copy in two publish intervals, a few times over a long copy (and all of a
-/// window that lasts no longer). A blob listed twice is found once; its other copy is
-/// wasted bytes.
+/// quarter's, started while this one still copies) plan the same items; each claims what
+/// it copies and leaves to the others what they have claimed ([`copy_all`]), in whatever
+/// order. The order is for runs that do not see each other's claims (a build from before
+/// `claims.bin`, a clock too far off: [`crate::claims`]): in one order each takes an
+/// item while the other is still copying it, to the last one, and in orders of their own
+/// a run mostly comes to items the other has published by then.
 pub fn copy_needed(
     up: &mut Upstream,
     c: &Copies,
@@ -827,6 +1168,45 @@ mod tests {
             index_len: 1,
             pack_sha: [end as u8; 20],
         }
+    }
+
+    /// What a copy claims ahead of its jobs: nothing while each job has an item claimed
+    /// and not begun; else up to four items a job, 256 MiB in a claim, and 4,096 blobs
+    /// claimed and not begun, but an item if none is.
+    #[test]
+    fn a_copy_claims_a_few_items_ahead_of_its_jobs() {
+        let large = |mib: u64| Item::Large {
+            oid: Oid::ZERO,
+            size: mib << 20,
+        };
+        let pack = |blobs: usize| Item::Batch {
+            oids: vec![Oid::ZERO; blobs],
+            bytes: 64 << 20,
+        };
+        let ahead =
+            |items: &[Item], jobs, ready, blobs| claim_ahead(items.iter(), jobs, ready, blobs);
+        // Blobs of 16 MiB.
+        let items = vec![large(16); 100];
+        assert_eq!(ahead(&items, 1, 0, 0), 4);
+        assert_eq!(ahead(&items, 4, 0, 0), 16);
+        assert_eq!(ahead(&items, 4, 3, 3), 13);
+        assert_eq!(ahead(&items, 4, 4, 4), 0);
+        assert_eq!(ahead(&items, 16, 0, 0), 16);
+        assert_eq!(ahead(&items[..5], 4, 0, 0), 5);
+        assert_eq!(ahead(&[], 4, 0, 0), 0);
+        // Blobs of 1 GiB: one a claim, as long as a job would find none.
+        let items = vec![large(1024); 10];
+        assert_eq!(ahead(&items, 4, 0, 0), 1);
+        assert_eq!(ahead(&items, 4, 3, 3), 1);
+        assert_eq!(ahead(&items, 4, 4, 4), 0);
+        // Packs of 5,000 small blobs: one ahead. Of 1,000: four.
+        let items = vec![pack(5000); 10];
+        assert_eq!(ahead(&items, 4, 0, 0), 1);
+        assert_eq!(ahead(&items, 4, 1, 5000), 0);
+        let items = vec![pack(1000); 10];
+        assert_eq!(ahead(&items, 4, 0, 0), 4);
+        assert_eq!(ahead(&items, 4, 3, 3000), 1);
+        assert_eq!(ahead(&items, 4, 3, 4000), 0);
     }
 
     /// Pruning the runner's cache removes the downloads the store no longer lists (a slab's

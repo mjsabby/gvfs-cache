@@ -805,6 +805,79 @@ fn azure_separate_store() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Two mirrors at once into an object store copy each blob once between them:
+/// `claims.bin` is created and replaced by the service's own conditional writes
+/// (`If-None-Match`, `If-Match` on its ETags), and read again only when it is another
+/// object.
+#[test]
+fn two_mirrors_of_an_object_store_copy_each_blob_once() {
+    let Some(backend) = Backend::new("claims") else {
+        return;
+    };
+    let root = tempdir("azure-claims");
+    let store = format!("azure:{}", backend.spec);
+    let up = Upstream::new(&root);
+    let files: Vec<(String, Option<Vec<u8>>)> = (0..12u32)
+        .map(|i| {
+            let content = noise(600_000 + i as usize, 3000 + u64::from(i));
+            (format!("big/f{i:02}.bin"), Some(content))
+        })
+        .chain((0..20u32).map(|i| (format!("small/f{i:02}.txt"), Some(text(200 + i)))))
+        .collect();
+    let refs: Vec<(&str, Option<Vec<u8>>)> =
+        files.iter().map(|(p, c)| (p.as_str(), c.clone())).collect();
+    commit_files(&up, "c1", &refs);
+    git(&up.bare, &["config", "uploadpack.allowFilter", "true"]);
+    let http = SmartHttp::azure_devops(&up.bare, "secret");
+    let env = [
+        ("GVD_AZ_CS", backend.cs.as_str()),
+        ("GVD_TEST_TOKEN", "secret"),
+    ];
+    let auth = [
+        "--store-auth-env",
+        "GVD_AZ_CS",
+        "--token-env",
+        "GVD_TEST_TOKEN",
+    ];
+    let genesis = [&auth[..], &["--blobs", "separate"]].concat();
+    pipeline_at(&root, &store, &http.url, "15m", &genesis, &env)
+        .unwrap_or_else(|log| panic!("pipeline: {log}"));
+
+    http.objects_delay(300);
+    let work = root.join("mirror-work");
+    std::fs::create_dir_all(&work).unwrap();
+    let mirror = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_gvfs-cache"));
+        cmd.args(["mirror", "--store", &store, "--upstream", &http.url])
+            .args(auth)
+            .args(["--work-dir", work.to_str().unwrap(), "--threads", "2"])
+            .args(["--jobs", "2", "--publish-secs", "0", "--blob-pack-mib", "1"])
+            .envs(env)
+            .stderr(Stdio::piped());
+        gvfs_cache::upstream::hermetic_git_env(&mut cmd);
+        cmd.spawn().unwrap()
+    };
+    for run in [mirror(), mirror()] {
+        let out = run.wait_with_output().unwrap();
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{log}");
+    }
+    let mut asked = http.objects_asked().concat();
+    asked.sort();
+    let all: Vec<String> = git_blobs(&up.bare, &["--all"]).into_keys().collect();
+    assert!(
+        asked == all,
+        "{} blobs asked for, of {}: each is to be asked for once",
+        asked.len(),
+        all.len()
+    );
+    let s = backend.store("");
+    assert!(gvfs_cache::blobcopy::load(&s).unwrap().0.complete());
+    assert_eq!(gvfs_cache::claims::load(&s).unwrap(), []);
+    assert!(s.get(gvfs_cache::claims::CLAIMS_KEY).unwrap().is_some());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Runs `gvfs-cache mirror` to its end: every blob of the upstream's history in one pack.
 fn mirror(root: &std::path::Path, store: &str, upstream: &str, env: &[(&str, &str)]) {
     let work = root.join("mirror-work");

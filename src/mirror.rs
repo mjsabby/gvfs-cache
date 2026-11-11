@@ -6,8 +6,10 @@
 //! tree first, in path order, so a checkout reads its blobs back to back; then the rest of
 //! the history as its trees are stored), sizes from the slabs' sizes tables. Blobs
 //! `blobs.bin` already lists (the pipeline's, an earlier run's) are skipped, so a restart
-//! resumes where the published packs end; before each pack, blobs that pipeline runs copied
-//! meanwhile (an old version a new commit reuses) are left out, so nothing is copied twice.
+//! resumes where the published packs end; before each pack its blobs are claimed
+//! ([`crate::claims`]), and those that a pipeline run or another mirror has copied
+//! meanwhile (an old version a new commit reuses), or is copying, are left out, so nothing
+//! is copied twice.
 //!
 //! Every blob is verified by its id as it streams in, and its size against the sizes table
 //! clients were given. `--jobs` copies run in parallel, one upstream connection each.
@@ -55,6 +57,9 @@ pub struct Options {
     pub rate: Option<u64>,
     pub max_items: Option<usize>,
     pub publish_every: Duration,
+    /// How long the run's claim on the blobs it is copying holds without the run writing
+    /// it again (`--claim-secs`, [`crate::claims`]).
+    pub claim: Duration,
 }
 
 /// `gvfs-cache mirror ...`
@@ -77,6 +82,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "rate-mbps",
             "max-items",
             "publish-secs",
+            "claim-secs",
         ],
     )?;
     let o = Options {
@@ -111,6 +117,7 @@ pub fn main(args: &[String]) -> Result<()> {
             Some(_) => Some(f.num("max-items", 0usize)?),
         },
         publish_every: Duration::from_secs(f.num("publish-secs", 60u64)?),
+        claim: Duration::from_secs(f.num("claim-secs", crate::claims::CLAIM_SECS)?.max(1)),
     };
     let bm = run(&o)?;
     crate::log!(
@@ -211,6 +218,7 @@ pub fn run(o: &Options) -> Result<BlobManifest> {
         jobs: o.jobs,
         publish_every: o.publish_every,
         rate: o.rate,
+        claim: o.claim,
     };
     let sizes = SizeOf {
         said: "the sizes table says",
