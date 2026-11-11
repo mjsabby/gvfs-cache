@@ -1757,58 +1757,58 @@ on this host, interleaved and repeated; none is to be set beside an earlier sect
 
 | # | Finding | Fixed | Measured |
 |---|---|---|---|
-| C1 | Whoever can push can make ids that no seed of the index's hash places: 2,400 blobs in one commit (41M SHA-1 trials) failed L0 ingest on every poll, every pipeline run from then on, and a fresh genesis | `bd0acd9` | The seed is derived from the ids once the fixed ones fail. The push is ingested and sealed; indexes of ordinary ids are byte-identical |
-| C2 | A client can pick existing ids that share a window of the POST dedupe set: 48,000 of SearchGold's took 0.84–0.89 s where 48,000 others take 0.04 s | `f3fe707`, `6ce7329` | A keyed hash places ids: 0.033–0.039 s |
-| C3 | A single blob's POST answer held its arena until the client had read it: with one arena, the next request got 503 after 10 s | `3f10b8f` | The arena goes back first |
-| C4 | A request waiting for a plan held a thread: 700 cold prefetches at start made 522 threads and a `/gvfs/config` beside them wait 5.5 s | `83e28e1` | Tasks: 13 threads, 14–23 ms |
-| C5 | The proxy's cache was bounded in bytes, and held a descriptor and a mapping per pack: under a limit of 1,024, fetch 1,010 and every later one failed (EMFILE) | `3041c3f`, `761fee3` | `--proxy-cache-packs`; packs up to 16 KiB stay in memory: 1,200 fetches hold 16 descriptors, and their first pass takes 3.6 s, not 11.1 |
-| C6 | The weekly rebuild ran whenever asked: two runs left two "weeks" of three objects, and every older client got the cold pack | `439da45` | It waits six days from the last week's end (`--weekly always` forces one) |
-| C7 | Garbage collection went by a file's age and deleted unconditionally: what a run dropped went seconds after the manifest that listed it (an edge on that manifest did not start), and an upload could be deleted under the run that made it | `1eb9eb5`, `ea63aad`, `70fca31` | An upload replaces; `gc.bin` notes a file when a pass first finds it unlisted, and it is deleted a grace period later if it is still that file. What a killed writer leaves in a directory store goes the same way (a weekly run killed while it copied its baseline left a file of the baseline's size, for good) |
-| C8 | One failed `/gvfs/config` probe made the upstream "not GVFS" for the life of the process | `9b08ada` | Only a definite answer is kept |
-| C9 | One commit dated in the future emptied the retained slabs, or kept every one | `764145f` | Retention ages against the earlier of the newest stamp and the clock, and is capped in count |
-| C10 | A window's blobs were copied one at a time and published after the last: a run cut short left them all unlisted, and runs that overlapped each copied all | `f32dcf6`, `990fc4a` | The mirror's loop: 32 blobs of 16 MiB in 2.4 s with four jobs, not 8.8; a killed run's successor fetches 17–20, not 32. Runs that copy at once claim their blobs in `claims.bin`: two runs of that window fetch 32 between them (it was 64, then 43 to 62), and two mirrors each blob once, not twice |
-| C11 | The indexer believed a pack's headers: an 81-byte pack that declares 1 TiB aborted the process; a REF delta on an id held twice never returned | `ac96607`, `efc6cc3`, `2aee867` | Declared sizes are checked before a buffer is sized; a REF delta is resolved once; of an id's copies the shortest chain is kept |
-| C12 | `commitDepth` was honoured to 1,000: a 77-byte request cost 12.5 s of CPU on RepoB | `9b64a91` | `--max-commit-depth`, 16 by default: 1.3 s |
+| C1 | Whoever can push can make ids that no seed of the index's hash places: 2,400 blobs in one commit (41M SHA-1 trials) failed L0 ingest on every poll, every pipeline run from then on, and a fresh genesis | `362bc2e` | The seed is derived from the ids once the fixed ones fail. The push is ingested and sealed; indexes of ordinary ids are byte-identical |
+| C2 | A client can pick existing ids that share a window of the POST dedupe set: 48,000 of SearchGold's took 0.84–0.89 s where 48,000 others take 0.04 s | `3c090b8`, `09216ff` | A keyed hash places ids: 0.033–0.039 s |
+| C3 | A single blob's POST answer held its arena until the client had read it: with one arena, the next request got 503 after 10 s | `8f5380e` | The arena goes back first |
+| C4 | A request waiting for a plan held a thread: 700 cold prefetches at start made 522 threads and a `/gvfs/config` beside them wait 5.5 s | `66bce8d` | Tasks: 13 threads, 14–23 ms |
+| C5 | The proxy's cache was bounded in bytes, and held a descriptor and a mapping per pack: under a limit of 1,024, fetch 1,010 and every later one failed (EMFILE) | `1f5271d`, `6550664` | `--proxy-cache-packs`; packs up to 16 KiB stay in memory: 1,200 fetches hold 16 descriptors, and their first pass takes 3.6 s, not 11.1 |
+| C6 | The weekly rebuild ran whenever asked: two runs left two "weeks" of three objects, and every older client got the cold pack | `d0ecbc5` | It waits six days from the last week's end (`--weekly always` forces one) |
+| C7 | Garbage collection went by a file's age and deleted unconditionally: what a run dropped went seconds after the manifest that listed it (an edge on that manifest did not start), and an upload could be deleted under the run that made it | `8bff01f`, `b7f1056`, `688fc52` | An upload replaces; `gc.bin` notes a file when a pass first finds it unlisted, and it is deleted a grace period later if it is still that file. What a killed writer leaves in a directory store goes the same way (a weekly run killed while it copied its baseline left a file of the baseline's size, for good) |
+| C8 | One failed `/gvfs/config` probe made the upstream "not GVFS" for the life of the process | `0524099` | Only a definite answer is kept |
+| C9 | One commit dated in the future emptied the retained slabs, or kept every one | `2286910` | Retention ages against the earlier of the newest stamp and the clock, and is capped in count |
+| C10 | A window's blobs were copied one at a time and published after the last: a run cut short left them all unlisted, and runs that overlapped each copied all | `5c049ea`, `7aaa131` | The mirror's loop: 32 blobs of 16 MiB in 2.4 s with four jobs, not 8.8; a killed run's successor fetches 17–20, not 32. Runs that copy at once claim their blobs in `claims.bin`: two runs of that window fetch 32 between them (it was 64, then 43 to 62), and two mirrors each blob once, not twice |
+| C11 | The indexer believed a pack's headers: an 81-byte pack that declares 1 TiB aborted the process; a REF delta on an id held twice never returned | `8ce77f4`, `e9e41b5`, `83f3ae3` | Declared sizes are checked before a buffer is sized; a REF delta is resolved once; of an id's copies the shortest chain is kept |
+| C12 | `commitDepth` was honoured to 1,000: a 77-byte request cost 12.5 s of CPU on RepoB | `ab97ea5` | `--max-commit-depth`, 16 by default: 1.3 s |
 
 **Performance and memory.**
 
 | # | Finding | Fixed | Measured |
 |---|---|---|---|
-| P1 | A POST batch read each record and each entry cold, one at a time | `b79f850` | Asked for ahead: 7 to 20% less CPU per 4,000-id POST |
-| P2 | A block cache hit cost 3.8 µs for 300 bytes: the cache's lock twice, the block's file opened, read and closed, a buffer zeroed, a boxed future. A miss sent nothing until its window of up to 32 MiB had been fetched | `57785bd`, `cd7b150`, `4c12595`, `498c8b1` | A hit is a copy from a mapped block, or `sendfile(2)`: 0.03 µs. A POST of 4,000 blobs from Azurite 33.5 → 8.0 ms and 13,077 → 53 system calls, as from a directory store. A block that is not cached is fetched by a task of its own and sent as it arrives: from a store that gives 50 MB/s, a 20 KB blob at the start of its block in 6.9 ms, not 89, and 30 MiB to a client as fast as the store in 0.63 s, not 1.26 |
-| P3 | A sizes request computed each slot twice and parsed hex a digit at a time; a blob probed every segment | `e1f909b`, `e12d287` | 13% less CPU on SearchGold, 27% on RepoB |
-| P4 | A deltified loose object is rebuilt and deflated again: 101 µs a tree | `9378793` | `--loose-deltas stored-trees` sends it in stored blocks: 55 µs, 9.8 KB for 5.8 (off by default) |
-| P5 | An idle edge read the manifest and `blobs.bin` at every poll, and the whole ref advertisement of a v0 upstream (10.2 MB for SearchGold's 82,779 refs); a run that changed nothing published | `5ceaaa4`, `1bb878c`, `6ed664b` | Conditional polls on a kept connection: 30 connections and 28,680 bytes in 30 s → none and 9,540. A v0 poll reads to its branch's line: 4.8 MB/s → 73 KB/s. A no-op run publishes nothing |
-| P6 | The cold plan's `.idx` took 5.5 s, at every start and for every view | `08ac959`, `1f4a9ad` | 1.3 s; a view that only has a new `blobs.bin` keeps its plans. Not done: the cold answer as two packs |
-| P7 | Azure DevOps sends a single object loose, and it was inflated, deflated at level 6 and inflated again: 43–55 MiB/s a copy, on the request's own worker at the edge | `c6bff9b` | Inflated once, by the sink: 380–405 MiB/s for a blob that does not compress; the edge's other requests wait 3.5 ms at most, not 512 |
-| P8 | Pass 2 of the indexer listed its roots on one thread: 3.1 s of 8.5 | `3c5054a`, `fa231d6` | SearchGold's clone pack in 5.6 s, not 8.2 |
-| P9 | A small GET armed a timer and formatted its head through `core::fmt` | `e7a02a7` | 2 to 4% less CPU |
-| P10 | The localhost proxy started with an edge's arenas: 2,023 MB on 32 cores | `4d36c00` | `--profile proxy`: 73 MB |
-| P11 | Every edge downloaded every weekly baseline: 2.6 GB of pack and 375 MB of index for SearchGold | `0ebbedb`, `23bb70a` | The run publishes what the new pack and index hold after the old ones: 0.63 MB. The edge makes both, the index in 2.4 s |
-| P12 | Genesis of a separate store asked for blob sizes one request at a time: 102 s of 143 | `902cd19` | Eight at a time: 10 s of 44 |
-| P13 | Whether an index was mapped with 2 MiB pages was luck (none to nearly all of it) | `ec00d30` | `--index-pages huge`, and gauges that say: sizes 7 to 11% cheaper |
-| P14 | A warm client's pack was written from the heap: half the CPU zeroed socket pages | `b7bf310` | A memfd and `sendfile(2)`: 56 to 83% less CPU per warm prefetch |
-| M1 | Each indexer thread kept a buffer per level of a delta chain: 8.1 GiB for SearchGold's baseline at 32 threads | `1371694` | Two buffers a chain: 2.1 GiB, and 2.7 s for 4.1 |
+| P1 | A POST batch read each record and each entry cold, one at a time | `1471f61` | Asked for ahead: 7 to 20% less CPU per 4,000-id POST |
+| P2 | A block cache hit cost 3.8 µs for 300 bytes: the cache's lock twice, the block's file opened, read and closed, a buffer zeroed, a boxed future. A miss sent nothing until its window of up to 32 MiB had been fetched | `3e1a6de`, `5b9687b`, `946e3aa`, `0c7ebc0` | A hit is a copy from a mapped block, or `sendfile(2)`: 0.03 µs. A POST of 4,000 blobs from Azurite 33.5 → 8.0 ms and 13,077 → 53 system calls, as from a directory store. A block that is not cached is fetched by a task of its own and sent as it arrives: from a store that gives 50 MB/s, a 20 KB blob at the start of its block in 6.9 ms, not 89, and 30 MiB to a client as fast as the store in 0.63 s, not 1.26 |
+| P3 | A sizes request computed each slot twice and parsed hex a digit at a time; a blob probed every segment | `a5321e0`, `d1b9edf` | 13% less CPU on SearchGold, 27% on RepoB |
+| P4 | A deltified loose object is rebuilt and deflated again: 101 µs a tree | `8866cdc` | `--loose-deltas stored-trees` sends it in stored blocks: 55 µs, 9.8 KB for 5.8 (off by default) |
+| P5 | An idle edge read the manifest and `blobs.bin` at every poll, and the whole ref advertisement of a v0 upstream (10.2 MB for SearchGold's 82,779 refs); a run that changed nothing published | `bd400cd`, `a918110`, `804ae47` | Conditional polls on a kept connection: 30 connections and 28,680 bytes in 30 s → none and 9,540. A v0 poll reads to its branch's line: 4.8 MB/s → 73 KB/s. A no-op run publishes nothing |
+| P6 | The cold plan's `.idx` took 5.5 s, at every start and for every view | `6f12d0e`, `80fb2fc` | 1.3 s; a view that only has a new `blobs.bin` keeps its plans. Not done: the cold answer as two packs |
+| P7 | Azure DevOps sends a single object loose, and it was inflated, deflated at level 6 and inflated again: 43–55 MiB/s a copy, on the request's own worker at the edge | `1e74126` | Inflated once, by the sink: 380–405 MiB/s for a blob that does not compress; the edge's other requests wait 3.5 ms at most, not 512 |
+| P8 | Pass 2 of the indexer listed its roots on one thread: 3.1 s of 8.5 | `b056c29`, `b70d720` | SearchGold's clone pack in 5.6 s, not 8.2 |
+| P9 | A small GET armed a timer and formatted its head through `core::fmt` | `c45fb8c` | 2 to 4% less CPU |
+| P10 | The localhost proxy started with an edge's arenas: 2,023 MB on 32 cores | `f26a5c9` | `--profile proxy`: 73 MB |
+| P11 | Every edge downloaded every weekly baseline: 2.6 GB of pack and 375 MB of index for SearchGold | `cbf7a49`, `a391564` | The run publishes what the new pack and index hold after the old ones: 0.63 MB. The edge makes both, the index in 2.4 s |
+| P12 | Genesis of a separate store asked for blob sizes one request at a time: 102 s of 143 | `cdccdd4` | Eight at a time: 10 s of 44 |
+| P13 | Whether an index was mapped with 2 MiB pages was luck (none to nearly all of it) | `ac795dd` | `--index-pages huge`, and gauges that say: sizes 7 to 11% cheaper |
+| P14 | A warm client's pack was written from the heap: half the CPU zeroed socket pages | `c863b54` | A memfd and `sendfile(2)`: 56 to 83% less CPU per warm prefetch |
+| M1 | Each indexer thread kept a buffer per level of a delta chain: 8.1 GiB for SearchGold's baseline at 32 threads | `8b03fc1` | Two buffers a chain: 2.1 GiB, and 2.7 s for 4.1 |
 
 **Smaller findings**, all fixed: an ingest that fails is retried with a growing wait
-(`fe7d9d6`); a poll that fails changes nothing (`fdad50a`); a slab's files are checked
-against the manifest (`e0caacf`); the store is followed on a thread of its own, so a
-baseline that is being downloaded does not stop the upstream's polls (`986f68b`); a store
-made anew is followed (`f3da2ee`); a collection that fails does not fail a run that has
-published (`c4a78df`); `--rate-mbps` caps the rate, where a 15-minute pause had left 450 GB
-of credit (`986e1f8`); the blob copier bounds padded streams, refuses a pack of more
-entries than blobs asked for, and chooses stored blocks by content (`b6e31ef`, `de148c5`,
-`6652617`); cache pruning removes only its own downloads (`3d331e1`, `e513d54`); readers
+(`4fc7b33`); a poll that fails changes nothing (`10a4a40`); a slab's files are checked
+against the manifest (`b083ab1`); the store is followed on a thread of its own, so a
+baseline that is being downloaded does not stop the upstream's polls (`89b36c4`); a store
+made anew is followed (`d499a4e`); a collection that fails does not fail a run that has
+published (`f6fe59c`); `--rate-mbps` caps the rate, where a 15-minute pause had left 450 GB
+of credit (`8a41fc5`); the blob copier bounds padded streams, refuses a pack of more
+entries than blobs asked for, and chooses stored blocks by content (`5ad25d8`, `849aca2`,
+`0912691`); cache pruning removes only its own downloads (`10e6906`, `8e12a69`); readers
 that wait for a fetch fail with it, and the runs fetched before a failed one are kept
-(`f9a5513`, `f6acf36`); a retry takes a new connection (`fa9904e`); a response that breaks
-off is asked for again from where it broke (`87c3b64`); a local `upload-pack`'s stderr is
-drained as it runs (`c13a5f9`); a zero-padded directory mode is a directory (`d002090`);
-one file that goes while a store is listed does not end the listing (`bcf909e`); a client
-exactly at the warm floor is warm (`2b778b0`). Four statements of the documents that the
-code did not bear out are corrected (`abcf8e9`).
+(`0041d66`, `e95aba8`); a retry takes a new connection (`f0bd393`); a response that breaks
+off is asked for again from where it broke (`dee3db2`); a local `upload-pack`'s stderr is
+drained as it runs (`25fb69b`); a zero-padded directory mode is a directory (`1cf7f2f`);
+one file that goes while a store is listed does not end the listing (`af312d4`); a client
+exactly at the warm floor is warm (`f29c6fb`). Four statements of the documents that the
+code did not bear out are corrected (`410facb`).
 
-**End to end.** CPU of the edge per request, the build before the batch against `cd7b150`,
-two interleaved rounds each (the mean; µs unless marked). The commits after `cd7b150`
+**End to end.** CPU of the edge per request, the build before the batch against `5b9687b`,
+two interleaved rounds each (the mean; µs unless marked). The commits after `5b9687b`
 change nothing these requests run (the block cache's miss path, the weekly tail's index,
 the pipeline's copies and collections):
 
