@@ -2239,6 +2239,7 @@ pub fn metrics_text(ctx: &Ctx) -> String {
          gvfs_blob_cache_bypass_total {}\n\
          gvfs_blob_cache_bytes {}\n\
          gvfs_blob_cache_blocks {}\n\
+         gvfs_blob_cache_fetching {}\n\
          gvfs_proxy_cache_packs {}\n\
          gvfs_proxy_cache_files {}\n\
          gvfs_proxy_cache_bytes {}\n\
@@ -2287,6 +2288,7 @@ pub fn metrics_text(ctx: &Ctx) -> String {
         ctx.blob_cache.as_ref().map_or(0, |c| get(&c.bypassed)),
         blocks.1,
         blocks.0,
+        ctx.blob_cache.as_ref().map_or(0, |c| c.fetching()),
         proxied.0,
         proxied.1,
         proxied.2,

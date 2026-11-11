@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::Notify;
 
-use super::blobcache::{Attempt, Block, BlockCache, Pack, Reader};
+use super::blobcache::{Attempt, Block, BlockCache, Flush, Pack, Reader};
 use super::view::Ahead;
 use crate::blobs::{BlobManifest, BlobRec, Segment, pack_key};
 use crate::blobstream::{BlobSink, FileSpool};
@@ -174,7 +174,7 @@ impl BlobPack {
     /// through the block cache when there is one, else a ranged GET per
     /// [`super::blobcache::WINDOW`] blocks). Pass whole ranges, or all that is left of
     /// one: the cache decides by a read's length, and fetches a window at a time.
-    pub async fn read<S: crate::store::Sink>(&self, at: u64, len: u64, sink: &mut S) -> Result<()> {
+    pub async fn read<S: Flush>(&self, at: u64, len: u64, sink: &mut S) -> Result<()> {
         if let Some(b) = self.bytes() {
             return sink
                 .put(sub(b, us(at), us(len)).ctx("blob pack range")?)

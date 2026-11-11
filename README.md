@@ -284,8 +284,10 @@ Two more tools work on slabs directly:
   (`gvfs_proxy_cache_{packs,files,bytes}`: small ones in memory, larger ones as files,
   within `--proxy-cache-mib` and `--proxy-cache-packs`);
 * **blob packs in object storage:** the edge's block cache
-  (`gvfs_blob_cache_{hits,misses,fetches,bypass}_total`, `gvfs_blob_cache_bytes`, and
-  `gvfs_blob_cache_blocks`: each cached block is a file the edge keeps open and mapped);
+  (`gvfs_blob_cache_{hits,misses,fetches,bypass}_total`, `gvfs_blob_cache_bytes`,
+  `gvfs_blob_cache_blocks`: each cached block is a file the edge keeps open and mapped;
+  and `gvfs_blob_cache_fetching`: the fetches in flight, 64 at most, which reads of blocks
+  that are not cached follow as they arrive);
   size it with `--blob-cache-mib` (default 32 GiB; the edge keeps fewer blocks than that
   holds, and says so at start, where its descriptor limit is under 524,288).
 

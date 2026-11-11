@@ -547,15 +547,28 @@ impl crate::store::Sink for ToClient<'_, '_, '_, '_> {
         if let Some(h) = self.hash.as_deref_mut() {
             hash_into(h, piece, self.budget).await;
         }
-        match self.out.bytes(piece).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                let err = crate::err!("sending to the client: {e}");
-                self.failed = Some(e);
-                Err(err)
-            }
-        }
+        sent(self.out.bytes(piece).await, &mut self.failed)
     }
+}
+
+impl super::blobcache::Flush for ToClient<'_, '_, '_, '_> {
+    /// The read waits for the store: what the response's buffer holds leaves meanwhile.
+    async fn flush(&mut self) -> crate::util::Result<()> {
+        sent(self.out.flush().await, &mut self.failed)
+    }
+}
+
+/// How a write to a client ended, for the read whose bytes they were: the client's
+/// error is kept in `failed` ([`client_or_store`]).
+fn sent(
+    wrote: std::io::Result<()>,
+    failed: &mut Option<std::io::Error>,
+) -> crate::util::Result<()> {
+    wrote.map_err(|e| {
+        let err = crate::err!("sending to the client: {e}");
+        *failed = Some(e);
+        err
+    })
 }
 
 /// The zlib stream of a blob entry in object storage going to a client as a loose
@@ -616,12 +629,8 @@ impl crate::store::Sink for LooseStream<'_, '_> {
         let body_end = self.zlen.saturating_sub(4);
         let to_body = us(body_end.saturating_sub(self.seen)).min(piece.len());
         let (body, tail) = piece.split_at(to_body);
-        if !body.is_empty()
-            && let Err(e) = self.out.bytes(body).await
-        {
-            let err = crate::err!("sending to the client: {e}");
-            self.failed = Some(e);
-            return Err(err);
+        if !body.is_empty() {
+            sent(self.out.bytes(body).await, &mut self.failed)?;
         }
         for (i, &byte) in tail.iter().enumerate() {
             let at = self
@@ -635,6 +644,13 @@ impl crate::store::Sink for LooseStream<'_, '_> {
         }
         self.seen = self.seen.saturating_add(u64_of(piece.len()));
         Ok(())
+    }
+}
+
+impl super::blobcache::Flush for LooseStream<'_, '_> {
+    /// The read waits for the store: what has begun of the response leaves meanwhile.
+    async fn flush(&mut self) -> crate::util::Result<()> {
+        sent(self.out.flush().await, &mut self.failed)
     }
 }
 
