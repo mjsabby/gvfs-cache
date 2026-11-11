@@ -754,6 +754,8 @@ store/
                           genesis commit, whether the history is mirrored
   blobs/<id>.pack         whole blobs (a stock git pack, never deltas)
   blobs/<id>.bidx         segment: PTHash MPHF + 48-byte records over one or more packs
+  claims.bin              the blobs that runs are copying now, by run, and until when each
+                          run's claim holds (compare-and-swap)
   gc.bin                  as for every store: also what `blobs.bin` no longer lists
 ```
 
@@ -839,28 +841,21 @@ the mirror.
   at least every `--publish-secs` (default 60); a rate limit waited out; an item tried
   three times. A run that stops before its last blob (its runner's time limit, an item
   that failed) keeps what it published: the next run copies what `blobs.bin` still
-  lacks, then seals. The slab goes out only once `blobs.bin`, read again after the copy,
-  lists every blob the window needs, whoever copied it. (The copy took one blob at a time
-  and published once, after the last: a window that outlived its runner left every pack
-  unlisted, and each run began again. A window of 32 blobs of 16 MiB from an upstream
-  that sends each at 64 MiB/s: 8.8 s one at a time, 2.5 s with four jobs; a run killed
-  after 16 of them left the next one all 32 to fetch, and now, at `--publish-secs 1`,
-  the 17 to 20 it had not published.)
+  lacks (what the run that stopped had claimed, once that claim has lapsed: next
+  section), then seals. The slab goes out only once `blobs.bin`, read again after the
+  copy, lists every blob the window needs, whoever copied it. (The copy took one blob at
+  a time and published once, after the last: a window that outlived its runner left every
+  pack unlisted, and each run began again. A window of 32 blobs of 16 MiB from an
+  upstream that sends each at 64 MiB/s: 8.8 s one at a time, 2.5 s with four jobs; a run
+  killed after 16 of them left the next one all 32 to fetch, and now, at
+  `--publish-secs 1`, the 17 to 20 it had not published.)
 * **Runs that overlap share a window** (the next quarter's run starts while this one
-  copies; both plan the same items). Each takes the items in an order of its own and
-  reads `blobs.bin` again at each of its publishes, leaving out what the other has
-  listed. A blob is copied twice only when both took it before either had published it
-  and the other read that: what the runs copy in about two publish intervals and an
-  item's time, a few times over the copy (the last items always). Two runs at once of a
-  window of 256 blobs, half a second each, `--jobs 4 --publish-secs 1`: 299 to 303
-  fetched in 20 s, where two serial runs fetched 512 in 134 s. A window that lasts no
-  longer than those intervals is still copied by each (32 blobs in 2.5 s: 59 to 62
-  fetched). In one order each run takes an item while the other is still copying it,
-  to the last one: every blob twice, as measured, however often they publish. A blob
-  listed twice is found once; its other copy is wasted bytes, which nothing reclaims
-  (Limits). Neither run fails the other: `blobs.bin` is swapped with retries, a fold
-  gives way to another writer, and of two manifests one wins: the other run starts
-  over, finds the window sealed and publishes nothing.
+  copies; both plan the same items). Each claims the blobs it copies and leaves alone
+  what the other has claimed, so each blob is copied by one of them, and both copy
+  (Runs that copy at once, below). Neither run fails the other: `blobs.bin` and
+  `claims.bin` are swapped with retries, a fold gives way to another writer, and of two
+  manifests one wins: the other run starts over, finds the window sealed and publishes
+  nothing.
 * **The manifest names the `blobs.bin` generation** the run computed its copies against,
   or the one it read after its copy, which lists them all, even when it copied nothing:
   a run that died after publishing `blobs.bin` left the blobs the next run's trees rely
@@ -871,6 +866,86 @@ the mirror.
   of a slab the manifest dropped) is noted in `gc.bin` by the first run that finds it
   so, and deleted `--gc-grace-secs` later, as slab files are: an edge that has read the
   `blobs.bin` from before a fold still finds its segments.
+
+### Runs that copy at once (`src/claims.rs`)
+
+Two runs of one window, two mirrors, a mirror and a window: each plans the blobs the
+store lacks. So that each blob is copied once, a run claims what it copies in
+`claims.bin`, at the store's root: an entry per run, with the ids of the blobs of the
+items it is copying or about to, and the time until which the claim holds (`until`: the
+run's clock plus `--claim-secs`, default 120). It is one object, replaced by
+compare-and-swap, and claims are compared by blob id: runs plan different items (a batch
+of small blobs is cut by what the store lists when its run plans, and a later run's
+window may be longer), so an object per item would tell two runs apart only where they
+planned alike.
+
+* **Before a job gets an item**, the run takes of the item the blobs that are neither
+  listed nor in another run's claim, by `claims.bin` and `blobs.bin` as it read them,
+  in that order, and writes `claims.bin` with them in its own claim, on condition that
+  it is still the object the run has (`If-Match`; `If-None-Match` for the first).
+  Refused, because another run wrote first, it reads both again, in that order.
+* **A pack's blobs leave the claim once the pack is published** in `blobs.bin`, never
+  before. So a blob leaves the claims only when it is listed, and a run that reads the
+  claims before the listing finds a blob whose claim has been given up listed. Any
+  other order leaves a gap: run A reads `blobs.bin` (X is not listed); run B claims X,
+  copies it, publishes it and gives up its claim; A reads `claims.bin` (no claim has X,
+  and nothing is written after), claims X and copies it a second time. Every write
+  carries a number of its own, so that a `claims.bin` with the claims it had before is
+  another object in a directory too, where an object's etag is a hash of its bytes.
+* **What another run's claim holds** the run passes over. Once through its items it
+  goes back to those blobs: one that is listed by then is done; one still claimed is
+  waited for; one that is neither (that run failed, or died) this run claims and
+  copies. It looks at once, a quarter of a second later, then after twice as long each
+  time nothing has changed, up to two seconds: two conditional reads, answered without
+  the objects while they are the same. What its own jobs have finished it publishes
+  then, without waiting for `--publish-secs`: the other run may be waiting likewise.
+  The last check is as it was: the slab goes out (the history counts as mirrored) only
+  once `blobs.bin`, read again, lists every blob, whoever copied it.
+* **A claim lapses unless its run writes it again**, which it does with each claim it
+  makes or gives up, and at least every third of `--claim-secs`. A run that is killed
+  stops writing: `--claim-secs` later at most the others take its blobs, and a run
+  started at once in its place copies the rest of the window, then waits for that. A
+  run whose copy fails gives up the claims of the item that failed and of those no job
+  had begun at once, and the rest as it ends: nobody waits for a run that ended.
+* **Claiming costs a run that copies alone one write per claim.** It writes on the etag
+  of its own last write, which is refused only if another run has written since: then,
+  and at its first claim, it reads. It claims ahead of its jobs: when fewer items are
+  claimed and not begun than it has jobs, the next ones, up to four per job, 256 MiB in
+  one claim and 4,096 blobs claimed and not begun (an item at least), so that a job
+  that ends an item finds the next one claimed. A window of 32 blobs of 16 MiB into a
+  store in Azurite: 114 requests to the store before, 120 with four jobs (one read of
+  `claims.bin`, four writes, one more read of `blobs.bin`) and 125 with one job (nine
+  writes); claiming an item per job ahead, 138 to 142 and 149. 256 blobs of 1 MiB,
+  four jobs: 274 before, 297.
+* **Clocks.** `until` is by the claimant's clock, compared with the reader's (the
+  system's, whatever `--now` says). A claim has between two thirds of `--claim-secs`
+  and all of it to go, so a reader more than 80 s ahead may take a claim that holds for
+  lapsed; and a claim that would hold for more than twice the time it was made for is
+  from a clock that far ahead and is not believed (were its run to die, it would hold
+  the others up for as long as that clock is ahead). Either costs a second copy of
+  those blobs, as every overlap did before, never a wrong store: what `blobs.bin` lists
+  is content verified by its id, whoever copied it.
+
+`claims.bin` is `"GVDCLAM1" | version u32 | nonce u64 | count u32 | (run u64 | until u64
+| secs u32 | blobs u32 | id[20]*)* | SHA-256`: 24 bytes a run and 20 a blob claimed
+(blobs of 16 MiB, four jobs: 20 of them, under 1 KiB; packs of 100,000 small blobs: five
+packs, 10 MB). Every write is of the whole object. One that does not
+decode counts as empty and is written anew. Edges never read it, and garbage collection
+lists `slabs/` and `blobs/` only. `gvfs-cache inspect manifest` says how many blobs are
+claimed, and until when.
+
+Measured against an upstream that answers as Azure DevOps does, each answer paced
+(`--publish-secs 1`, a directory store), two runs started together, three times each:
+
+| | blobs fetched, before | now | seconds, before | now |
+|---|---|---|---|---|
+| a window of 32 blobs of 16 MiB (0.25 s each), `--jobs 1` | 43 to 46 | 32 | 6.1 to 6.6 | 5.0 to 5.1 |
+| the same, `--jobs 4` | 60 | 32 | 2.5 | 1.8 to 1.9 |
+| a window of 256 blobs of 1 MiB (0.5 s each), `--jobs 4` | 297 to 305 | 256 | 20.3 to 20.9 | 17.4 to 18.5 |
+| two mirrors of those 256 and a README, `--jobs 4` | 514 | 257 | 33.8 to 34.0 | 18.2 to 18.3 |
+
+One run alone takes as long as it did (8.8 s, 2.5 to 2.6 s and 34 s for the three
+windows).
 
 ### Copying blobs (`src/blobstream.rs`, `src/blobcopy.rs`)
 
@@ -939,13 +1014,14 @@ first tree naming each blob is stored (an upstream writes trees newest commit fi
 commit's in path order). `--jobs` copies run in parallel, finished packs are published
 every `--publish-secs` (`separate::copy_all`, the loop a pipeline run's window goes
 through too), `--rate-mbps` paces all copies through one throttle, and
-`--max-items` seeds in slices. Before each pack, blobs that pipeline runs copied meanwhile
-are left out (the index is reloaded after each publish), and every copied blob's size is
-checked against the sizes table clients were given. The run that copies the last item
-checks that every blob is listed and records `blobs.bin` as mirrored: edges serve from
-then on. A restart re-plans and skips what was published; a killed run's unpublished
-uploads are never listed and GC removes them (tested by `SIGKILL` at several points). The
-throttle is a token bucket, so `--rate-mbps` caps the rate, not the average since the
+`--max-items` seeds in slices. Before each pack its blobs are claimed (Runs that copy at
+once): those that a pipeline run or another mirror has copied meanwhile, or is copying,
+are left out, and every copied blob's size is checked against the sizes table clients
+were given. The run that copies the last item checks that every blob is listed and
+records `blobs.bin` as mirrored: edges serve from then on. A restart re-plans and skips
+what was published; a killed run's unpublished uploads are never listed and GC removes
+them, and its claim lapses `--claim-secs` later (tested by `SIGKILL` at several points).
+The throttle is a token bucket, so `--rate-mbps` caps the rate, not the average since the
 start: a pause (a 429 waited out) earns a quarter of a second of credit, not its length.
 
 **Repair is on demand.** Nothing repairs a store by itself: once mirrored there is nothing
@@ -1159,7 +1235,12 @@ not the hot path's).
   an id that is no blob which pays for the other kind: a commit, a tree or an id the store
   lacks first misses the biggest segment's index and each smaller one's filter.
 * No reachability GC of blob packs (blobs of force-pushed-away commits stay, and so does
-  the second copy of a blob that two overlapping runs both copied).
+  the second copy of a blob that two runs both copied: runs that copy at once claim
+  their blobs, so that takes a claim that lapsed with its run alive, clocks more than
+  80 s apart, or a build from before `claims.bin`).
+* A run that is killed while it copies holds its claim for `--claim-secs` more (default
+  120): a run started at once in its place copies the rest, and waits that long for the
+  items the dead run had claimed (those its jobs were in, and up to four more per job).
 * A copy has `--gc-grace-secs` from the first garbage collection that sees one of its
   packs unlisted to the `blobs.bin` that lists it. The mirror and a window publish every
   `--publish-secs`, far inside it. A copy that could not publish for longer than that

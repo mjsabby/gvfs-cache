@@ -54,8 +54,8 @@
 //!   their blobs. The copy is the mirror's ([`crate::separate::copy_all`]): `--jobs` blobs
 //!   at a time, and what is copied published at least every `--publish-secs`, so that a
 //!   run cut short (a runner's time limit, an item that failed) keeps it: the next run
-//!   copies what `blobs.bin` still lacks, then seals. Runs that overlap take the items
-//!   in orders of their own and leave out what another has published. Until the mirror
+//!   copies what `blobs.bin` still lacks, then seals. Runs that overlap claim what they
+//!   copy ([`crate::claims`]): each blob is copied by one of them. Until the mirror
 //!   has finished, old versions are the mirror's to copy, except those the new tip has,
 //!   within one blob pack's bytes, so that a tip the mirror has copied stays whole.
 //! * Rollups and weekly rebuilds union their parts' sizes tables.
@@ -107,6 +107,9 @@ pub struct Options {
     /// `--blobs separate`: a window's copied blob packs are published at least this often
     /// (`--publish-secs`).
     pub publish_every: std::time::Duration,
+    /// `--blobs separate`: how long the run's claim on the blobs it is copying holds
+    /// without the run writing it again (`--claim-secs`, [`crate::claims`]).
+    pub claim: std::time::Duration,
 }
 
 /// How long after a week's end the next weekly rebuild is due: a day less than a week, so
@@ -226,6 +229,7 @@ pub fn main(args: &[String]) -> Result<()> {
             "cache-dir",
             "jobs",
             "publish-secs",
+            "claim-secs",
         ],
     )?;
     let work_dir = f
@@ -274,6 +278,9 @@ pub fn main(args: &[String]) -> Result<()> {
             .unwrap_or_else(|| work_dir.join("gvfs-cache-store-cache")),
         jobs: f.num("jobs", 4usize)?.max(1),
         publish_every: std::time::Duration::from_secs(f.num("publish-secs", 60u64)?),
+        claim: std::time::Duration::from_secs(
+            f.num("claim-secs", crate::claims::CLAIM_SECS)?.max(1),
+        ),
     };
     let (m, published) = run(&mut opts)?;
     if published {
@@ -647,6 +654,7 @@ fn window_separate(
         jobs: o.jobs,
         publish_every: o.publish_every,
         rate: None,
+        claim: o.claim,
     };
     let (published, copied) = crate::separate::copy_needed(
         &mut o.upstream,

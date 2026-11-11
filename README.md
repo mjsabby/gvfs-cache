@@ -145,7 +145,9 @@ Run one job every 15 minutes with the highest tier that is due:
   already in the store.
 * Concurrent runs are safe: the manifest is published with compare-and-swap, and the loser
   starts over. Runs of a `--blobs separate` store that overlap share a window's blobs:
-  each copies what the others have not published.
+  each claims the blobs it copies (`claims.bin`, beside the manifest), so each blob is
+  copied once, by one of them. A run that is killed holds its claim for `--claim-secs`
+  (default 120) more: the other runs take its blobs after that.
 * A run with nothing to do (no new commits, no rollup due) publishes nothing: the manifest
   keeps its generation and edges keep their views.
 
@@ -201,6 +203,7 @@ gvfs-cache pipeline --store "$STORE" --upstream "$ADO_URL" --auth-command ~/get_
 
 # The seed of the blobs: every blob of the history (the tip's first), resumable,
 # verified by id and size, published as it goes; edges report ready once it is done.
+# Mirrors run at once share the history: each blob is copied by one of them.
 gvfs-cache mirror --store "$STORE" --upstream "$ADO_URL" --auth-command ~/get_token \
     --jobs 16 [--rate-mbps 4000] [--max-items N]
 
@@ -387,6 +390,7 @@ src/gc.rs                  garbage collection of the store, at the end of each p
 src/mirror.rs              --blobs separate: the resumable seed (and on-demand repair) of the blob packs
 src/separate.rs            --blobs separate: what pipeline, mirror and edge share (sizes, blob index,
                            the parallel copy, the history's blobs, lost-object checks)
+src/claims.rs              --blobs separate: claims.bin, where runs that copy at once claim their blobs
 src/blobs.rs, sizes.rs     blob packs, segments, blobs.bin; sizes tables and the GSZ1 section
 src/blobstream.rs, blobcopy.rs   streaming whole-blob packs from upstream fetches; copy items, publish
 src/manifest.rs, store.rs, azure.rs    manifest.bin (CAS) and the fs / Azure stores

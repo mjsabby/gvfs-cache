@@ -618,6 +618,9 @@ struct SmartHttpState {
     /// `/gvfs/objects` requests being answered, and the most there have been at once.
     objects_in_flight: std::sync::atomic::AtomicUsize,
     objects_most: std::sync::atomic::AtomicUsize,
+    /// An object, and how many more `/gvfs/objects` requests that ask for it are answered
+    /// 500 ([`SmartHttp::objects_fail`]).
+    objects_failing: std::sync::Mutex<(String, usize)>,
 }
 
 pub const SMART_HTTP_PREFIX: &str = "/org/proj/_git/repo";
@@ -652,6 +655,7 @@ impl SmartHttp {
             objects_asked: Mutex::new(Vec::new()),
             objects_in_flight: AtomicUsize::new(0),
             objects_most: AtomicUsize::new(0),
+            objects_failing: Mutex::new((String::new(), 0)),
         });
         let (repo, shared) = (repo.to_path_buf(), state.clone());
         std::thread::spawn(move || {
@@ -730,6 +734,12 @@ impl SmartHttp {
         self.state
             .objects_most
             .swap(0, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Answers the next `n` `/gvfs/objects` requests that ask for the object `id` with a
+    /// 500: an object the upstream cannot send for a while.
+    pub fn objects_fail(&self, id: &str, n: usize) {
+        *self.state.objects_failing.lock().unwrap() = (id.to_string(), n);
     }
 }
 
@@ -893,6 +903,16 @@ fn smart_http_connection(
         {
             let ids = hex_ids(&body);
             state.objects_asked.lock().unwrap().push(ids.clone());
+            let refused = {
+                let mut failing = state.objects_failing.lock().unwrap();
+                let refused = failing.1 > 0 && ids.contains(&failing.0);
+                failing.1 -= usize::from(refused);
+                refused
+            };
+            if refused {
+                out.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")?;
+                continue;
+            }
             let at_once = state.objects_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             state.objects_most.fetch_max(at_once, Ordering::SeqCst);
             std::thread::sleep(Duration::from_millis(

@@ -377,6 +377,7 @@ fn main() {
         cache_dir: work.join("pipeline-cache"),
         jobs: 4,
         publish_every: std::time::Duration::from_secs(60),
+        claim: std::time::Duration::from_secs(gvfs_cache::claims::CLAIM_SECS),
     };
     let mut edge = Edge {
         store: Store::open(&store_spec, "").unwrap(),

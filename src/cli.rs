@@ -97,11 +97,17 @@ PIPELINE OPTIONS:
                                copied at least this often (default: 60); a run that
                                stops before its last blob keeps them, and the next
                                copies only what is still missing, then seals the slab
+    --claim-secs <N>           separate stores: how long a run's claim on the blobs it is
+                               copying holds without the run renewing it (default: 120).
+                               Runs that copy at once (two runs of one window, a mirror)
+                               leave each other's claimed blobs alone, so each blob is
+                               copied once; a run that died is waited for this long
 
 MIRROR OPTIONS:
     --jobs <N>                 parallel copies, one upstream connection each (default: 4)
     --blob-pack-mib <N>        as for the pipeline
     --publish-secs <N>         publish finished packs at least this often (default: 60)
+    --claim-secs <N>           as for the pipeline: two mirrors at once share the history
     --rate-mbps <N>            cap the combined download rate (megabits per second)
     --max-items <N>            stop after N packs (seed in slices; run again to continue)
     --work-dir, --threads      as for the pipeline

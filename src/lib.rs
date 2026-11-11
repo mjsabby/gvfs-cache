@@ -44,6 +44,7 @@ pub mod azure;
 pub mod blobcopy;
 pub mod blobs;
 pub mod blobstream;
+pub mod claims;
 pub mod manifest;
 pub mod mirror;
 pub mod store;

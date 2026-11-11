@@ -1380,8 +1380,10 @@ fn mirror_survives_being_killed() {
 
     let work = root.join("mirror-work");
     std::fs::create_dir_all(&work).unwrap();
+    let s = Store::open(&store, "").unwrap();
     // Two runs that publish only at the end (killed: their finished packs are uploaded
-    // but never listed), then one that publishes as it goes.
+    // but never listed), then one that publishes as it goes. Each starts once the claim
+    // of the one killed before it has lapsed: until then it would wait for those blobs.
     for (delay_ms, publish) in [(300u64, "3600"), (500, "3600"), (400, "0")] {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-cache"));
         cmd.args(["mirror", "--store", &store, "--upstream"])
@@ -1394,6 +1396,8 @@ fn mirror_survives_being_killed() {
                 "1",
                 "--rate-mbps",
                 "240",
+                "--claim-secs",
+                "1",
             ])
             .stderr(std::process::Stdio::null());
         gvfs_cache::upstream::hermetic_git_env(&mut cmd);
@@ -1401,8 +1405,11 @@ fn mirror_survives_being_killed() {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         let _ = child.kill();
         let _ = child.wait();
+        let holds = |c: &gvfs_cache::claims::Claim| c.holds(gvfs_cache::util::now_secs());
+        while gvfs_cache::claims::load(&s).unwrap().iter().any(holds) {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
-    let s = Store::open(&store, "").unwrap();
     let partial = blobcopy::load(&s).unwrap().0;
     assert!(!partial.complete(), "killed before the end");
     assert!(
@@ -2004,6 +2011,7 @@ fn a_manifest_names_the_blobs_generation_its_trees_need() {
         jobs: 1,
         publish_every: std::time::Duration::from_secs(60),
         rate: None,
+        claim: std::time::Duration::from_secs(gvfs_cache::claims::CLAIM_SECS),
     };
     let (bm, _) = blobcopy::load(&s).unwrap();
     let index = gvfs_cache::separate::BlobIndex::load(&s, &work, &bm).unwrap();
@@ -2616,6 +2624,25 @@ impl Window {
         self.http.objects_asked()[self.before..].concat()
     }
 
+    /// Waits until the upstream has been asked for `n` blobs since the push, with `run`
+    /// still at it.
+    fn until_asked(&self, n: usize, run: &mut std::process::Child) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while self.asked().len() < n {
+            assert!(run.try_wait().unwrap().is_none(), "the run ended by itself");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the run asked for no blobs"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// The claims in the store's `claims.bin`.
+    fn claims(&self) -> Vec<gvfs_cache::claims::Claim> {
+        gvfs_cache::claims::load(&Store::open(&self.store, "").unwrap()).unwrap()
+    }
+
     /// A 15m run of the pipeline on the store, to spawn or to wait for.
     fn pipeline(&self, extra: &[&str]) -> std::process::Command {
         let work = self.root.join("pipeline-work");
@@ -2668,9 +2695,10 @@ impl Window {
 /// A window's copy cut short (its run killed, as a runner's time limit does) keeps the
 /// blob packs it had published: `blobs.bin` lists them, and the manifest still ends at the
 /// old tip, so no tree names a blob the store lacks. The next run asks the upstream only
-/// for the blobs still missing, each once, then seals the window. (The copy published
-/// once, after its last blob: a run that stopped before that left every pack unlisted,
-/// and the next one began again.)
+/// for the blobs still missing, each once, then seals the window: those the dead run had
+/// claimed once its claim has lapsed (`--claim-secs`). (The copy published once, after
+/// its last blob: a run that stopped before that left every pack unlisted, and the next
+/// one began again.)
 #[test]
 fn a_window_cut_short_keeps_the_blobs_it_published() {
     let w = Window::new("sep-window-cut", 12);
@@ -2678,18 +2706,10 @@ fn a_window_cut_short_keeps_the_blobs_it_published() {
     // is being answered.
     w.http.objects_delay(150);
     let mut run = w
-        .pipeline(&["--jobs", "1", "--publish-secs", "0"])
+        .pipeline(&["--jobs", "1", "--publish-secs", "0", "--claim-secs", "1"])
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while w.asked().len() < 5 {
-        assert!(run.try_wait().unwrap().is_none(), "the run ended by itself");
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the run asked for no blobs"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
+    w.until_asked(5, &mut run);
     run.kill().unwrap();
     run.wait().unwrap();
     let first = w.asked().len();
@@ -2706,7 +2726,11 @@ fn a_window_cut_short_keeps_the_blobs_it_published() {
     assert!(m.pyramid.is_empty());
 
     w.http.objects_delay(0);
-    let again = w.pipeline(&["--jobs", "1"]).output().unwrap();
+    let again = w
+        .pipeline(&["--jobs", "1", "--claim-secs", "1"])
+        .spawn()
+        .unwrap();
+    let again = output_within(again, 120, "the next run");
     let log = String::from_utf8_lossy(&again.stderr);
     assert!(again.status.success(), "{log}");
     let asked: Vec<String> = w.asked().split_off(first);
@@ -2747,25 +2771,44 @@ fn a_window_copies_several_blobs_at_a_time() {
     }
 }
 
+/// Waits for `run` to end, `secs` at most: what it wrote.
+fn output_within(mut run: std::process::Child, secs: u64, what: &str) -> std::process::Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while run.try_wait().unwrap().is_none() {
+        if std::time::Instant::now() >= deadline {
+            run.kill().unwrap();
+            let out = run.wait_with_output().unwrap();
+            let log = String::from_utf8_lossy(&out.stderr);
+            panic!("{what} had not ended after {secs} s\n{log}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    run.wait_with_output().unwrap()
+}
+
 /// Two runs of one window at once (a schedule's next run, started while the last one
 /// still copies): both end well. One seals the window; the other finds it sealed and
-/// publishes nothing. Every blob is in the store, as git has it, and the runs did not
-/// each copy the window: a run takes the items in an order of its own, and leaves out
-/// what the other has published by the time it gets to them. (Each copied every blob, and
-/// would have with a copy that published as it went too: in one order, each run takes
-/// an item while the other is still copying it.)
+/// publishes nothing. Every blob is in the store, as git has it, and each was asked of
+/// the upstream once: a run claims the blobs it copies, and leaves to the other what the
+/// other has claimed. Both copy: the second takes items the first has not come to. A
+/// run that has only the other's blobs left to wait for publishes what it has copied
+/// then, an hour before `--publish-secs` here: the other is waiting for it. No claim is
+/// left. (The runs took the items in orders of their own and left out what the other
+/// had published by then: 31 to 34 blobs asked for, of these 24, with each blob
+/// published as it came; all 48 with the publish an hour away, and before that.)
 #[test]
-fn two_runs_of_one_window_do_not_each_copy_it() {
+fn two_runs_of_one_window_copy_each_blob_once() {
     let w = Window::new("sep-window-two", 24);
-    w.http.objects_delay(200);
-    let args = ["--jobs", "2", "--publish-secs", "0"];
-    let runs = [
-        w.pipeline(&args).spawn().unwrap(),
-        w.pipeline(&args).spawn().unwrap(),
-    ];
+    w.http.objects_delay(500);
+    w.http.objects_at_once();
+    let args = ["--jobs", "2", "--publish-secs", "3600"];
+    let mut first = w.pipeline(&args).spawn().unwrap();
+    // The second starts once the first is copying.
+    w.until_asked(1, &mut first);
+    let second = w.pipeline(&args).spawn().unwrap();
     let mut published = 0;
-    for run in runs {
-        let out = run.wait_with_output().unwrap();
+    for run in [first, second] {
+        let out = output_within(run, 120, "a run of the window");
         let log = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{log}");
         published += usize::from(log.contains("published manifest"));
@@ -2775,15 +2818,352 @@ fn two_runs_of_one_window_do_not_each_copy_it() {
         );
     }
     assert_eq!(published, 1, "one run seals the window");
-    let asked = w.asked();
+    let mut asked = w.asked();
+    asked.sort();
+    let all: Vec<String> = w.blobs.iter().cloned().collect();
     assert!(
-        asked.len() < 2 * w.blobs.len(),
-        "{} blobs asked for: each run copied all {}",
+        asked == all,
+        "{} blobs asked for, of {}: each is to be asked for once",
         asked.len(),
-        w.blobs.len()
+        all.len()
     );
-    let distinct: std::collections::BTreeSet<String> = asked.into_iter().collect();
-    assert_eq!(distinct, w.blobs);
+    // Two jobs a run: more than two blobs on their way at once are both runs'.
+    assert!(
+        w.http.objects_at_once() > 2,
+        "the second run took none of the window"
+    );
+    assert_eq!(w.claims(), []);
     w.assert_sealed();
     let _ = std::fs::remove_dir_all(&w.root);
+}
+
+/// A run renews its claim while it copies: a blob that takes longer to copy than a claim
+/// holds (`--claim-secs`) stays claimed, its `until` moved on every third of that time.
+/// (Written once, the claim would lapse with its run alive, and another run would copy
+/// the blob too.)
+#[test]
+fn a_run_renews_its_claim_while_it_copies() {
+    let w = Window::new("sep-window-renewed", 1);
+    w.http.objects_delay(3000);
+    let mut run = w
+        .pipeline(&["--jobs", "1", "--claim-secs", "2"])
+        .spawn()
+        .unwrap();
+    w.until_asked(1, &mut run);
+    let mut untils = std::collections::BTreeSet::new();
+    while run.try_wait().unwrap().is_none() {
+        for claim in w.claims() {
+            assert_eq!((claim.oids.len(), claim.secs), (1, 2));
+            untils.insert(claim.until);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let out = run.wait_with_output().unwrap();
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{log}");
+    assert!(
+        untils.len() >= 2,
+        "the blob took 3 s to copy, and its claim was only ever to hold until {untils:?}"
+    );
+    assert_eq!(w.claims(), []);
+    w.assert_sealed();
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
+/// A run killed while it copies leaves its claim. A run started at once copies the rest
+/// of the window, and leaves the dead run's blobs alone while the claim holds: another
+/// run may be copying them. Once it has lapsed (`--claim-secs` after the dead run last
+/// wrote it) the run takes them, each once, and seals. `inspect manifest` says what is
+/// claimed.
+#[test]
+fn a_dead_runs_blobs_are_taken_once_its_claim_has_lapsed() {
+    let w = Window::new("sep-window-dead", 16);
+    w.http.objects_delay(150);
+    let args = ["--jobs", "2", "--publish-secs", "0", "--claim-secs", "3"];
+    let mut run = w.pipeline(&args).spawn().unwrap();
+    w.until_asked(3, &mut run);
+    run.kill().unwrap();
+    run.wait().unwrap();
+    let first = w.asked().len();
+
+    // What the dead run had claimed and not listed, and until when its claim holds.
+    let claims = w.claims();
+    assert_eq!(claims.len(), 1, "the dead run's claim");
+    let until = claims[0].until;
+    let listed = w.listed();
+    let held: std::collections::BTreeSet<String> = claims[0]
+        .oids
+        .iter()
+        .map(|oid| oid.to_string())
+        .filter(|id| !listed.contains(id))
+        .collect();
+    assert!(!held.is_empty() && held.len() < w.blobs.len() - listed.len());
+    let said = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-cache"))
+        .args(["inspect", "manifest", "--store", &w.store])
+        .output()
+        .unwrap();
+    let said = String::from_utf8_lossy(&said.stdout).into_owned();
+    let want = format!(
+        "claimed {} blobs in claims.bin by 1 runs that are copying them, until {until} at",
+        claims[0].oids.len()
+    );
+    assert!(said.contains(&want), "{said}");
+
+    w.http.objects_delay(0);
+    let mut next = w.pipeline(&args).spawn().unwrap();
+    // What was asked for by a moment at which the claim holds was asked for while it
+    // held. The run is through the rest of the window by then, if it has asked for it,
+    // and says what it waits for (if the claim holds for a second more, when it looks).
+    let rest = w.blobs.len() - listed.len() - held.len();
+    let mut waited = false;
+    loop {
+        let asked = w.asked().split_off(first);
+        let now = gvfs_cache::util::now_secs();
+        if now > until || next.try_wait().unwrap().is_some() {
+            break;
+        }
+        let early: Vec<&String> = asked.iter().filter(|id| held.contains(*id)).collect();
+        assert!(
+            early.is_empty(),
+            "asked for {early:?}, which the dead run's claim holds until {until}"
+        );
+        waited |= asked.len() == rest && now < until;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let out = output_within(next, 120, "the next run");
+    let log = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{log}");
+    assert!(
+        gvfs_cache::util::now_secs() > until,
+        "the run ended while the dead run's claim held\n{log}"
+    );
+    let said = format!(
+        "window: {} blobs are other runs', claimed until {until} for now: waiting",
+        held.len()
+    );
+    assert!(!waited || log.contains(&said), "{log}");
+    let mut asked = w.asked().split_off(first);
+    asked.sort();
+    let missing: Vec<String> = w.blobs.difference(&listed).cloned().collect();
+    assert!(
+        asked == missing,
+        "the next run is to ask for the {} blobs that were missing, each once; it asked for {}\n{log}",
+        missing.len(),
+        asked.len()
+    );
+    assert_eq!(w.claims(), []);
+    w.assert_sealed();
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
+/// A run whose copy of a blob fails gives up its claim as it ends, of that blob and of
+/// those it had not begun. Another run of the window, which left them to it, copies
+/// them without waiting for the claim to lapse (ten minutes here), and seals.
+#[test]
+fn a_run_that_fails_gives_up_its_claim() {
+    let w = Window::new("sep-window-failed", 12);
+    // The upstream fails three requests for one blob: the three tries of one run.
+    let bad = w.blobs.iter().next().unwrap().clone();
+    w.http.objects_fail(&bad, 3);
+    w.http.objects_delay(100);
+    let args = ["--jobs", "2", "--publish-secs", "0", "--claim-secs", "600"];
+    let runs = [
+        w.pipeline(&args).spawn().unwrap(),
+        w.pipeline(&args).spawn().unwrap(),
+    ];
+    let (mut sealed, mut failed) = (0, 0);
+    for run in runs {
+        let out = output_within(run, 90, "a run of the window");
+        let log = String::from_utf8_lossy(&out.stderr);
+        if out.status.success() {
+            assert!(log.contains("published manifest"), "{log}");
+            sealed += 1;
+        } else {
+            assert!(log.contains("blob copy failed"), "{log}");
+            failed += 1;
+        }
+    }
+    assert_eq!((sealed, failed), (1, 1), "one run fails, the other seals");
+    let mut asked = w.asked();
+    asked.sort();
+    let mut want: Vec<String> = w.blobs.iter().cloned().collect();
+    want.extend([bad.clone(), bad.clone(), bad.clone()]);
+    want.sort();
+    assert!(
+        asked == want,
+        "{} blobs asked for: the one that failed is to be asked for four times, the other {} once",
+        asked.len(),
+        w.blobs.len() - 1
+    );
+    assert_eq!(w.claims(), []);
+    w.assert_sealed();
+    let _ = std::fs::remove_dir_all(&w.root);
+}
+
+/// Two mirrors of one store at once copy each blob of the history once between them,
+/// and both copy. They plan other packs (1 MiB and 2 MiB of small blobs): of a pack the
+/// second takes the blobs the first has not claimed. (Each planned every blob the store
+/// lacked and copied it: the history twice.)
+#[test]
+fn two_mirrors_copy_each_blob_once() {
+    let root = tempdir("sep-mirror-two");
+    let up = Upstream::new(&root);
+    // Files of 600 KB of noise, each a pack with 1 MiB blob packs and three to a pack
+    // with 2 MiB, and small ones that share a pack.
+    let mut files: Vec<(String, Option<Vec<u8>>)> = (0..24u32)
+        .map(|i| {
+            let content = noise(600_000 + i as usize, 2000 + u64::from(i));
+            (format!("big/f{i:02}.bin"), Some(content))
+        })
+        .collect();
+    files.extend((0..40u32).map(|i| (format!("small/f{i:02}.txt"), Some(text(100 + i)))));
+    let refs: Vec<(&str, Option<Vec<u8>>)> =
+        files.iter().map(|(p, c)| (p.as_str(), c.clone())).collect();
+    commit_files(&up, "c1", &refs);
+    git(&up.bare, &["config", "uploadpack.allowFilter", "true"]);
+    let http = SmartHttp::azure_devops(&up.bare, "secret");
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    let token = [("GVD_TEST_TOKEN", "secret")];
+    let auth = ["--token-env", "GVD_TEST_TOKEN"];
+    let genesis = [&auth[..], &["--blobs", "separate"]].concat();
+    pipeline_at(&root, &store, &http.url, "15m", &genesis, &token).unwrap();
+    assert!(store_blobs(&root, &store_dir).is_empty());
+
+    http.objects_delay(500);
+    http.objects_at_once();
+    let work = root.join("mirror-work");
+    std::fs::create_dir_all(&work).unwrap();
+    let mirror = |pack_mib: &str| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-cache"));
+        cmd.args(["mirror", "--store", &store, "--upstream", &http.url])
+            .args(auth)
+            .args(["--work-dir", work.to_str().unwrap(), "--threads", "2"])
+            .args(["--jobs", "2", "--publish-secs", "0"])
+            .args(["--blob-pack-mib", pack_mib])
+            .envs(token)
+            .stderr(std::process::Stdio::piped());
+        gvfs_cache::upstream::hermetic_git_env(&mut cmd);
+        cmd.spawn().unwrap()
+    };
+    // The second starts once the first has claimed its first packs, and is copying.
+    let first = mirror("1");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while http.objects_asked().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the mirror asked for no blobs"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    for run in [first, mirror("2")] {
+        let out = output_within(run, 120, "a mirror");
+        let log = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{log}");
+        assert!(log.contains("complete"), "{log}");
+    }
+    let history = git_blobs(&up.bare, &["--all"]);
+    let mut asked = http.objects_asked().concat();
+    asked.sort();
+    let all: Vec<String> = history.keys().cloned().collect();
+    assert!(
+        asked == all,
+        "{} blobs asked for, of {}: each is to be asked for once",
+        asked.len(),
+        all.len()
+    );
+    assert!(
+        http.objects_at_once() > 2,
+        "one mirror took none of the history"
+    );
+    let s = Store::open(&store, "").unwrap();
+    let (bm, _) = blobcopy::load(&s).unwrap();
+    assert!(bm.complete());
+    let stored = store_blobs(&root, &store_dir);
+    for id in history.keys() {
+        assert!(stored[id] == cat_blob(&up.bare, id), "blob {id}");
+    }
+    let records: usize = bm.segments.iter().map(|m| m.blobs as usize).sum();
+    assert_eq!(records, history.len(), "a blob listed twice");
+    assert_eq!(gvfs_cache::claims::load(&s).unwrap(), []);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A mirror and a window at once: the blobs both have planned (the files of the new tip
+/// that the store lacks, one of them an old version the tip has again: the history's for
+/// the mirror, the tip's for the window) are copied by the one that claimed them, and
+/// the other waits for them.
+#[test]
+fn a_mirror_and_a_window_copy_a_blob_once() {
+    let root = tempdir("sep-mirror-window");
+    let up = Upstream::new(&root);
+    let old = [
+        ("a/f.txt", Some(text(1))),
+        ("b/old.bin", Some(noise(700_000, 2))),
+    ];
+    commit_files(&up, "c1", &old);
+    commit_files(&up, "c2", &[("a/f.txt", Some(text(2)))]);
+    git(&up.bare, &["config", "uploadpack.allowFilter", "true"]);
+    let http = SmartHttp::azure_devops(&up.bare, "secret");
+    let store_dir = root.join("store");
+    let store = format!("fs:{}", store_dir.display());
+    let token = [("GVD_TEST_TOKEN", "secret")];
+    let auth = ["--token-env", "GVD_TEST_TOKEN"];
+    let genesis = [&auth[..], &["--blobs", "separate"]].concat();
+    pipeline_at(&root, &store, &http.url, "15m", &genesis, &token).unwrap();
+    let new = [
+        ("a/f.txt", Some(text(1))),
+        ("c/new.txt", Some(b"new\n".to_vec())),
+    ];
+    let tip = commit_files(&up, "c3", &new);
+
+    // The mirror's one pack is a second and a half on its way: the window comes to
+    // the tip's two blobs of it meanwhile.
+    http.objects_delay(1500);
+    let work = root.join("mirror-work");
+    std::fs::create_dir_all(&work).unwrap();
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_gvfs-cache"));
+    cmd.args(["mirror", "--store", &store, "--upstream", &http.url])
+        .args(auth)
+        .args(["--work-dir", work.to_str().unwrap(), "--threads", "2"])
+        .args(["--publish-secs", "0", "--blob-pack-mib", "1"])
+        .envs(token)
+        .stderr(std::process::Stdio::piped());
+    gvfs_cache::upstream::hermetic_git_env(&mut cmd);
+    let mirror = cmd.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while http.objects_asked().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the mirror asked for no blobs"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let log = pipeline_at(&root, &store, &http.url, "15m", &auth, &token).unwrap();
+    assert!(log.contains("the tip lacks 2 blobs"), "{log}");
+    let out = output_within(mirror, 120, "the mirror");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let history = git_blobs(&up.bare, &["--all"]);
+    let mut asked = http.objects_asked().concat();
+    asked.sort();
+    let all: Vec<String> = history.keys().cloned().collect();
+    assert!(
+        asked == all,
+        "{} blobs asked for, of {}: each is to be asked for once\n{log}",
+        asked.len(),
+        all.len()
+    );
+    assert_eq!(manifest(&store_dir).tip.to_string(), tip);
+    let stored = store_blobs(&root, &store_dir);
+    for id in history.keys() {
+        assert!(stored[id] == cat_blob(&up.bare, id), "blob {id}");
+    }
+    let s = Store::open(&store, "").unwrap();
+    assert_eq!(gvfs_cache::claims::load(&s).unwrap(), []);
+    let _ = std::fs::remove_dir_all(&root);
 }

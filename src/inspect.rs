@@ -35,6 +35,18 @@ pub fn main(args: &[String]) -> Result<()> {
                     noted.len()
                 );
             }
+            // What runs are copying now, or were when they died, if `claims.bin` can be
+            // read.
+            if let Ok(claims) = crate::claims::load(&store)
+                && let Some(until) = claims.iter().map(|c| c.until).max()
+            {
+                println!(
+                    "  claimed {} blobs in claims.bin by {} runs that are copying them, until \
+                     {until} at the latest: a claim lapses unless its run renews it",
+                    claims.iter().map(|c| c.oids.len()).sum::<usize>(),
+                    claims.len()
+                );
+            }
             Ok(())
         }
         "slab" => {
