@@ -986,6 +986,222 @@ fn cached_blocks_are_read_as_a_local_pack_is() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A relay in front of a store on this host, whose answers the test can hold back.
+struct Relay {
+    port: u16,
+    /// Bytes of answers that may still pass; `u64::MAX`: any number.
+    may_pass: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Relay {
+    fn to(store: u16) -> Relay {
+        use std::io::{Read, Write};
+        use std::net::{Shutdown, TcpListener, TcpStream};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let may_pass = std::sync::Arc::new(AtomicU64::new(u64::MAX));
+        let gate = std::sync::Arc::clone(&may_pass);
+        std::thread::spawn(move || {
+            for client in listener.incoming().flatten() {
+                let Ok(answering) = TcpStream::connect(("127.0.0.1", store)) else {
+                    continue;
+                };
+                let (mut asking, mut asked) =
+                    (client.try_clone().unwrap(), answering.try_clone().unwrap());
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut asking, &mut asked);
+                    let _ = asked.shutdown(Shutdown::Write);
+                });
+                let gate = std::sync::Arc::clone(&gate);
+                let (mut answering, mut client) = (answering, client);
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 16 << 10];
+                    while let Ok(n @ 1..) = answering.read(&mut buf) {
+                        let mut sent = 0;
+                        while sent < n {
+                            let want = (n - sent) as u64;
+                            let take = |left: u64| match left {
+                                u64::MAX => Some(left),
+                                _ => Some(left - left.min(want)),
+                            };
+                            let left = gate
+                                .try_update(Ordering::SeqCst, Ordering::SeqCst, take)
+                                .unwrap();
+                            let now = left.min(want) as usize;
+                            if now == 0 {
+                                std::thread::sleep(Duration::from_millis(1));
+                            } else if client.write_all(&buf[sent..sent + now]).is_err() {
+                                return;
+                            }
+                            sent += now;
+                        }
+                    }
+                    let _ = client.shutdown(Shutdown::Write);
+                });
+            }
+        });
+        Relay { port, may_pass }
+    }
+}
+
+/// A blob leaves the edge when its bytes have arrived from the store, not when its
+/// block has. The store here stops after the first 64 KiB of its answer to the fetch of
+/// a block of 1.5 MiB: the blob at the block's start is answered, the block still
+/// coming and nothing cached, and a batch of that blob and the next is sent what has
+/// arrived of them. When the store goes on, the batch gets the rest, and the block is
+/// cached by a fetch that no request waits for. (A request fetched its block itself,
+/// and sent its first byte when the whole block had arrived: this blob waited for the
+/// store.)
+#[test]
+fn a_blob_leaves_while_its_block_arrives() {
+    use std::io::{Read, Write};
+    use std::sync::atomic::Ordering;
+    let Some(backend) = Backend::new("arriving") else {
+        return;
+    };
+    let local = backend
+        .cs
+        .split_once("BlobEndpoint=http://127.0.0.1:")
+        .and_then(|(_, rest)| rest.split_once('/')?.0.parse::<u16>().ok());
+    let Some(azurite) = local else {
+        eprintln!("skipping: needs a store whose answers it can hold back (Azurite)");
+        return;
+    };
+    let root = tempdir("azure-arriving");
+    let env = [("GVD_AZ_CS", backend.cs.as_str())];
+    let store = format!("azure:{}", backend.spec);
+    let up = Upstream::new(&root);
+    let upstream = up.bare.to_str().unwrap().to_string();
+    // In path order, which is the pack's: a small blob, then 1.5 MiB.
+    let files = [
+        ("a/first.txt", Some(text(1))),
+        ("b/noise.bin", Some(noise(3 << 19, 7))),
+    ];
+    commit_files(&up, "c1", &files);
+    let auth = ["--store-auth-env", "GVD_AZ_CS", "--blobs", "separate"];
+    pipeline_at(&root, &store, &upstream, "15m", &auth, &env)
+        .unwrap_or_else(|log| panic!("pipeline: {log}"));
+    mirror(&root, &store, &upstream, &env);
+    let first = rev(&up.bare, "main:a/first.txt");
+    let ids: Vec<String> = git_blobs(&up.bare, &["--all"]).keys().cloned().collect();
+
+    let relay = Relay::to(azurite);
+    let through = backend.cs.replace(
+        &format!("127.0.0.1:{azurite}/"),
+        &format!("127.0.0.1:{}/", relay.port),
+    );
+    let cache = root.join("cache");
+    let mut args = vec!["--store", &store, "--store-auth-env", "GVD_AZ_CS"];
+    args.extend([
+        "--poll-ms",
+        "600000",
+        "--cache-dir",
+        cache.to_str().unwrap(),
+    ]);
+    let server = Server::start_with_env(&args, &[("GVD_AZ_CS", through.as_str())]);
+    let blocks = |s: &Server| {
+        (
+            s.metric("gvfs_blob_cache_blocks"),
+            s.metric("gvfs_blob_cache_fetching"),
+        )
+    };
+
+    relay.may_pass.store(64 << 10, Ordering::SeqCst);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (mut client, path) = (server.client(), format!("/gvfs/objects/{first}"));
+    let asking = std::thread::spawn(move || {
+        let mut r = client.request("GET", &path, &[], b"").unwrap();
+        let body = r.body_vec(1 << 20).unwrap();
+        let _ = tx.send((r.status, body));
+    });
+    let answered = rx.recv_timeout(Duration::from_secs(20));
+    if answered.is_err() {
+        // So that the request ends.
+        relay.may_pass.store(u64::MAX, Ordering::SeqCst);
+    }
+    let (status, loose_first) = answered.expect("the blob waited for its block");
+    assert_eq!(status, 200);
+    asking.join().unwrap();
+    // The store has sent its 64 KiB and waits: the block is coming, and not cached.
+    server.wait_for("the store's answer to be held back", |_| {
+        relay.may_pass.load(Ordering::SeqCst) == 0
+    });
+    assert_eq!(blocks(&server), (0, 1));
+    assert_eq!(server.metric("gvfs_blob_cache_fetches_total"), 1);
+    // A batch of both blobs, the store still held back: what has arrived of them leaves
+    // (the first, and the start of the second), far from filling the response's buffer.
+    let both = [first.clone(), rev(&up.bare, "main:b/noise.bin")];
+    let body = json_ids(&both, None);
+    let mut conn = std::net::TcpStream::connect(("127.0.0.1", server.port)).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    write!(
+        conn,
+        "POST /gvfs/objects HTTP/1.1\r\nHost: edge\r\nContent-Type: application/json\r\n\
+         Accept: {CT_PACK}\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let (mut answer, mut piece) = (Vec::new(), [0u8; 16 << 10]);
+    let mut more = |answer: &mut Vec<u8>| {
+        let n = conn
+            .read(&mut piece)
+            .expect("the batch waited for the store");
+        assert!(n > 0, "the answer broke off");
+        answer.extend_from_slice(&piece[..n]);
+    };
+    let head = loop {
+        if let Some(p) = answer.windows(4).position(|w| w == b"\r\n\r\n") {
+            break p + 4;
+        }
+        more(&mut answer);
+    };
+    while answer.len() - head < 32 << 10 {
+        more(&mut answer);
+    }
+    assert_eq!(relay.may_pass.load(Ordering::SeqCst), 0);
+    assert_eq!(blocks(&server), (0, 1));
+    relay.may_pass.store(u64::MAX, Ordering::SeqCst);
+    let len: usize = String::from_utf8_lossy(&answer[..head])
+        .lines()
+        .find_map(|l| l.strip_prefix("Content-Length: ")?.parse().ok())
+        .unwrap();
+    while answer.len() < head + len {
+        more(&mut answer);
+    }
+    let posted = fresh_repo(&root, "post");
+    git_stdin(
+        &posted,
+        &["index-pack", "--stdin", "--strict", "--keep=t"],
+        &answer[head..],
+    );
+    assert_eq!(cat_batch(&posted, &both), cat_batch(&up.bare, &both));
+    server.wait_for("the block", |s| blocks(s) == (1, 0));
+    assert_eq!(server.metric("gvfs_blob_cache_fetches_total"), 1);
+
+    // Each blob as a loose object, from the block: the first as it was answered.
+    let hits = server.metric("gvfs_blob_cache_hits_total");
+    let loose = fresh_repo(&root, "loose");
+    for id in &ids {
+        let (status, ct, body) = server.get(&format!("/gvfs/objects/{id}"));
+        assert_eq!((status, ct.as_str()), (200, CT_LOOSE), "{id}");
+        assert!(*id != first || body == loose_first);
+        let dir = loose.join("objects").join(&id[..2]);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&id[2..]), body).unwrap();
+    }
+    git(&loose, &["fsck", "--strict", "--no-dangling"]);
+    assert_eq!(cat_batch(&loose, &ids), cat_batch(&up.bare, &ids));
+    assert_eq!(server.metric("gvfs_blob_cache_fetches_total"), 1);
+    assert!(server.metric("gvfs_blob_cache_hits_total") >= hits + ids.len() as u64);
+    assert_eq!(blocks(&server), (1, 0));
+    server.assert_clean();
+    drop(server);
+    drop(backend);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// An edge of an object store keeps gigabytes in its cache directory: one is required (the
 /// system's temp directory, the default for a directory store, is memory on many hosts).
 #[test]

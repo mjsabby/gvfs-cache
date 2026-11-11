@@ -4,8 +4,7 @@
 //! [`WINDOW`] blocks at a time. The blocks a window lacks are fetched together, one ranged
 //! GET per run of consecutive missing blocks, and kept on local disk. Blobs are packed in
 //! path order, so the blobs of one checkout share blocks: a batch of thousands of small
-//! blobs costs a few requests, and a repeated read costs none. A block being fetched is
-//! fetched once: other readers wait for that fetch, and fail with it if it fails.
+//! blobs costs a few requests, and a repeated read costs none.
 //!
 //! A cached block is a file that stays open and mapped ([`Block`]), so a read of cached
 //! blocks (a hit) is what a read of a local pack is: a copy from the mapping, or
@@ -19,6 +18,20 @@
 //! a buffer allocated and zeroed for the read: 3.8 µs for 300 bytes. It takes 0.03 µs,
 //! of which the copy from the mapping is half.)
 //!
+//! A fetch is a task of its own ([`Fetch`]), and the reads that need its blocks follow
+//! it ([`Coming`]): each sends what has arrived of its range as it arrives, read from the
+//! file the block is being written to, and ends when its range is sent, whether or not
+//! the block is whole by then; before it waits for more, it flushes what it has handed
+//! on ([`Flush`]). A block is fetched once however many reads want it; it is cached the
+//! moment it is whole, while the blocks after it still arrive; and the fetch goes on at
+//! the store's pace whatever becomes of the reads: one that is slow, or gone, holds up
+//! neither the fetch nor another read. A fetch that fails fails the reads still waiting
+//! for bytes of its blocks; those whose bytes had arrived are served. (A read fetched
+//! the blocks its window lacked itself, and sent its first byte when the last of them
+//! had arrived: a 20 KB blob waited for the 4 MiB of its block, 30 MiB were fetched and
+//! then sent, and a fetch ended with the request that made it.) Fetches in flight are
+//! bounded ([`FETCHES`]): a read that needs one more waits for one to end.
+//!
 //! Blocks are evicted least recently used beyond the byte budget (`--blob-cache-mib`) and
 //! beyond a number of blocks (each holds a descriptor and a mapping). Eviction sorts the
 //! blocks by stamp when it needs room, and takes them in that order until it is used up:
@@ -29,15 +42,16 @@
 //! store, a window at a time: keeping it would only evict everything else.
 //!
 //! Misses are async (the edge's handlers await them): fetches go through the store's async
-//! client, and a reader waiting for another's fetch parks its task, not a thread.
+//! client, and a read following a fetch parks its task, not a thread.
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::store::{Sink, Store};
 use crate::util::{Context, Error, Result, sub, u64_of, us};
@@ -46,6 +60,30 @@ use crate::util::{Context, Error, Result, sub, u64_of, us};
 pub const BLOCK: u64 = 4 << 20;
 /// Most blocks one read fetches at a time.
 pub const WINDOW: u64 = 8;
+/// Most fetches in flight. A fetch holds a connection to the store and the file of the
+/// block that is arriving, so there may be one for every [`BLOCKS_A_FETCH`] blocks the
+/// cache may keep: an eighth as many descriptors as the blocks hold, 16 fetches under a
+/// limit of 1,024 descriptors and 64 from 4,096 on. 64 connections fill a 10 Gbit/s link
+/// at 20 MB/s each, and bring up to 2 GiB at once: more would bring no more. (Each
+/// request fetched for itself, so `--max-conns` bounded the fetches: 64 or more.)
+pub const FETCHES: usize = 64;
+const BLOCKS_A_FETCH: usize = 16;
+/// Most bytes a read takes at once from a block that is arriving.
+const PIECE: u64 = 64 << 10;
+
+/// Where a read of the cache hands its bytes: a [`Sink`] that is also told when the read
+/// has caught up with what has arrived and waits for the store. One that keeps pieces
+/// back to send them together (a response's buffer) sends them on then: a client gets
+/// what is here while the store is slow, not when the buffer is full.
+pub trait Flush: Sink {
+    fn flush(&mut self) -> impl Future<Output = Result<()>> + Send;
+}
+
+impl<F: FnMut(&[u8]) -> Result<()> + Send> Flush for F {
+    fn flush(&mut self) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(Ok(()))
+    }
+}
 
 /// A cached block: its file, open and mapped until the cache has evicted it and the last
 /// read of it has ended. The file is removed then. It was written once, under another
@@ -172,8 +210,8 @@ struct Cached {
 struct State {
     /// The cached blocks, each in its pack's slot too.
     cached: HashMap<Key, Cached>,
-    /// The blocks being fetched, each with the fetch that will bring it.
-    fetching: HashMap<Key, Arc<Attempt>>,
+    /// The blocks being fetched, each as far as it has come.
+    fetching: HashMap<Key, Arc<Coming>>,
     /// Blocks in the order eviction takes them, least recently used first, as last sorted:
     /// each with its stamp then. One read since has another stamp, and is passed over.
     queue: VecDeque<(u64, Key)>,
@@ -184,8 +222,8 @@ struct State {
 /// proxy's request to the upstream). A fetch that fails says so here, while it holds the
 /// lock under which its marks go, and those who waited for it fail with it. Each used to
 /// make the fetch its own instead, one after another: against a stalled origin the last
-/// of N waiters got its error after N timeouts. A fetch that is dropped says nothing: one
-/// of its waiters takes over.
+/// of N waiters got its error after N timeouts. A fetch of the proxy's that is dropped
+/// says nothing: one of its waiters takes over.
 #[derive(Default)]
 pub(super) struct Attempt {
     failed: OnceLock<Error>,
@@ -204,6 +242,161 @@ impl Attempt {
             format!("the fetch it waited for failed: {e}"),
         ))
     }
+
+    /// The failure as it was, for the one whose fetch this is.
+    fn cause(&self) -> Option<Error> {
+        let e = self.failed.get()?;
+        Some(Error::with_kind(e.kind, e.to_string()))
+    }
+}
+
+/// A block that a fetch is bringing, as far as it has come: what the reads that need it
+/// follow. A read holds the block's `Coming` from when it looks until it has sent its
+/// range, so what has arrived stays readable for it whatever the cache does with the
+/// block meanwhile (it may evict one the moment it is whole) and however the fetch ends.
+struct Coming {
+    /// The fetch that brings it. Should it fail, so do the reads that still wait for
+    /// bytes of this block.
+    fetch: Arc<Attempt>,
+    /// Woken when more of the block has arrived, when it is whole, and when its fetch
+    /// has failed.
+    more: Notify,
+    arrived: Mutex<Arrived>,
+}
+
+/// How much of a block that is coming is here.
+enum Arrived {
+    /// Its first bytes.
+    Part {
+        /// The file they are written to (none before the first). It is the fetch's
+        /// while the block arrives; a fetch that fails removes it, and what was written
+        /// stays readable here.
+        file: Option<Arc<File>>,
+        written: u64,
+        /// The first byte a read is waiting for, if one is: the reads are woken when it
+        /// has arrived, not for every piece before it.
+        wanted: u64,
+    },
+    /// All of it: the block, as the cache was given it.
+    Whole(Arc<Block>),
+}
+
+/// What a read can take next of a block that is coming.
+enum Next {
+    /// The rest of its range, from the block.
+    Rest(Arc<Block>),
+    /// Its range up to this byte of the block, from the file the block arrives in.
+    Upto(Arc<File>, u64),
+    /// Nothing yet.
+    Nothing,
+}
+
+impl Coming {
+    /// A block of which nothing is here yet.
+    fn new(fetch: &Arc<Attempt>) -> Arc<Coming> {
+        Arc::new(Coming {
+            fetch: Arc::clone(fetch),
+            more: Notify::new(),
+            arrived: Mutex::new(Arrived::Part {
+                file: None,
+                written: 0,
+                wanted: u64::MAX,
+            }),
+        })
+    }
+
+    /// The block's first `so_far` bytes are written, to `file` if this is the first of
+    /// them: the reads waiting for one of them are woken.
+    fn wrote(&self, file: Option<&Arc<File>>, so_far: u64) {
+        let wake = match &mut *lock(&self.arrived) {
+            Arrived::Part {
+                file: into,
+                written,
+                wanted,
+            } => {
+                if let Some(file) = file {
+                    *into = Some(Arc::clone(file));
+                }
+                *written = so_far;
+                let wake = so_far > *wanted;
+                if wake {
+                    *wanted = u64::MAX;
+                }
+                wake
+            }
+            Arrived::Whole(_) => false,
+        };
+        if wake {
+            self.more.notify_waiters();
+        }
+    }
+
+    /// Hands bytes `lo..hi` of the block to `sink` as they arrive: from the file the
+    /// block is being written to (through `scratch`), and from its mapping once it is
+    /// whole; `sink` is flushed before the read waits for more. Fails with the block's
+    /// fetch if that fails before the bytes are here (`mine`: the read started that
+    /// fetch, and gets its error as it is).
+    async fn send<S: Flush>(
+        &self,
+        lo: u64,
+        hi: u64,
+        mine: bool,
+        scratch: &mut [u8],
+        sink: &mut S,
+    ) -> Result<()> {
+        let mut at = lo;
+        while at < hi {
+            // Waiting is registered before the block is looked at: what arrives in
+            // between still wakes this read.
+            let mut more = std::pin::pin!(self.more.notified());
+            more.as_mut().enable();
+            let next = match &mut *lock(&self.arrived) {
+                Arrived::Whole(block) => Next::Rest(Arc::clone(block)),
+                Arrived::Part {
+                    file: Some(file),
+                    written,
+                    ..
+                } if *written > at => Next::Upto(Arc::clone(file), (*written).min(hi)),
+                Arrived::Part { wanted, .. } => {
+                    *wanted = (*wanted).min(at);
+                    Next::Nothing
+                }
+            };
+            match next {
+                Next::Rest(block) => {
+                    let rest = sub(block.bytes(), us(at), us(hi.saturating_sub(at)));
+                    sink.put(rest.ctx("a fetched block's range")?).await?;
+                    at = hi;
+                }
+                Next::Upto(file, upto) => {
+                    while at < upto {
+                        let n = us(upto.saturating_sub(at)).min(scratch.len());
+                        let piece = scratch
+                            .get_mut(..n)
+                            .filter(|p| !p.is_empty())
+                            .ctx("no room to read an arriving block into")?;
+                        file.read_exact_at(piece, at)
+                            .ctx("reading a block as it arrives")?;
+                        sink.put(piece).await?;
+                        at = at.saturating_add(u64_of(n));
+                    }
+                }
+                Next::Nothing => {
+                    let failed = if mine {
+                        self.fetch.cause()
+                    } else {
+                        self.fetch.failure()
+                    };
+                    if let Some(e) = failed {
+                        return Err(e);
+                    }
+                    sink.flush().await?;
+                    more.await;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 pub struct BlockCache {
@@ -213,13 +406,14 @@ pub struct BlockCache {
     budget: u64,
     max_blocks: usize,
     state: Mutex<State>,
-    /// Woken when a fetch ends (blocks cached, or the fetch failed).
-    done: Notify,
+    /// One permit for each fetch that may be in flight, as many as `at_once`.
+    permits: Arc<Semaphore>,
+    at_once: usize,
     /// Moves on when blocks are cached and when eviction sorts them. A read stamps its
     /// block with it, and moves nothing itself.
     clock: AtomicU64,
-    /// Reads answered from cached blocks (a longer one counts once per window), and
-    /// windows that fetched blocks.
+    /// Reads answered from cached blocks and from fetches other reads started (a longer
+    /// one counts once per window), and windows a read started a fetch for.
     pub hits: AtomicU64,
     pub misses: AtomicU64,
     /// Ranged GETs (into the cache, and for reads streamed past it).
@@ -231,7 +425,7 @@ pub struct BlockCache {
     packs: AtomicU64,
 }
 
-fn lock(m: &Mutex<State>) -> MutexGuard<'_, State> {
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     match m.lock() {
         Ok(g) => g,
         Err(p) => p.into_inner(),
@@ -252,15 +446,25 @@ fn write<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     }
 }
 
-/// The blocks of one window of a read (ascending, consecutive), each held from when it
-/// is found or fetched until it has been handed on.
+/// Where a read gets a block of its window.
+enum Source {
+    /// From the cache, which had it when the read looked.
+    Held(Arc<Block>),
+    /// From the fetch that is bringing it.
+    Coming(Arc<Coming>),
+}
+
+/// The blocks of one window of a read (ascending, consecutive), each held from when the
+/// read looks until it has been handed on.
 struct Window {
-    blocks: [Option<Arc<Block>>; WINDOW as usize],
+    blocks: [Option<Source>; WINDOW as usize],
     /// The numbers of its first and last block, and the part of the pack read from them.
     first: u64,
     last: u64,
     from: u64,
     end: u64,
+    /// The fetch this read started for blocks of it, if it started one.
+    started: Option<Arc<Attempt>>,
 }
 
 impl Window {
@@ -278,12 +482,29 @@ impl Window {
             last,
             from: pos,
             end: end.min(last.saturating_add(1).saturating_mul(BLOCK)),
+            started: None,
         })
     }
 
     /// Each block's place with its number.
-    fn places(&mut self) -> impl Iterator<Item = (&mut Option<Arc<Block>>, u64)> {
+    fn places(&mut self) -> impl Iterator<Item = (&mut Option<Source>, u64)> {
         self.blocks.iter_mut().zip(self.first..=self.last)
+    }
+
+    /// The place of block `b`.
+    fn place(&mut self, b: u64) -> Option<&mut Option<Source>> {
+        self.blocks.get_mut(us(b.checked_sub(self.first)?))
+    }
+
+    /// Ends the window before block `b`, which is not its first.
+    fn cut(&mut self, b: u64) {
+        for (place, at) in self.places() {
+            if at >= b {
+                *place = None;
+            }
+        }
+        self.last = b.saturating_sub(1);
+        self.end = self.end.min(b.saturating_mul(BLOCK));
     }
 }
 
@@ -418,38 +639,198 @@ impl Drop for Reader<'_> {
     }
 }
 
-/// Blocks a read is fetching: if the read is dropped before the fetch ends, they are no
-/// longer marked, and readers waiting for them are woken (one of them fetches them).
-struct Fetching<'a> {
-    cache: &'a BlockCache,
-    pack: u64,
-    blocks: &'a [u64],
-    armed: bool,
+/// One fetch of blocks of a pack that are neither cached nor coming: a task of its own,
+/// started by the read that found them so and ended by nothing but the store. Its
+/// blocks are fetched in order, one ranged GET per run of consecutive ones, each written
+/// to its file as it arrives and cached when it is whole.
+struct Fetch {
+    cache: Arc<BlockCache>,
+    pack: Arc<Pack>,
+    attempt: Arc<Attempt>,
+    /// Its blocks that are not whole yet, ascending: the first is the one arriving.
+    blocks: VecDeque<(u64, Arc<Coming>)>,
+    /// Why it ended with blocks left, if a run failed.
+    failed: Option<Error>,
+    /// One of the fetches that may be in flight, until this one is gone.
+    _permit: OwnedSemaphorePermit,
 }
 
-impl Drop for Fetching<'_> {
-    fn drop(&mut self) {
-        if self.armed {
-            let mut st = lock(&self.cache.state);
-            for &b in self.blocks {
-                st.fetching.remove(&(self.pack, b));
+impl Fetch {
+    async fn run(mut self) {
+        if let Err(e) = self.runs().await {
+            self.failed = Some(e);
+        }
+    }
+
+    /// Fetches the blocks left, one run after another. A run that fails ends the fetch:
+    /// the blocks that were whole by then are cached, and the others are not coming.
+    async fn runs(&mut self) -> Result<()> {
+        let (cache, pack) = (Arc::clone(&self.cache), Arc::clone(&self.pack));
+        while let Some(&(first, _)) = self.blocks.front() {
+            let run = (first..)
+                .zip(&self.blocks)
+                .take_while(|(b, (block, _))| b == block)
+                .count();
+            let start = first.saturating_mul(BLOCK);
+            let end = first
+                .saturating_add(u64_of(run))
+                .saturating_mul(BLOCK)
+                .min(pack.len);
+            cache.fetches.fetch_add(1, Ordering::Relaxed);
+            let mut into = Arrival {
+                fetch: self,
+                arriving: None,
+                pos: start,
+            };
+            cache
+                .store
+                .read_range_async(&pack.object, start, end.saturating_sub(start), &mut into)
+                .await?;
+            if into.pos != end || into.arriving.is_some() {
+                crate::bail!("a fetch of blob pack {} ended short of its blocks", pack.id);
             }
-            drop(st);
-            self.cache.done.notify_waiters();
+        }
+        Ok(())
+    }
+
+    /// The block arriving is whole, `len` bytes: it is cached, and no longer coming.
+    fn whole(&mut self, arriving: Arriving, len: u64) -> Result<()> {
+        let block = arriving.whole(len)?;
+        let (b, coming) = self.blocks.pop_front().ctx("a block of no fetch")?;
+        let mut gone = Vec::new();
+        {
+            let mut st = lock(&self.cache.state);
+            let now = self.cache.clock.fetch_add(1, Ordering::Relaxed);
+            block.used.store(now.wrapping_add(1), Ordering::Relaxed);
+            self.cache.keep(&mut st, &self.pack, b, &block, &mut gone);
+            self.cache.evict(&mut st, &mut gone);
+            unmark(&mut st, (self.pack.serial, b), &coming);
+            // Those following it read on from the block, whatever the cache did with it.
+            *lock(&coming.arrived) = Arrived::Whole(block);
+        }
+        // Out of the lock: a block's last reference removes, unmaps and closes its file.
+        drop(gone);
+        coming.more.notify_waiters();
+        Ok(())
+    }
+}
+
+impl Drop for Fetch {
+    /// However the fetch ends (a run failed; the task was dropped with its runtime):
+    /// the blocks that are left are no longer coming, and the reads waiting for more of
+    /// them fail with the fetch. Its marks never outlive it.
+    fn drop(&mut self) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        let e = self
+            .failed
+            .take()
+            .unwrap_or_else(|| crate::err!("the fetch of the block was dropped"));
+        {
+            let mut st = lock(&self.cache.state);
+            for (b, coming) in &self.blocks {
+                unmark(&mut st, (self.pack.serial, *b), coming);
+            }
+            // Said under the lock the marks go under: a read that finds a block coming
+            // found it before its fetch failed, and one that looks later starts another.
+            self.attempt.fail(&e);
+        }
+        for (_, coming) in &self.blocks {
+            coming.more.notify_waiters();
         }
     }
 }
 
+/// Block `key` is no longer coming, if `coming` is how it was.
+fn unmark(st: &mut State, key: Key, coming: &Arc<Coming>) {
+    if st
+        .fetching
+        .get(&key)
+        .is_some_and(|c| Arc::ptr_eq(c, coming))
+    {
+        st.fetching.remove(&key);
+    }
+}
+
+/// A run's bytes on their way from the store into the files of its blocks.
+struct Arrival<'a> {
+    fetch: &'a mut Fetch,
+    /// The file of the block that `pos` is in, once its first byte is here.
+    arriving: Option<Arriving>,
+    /// Where in the pack the next byte belongs.
+    pos: u64,
+}
+
+impl Arrival<'_> {
+    fn write(&mut self, mut piece: &[u8]) -> Result<()> {
+        while !piece.is_empty() {
+            let (cache, pack) = (&self.fetch.cache, &self.fetch.pack);
+            let (b, coming) = match self.fetch.blocks.front() {
+                Some((b, coming)) if self.pos.checked_div(BLOCK) == Some(*b) => (*b, coming),
+                _ => crate::bail!("more of blob pack {} than was asked for", pack.id),
+            };
+            let start = b.saturating_mul(BLOCK);
+            let len = start
+                .saturating_add(BLOCK)
+                .min(pack.len)
+                .saturating_sub(start);
+            let fresh = self.arriving.is_none();
+            let arriving = match &mut self.arriving {
+                Some(arriving) => arriving,
+                none => none.insert(Arriving::create(cache, pack, b)?),
+            };
+            let room = us(start.saturating_add(len).saturating_sub(self.pos));
+            let (now, rest) = piece.split_at(room.min(piece.len()));
+            std::io::Write::write_all(&mut &*arriving.file, now).ctx("writing a cache block")?;
+            self.pos = self.pos.saturating_add(u64_of(now.len()));
+            let written = self.pos.saturating_sub(start);
+            coming.wrote(fresh.then_some(&arriving.file), written);
+            if written >= len
+                && let Some(arriving) = self.arriving.take()
+            {
+                self.fetch.whole(arriving, len)?;
+            }
+            piece = rest;
+        }
+        Ok(())
+    }
+}
+
+impl Sink for Arrival<'_> {
+    fn put(&mut self, piece: &[u8]) -> impl Future<Output = Result<()>> + Send {
+        std::future::ready(self.write(piece))
+    }
+}
+
 /// A block as it arrives: a file under a temporary name, which goes unless the block
-/// becomes whole (the fetch failed, or the read that made it was dropped).
+/// becomes whole (its fetch failed, or was dropped).
 struct Arriving {
-    block: u64,
-    file: File,
+    /// Written by the fetch, and read by those following it.
+    file: Arc<File>,
     tmp: PathBuf,
     path: PathBuf,
 }
 
 impl Arriving {
+    /// An empty file for block `b` of `pack`.
+    fn create(cache: &BlockCache, pack: &Pack, b: u64) -> Result<Arriving> {
+        let path = cache.path(pack, b, cache.files.fetch_add(1, Ordering::Relaxed));
+        let tmp = crate::fsutil::temp_path(&path);
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .ctx("creating a cache block")?;
+        Ok(Arriving {
+            file: Arc::new(file),
+            tmp,
+            path,
+        })
+    }
+
     /// The block, whole (`len` bytes): under its own name, open and mapped.
     fn whole(mut self, len: u64) -> Result<Arc<Block>> {
         // No fsync: the cache starts empty after a restart anyway.
@@ -478,6 +859,10 @@ impl BlockCache {
     ) -> Result<BlockCache> {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).ctx(&format!("creating {}", dir.display()))?;
+        let at_once = max_blocks
+            .checked_div(BLOCKS_A_FETCH)
+            .unwrap_or(0)
+            .clamp(1, FETCHES);
         Ok(BlockCache {
             store,
             dir,
@@ -490,7 +875,8 @@ impl BlockCache {
                 queue: VecDeque::new(),
                 bytes: 0,
             }),
-            done: Notify::new(),
+            permits: Arc::new(Semaphore::new(at_once)),
+            at_once,
             clock: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -538,13 +924,21 @@ impl BlockCache {
         Some(block)
     }
 
+    /// The fetches in flight.
+    pub fn fetching(&self) -> usize {
+        self.at_once
+            .saturating_sub(self.permits.available_permits())
+    }
+
     /// `len` bytes of `pack` from `at`, handed to `sink` in pieces: the cold path of a
-    /// read, which fetches what is not cached (handlers send what is cached themselves,
-    /// through a [`Reader`]). Callers pass a whole range, or all that is left of one: its
-    /// length decides whether it streams past the cache, and its blocks are fetched a
-    /// window at a time.
-    pub async fn read<S: Sink>(
-        &self,
+    /// read, for what is not cached (handlers send what is cached themselves, through a
+    /// [`Reader`]). Each block comes from the cache, or from the fetch that is bringing
+    /// it, as it arrives; a block that is neither gets a fetch started, with the others
+    /// of its window. The read ends when its range is handed on: it waits for its bytes,
+    /// not for its blocks. Callers pass a whole range, or all that is left of one: its
+    /// length decides whether it streams past the cache.
+    pub async fn read<S: Flush>(
+        self: &Arc<Self>,
         pack: &Arc<Pack>,
         at: u64,
         len: u64,
@@ -570,199 +964,132 @@ impl BlockCache {
             }
             return Ok(());
         }
+        // What a block that is arriving is read through, once the read follows one.
+        let mut scratch = Vec::new();
         let mut pos = at;
         while pos < end {
-            let mut window = self.hold(pack, pos, end).await?;
+            let mut permit = None;
+            let mut window = loop {
+                if let Some(window) = self.look(pack, pos, end, permit.take())? {
+                    break window;
+                }
+                // Its next block needs a fetch, and as many are in flight as may be: the
+                // read waits for one to end, holding nothing, and looks again.
+                sink.flush().await?;
+                let free = Arc::clone(&self.permits).acquire_owned().await;
+                permit = Some(free.map_err(|_| crate::err!("the block cache is closed"))?);
+            };
             let (from, upto) = (window.from, window.end);
+            let started = window.started.take();
             for (place, b) in window.places() {
                 // Let go of once it is sent: a block the cache has evicted meanwhile
                 // then goes with this read's use of it, not with its whole window's.
-                let Some(block) = place.take() else { continue };
+                let Some(source) = place.take() else { continue };
                 let start = b.saturating_mul(BLOCK);
                 let lo = from.max(start).saturating_sub(start);
                 let hi = upto.min(start.saturating_add(BLOCK)).saturating_sub(start);
-                let piece = sub(block.bytes(), us(lo), us(hi.saturating_sub(lo)));
-                sink.put(piece.ctx("a cached block's range")?).await?;
+                match source {
+                    Source::Held(block) => {
+                        let piece = sub(block.bytes(), us(lo), us(hi.saturating_sub(lo)));
+                        sink.put(piece.ctx("a cached block's range")?).await?;
+                    }
+                    Source::Coming(coming) => {
+                        if scratch.is_empty() {
+                            scratch.resize(us(len.min(PIECE)), 0);
+                        }
+                        let mine = started
+                            .as_ref()
+                            .is_some_and(|a| Arc::ptr_eq(a, &coming.fetch));
+                        coming.send(lo, hi, mine, &mut scratch, sink).await?;
+                    }
+                }
             }
             pos = upto;
         }
         Ok(())
     }
 
-    /// The blocks of the window of the read `[pos, end)` that starts at `pos`, held:
-    /// fetching those not cached (or waiting for another reader's fetch of them, and
-    /// failing with it if it fails).
-    async fn hold(&self, pack: &Arc<Pack>, pos: u64, end: u64) -> Result<Window> {
+    /// The window of the read `[pos, end)` that starts at `pos`, each of its blocks held
+    /// as the cache has it or as the fetch that brings it. For the blocks that are
+    /// neither, a fetch is started, with `permit` or, the read having none, if one more
+    /// may be in flight. If none may, the read takes the blocks before the first that
+    /// needs a fetch (the window ends there); that being its first, there is no window
+    /// (`None`), and the read comes back with a permit: another read may have started
+    /// that fetch by then, and the permit is not used.
+    fn look(
+        self: &Arc<Self>,
+        pack: &Arc<Pack>,
+        pos: u64,
+        end: u64,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<Option<Window>> {
         let mut window = Window::over(pos, end).ctx("an empty read")?;
-        let mut fetched = false;
-        // The fetches this read waited for last, by block.
-        let mut waited: HashMap<u64, Arc<Attempt>> = HashMap::new();
-        loop {
-            let (mine, attempt): (Vec<u64>, Arc<Attempt>) = loop {
-                // Waiting is registered before the state is read: a fetch that ends in
-                // between still wakes this reader.
-                let mut ended = std::pin::pin!(self.done.notified());
-                ended.as_mut().enable();
-                {
-                    let mut st = lock(&self.state);
-                    let (mut missing, mut waiting) = (Vec::new(), HashMap::new());
-                    for (place, b) in window.places() {
-                        if place.is_some() {
-                            continue;
-                        }
-                        if let Some(block) = self.cached(pack, b) {
-                            *place = Some(block);
-                        } else if let Some(a) = st.fetching.get(&(pack.serial, b)) {
-                            waiting.insert(b, Arc::clone(a));
-                        } else if let Some(e) = waited.get(&b).and_then(|a| a.failure()) {
-                            // Neither cached nor being fetched, and the fetch this read
-                            // waited for failed: so does the read.
-                            return Err(e);
-                        } else {
-                            missing.push(b);
-                        }
-                    }
-                    if missing.is_empty() && waiting.is_empty() {
-                        let c = if fetched { &self.misses } else { &self.hits };
-                        c.fetch_add(1, Ordering::Relaxed);
-                        return Ok(window);
-                    }
-                    if !missing.is_empty() {
-                        let attempt = Arc::new(Attempt::default());
-                        for &b in &missing {
-                            st.fetching.insert((pack.serial, b), Arc::clone(&attempt));
-                        }
-                        break (missing, attempt);
-                    }
-                    waited = waiting;
-                }
-                ended.await;
-            };
-            fetched = true;
-            // Should this read be dropped mid-fetch, the blocks stop being "fetching".
-            let mut guard = Fetching {
-                cache: self,
-                pack: pack.serial,
-                blocks: &mine,
-                armed: true,
-            };
-            let (got, outcome) = self.fetch(pack, &mine).await;
-            guard.armed = false;
-            let mut gone = Vec::new();
-            {
-                let mut st = lock(&self.state);
-                for &b in &mine {
-                    st.fetching.remove(&(pack.serial, b));
-                }
-                // What arrived is cached, also when a later run failed.
-                if !got.is_empty() {
-                    let now = self.clock.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-                    for (&b, block) in mine.iter().zip(got) {
-                        block.used.store(now, Ordering::Relaxed);
-                        self.keep(&mut st, pack, b, &block, &mut gone);
-                        let at = us(b.saturating_sub(window.first));
-                        if let Some(place) = window.blocks.get_mut(at) {
-                            *place = Some(block);
-                        }
-                    }
-                    self.evict(&mut st, &mut gone);
-                }
-                // Those waiting for the blocks that did not arrive fail with this read.
-                if let Err(e) = &outcome {
-                    attempt.fail(e);
+        let fetch = {
+            let mut st = lock(&self.state);
+            let mut missing = Vec::new();
+            for (place, b) in window.places() {
+                if let Some(block) = self.cached(pack, b) {
+                    *place = Some(Source::Held(block));
+                } else if let Some(coming) = st.fetching.get(&(pack.serial, b)) {
+                    *place = Some(Source::Coming(Arc::clone(coming)));
+                } else {
+                    missing.push(b);
                 }
             }
-            // Out of the lock: a block's last reference removes, unmaps and closes its file.
-            drop(gone);
-            self.done.notify_waiters();
-            outcome?;
-        }
+            let Some(&first) = missing.first() else {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Ok(Some(window));
+            };
+            let free = || Arc::clone(&self.permits).try_acquire_owned().ok();
+            match permit.or_else(free) {
+                Some(permit) => self.start(&mut st, pack, &mut window, missing, permit),
+                None if first > window.first => {
+                    window.cut(first);
+                    self.hits.fetch_add(1, Ordering::Relaxed);
+                    return Ok(Some(window));
+                }
+                None => return Ok(None),
+            }
+        };
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(fetch.run());
+        Ok(Some(window))
     }
 
-    /// Fetches `blocks` (ascending), one ranged GET per run of consecutive ones. Returns the
-    /// blocks fetched (the first of `blocks`, in order), and how the fetch ended. When a
-    /// run fails, the blocks of the runs before it are whole and are returned with the
-    /// error, for the caller to cache (they used to stay on disk untracked: never read
-    /// again, never evicted); no block of the failed run is kept. What is not returned
-    /// leaves no file, also when the read that fetches is dropped on the way.
-    async fn fetch(&self, pack: &Pack, blocks: &[u64]) -> (Vec<Arc<Block>>, Result<()>) {
-        let mut got = Vec::with_capacity(blocks.len());
-        let mut i = 0usize;
-        while let Some(&b0) = blocks.get(i) {
-            let mut j = i.saturating_add(1);
-            while blocks
-                .get(j)
-                .is_some_and(|&b| b == b0.saturating_add(u64_of(j.saturating_sub(i))))
-            {
-                j = j.saturating_add(1);
+    /// The fetch of `missing` (blocks of `window`, ascending, neither cached nor coming),
+    /// which are coming from now on: the read's to follow, as any other's.
+    fn start(
+        self: &Arc<Self>,
+        st: &mut State,
+        pack: &Arc<Pack>,
+        window: &mut Window,
+        missing: Vec<u64>,
+        permit: OwnedSemaphorePermit,
+    ) -> Fetch {
+        let attempt = Arc::new(Attempt::default());
+        let mut blocks = VecDeque::with_capacity(missing.len());
+        for b in missing {
+            let coming = Coming::new(&attempt);
+            st.fetching.insert((pack.serial, b), Arc::clone(&coming));
+            if let Some(place) = window.place(b) {
+                *place = Some(Source::Coming(Arc::clone(&coming)));
             }
-            let n = u64_of(j.saturating_sub(i));
-            let start = b0.saturating_mul(BLOCK);
-            let end = b0.saturating_add(n).saturating_mul(BLOCK).min(pack.len);
-            // Blocks are written as the bytes arrive, each opened and mapped when whole.
-            let mut cur: Option<Arriving> = None;
-            let mut whole: Vec<Arc<Block>> = Vec::new();
-            let mut written = 0u64;
-            let finish = |cur: &mut Option<Arriving>, whole: &mut Vec<Arc<Block>>| -> Result<()> {
-                if let Some(arriving) = cur.take() {
-                    let at = arriving.block.saturating_mul(BLOCK);
-                    let len = at.saturating_add(BLOCK).min(pack.len).saturating_sub(at);
-                    whole.push(arriving.whole(len)?);
-                }
-                Ok(())
-            };
-            self.fetches.fetch_add(1, Ordering::Relaxed);
-            let run = self
-                .store
-                .read_range_async(
-                    &pack.object,
-                    start,
-                    end.saturating_sub(start),
-                    &mut |mut chunk: &[u8]| {
-                        while !chunk.is_empty() {
-                            let pos = start.saturating_add(written);
-                            let b = pos.checked_div(BLOCK).unwrap_or(0);
-                            if cur.as_ref().is_none_or(|c| c.block != b) {
-                                finish(&mut cur, &mut whole)?;
-                                let file = self.files.fetch_add(1, Ordering::Relaxed);
-                                let path = self.path(pack, b, file);
-                                let tmp = crate::fsutil::temp_path(&path);
-                                cur = Some(Arriving {
-                                    block: b,
-                                    file: File::create(&tmp).ctx("creating a cache block")?,
-                                    tmp,
-                                    path,
-                                });
-                            }
-                            let room = us(b
-                                .saturating_add(1)
-                                .saturating_mul(BLOCK)
-                                .saturating_sub(pos));
-                            let (now, rest) = chunk.split_at(room.min(chunk.len()));
-                            if let Some(arriving) = cur.as_mut() {
-                                std::io::Write::write_all(&mut arriving.file, now)
-                                    .ctx("writing a cache block")?;
-                            }
-                            written = written.saturating_add(u64_of(now.len()));
-                            chunk = rest;
-                        }
-                        Ok(())
-                    },
-                )
-                .await
-                .and_then(|()| finish(&mut cur, &mut whole));
-            if let Err(e) = run {
-                return (got, Err(e));
-            }
-            got.append(&mut whole);
-            i = j;
+            blocks.push_back((b, coming));
         }
-        (got, Ok(()))
+        window.started = Some(Arc::clone(&attempt));
+        Fetch {
+            cache: Arc::clone(self),
+            pack: Arc::clone(pack),
+            attempt,
+            blocks,
+            failed: None,
+            _permit: permit,
+        }
     }
 
     /// Caches `block` as block `b` of `pack`; what it replaces goes to `gone`. The pack
     /// gets its slots here if this is its first block. A pack that can have none keeps
-    /// no block: the read that fetched this one has it, and the next fetches again.
+    /// no block: the reads following its fetch have it, and the next fetches again.
     fn keep(
         &self,
         st: &mut State,
@@ -900,7 +1227,7 @@ mod tests {
     fn concurrent_readers_over_a_small_cache() {
         let (dir, cache, pack, data) = cache_over("race", BLOCK * 2);
         let n = data.len() as u64;
-        let (cache, data) = (Arc::new(cache), Arc::new(data));
+        let data = Arc::new(data);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(8)
             .enable_all()
@@ -932,6 +1259,7 @@ mod tests {
             for t in tasks {
                 t.await.unwrap();
             }
+            settled(&cache).await;
         });
         assert!(cache.kept().1 <= BLOCK * 2, "within budget");
         assert!(cache.bypassed.load(Ordering::Relaxed) > 0);
@@ -943,10 +1271,13 @@ mod tests {
     /// Once no read is running: nothing is being fetched, the bytes add up within the
     /// bounds, every cached block is in its pack's slot and held by the cache alone, no
     /// other slot of `pack` holds one, and the directory holds exactly the cached blocks'
-    /// files (none leaked, none missing).
+    /// files (none leaked, none missing), each open and mapped once, and no other file
+    /// of it is.
     fn consistent(cache: &BlockCache, pack: &Pack) {
+        assert_eq!(cache.fetching(), 0, "fetches in flight");
         let st = lock(&cache.state);
         assert!(st.fetching.is_empty());
+        assert_eq!(open_and_mapped(cache), (st.cached.len(), st.cached.len()));
         assert_eq!(
             st.bytes,
             st.cached.values().map(|c| c.block.len()).sum::<u64>()
@@ -996,7 +1327,7 @@ mod tests {
     }
 
     /// A store with one pack `p` of five blocks and 1,234 bytes, and a cache over it.
-    fn cache_over(tag: &str, budget: u64) -> (PathBuf, BlockCache, Arc<Pack>, Vec<u8>) {
+    fn cache_over(tag: &str, budget: u64) -> (PathBuf, Arc<BlockCache>, Arc<Pack>, Vec<u8>) {
         cache_of(tag, budget, usize::MAX)
     }
 
@@ -1004,20 +1335,23 @@ mod tests {
         tag: &str,
         budget: u64,
         max_blocks: usize,
-    ) -> (PathBuf, BlockCache, Arc<Pack>, Vec<u8>) {
+    ) -> (PathBuf, Arc<BlockCache>, Arc<Pack>, Vec<u8>) {
         let dir = std::env::temp_dir().join(format!("gvd-bcache-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store =
             Arc::new(Store::open(&format!("fs:{}", dir.join("store").display()), "").unwrap());
-        let data: Vec<u8> = (0..(BLOCK * 5 + 1234))
-            .map(|i| (i * 7 % 253) as u8)
-            .collect();
+        let data = bytes_of(BLOCK * 5 + 1234);
         let mut w = store.writer("blobs/p.pack").unwrap();
         std::io::Write::write_all(&mut w, &data).unwrap();
         w.finish().unwrap();
         let cache = BlockCache::new(store, dir.join("cache"), budget, max_blocks).unwrap();
         let pack = cache.pack("p", data.len() as u64);
-        (dir, cache, pack, data)
+        (dir, Arc::new(cache), pack, data)
+    }
+
+    /// A pack's bytes: no two blocks alike.
+    fn bytes_of(len: u64) -> Vec<u8> {
+        (0..len).map(|i| (i * 7 % 253) as u8).collect()
     }
 
     fn rt() -> tokio::runtime::Runtime {
@@ -1027,11 +1361,22 @@ mod tests {
             .unwrap()
     }
 
-    fn read_all(cache: &BlockCache, pack: &Arc<Pack>, data: &[u8], at: u64, len: u64) {
-        rt().block_on(read_all_async(cache, pack, data, at, len));
+    /// A read, and the end of the fetches it started: they go on after it, and would be
+    /// dropped with the runtime.
+    fn read_all(cache: &Arc<BlockCache>, pack: &Arc<Pack>, data: &[u8], at: u64, len: u64) {
+        rt().block_on(async {
+            read_all_async(cache, pack, data, at, len).await;
+            settled(cache).await;
+        });
     }
 
-    async fn read_all_async(cache: &BlockCache, pack: &Arc<Pack>, data: &[u8], at: u64, len: u64) {
+    async fn read_all_async(
+        cache: &Arc<BlockCache>,
+        pack: &Arc<Pack>,
+        data: &[u8],
+        at: u64,
+        len: u64,
+    ) {
         let mut got = Vec::new();
         cache
             .read(pack, at, len, &mut |b: &[u8]| {
@@ -1041,6 +1386,165 @@ mod tests {
             .await
             .unwrap();
         assert!(got == data[at as usize..(at + len) as usize], "{at}+{len}");
+    }
+
+    /// No fetch is in flight: each has ended, cached its blocks and let go of them.
+    async fn settled(cache: &BlockCache) {
+        let all = u32::try_from(cache.at_once).unwrap();
+        drop(cache.permits.acquire_many(all).await.unwrap());
+    }
+
+    /// Waits for `f` to hold while the runtime's tasks go on.
+    async fn until(what: &str, f: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !f() {
+            assert!(std::time::Instant::now() < deadline, "never: {what}");
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    }
+
+    /// A read of `len` bytes at `at` on a task of its own: what it has got so far, and
+    /// its end.
+    fn reading(
+        cache: &Arc<BlockCache>,
+        pack: &Arc<Pack>,
+        at: u64,
+        len: u64,
+    ) -> (Arc<Mutex<Vec<u8>>>, tokio::task::JoinHandle<Result<()>>) {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let (cache, pack, into) = (Arc::clone(cache), Arc::clone(pack), Arc::clone(&got));
+        let read = tokio::spawn(async move {
+            let sink = &mut |b: &[u8]| {
+                lock(&into).extend_from_slice(b);
+                Ok(())
+            };
+            cache.read(&pack, at, len, sink).await
+        });
+        (got, read)
+    }
+
+    /// What `f` comes to, which should not have to wait for anything more.
+    async fn soon<T>(f: impl Future<Output = T>) -> T {
+        let limit = std::time::Duration::from_secs(30);
+        tokio::time::timeout(limit, f).await.expect("it waited")
+    }
+
+    /// The end of a read that has what it needs.
+    async fn ended(read: tokio::task::JoinHandle<Result<()>>) -> Result<()> {
+        soon(read).await.unwrap()
+    }
+
+    /// An object store that holds one pack, `p`, and sends it as the test lets it. An
+    /// answer goes on up to byte `upto` of the pack and waits there. At byte `lost` it
+    /// breaks off, and what follows that byte is not found: the store has lost it.
+    struct Paced {
+        data: Vec<u8>,
+        upto: AtomicU64,
+        lost: AtomicU64,
+        /// Requests so far, and those being answered: now, and at most at once.
+        asked: AtomicU64,
+        answering: AtomicU64,
+        most: AtomicU64,
+    }
+
+    impl Paced {
+        fn answer(&self, mut conn: std::net::TcpStream) {
+            use std::io::{Read, Write};
+            let (mut head, mut piece) = (Vec::new(), [0u8; 4096]);
+            loop {
+                let end = loop {
+                    if let Some(p) = head.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p + 4;
+                    }
+                    match conn.read(&mut piece) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&piece[..n]),
+                    }
+                };
+                let request = String::from_utf8_lossy(&head[..end]).to_ascii_lowercase();
+                head.drain(..end);
+                let range = request
+                    .lines()
+                    .find_map(|l| l.strip_prefix("x-ms-range: bytes="))
+                    .unwrap();
+                let (from, last) = range.split_once('-').unwrap();
+                let (from, last): (u64, u64) = (from.parse().unwrap(), last.parse().unwrap());
+                self.asked.fetch_add(1, Ordering::SeqCst);
+                if from >= self.lost.load(Ordering::SeqCst) {
+                    let gone = b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+                    if conn.write_all(gone).is_err() {
+                        return;
+                    }
+                    continue;
+                }
+                let now = self.answering.fetch_add(1, Ordering::SeqCst) + 1;
+                self.most.fetch_max(now, Ordering::SeqCst);
+                let len = last + 1 - from;
+                let begin =
+                    format!("HTTP/1.1 206 Partial Content\r\nContent-Length: {len}\r\n\r\n");
+                let mut whole = conn.write_all(begin.as_bytes()).is_ok();
+                let mut pos = from;
+                while whole && pos <= last {
+                    let lost = self.lost.load(Ordering::SeqCst);
+                    let to = (last + 1)
+                        .min(lost)
+                        .min(self.upto.load(Ordering::SeqCst))
+                        .min(pos + (64 << 10));
+                    if pos >= lost {
+                        whole = false;
+                    } else if pos >= to {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    } else {
+                        let bytes = &self.data[pos as usize..to as usize];
+                        whole = conn.write_all(bytes).is_ok();
+                        pos = to;
+                    }
+                }
+                self.answering.fetch_sub(1, Ordering::SeqCst);
+                if !whole {
+                    return;
+                }
+            }
+        }
+
+        fn asked(&self) -> u64 {
+            self.asked.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A [`Paced`] store whose pack is `blocks` blocks and 1,234 bytes, sending nothing
+    /// yet, and a cache over it.
+    fn paced(
+        tag: &str,
+        blocks: u64,
+        budget: u64,
+        max_blocks: usize,
+    ) -> (PathBuf, Arc<Paced>, Arc<BlockCache>, Arc<Pack>) {
+        let dir = std::env::temp_dir().join(format!("gvd-bcache-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(Paced {
+            data: bytes_of(BLOCK * blocks + 1234),
+            upto: AtomicU64::new(0),
+            lost: AtomicU64::new(u64::MAX),
+            asked: AtomicU64::new(0),
+            answering: AtomicU64::new(0),
+            most: AtomicU64::new(0),
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let serving = Arc::clone(&store);
+        std::thread::spawn(move || {
+            for conn in listener.incoming().flatten() {
+                let serving = Arc::clone(&serving);
+                std::thread::spawn(move || serving.answer(conn));
+            }
+        });
+        let account =
+            format!("BlobEndpoint=http://127.0.0.1:{port}/acct;AccountName=acct;AccountKey=a2V5");
+        let azure = Store::Azure(crate::azure::AzureStore::new(&account, "packs").unwrap());
+        let cache = BlockCache::new(Arc::new(azure), dir.clone(), budget, max_blocks).unwrap();
+        let pack = cache.pack("p", store.data.len() as u64);
+        (dir, store, Arc::new(cache), pack)
     }
 
     /// `len` bytes at `at` as a request gets them without waiting, if the cache has them
@@ -1537,55 +2041,356 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A read that goes away while it fetches (its client did) leaves nothing: neither
-    /// the blocks that had arrived whole, which no one would read or evict, nor the one
-    /// being written. (Those files stayed until the edge started again.)
+    /// A read ends when its bytes are here, not when its block is. The store has sent
+    /// 100,000 bytes of a block and waits: a read of 20 KB among them ends, the block
+    /// still coming, in a file under a temporary name, and nothing cached. When the
+    /// store goes on, the block is cached and the file has its name. (A read fetched its
+    /// block itself and handed on its first byte when the last had arrived.)
     #[test]
-    fn a_read_dropped_while_it_fetches_leaves_no_file() {
-        use crate::testhttp::{Reply, serve};
-        use std::sync::atomic::{AtomicBool, AtomicUsize};
-        let dir = std::env::temp_dir().join(format!("gvd-bcache-dropped-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let asked = Arc::new(AtomicUsize::new(0));
-        let release = Arc::new(AtomicBool::new(false));
-        let (seen, gate) = (Arc::clone(&asked), Arc::clone(&release));
-        // A pack of three blocks. The first answer breaks off in the second block; the
-        // request for the rest gets no answer while the test runs.
-        let port = serve(move |_| {
-            if seen.fetch_add(1, Ordering::SeqCst) == 0 {
-                let sent = (BLOCK + BLOCK / 2) as usize;
-                let body = vec![7u8; 3 * BLOCK as usize];
-                return Reply::Cut("206 Partial Content".to_string(), body, sent);
-            }
-            while !gate.load(Ordering::SeqCst) {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-            }
-            Reply::status("404 Not Found")
-        });
-        let account =
-            format!("BlobEndpoint=http://127.0.0.1:{port}/acct;AccountName=acct;AccountKey=a2V5");
-        let store = Store::Azure(crate::azure::AzureStore::new(&account, "packs").unwrap());
-        let cache = BlockCache::new(Arc::new(store), dir.clone(), BLOCK * 64, usize::MAX).unwrap();
-        let pack = cache.pack("p", BLOCK * 3);
-        let cache = Arc::new(cache);
+    fn a_read_ends_while_its_block_still_arrives() {
+        let (dir, store, cache, pack) = paced("arriving", 2, BLOCK * 64, usize::MAX);
+        let data = &store.data;
+        store.upto.store(100_000, Ordering::SeqCst);
         rt().block_on(async {
-            let (reading, wanted) = (Arc::clone(&cache), Arc::clone(&pack));
-            let reader = tokio::spawn(async move {
-                let sink = &mut |_: &[u8]| Ok(());
-                reading.read(&wanted, 0, 3 * BLOCK, sink).await
-            });
-            while asked.load(Ordering::SeqCst) < 2 {
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            }
-            // The first block is whole, the second is arriving.
-            assert_eq!(files(&cache).len(), 2);
-            reader.abort();
-            assert!(reader.await.unwrap_err().is_cancelled());
+            let (got, read) = reading(&cache, &pack, 5_000, 20_000);
+            ended(read).await.unwrap();
+            assert!(*lock(&got) == data[5_000..25_000]);
+            assert_eq!((cache.kept(), cache.fetching()), ((0, 0), 1));
+            assert!(lock(&cache.state).fetching.contains_key(&(pack.serial, 0)));
+            let arriving = files(&cache);
+            assert_eq!(arriving.len(), 1);
+            assert!(arriving[0].to_str().unwrap().contains(".tmp-"));
+            assert_eq!(open_and_mapped(&cache), (1, 0));
+            store.upto.store(u64::MAX, Ordering::SeqCst);
+            soon(settled(&cache)).await;
         });
-        assert!(files(&cache).is_empty(), "{:?}", files(&cache));
-        assert_eq!(cache.kept(), (0, 0));
+        assert_eq!((store.asked(), cache.kept()), (1, (1, BLOCK)));
+        let counted = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        assert_eq!((counted(&cache.hits), counted(&cache.misses)), (0, 1));
         consistent(&cache, &pack);
-        release.store(true, Ordering::SeqCst);
+        let mut reader = Reader::new(Some(&cache));
+        assert!(reader.range(&pack, 5_000, 20_000).unwrap() == &data[5_000..25_000]);
+        drop(reader);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A block is fetched once however many reads want it, and each is handed its bytes
+    /// as they arrive: a second read of a block that is coming follows the same fetch,
+    /// gets what the store has sent of its range, and the rest as it comes.
+    #[test]
+    fn a_second_read_follows_the_same_fetch() {
+        let (dir, store, cache, pack) = paced("follows", 2, BLOCK * 64, usize::MAX);
+        let data = &store.data;
+        store.upto.store(300_000, Ordering::SeqCst);
+        rt().block_on(async {
+            let (_, first) = reading(&cache, &pack, 1_000, 50_000);
+            ended(first).await.unwrap();
+            let (got, second) = reading(&cache, &pack, 250_000, 100_000);
+            until("what has arrived", || lock(&got).len() == 50_000).await;
+            store.upto.store(320_000, Ordering::SeqCst);
+            until("what arrives", || lock(&got).len() == 70_000).await;
+            assert!(!second.is_finished());
+            assert!(*lock(&got) == data[250_000..320_000]);
+            assert_eq!((store.asked(), cache.kept()), (1, (0, 0)));
+            store.upto.store(u64::MAX, Ordering::SeqCst);
+            ended(second).await.unwrap();
+            assert!(*lock(&got) == data[250_000..350_000]);
+            soon(settled(&cache)).await;
+        });
+        assert_eq!((store.asked(), cache.kept()), (1, (1, BLOCK)));
+        let counted = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        assert_eq!((counted(&cache.hits), counted(&cache.misses)), (1, 1));
+        consistent(&cache, &pack);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A block is cached the moment it is whole, while the blocks after it of the same
+    /// fetch still arrive: a request reads it without waiting from then on. (The blocks
+    /// of a fetch were cached together, when the last of them had arrived.)
+    #[test]
+    fn a_block_is_cached_when_it_is_whole() {
+        let (dir, store, cache, pack) = paced("whole", 3, BLOCK * 64, usize::MAX);
+        let data = &store.data;
+        store.upto.store(BLOCK + 1_000, Ordering::SeqCst);
+        rt().block_on(async {
+            let (got, read) = reading(&cache, &pack, 0, 3 * BLOCK);
+            until("the first block", || cache.kept() == (1, BLOCK)).await;
+            let so_far = (BLOCK + 1_000) as usize;
+            until("the second's first bytes", || lock(&got).len() == so_far).await;
+            let mut reader = Reader::new(Some(&cache));
+            assert!(reader.range(&pack, 77, 300).unwrap() == &data[77..377]);
+            assert!(reader.range(&pack, BLOCK + 77, 300).is_none());
+            drop(reader);
+            assert_eq!((store.asked(), cache.fetching()), (1, 1));
+            assert!(!read.is_finished());
+            store.upto.store(u64::MAX, Ordering::SeqCst);
+            ended(read).await.unwrap();
+            assert!(*lock(&got) == data[..3 * BLOCK as usize]);
+            soon(settled(&cache)).await;
+        });
+        assert_eq!((store.asked(), cache.kept()), (1, (3, 3 * BLOCK)));
+        consistent(&cache, &pack);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fetch ends on its own, whatever becomes of the reads that wanted it. The read
+    /// that started one and a read that followed it go away (their clients did) while
+    /// its second block arrives: the fetch goes on to its end, its blocks are cached,
+    /// and nothing else is left of it. (A fetch ended with the request that made it, and
+    /// the blocks that had arrived went with it.)
+    #[test]
+    fn a_fetch_goes_on_when_its_reads_are_gone() {
+        let (dir, store, cache, pack) = paced("gone", 3, BLOCK * 64, usize::MAX);
+        store.upto.store(BLOCK + BLOCK / 2, Ordering::SeqCst);
+        rt().block_on(async {
+            let (_, started) = reading(&cache, &pack, 0, 3 * BLOCK);
+            until("the first block", || cache.kept() == (1, BLOCK)).await;
+            let (got, followed) = reading(&cache, &pack, BLOCK + 10, BLOCK);
+            until("the follower's first bytes", || !lock(&got).is_empty()).await;
+            for read in [started, followed] {
+                read.abort();
+                assert!(read.await.unwrap_err().is_cancelled());
+            }
+            // The second block is arriving still, and the third is to come.
+            assert_eq!(files(&cache).len(), 2);
+            assert_eq!(lock(&cache.state).fetching.len(), 2);
+            assert_eq!(cache.fetching(), 1);
+            store.upto.store(u64::MAX, Ordering::SeqCst);
+            soon(settled(&cache)).await;
+        });
+        assert_eq!((store.asked(), cache.kept()), (1, (3, 3 * BLOCK)));
+        consistent(&cache, &pack);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fetch that fails fails the reads that still wait for bytes of its blocks, and
+    /// no other. Here the store has lost a pack from the middle of its third block on.
+    /// A read whose bytes had all arrived when the fetch broke off has been served, as
+    /// has one of a block that was whole; one that needed more has what there was, and
+    /// the fetch's failure; the blocks that were whole are cached. The next read of
+    /// what is not asks the store again.
+    #[test]
+    fn a_failed_fetch_fails_the_reads_still_waiting_and_no_other() {
+        let (dir, store, cache, pack) = paced("failed", 4, BLOCK * 64, usize::MAX);
+        let data = &store.data;
+        store.upto.store(u64::MAX, Ordering::SeqCst);
+        let rt = rt();
+        // Block 1 is cached: a read of blocks 0..=3 then fetches the runs [0] and [2, 3].
+        rt.block_on(async {
+            read_all_async(&cache, &pack, data, BLOCK + 5, 10).await;
+            soon(settled(&cache)).await;
+        });
+        let lost = (2 * BLOCK + 500_000) as usize;
+        store.lost.store(lost as u64, Ordering::SeqCst);
+        // Nothing arrives until every read below is waiting.
+        store.upto.store(0, Ordering::SeqCst);
+        let hits = cache.hits.load(Ordering::Relaxed);
+        let third = 2 * BLOCK as usize;
+        let reads = rt.block_on(async {
+            let all = reading(&cache, &pack, 0, 4 * BLOCK);
+            until("the fetch", || lock(&cache.state).fetching.len() == 3).await;
+            let reads = [
+                all,
+                reading(&cache, &pack, 10, 100),
+                reading(&cache, &pack, 2 * BLOCK + 1_000, 100_000),
+                reading(&cache, &pack, 2 * BLOCK + 400_000, 200_000),
+                reading(&cache, &pack, 3 * BLOCK, 10),
+            ];
+            let following = || cache.hits.load(Ordering::Relaxed) == hits + 4;
+            until("the reads that follow it", following).await;
+            store.upto.store(u64::MAX, Ordering::SeqCst);
+            let mut ends = Vec::new();
+            for (got, read) in reads {
+                let end = ended(read).await.map_err(|e| e.to_string());
+                ends.push((std::mem::take(&mut *lock(&got)), end));
+            }
+            soon(settled(&cache)).await;
+            ends
+        });
+        let [all, first, arrived, half, never] = <[_; 5]>::try_from(reads).unwrap();
+        assert!(first.1.is_ok() && first.0 == data[10..110]);
+        assert!(arrived.1.is_ok() && arrived.0 == data[third + 1_000..third + 101_000]);
+        let e = half.1.unwrap_err();
+        assert!(e.contains("the fetch it waited for failed"), "{e}");
+        assert!(half.0 == data[third + 400_000..lost]);
+        let e = never.1.unwrap_err();
+        assert!(e.contains("the fetch it waited for failed"), "{e}");
+        assert!(never.0.is_empty());
+        let e = all.1.unwrap_err();
+        assert!(e.contains("HTTP 404") && !e.contains("waited"), "{e}");
+        assert!(all.0 == data[..lost], "what had arrived");
+        assert_eq!(
+            store.asked(),
+            4,
+            "block 1; the runs [0] and [2, 3]; what was left of the second"
+        );
+        assert_eq!(cache.kept(), (2, 2 * BLOCK), "blocks 0 and 1");
+        consistent(&cache, &pack);
+        // The store has the pack again.
+        store.lost.store(u64::MAX, Ordering::SeqCst);
+        rt.block_on(async {
+            read_all_async(&cache, &pack, data, 2 * BLOCK + 400_000, 200_000).await;
+            soon(settled(&cache)).await;
+        });
+        assert_eq!((store.asked(), cache.kept()), (5, (3, 3 * BLOCK)));
+        consistent(&cache, &pack);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No more fetches are in flight than the cache allows (one for every 16 blocks it
+    /// may keep: two here), however many reads need one. The others wait for a fetch to
+    /// end, holding nothing; a read that needs one for its later blocks only is handed
+    /// its first ones meanwhile. A fetch that ends, or fails, makes room for the next.
+    /// (Each read fetched for itself: six at once here.)
+    #[test]
+    fn fetches_in_flight_are_bounded() {
+        let (dir, store, cache, pack) = paced("bound", 8, BLOCK * 64, 32);
+        let data = &store.data;
+        assert_eq!(cache.at_once, 2);
+        // The store sends 1,000 bytes of the pack and waits.
+        store.upto.store(1_000, Ordering::SeqCst);
+        let rt = rt();
+        rt.block_on(async {
+            let small = |b: u64| {
+                let at = b * BLOCK + 2_000;
+                (at, reading(&cache, &pack, at, 10))
+            };
+            let mut reads = vec![small(0), small(1)];
+            until("two fetches", || store.asked() == 2).await;
+            reads.extend((2..6).map(small));
+            // Across blocks 0 and 1, which are coming, and block 2, which needs a fetch.
+            let (across, read) = reading(&cache, &pack, 200, 2 * BLOCK + 100);
+            until("the bytes of its first block", || {
+                lock(&across).len() == 800
+            })
+            .await;
+            assert_eq!((store.asked(), cache.fetching()), (2, 2));
+            assert_eq!(lock(&cache.state).fetching.len(), 2);
+            assert!(reads.iter().all(|(_, (_, read))| !read.is_finished()));
+            store.upto.store(u64::MAX, Ordering::SeqCst);
+            for (at, (got, read)) in reads {
+                ended(read).await.unwrap();
+                assert!(*lock(&got) == data[at as usize..at as usize + 10], "{at}");
+            }
+            ended(read).await.unwrap();
+            assert!(*lock(&across) == data[200..2 * BLOCK as usize + 300]);
+            soon(settled(&cache)).await;
+            assert_eq!(store.asked(), 6, "a fetch for each block");
+            // A fetch that fails: what follows block 5 is lost.
+            store.lost.store(6 * BLOCK, Ordering::SeqCst);
+            let (_, read) = reading(&cache, &pack, 7 * BLOCK, 10);
+            let e = ended(read).await.unwrap_err().to_string();
+            assert!(e.contains("HTTP 404"), "{e}");
+            soon(settled(&cache)).await;
+            store.lost.store(u64::MAX, Ordering::SeqCst);
+            read_all_async(&cache, &pack, data, 6 * BLOCK + 5, 10).await;
+            soon(settled(&cache)).await;
+        });
+        assert_eq!(store.most.load(Ordering::SeqCst), 2, "requests at once");
+        assert_eq!((store.asked(), cache.kept()), (8, (7, 7 * BLOCK)));
+        consistent(&cache, &pack);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read that has to wait for the store flushes its sink first, so what a response's
+    /// buffer holds of the read leaves while the store is slow: here the bytes that
+    /// had arrived when the store stopped. (They would wait in the buffer for the
+    /// store to go on.) What it is handed last is the sink's to send.
+    #[test]
+    fn a_read_flushes_its_sink_before_it_waits() {
+        /// Keeps what it is handed until it is flushed, as a response's buffer does.
+        struct Buffered {
+            kept: Vec<u8>,
+            sent: Arc<Mutex<Vec<u8>>>,
+        }
+        impl Sink for Buffered {
+            async fn put(&mut self, piece: &[u8]) -> Result<()> {
+                self.kept.extend_from_slice(piece);
+                Ok(())
+            }
+        }
+        impl Flush for Buffered {
+            async fn flush(&mut self) -> Result<()> {
+                lock(&self.sent).append(&mut self.kept);
+                Ok(())
+            }
+        }
+        let (dir, store, cache, pack) = paced("flush", 2, BLOCK * 64, usize::MAX);
+        let data = &store.data;
+        store.upto.store(300_000, Ordering::SeqCst);
+        rt().block_on(async {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            let mut sink = Buffered {
+                kept: Vec::new(),
+                sent: Arc::clone(&sent),
+            };
+            let (reading, wanted) = (Arc::clone(&cache), Arc::clone(&pack));
+            let read = tokio::spawn(async move {
+                let end = reading.read(&wanted, 250_000, 100_000, &mut sink).await;
+                (end, sink.kept)
+            });
+            until("what had arrived to leave", || lock(&sent).len() == 50_000).await;
+            assert!(*lock(&sent) == data[250_000..300_000]);
+            store.upto.store(u64::MAX, Ordering::SeqCst);
+            let (end, kept) = soon(read).await.unwrap();
+            end.unwrap();
+            let mut all = std::mem::take(&mut *lock(&sent));
+            all.extend(kept);
+            assert!(all == data[250_000..350_000]);
+            soon(settled(&cache)).await;
+        });
+        consistent(&cache, &pack);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read that is slow to take its bytes (its client is) holds up neither the fetch
+    /// it started nor another read of the same blocks: the fetch ends at the store's
+    /// pace, and its blocks are cached, while the read has taken one piece.
+    #[test]
+    fn a_slow_read_holds_up_neither_its_fetch_nor_another_read() {
+        struct Slow {
+            got: Arc<Mutex<Vec<u8>>>,
+            /// A permit for each piece it may take.
+            may: Arc<Semaphore>,
+        }
+        impl Sink for Slow {
+            async fn put(&mut self, piece: &[u8]) -> Result<()> {
+                self.may.acquire().await.unwrap().forget();
+                lock(&self.got).extend_from_slice(piece);
+                Ok(())
+            }
+        }
+        impl Flush for Slow {
+            async fn flush(&mut self) -> Result<()> {
+                Ok(())
+            }
+        }
+        let (dir, store, cache, pack) = paced("slow", 2, BLOCK * 64, usize::MAX);
+        let data = &store.data;
+        store.upto.store(u64::MAX, Ordering::SeqCst);
+        rt().block_on(async {
+            let (got, may) = (
+                Arc::new(Mutex::new(Vec::new())),
+                Arc::new(Semaphore::new(1)),
+            );
+            let mut sink = Slow {
+                got: Arc::clone(&got),
+                may: Arc::clone(&may),
+            };
+            let (reading, wanted) = (Arc::clone(&cache), Arc::clone(&pack));
+            let slow =
+                tokio::spawn(async move { reading.read(&wanted, 0, 2 * BLOCK, &mut sink).await });
+            until("its fetch", || cache.misses.load(Ordering::Relaxed) == 1).await;
+            soon(settled(&cache)).await;
+            assert_eq!(cache.kept(), (2, 2 * BLOCK));
+            assert!(!slow.is_finished() && lock(&got).len() <= PIECE as usize);
+            read_all_async(&cache, &pack, data, BLOCK - 5, 10).await;
+            may.add_permits(1 << 20);
+            ended(slow).await.unwrap();
+            assert!(*lock(&got) == data[..2 * BLOCK as usize]);
+        });
+        assert_eq!(store.asked(), 1);
+        consistent(&cache, &pack);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1621,7 +2426,19 @@ mod tests {
                     x % (n - len)
                 })
                 .collect();
-            let mut out: Vec<u8> = Vec::with_capacity(len as usize);
+            // Not one that lies across two pages, if it is shorter than a page: where the
+            // allocator puts it is not what is measured, and a copy into such a buffer
+            // takes 20 cycles more (4 ns of the 20 that 300 bytes take here).
+            let mut across = Vec::new();
+            let mut out: Vec<u8> = loop {
+                let out: Vec<u8> = Vec::with_capacity(len as usize);
+                let room = 4096 - out.as_ptr() as usize % 4096;
+                if len as usize <= room || len >= 4096 {
+                    break out;
+                }
+                across.push(out);
+            };
+            drop(across);
             let each = |t0: std::time::Instant| t0.elapsed().as_secs_f64() * 1e6 / reads as f64;
             let (mut request, mut through, mut copied) = (Vec::new(), Vec::new(), Vec::new());
             for _ in 0..5 {

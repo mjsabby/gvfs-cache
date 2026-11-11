@@ -979,8 +979,8 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   0.7 ms (`bench/profile_bpf.py`). Packs of a directory store are
   mapped and leave through `sendfile(2)`. Packs in Azure stay there. The edge holds
   their segment indexes and reads the packs in 4 MiB blocks into a local cache
-  (`src/serve/blobcache.rs`), at most 8 blocks per read at a time: a read fetches the
-  blocks it lacks, each run of consecutive ones with a single ranged GET. A cached
+  (`src/serve/blobcache.rs`), at most 8 blocks per read at a time: the blocks a read
+  lacks are fetched together, each run of consecutive ones with one ranged GET. A cached
   block is a file that stays open and mapped, and what the cache holds is read as a
   local pack is: an entry under 16 KiB is copied from the mapping into the response, a
   longer one leaves through `sendfile(2)` from the block's file (block by block, where
@@ -1014,13 +1014,13 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   and is passed over. A read holds the block it is sending: one evicted meanwhile
   stays readable, and its file is removed, unmapped and closed with its last reader,
   so every read finishes whatever the bounds; a block that does not become whole (its
-  fetch failed, or the request that fetched it went away) leaves no file.
+  fetch failed) leaves no file.
   `gvfs_blob_cache_blocks` and `gvfs_blob_cache_bytes` report what is kept. A read
   of more than a quarter of the budget (one huge blob) streams straight from the store,
   32 MiB at a time, instead of evicting everything else (`--blob-cache-mib 0`: every read
-  does). A read that fetches is of a whole range, or of all that is left of one, its
-  pieces handed to an async sink as they arrive (a client's socket, the pack's hash, an
-  inflater): no buffer between the store and the client, and the cache sees a read's
+  does). A read of what is not cached is of a whole range, or of all that is left of
+  one, its pieces handed to an async sink as they arrive (a client's socket, the pack's
+  hash, an inflater): nothing is gathered for it, and the cache sees a read's
   length. A loose blob that is not cached is one read of its entry's zlib stream, sent as
   it arrives: the response begins when the stream's first two bytes are here (its
   header, which says whether it can be spliced), and its last four, the Adler-32, are
@@ -1029,8 +1029,29 @@ its own trees need. A lost pack in object storage shows only when it is read (a 
   them, and kept, also of a blob the cache streams past. A blob of 9 MiB asked for
   first took two requests to the store and takes one, 34 MiB three and two; without a
   cache every loose blob took one more than it does.) The mirror writes the tip's blobs
-  first, in path order, so a checkout's blobs share blocks; a block being fetched is
-  fetched once (other readers' tasks wait for it, and fail with it if that fetch fails).
+  first, in path order, so a checkout's blobs share blocks. A fetch is a task of its
+  own, started by the read that finds blocks neither cached nor coming, and the reads
+  that need its blocks follow it: each sends what has arrived of its range as it
+  arrives (read back from the file the block is being written to, and from the block's
+  mapping once it is whole), flushes the response's buffer before it waits for more,
+  and ends when its range is sent, whether or not its block is whole. A block is fetched
+  once however many reads want it, and is cached the moment it is whole, while the
+  blocks after it still arrive. The fetch goes on at the store's pace whatever becomes
+  of the reads: one that is slow, or gone, holds up neither the fetch nor another read.
+  A fetch that fails fails the reads that still wait for bytes of its blocks; a read
+  whose bytes had arrived has been served, and the blocks that were whole are cached.
+  Fetches in flight are bounded, at one for every 16 blocks the cache may keep and 64
+  at most (each holds a connection to the store and the file of the block that is
+  arriving: 16 fetches under a limit of 1,024 descriptors); a read that needs one more
+  sends what it can and waits for one to end. `gvfs_blob_cache_fetching` counts them.
+  (A read fetched the blocks it lacked itself, and sent its first byte when the last
+  had arrived; a fetch ended with its request. From a store that sends 50 MB/s a
+  connection, to an edge that has just started: a blob of 20 KB at the start of its
+  block took 89 ms and takes 7, in the middle 49, at the end 88; 30 MiB sent their
+  first byte after 630 ms, and do after 1, and a client that reads as fast as the store
+  sends has the last after 631 ms, not 1,259; a batch of 3,000 small blobs in 21 blocks
+  took 1.9 s and takes 1.0 s, in path order 1.2 s, with the same 21 requests to the
+  store.)
   The ranged GETs go through the async client, its connections pooled per account.
 * **The proxy** serves blobs the store does not have, only for ids a sizes table names (a
   404 otherwise, without touching the upstream): the L0 overlay's, copied when the
@@ -1123,7 +1144,11 @@ not the hot path's).
   compresses still costs a deflate at level 6: 16.7 ms of CPU per MiB of text, 57 MiB/s
   a copy, where a pack's entry of the same blob passes at 340.
 * The edge's block cache lives in memory and on local disk and starts empty after a
-  restart. Hot small-blob packs are not prefetched whole.
+  restart. Hot small-blob packs are not prefetched whole. Nor is a block fetched before
+  a read comes to it: a batch starts the fetch of a block at its first blob there, and
+  a read of more than 32 MiB that of its next 32 MiB when it has sent those before, so
+  a batch over blocks that are not cached waits for the first byte it needs of one
+  block after another (the second that the 3,000 blobs above take).
 * A window run reads every segment index (48 B per blob) and the manifest's sizes tables:
   about 220 MB at SearchGold's scale. A runner that keeps `--cache-dir` downloads each
   once; an ephemeral runner, every run.
